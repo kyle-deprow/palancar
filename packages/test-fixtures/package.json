@@ -12,15 +12,16 @@
     }
   },
   "dependencies": {
+    "@palancar/contracts": "0.1.0",
     "@palancar/language-registry": "0.1.0"
   },
   "scripts": {
     "lint": "eslint .",
-    "pretypecheck": "npm run build --workspace @palancar/language-registry",
+    "prebuild": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/language-registry",
+    "pretypecheck": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/language-registry",
     "typecheck": "tsc -p tsconfig.json",
-    "pretest": "npm run build --workspace @palancar/language-registry",
+    "pretest": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/language-registry",
     "test": "vitest run",
-    "prebuild": "npm run build --workspace @palancar/language-registry",
     "build": "tsc -p tsconfig.build.json"
   }
 }

@@ -5,6 +5,8 @@ import {
   type TargetLanguage
 } from '@palancar/language-registry';
 
+export * from './protocol.js';
+
 export type LanguageEvidenceFixtureKind =
   | 'selected-target-final'
   | 'selected-target-provisional'
