@@ -1,0 +1,10 @@
+# Copy to a protected local backend.hcl after bootstrap has been applied.
+# Do not commit the filled-in file.
+subscription_id      = "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1"
+tenant_id             = "c69da7c1-f194-493b-9697-5b4bc8b56f37"
+resource_group_name   = "REPLACE_WITH_state_resource_group_name"
+storage_account_name  = "REPLACE_WITH_state_storage_account_name"
+container_name        = "REPLACE_WITH_bootstrap_state_container_name"
+key                   = "bootstrap/terraform.tfstate"
+use_azuread_auth      = true
+use_cli               = true

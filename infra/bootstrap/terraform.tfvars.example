@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars only if overriding defaults. Keep the copy local.
+subscription_id = "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1"
+tenant_id       = "c69da7c1-f194-493b-9697-5b4bc8b56f37"
+location        = "eastus2"
+prefix          = "palancar"
+environment     = "dev"
+state_suffix    = "REPLACE_WITH_STABLE_SUFFIX_OR_auto"
+
+bootstrap_container_name = "tfstate-bootstrap"
+dev_container_name       = "tfstate-dev"
+
+# Azure CLI/Entra data-plane access is the steady-state path.
+grant_apply_principal_blob_data_contributor = true

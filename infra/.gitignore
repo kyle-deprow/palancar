@@ -1,0 +1,43 @@
+# Terraform's initialized working directories and local state.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Local variable/backend files and generated plans. Keep the committed examples.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+backend.hcl
+backend.tf
+*.backend.hcl
+!backend.hcl.example
+!backend.tf.example
+tfplan
+plan.out
+*.tfplan
+*.tfplan.*
+*.plan
+*.plan.*
+*.jsonplan
+*.tfplan.json
+*.plan.json
+
+# Private keys and certificate/key bundles never belong beside infrastructure.
+*.key
+*.pem
+*.pfx
+*.p12
+*.pkcs12
+*.crt
+*.cer
+*.der
+*.csr
+id_rsa
+id_ed25519
+
+# Keep reproducibility metadata and committed examples tracked.
+!.terraform.lock.hcl
+!.terraform-version
+!*.example

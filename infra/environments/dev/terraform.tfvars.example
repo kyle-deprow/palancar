@@ -1,0 +1,37 @@
+# Copy to a protected local terraform.tfvars and set reviewed values.
+subscription_id = "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1"
+tenant_id       = "c69da7c1-f194-493b-9697-5b4bc8b56f37"
+location        = "eastus2"
+prefix          = "palancar"
+environment     = "dev"
+
+# Replace the placeholder with a stable lower-case suffix, or use auto.
+state_suffix = "REPLACE_WITH_STABLE_SUFFIX_OR_auto"
+
+budget_amount             = 100
+# Replace owner@example.com before plan; live validation rejects reserved domains.
+budget_start_date         = "2026-08-01T00:00:00Z"
+budget_end_date           = "2027-08-01T00:00:00Z"
+budget_contact_emails     = ["owner@example.com"]
+budget_forecast_threshold = 80
+
+retention_in_days = 30
+
+foundry_deployments = {
+  "gpt-4o-mini-transcribe" = {
+    model_name             = "gpt-4o-mini-transcribe"
+    model_version          = "2025-12-15"
+    model_format           = "OpenAI"
+    sku_name               = "GlobalStandard"
+    capacity               = 1
+    version_upgrade_option = "NoAutoUpgrade"
+  }
+  "gpt-5-6-luna" = {
+    model_name             = "gpt-5.6-luna"
+    model_version          = "2026-07-09"
+    model_format           = "OpenAI"
+    sku_name               = "GlobalStandard"
+    capacity               = 1
+    version_upgrade_option = "NoAutoUpgrade"
+  }
+}
