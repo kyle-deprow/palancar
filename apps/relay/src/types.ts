@@ -29,11 +29,12 @@ export type TicketConsumeFailureReason =
   | 'origin_rejected'
   | 'state_unavailable';
 
+export type TicketConsumeResult =
+  | { readonly status: 'accepted'; readonly claim: ConsumedRelayTicket }
+  | { readonly status: 'rejected'; readonly reason: TicketConsumeFailureReason };
+
 export interface TicketConsumer {
-  consume(ticket: string, audience: RelayUpgradeAudience): Promise<
-    | { readonly status: 'accepted'; readonly claim: ConsumedRelayTicket }
-    | { readonly status: 'rejected'; readonly reason: TicketConsumeFailureReason }
-  >;
+  consume(ticket: string, audience: RelayUpgradeAudience): Promise<TicketConsumeResult>;
 }
 
 export type StreamSubprotocolSelection =

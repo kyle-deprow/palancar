@@ -16,12 +16,18 @@
     "@palancar/contracts": "0.1.0",
     "@palancar/generation": "0.1.0",
     "@palancar/language-registry": "0.1.0",
-    "@palancar/transcription": "0.1.0"
+    "@palancar/transcription": "0.1.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "@types/ws": "8.18.1"
   },
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
   }
 }
