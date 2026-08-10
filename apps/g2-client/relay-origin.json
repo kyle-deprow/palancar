@@ -1,4 +1,4 @@
 {
-  "mode": "mock-development",
-  "relayOrigin": "http://localhost:8787"
+  "mode": "production",
+  "relayOrigin": "https://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io"
 }

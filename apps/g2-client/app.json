@@ -10,7 +10,7 @@
     {
       "name": "network",
       "desc": "Connect to the configured Palancar relay origin.",
-      "whitelist": ["http://localhost:8787"]
+      "whitelist": ["https://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io"]
     },
     {
       "name": "g2-microphone",
