@@ -1,5 +1,8 @@
 # Azure foundation evidence — 2026-08-10
 
+Follow-on workload deployment status is recorded in
+`docs/evidence/deployment-status-2026-08-10.md`.
+
 ## Status
 
 The Azure foundation is deployed and verified, but model deployment remains
@@ -41,7 +44,9 @@ The development foundation created and tracks 15 non-model resources:
 - An empty Container Apps environment.
 - The Azure OpenAI/Foundry account, with local authentication disabled.
 
-No Container App workload or cleanup Job exists yet.
+At the time of this foundation check, no Container App workload or cleanup Job
+existed yet. The relay workload was deployed later on 2026-08-10; see the
+follow-on deployment status evidence linked above.
 
 The first apply exposed the reviewed AzureRM 5 requirement to pair
 `logs_destination = "log-analytics"` with the Log Analytics workspace. The
