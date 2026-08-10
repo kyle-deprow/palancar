@@ -105,3 +105,35 @@ without Support direction.
 Until this block is removed, the deployed relay can run health checks and
 synthetic/mock protocol flows, but it cannot perform real model-backed
 transcription, English translation, or response suggestion generation.
+
+## Region retry evidence
+
+At the user's request, a different-region retry was attempted on 2026-08-10 UTC
+using a temporary OpenAI account in `westus3`:
+
+- Temporary account:
+  `palancarprobeopenaiwus3`
+- Resource group:
+  `rg-palancar-dev-aeeacd8c`
+- Region:
+  `westus3`
+- Account provisioning:
+  `Succeeded`
+- Model availability check:
+  `gpt-5.6-luna` version `2026-07-09` was listed; `gpt-4o-mini-transcribe`
+  version `2025-12-15` was not listed for this temporary account.
+- Deployment attempted:
+  `gpt-5-6-luna` using model `gpt-5.6-luna`, version `2026-07-09`,
+  `GlobalStandard` capacity `1`
+- Result:
+  Azure returned the same HTTP 400 service code `715-123420`.
+
+This confirms the observed blocker is not specific to the original `eastus2`
+resource. It follows the deployment request in at least one alternate region
+where the target model is available.
+
+The temporary `westus3` probe account was deleted after the failed deployment
+attempt to avoid leaving unmanaged resources in the Terraform-managed
+development resource group. The account may still appear in Azure's soft-delete
+retention surface, but it is no longer listed as an active account in the
+resource group.
