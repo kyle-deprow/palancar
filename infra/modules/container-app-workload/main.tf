@@ -5,6 +5,12 @@ resource "azapi_resource" "this" {
   location  = var.location
   tags      = var.tags
 
+  retry = {
+    error_message_regex  = ["IdentityDoesNotExist"]
+    interval_seconds     = 10
+    max_interval_seconds = 30
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [var.image_pull_identity_id, var.runtime_identity_id]
