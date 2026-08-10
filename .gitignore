@@ -1,0 +1,14 @@
+node_modules/
+**/dist/
+coverage/
+.env*
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+simulator-screenshots/
+**/simulator-screenshots/
+*.ehpk
+docs/evidence/local/
+local-evidence/

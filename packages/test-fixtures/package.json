@@ -1,0 +1,26 @@
+{
+  "name": "@palancar/test-fixtures",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@palancar/language-registry": "0.1.0"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "pretypecheck": "npm run build --workspace @palancar/language-registry",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretest": "npm run build --workspace @palancar/language-registry",
+    "test": "vitest run",
+    "prebuild": "npm run build --workspace @palancar/language-registry",
+    "build": "tsc -p tsconfig.build.json"
+  }
+}
