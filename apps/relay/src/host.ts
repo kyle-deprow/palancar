@@ -38,12 +38,16 @@ const MAX_SESSION_TICKET_BODY_BYTES = 4_096;
 const DEFAULT_PORT = 8_787;
 const DEFAULT_ENVIRONMENT = 'dev-local';
 const DEFAULT_GATE_POLICY_VERSION = '1.0.0';
+const DEFAULT_BIND_HOST = '127.0.0.1' as const;
 const REQUEST_REJECTED_BODY = Object.freeze({ error: 'request_rejected' });
+
+type RelayBindHost = '127.0.0.1' | '0.0.0.0';
 
 export interface RelayHostConfig {
   readonly environment: string;
   readonly origin: string;
   readonly port: number;
+  readonly bindHost?: RelayBindHost;
   readonly gatePolicyVersion: string;
   readonly ticketStore?: DevelopmentTicketStore;
   readonly clock?: RelayClock;
@@ -116,6 +120,14 @@ function parsePort(value: string | undefined): number {
     throw new RangeError('Relay PORT is invalid');
   }
   return normalizePort(Number(value));
+}
+
+function parseBindHost(value: string | undefined): RelayBindHost {
+  const bindHost = value ?? DEFAULT_BIND_HOST;
+  if (bindHost !== '127.0.0.1' && bindHost !== '0.0.0.0') {
+    throw new RangeError('Relay bind host is invalid');
+  }
+  return bindHost;
 }
 
 function writeJson(response: ServerResponse, status: number, value: unknown): void {
@@ -283,6 +295,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
     environment: env.PALANCAR_RELAY_ENVIRONMENT ?? DEFAULT_ENVIRONMENT,
     origin,
     port,
+    bindHost: parseBindHost(env.PALANCAR_RELAY_BIND_HOST),
     gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION
   });
 }
@@ -291,6 +304,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const environment = config.environment;
   const origin = assertCanonicalWssOrigin(config.origin);
   const port = normalizePort(config.port);
+  const bindHost = parseBindHost(config.bindHost);
   const gatePolicyVersion = config.gatePolicyVersion;
   const ticketStore = config.ticketStore ?? new DevelopmentTicketStore();
   const clock = config.clock ?? systemClock();
@@ -582,7 +596,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(port, '127.0.0.1');
+    server.listen(port, bindHost);
   });
 
   const closeServer = (): Promise<void> => new Promise((resolve, reject) => {

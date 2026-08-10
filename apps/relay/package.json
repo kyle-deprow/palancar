@@ -28,6 +28,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "container:build": "docker build -f Dockerfile -t palancar-relay:local ../..",
+    "container:smoke": "node scripts/smoke-container.mjs"
   }
 }
