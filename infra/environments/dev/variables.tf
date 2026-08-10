@@ -191,3 +191,23 @@ variable "openai_user_role_definition_id" {
   type        = string
   default     = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
 }
+
+variable "relay_image_digest" {
+  description = "Optional immutable ACR digest for the relay workload."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.relay_image_digest == "" || can(regex(
+      "^[a-z0-9.-]+\\.azurecr\\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$",
+      var.relay_image_digest
+    ))
+    error_message = "relay_image_digest must be empty or an immutable lower-case ACR sha256 digest."
+  }
+}
+
+variable "deploy_relay_workload" {
+  description = "Whether to deploy the immutable relay Container App workload."
+  type        = bool
+  default     = false
+}

@@ -86,3 +86,29 @@ module "identities_rbac" {
   table_data_contributor_role_definition_id = var.table_data_contributor_role_definition_id
   openai_user_role_definition_id            = var.openai_user_role_definition_id
 }
+
+module "container_app_workload" {
+  count  = var.deploy_relay_workload ? 1 : 0
+  source = "../../modules/container-app-workload"
+
+  name                         = local.names.relay_container_app
+  resource_group_id            = azurerm_resource_group.foundation.id
+  resource_group_name          = azurerm_resource_group.foundation.name
+  location                     = var.location
+  tags                         = local.tags
+  container_app_environment_id = module.container_app_environment.id
+  image_digest                 = var.relay_image_digest
+  acr_login_server             = module.container_registry.login_server
+  image_pull_identity_id       = module.identities_rbac.image_pull_identity_id
+  runtime_identity_id          = module.identities_rbac.runtime_identity_id
+  runtime_identity_client_id   = module.identities_rbac.runtime_client_id
+  workload_table_endpoint      = module.workload_state.table_endpoint
+  security_state_table_name    = module.workload_state.security_state_name
+  rate_state_table_name        = module.workload_state.rate_state_name
+  foundry_endpoint             = module.foundry.endpoint
+  foundry_deployment_names     = sort(keys(var.foundry_deployments))
+  environment                  = var.environment
+  relay_origin                 = local.relay_origin
+
+  depends_on = [module.identities_rbac]
+}

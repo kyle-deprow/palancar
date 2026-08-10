@@ -98,3 +98,23 @@ output "application_insights_connection_string" {
   value       = module.observability.application_insights_connection_string
   sensitive   = true
 }
+
+output "relay_container_app_name" {
+  description = "Relay Container App name when the workload is deployed."
+  value       = var.deploy_relay_workload ? module.container_app_workload[0].name : null
+}
+
+output "relay_container_app_id" {
+  description = "Relay Container App ARM resource ID when the workload is deployed."
+  value       = var.deploy_relay_workload ? module.container_app_workload[0].id : null
+}
+
+output "relay_origin" {
+  description = "Deterministic Azure-provided relay WebSocket origin."
+  value       = local.relay_origin
+}
+
+output "relay_latest_revision_name" {
+  description = "Latest relay Container App revision name when the workload is deployed."
+  value       = var.deploy_relay_workload ? module.container_app_workload[0].latest_revision_name : null
+}

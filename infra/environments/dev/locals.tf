@@ -17,6 +17,9 @@ locals {
     log_analytics         = "law-${var.prefix}-${var.environment}-${local.suffix}"
     application_insights  = "appi-${var.prefix}-${var.environment}-${local.suffix}"
     container_environment = "cae-${var.prefix}-${var.environment}-${local.suffix}"
+    relay_container_app   = "ca-${var.prefix}-${var.environment}-relay-${local.suffix}"
     foundry               = substr("${local.name_seed}openai${local.suffix}", 0, 64)
   }
+
+  relay_origin = "wss://${local.names.relay_container_app}.${module.container_app_environment.default_domain}"
 }
