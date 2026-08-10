@@ -1,0 +1,8 @@
+dist/
+.pure-dist/
+simulator-screenshots/
+*.ehpk
+*.map
+.env
+.env.*
+relay-origin.production.json

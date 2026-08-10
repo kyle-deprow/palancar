@@ -1,0 +1,30 @@
+{
+  "name": "@palancar/g2-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "0.0.12",
+    "@palancar/audio": "0.1.0",
+    "@palancar/contracts": "0.1.0",
+    "@palancar/language-registry": "0.1.0"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "0.1.13",
+    "@evenrealities/evenhub-simulator": "0.8.0",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
+  },
+  "scripts": {
+    "dev": "vite",
+    "lint": "eslint .",
+    "pretypecheck": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
+    "typecheck": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "pretest": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
+    "test": "vitest run",
+    "prebuild": "npm run check:relay-origin && npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
+    "build": "vite build && node ../../node_modules/typescript/bin/tsc -p tsconfig.pure.json",
+    "check:relay-origin": "node scripts/validate-relay-origin.mjs",
+    "pack": "evenhub pack app.json dist -o palancar.ehpk"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "package_id": "com.palancar.translate",
+  "edition": "202601",
+  "name": "Palancar Translate",
+  "version": "0.1.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.12",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Connect to the configured Palancar relay origin.",
+      "whitelist": ["http://localhost:8787"]
+    },
+    {
+      "name": "g2-microphone",
+      "desc": "Capture speech only while the user starts a translation turn."
+    }
+  ],
+  "supported_languages": ["en"]
+}
