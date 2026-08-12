@@ -12,6 +12,11 @@ configuration is supplied through non-secret environment variables and the
 managed identities are configured with `None` and `Main` lifecycles for image
 pull and application runtime respectively.
 
+The caller must provide `runtime_secrets_user_role_assignment_id` from the
+workload identity's Key Vault Secrets User role assignment. It is a Terraform
+dependency token that ensures the Container App is created after Key Vault RBAC
+readiness; it is not sent to Azure.
+
 ## Optional LiteLLM sidecar
 
 Set `enable_litellm_sidecar = true` to add a container named `litellm` on the

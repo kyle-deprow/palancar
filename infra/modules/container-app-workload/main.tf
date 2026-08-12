@@ -298,6 +298,11 @@ resource "azapi_resource" "this" {
 
   lifecycle {
     precondition {
+      condition     = trimspace(var.runtime_secrets_user_role_assignment_id) != ""
+      error_message = "runtime_secrets_user_role_assignment_id must be nonempty."
+    }
+
+    precondition {
       condition     = trimspace(var.image_digest) != ""
       error_message = "image_digest must be nonempty when the relay workload is deployed."
     }

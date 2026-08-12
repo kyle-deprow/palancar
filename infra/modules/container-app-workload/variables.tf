@@ -118,6 +118,11 @@ variable "runtime_identity_client_id" {
   }
 }
 
+variable "runtime_secrets_user_role_assignment_id" {
+  description = "Key Vault Secrets User role assignment ID used as a Terraform dependency token."
+  type        = string
+}
+
 variable "workload_table_endpoint" {
   description = "Azure Table endpoint for workload state."
   type        = string

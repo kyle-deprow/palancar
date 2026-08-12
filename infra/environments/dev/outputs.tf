@@ -88,6 +88,21 @@ output "runtime_identity_id" {
   value       = module.identities_rbac.runtime_identity_id
 }
 
+output "key_vault_name" {
+  description = "Workload Key Vault name."
+  value       = module.workload_key_vault.name
+}
+
+output "key_vault_id" {
+  description = "Workload Key Vault resource ID."
+  value       = module.workload_key_vault.id
+}
+
+output "key_vault_uri" {
+  description = "Workload Key Vault URI for secret references."
+  value       = module.workload_key_vault.uri
+}
+
 output "image_pull_identity_id" {
   description = "Image-pull managed identity resource ID."
   value       = module.identities_rbac.image_pull_identity_id
