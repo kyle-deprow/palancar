@@ -6,6 +6,9 @@ Implement a real LiteLLM OpenAI-compatible chat provider in
 `packages/generation`, with unit tests. This slice must not touch relay,
 infrastructure, Docker, Azure, or deployment files.
 
+You are explicitly allowed to edit the files listed under "Files you may
+change". Do not treat this handoff as read-only.
+
 ## Files you may change
 
 - `packages/generation/src/litellm.ts`
@@ -31,7 +34,7 @@ infrastructure, Docker, Azure, or deployment files.
   - `baseUrl`: HTTP/HTTPS URL with no query/fragment; normalize trailing slash.
   - `apiKey`: nonempty string.
   - `model`: nonempty string, max 128.
-  - `timeoutMs`: positive integer, recommended default 15_000, max 60_000.
+  - `timeoutMs`: positive integer, default 15_000, max 60_000.
   - `maxResponseBytes`: positive integer, default 16_384, max 16_384.
   - `maxTokens`: positive integer, default 1_024, max 1_024.
   - optional `id`/`version` with provider-safe values.
@@ -42,7 +45,7 @@ infrastructure, Docker, Azure, or deployment files.
   - `content-type: application/json`
   - `model`
   - `stream: false`
-  - small `temperature`
+  - omit `temperature`
   - bounded `max_tokens`
   - strict JSON-schema `response_format` with:
     - `type: "json_schema"`
