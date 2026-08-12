@@ -259,3 +259,112 @@ variable "memory" {
     error_message = "memory must be nonempty."
   }
 }
+
+variable "enable_litellm_sidecar" {
+  description = "Whether to add the optional LiteLLM generation sidecar."
+  type        = bool
+  default     = false
+}
+
+variable "litellm_image_digest" {
+  description = "Immutable LiteLLM sidecar image digest."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.litellm_image_digest == "" || can(regex(
+      "^[^[:space:]@]+@sha256:[0-9a-f]{64}$",
+      var.litellm_image_digest
+    ))
+    error_message = "litellm_image_digest must be empty or an immutable image sha256 digest."
+  }
+}
+
+variable "litellm_backend" {
+  description = "LiteLLM upstream backend."
+  type        = string
+  default     = "openrouter"
+
+  validation {
+    condition     = contains(["openrouter", "azure"], var.litellm_backend)
+    error_message = "litellm_backend must be openrouter or azure."
+  }
+}
+
+variable "litellm_upstream_model" {
+  description = "Provider-prefixed upstream model routed by LiteLLM."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = trimspace(var.litellm_upstream_model) == "" || length(var.litellm_upstream_model) <= 128
+    error_message = "litellm_upstream_model must be empty or at most 128 characters."
+  }
+}
+
+variable "openrouter_api_key_secret_url" {
+  description = "HTTPS Key Vault secret URL for the OpenRouter API key."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.openrouter_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.openrouter_api_key_secret_url))
+    error_message = "openrouter_api_key_secret_url must be empty or an HTTPS URL."
+  }
+}
+
+variable "litellm_master_key_secret_url" {
+  description = "HTTPS Key Vault secret URL for the LiteLLM master key."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.litellm_master_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.litellm_master_key_secret_url))
+    error_message = "litellm_master_key_secret_url must be empty or an HTTPS URL."
+  }
+}
+
+variable "azure_api_base" {
+  description = "Azure OpenAI API base used by LiteLLM in Azure mode."
+  type        = string
+  default     = ""
+}
+
+variable "azure_api_version" {
+  description = "Azure OpenAI API version used by LiteLLM in Azure mode."
+  type        = string
+  default     = ""
+}
+
+variable "azure_api_key_secret_url" {
+  description = "HTTPS Key Vault secret URL for the Azure OpenAI API key."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.azure_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.azure_api_key_secret_url))
+    error_message = "azure_api_key_secret_url must be empty or an HTTPS URL."
+  }
+}
+
+variable "litellm_cpu" {
+  description = "CPU allocation for the LiteLLM sidecar."
+  type        = number
+  default     = 0.25
+
+  validation {
+    condition     = var.litellm_cpu > 0
+    error_message = "litellm_cpu must be positive."
+  }
+}
+
+variable "litellm_memory" {
+  description = "Memory allocation for the LiteLLM sidecar."
+  type        = string
+  default     = "0.5Gi"
+
+  validation {
+    condition     = trimspace(var.litellm_memory) != ""
+    error_message = "litellm_memory must be nonempty."
+  }
+}
