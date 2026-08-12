@@ -137,3 +137,42 @@ attempt to avoid leaving unmanaged resources in the Terraform-managed
 development resource group. The account may still appear in Azure's soft-delete
 retention surface, but it is no longer listed as an active account in the
 resource group.
+
+## Follow-up retry evidence — 2026-08-12
+
+At the user's request, the Terraform-managed `eastus2` model deployments were
+retried on 2026-08-12.
+
+Pre-apply checks:
+
+- Active subscription:
+  `a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1`
+- Active tenant:
+  `c69da7c1-f194-493b-9697-5b4bc8b56f37`
+- Existing model deployments before retry:
+  none
+- Initial unconstrained Terraform plan:
+  `2 add, 0 change, 1 destroy` because the relay workload variables are not in
+  the default `terraform.tfvars`; this plan was not applied.
+- Safe retry plan:
+  targeted only the two `azurerm_cognitive_deployment` resources with the live
+  relay workload variables supplied explicitly, resulting in `2 add, 0 change,
+  0 destroy`.
+
+Deployments retried:
+
+- `gpt-4o-mini-transcribe`, model `gpt-4o-mini-transcribe`, version
+  `2025-12-15`, `GlobalStandard` capacity `1`
+- `gpt-5-6-luna`, model `gpt-5.6-luna`, version `2026-07-09`,
+  `GlobalStandard` capacity `1`
+
+Result:
+
+- Both deployments again failed with HTTP 400 service code `715-123420`.
+- No partial model deployments were created.
+- The relay Container App remained on revision
+  `ca-palancar-dev-relay-aeeacd8c--9wjvqrf`.
+- Relay health remained good:
+  `/healthz -> {"ok":true}` and `/readyz -> {"ready":true}`.
+
+This confirms the deployment block was still active on 2026-08-12.
