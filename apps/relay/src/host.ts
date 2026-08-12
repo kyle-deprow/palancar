@@ -10,7 +10,8 @@ import {
 } from '@palancar/contracts';
 import {
   DeterministicMockProvider,
-  GenerationService
+  GenerationService,
+  LiteLLMChatGenerationProvider
 } from '@palancar/generation';
 import {
   DeterministicMockTranscriptionAdapter,
@@ -40,8 +41,28 @@ const DEFAULT_ENVIRONMENT = 'dev-local';
 const DEFAULT_GATE_POLICY_VERSION = '1.0.0';
 const DEFAULT_BIND_HOST = '127.0.0.1' as const;
 const REQUEST_REJECTED_BODY = Object.freeze({ error: 'request_rejected' });
+const RELAY_CONFIGURATION_ERROR = 'Invalid relay host configuration.';
+const READINESS_TIMEOUT_MS = 2_000;
+const READINESS_MAX_RESPONSE_BYTES = 16_384;
 
 type RelayBindHost = '127.0.0.1' | '0.0.0.0';
+
+interface MockGenerationReadiness {
+  readonly provider: 'mock';
+  readonly providerId: string;
+  readonly model: 'mock';
+}
+
+interface LiteLLMGenerationReadiness {
+  readonly provider: 'litellm';
+  readonly providerId: string;
+  readonly model: string;
+  readonly backend: string;
+  readonly upstreamModel: string;
+  readonly check: () => Promise<boolean>;
+}
+
+export type RelayGenerationReadiness = MockGenerationReadiness | LiteLLMGenerationReadiness;
 
 export interface RelayHostConfig {
   readonly environment: string;
@@ -54,6 +75,7 @@ export interface RelayHostConfig {
   readonly ids?: RelayIdGenerator;
   readonly transcriptionAdapter?: TranscriptionAdapter;
   readonly generationService?: GenerationService;
+  readonly generationReadiness?: RelayGenerationReadiness;
 }
 
 export interface RelayHost {
@@ -94,6 +116,7 @@ function defaultTranscriptionAdapter(): TranscriptionAdapter {
 function defaultGenerationService(): GenerationService {
   return new GenerationService(
     new DeterministicMockProvider({
+      id: 'deterministic-mock-generation',
       translate: { result: { englishTranslation: 'hello' } },
       suggest: {
         result: [
@@ -103,6 +126,14 @@ function defaultGenerationService(): GenerationService {
       }
     })
   );
+}
+
+function defaultGenerationReadiness(generationService: GenerationService): MockGenerationReadiness {
+  return Object.freeze({
+    provider: 'mock',
+    providerId: generationService.provider.id,
+    model: 'mock'
+  });
 }
 
 function normalizePort(value: number): number {
@@ -128,6 +159,230 @@ function parseBindHost(value: string | undefined): RelayBindHost {
     throw new RangeError('Relay bind host is invalid');
   }
   return bindHost;
+}
+
+function requiredEnvironmentString(env: NodeJS.ProcessEnv, name: string): string {
+  const value = env[name];
+  if (value === undefined || value.trim().length === 0) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function parseOptionalTimeout(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  const timeoutMs = Number(value);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60_000) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return timeoutMs;
+}
+
+function normalizedReadinessUrl(value: string): string {
+  let url: URL;
+  try {
+    if (value.trim() !== value) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    url = new URL(value);
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    value.includes('?') ||
+    value.includes('#')
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+
+function readinessUrl(baseUrl: string, path: string): string {
+  return `${baseUrl}${path}`;
+}
+
+async function readBoundedReadinessBody(response: Response): Promise<string | undefined> {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null && /^\d+$/.test(contentLength)) {
+    const bytes = Number(contentLength);
+    if (!Number.isSafeInteger(bytes) || bytes > READINESS_MAX_RESPONSE_BYTES) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The body is intentionally never surfaced in readiness failures.
+      }
+      return undefined;
+    }
+  }
+
+  if (response.body === null) {
+    try {
+      const text = await response.text();
+      return new TextEncoder().encode(text).byteLength <= READINESS_MAX_RESPONSE_BYTES
+        ? text
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        break;
+      }
+      if (!(result.value instanceof Uint8Array)) {
+        return undefined;
+      }
+      totalBytes += result.value.byteLength;
+      if (totalBytes > READINESS_MAX_RESPONSE_BYTES) {
+        return undefined;
+      }
+      chunks.push(result.value);
+    }
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Readiness is content-free and failure is represented only by false.
+    }
+  }
+}
+
+async function fetchReadinessJson(url: string, apiKey?: string): Promise<unknown | undefined> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const request = (async (): Promise<unknown | undefined> => {
+    try {
+      const response = await globalThis.fetch(url, {
+        method: 'GET',
+        redirect: 'error',
+        ...(apiKey === undefined
+          ? {}
+          : { headers: { Authorization: `Bearer ${apiKey}` } }),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          // The body is intentionally never surfaced in readiness failures.
+        }
+        return undefined;
+      }
+      const body = await readBoundedReadinessBody(response);
+      if (body === undefined) {
+        return undefined;
+      }
+      try {
+        return JSON.parse(body) as unknown;
+      } catch {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  })();
+  const timeoutPromise = new Promise<undefined>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new Error('readiness_timeout'));
+    }, READINESS_TIMEOUT_MS);
+  });
+
+  try {
+    return await Promise.race([request, timeoutPromise]);
+  } catch {
+    return undefined;
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExpectedModel(value: unknown, model: string): boolean {
+  if (!isPlainObject(value) || !Array.isArray(value.data)) {
+    return false;
+  }
+  let matches = 0;
+  for (const item of value.data) {
+    if (isPlainObject(item) && item.id === model) {
+      matches += 1;
+    }
+  }
+  return matches === 1;
+}
+
+function hasExpectedMetadata(
+  value: unknown,
+  expected: Pick<LiteLLMGenerationReadiness, 'backend' | 'model' | 'upstreamModel'>
+): boolean {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  return (
+    keys.length === 3 &&
+    keys.includes('alias') &&
+    keys.includes('backend') &&
+    keys.includes('upstreamModel') &&
+    value.alias === expected.model &&
+    value.backend === expected.backend &&
+    value.upstreamModel === expected.upstreamModel
+  );
+}
+
+async function checkLiteLLMReadiness(config: {
+  readonly baseUrl: string;
+  readonly apiKey: string;
+  readonly model: string;
+  readonly metadataUrl: string;
+  readonly backend: string;
+  readonly upstreamModel: string;
+}): Promise<boolean> {
+  const catalog = await fetchReadinessJson(
+    readinessUrl(config.baseUrl, '/v1/models'),
+    config.apiKey
+  );
+  if (!hasExpectedModel(catalog, config.model)) {
+    return false;
+  }
+  const metadata = await fetchReadinessJson(
+    readinessUrl(config.metadataUrl, '/palancar/provider')
+  );
+  return hasExpectedMetadata(metadata, config);
 }
 
 function writeJson(response: ServerResponse, status: number, value: unknown): void {
@@ -287,17 +542,77 @@ function withWakeup(adapter: TranscriptionAdapter, wakeup: () => void): Transcri
 }
 
 export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): RelayHostConfig {
-  const port = parsePort(env.PORT);
-  const origin = env.PALANCAR_RELAY_ORIGIN ??
-    (port === 0 ? 'wss://127.0.0.1' : `wss://127.0.0.1:${port}`);
-  assertCanonicalWssOrigin(origin);
-  return Object.freeze({
-    environment: env.PALANCAR_RELAY_ENVIRONMENT ?? DEFAULT_ENVIRONMENT,
-    origin,
-    port,
-    bindHost: parseBindHost(env.PALANCAR_RELAY_BIND_HOST),
-    gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION
-  });
+  try {
+    const port = parsePort(env.PORT);
+    const origin = env.PALANCAR_RELAY_ORIGIN ??
+      (port === 0 ? 'wss://127.0.0.1' : `wss://127.0.0.1:${port}`);
+    assertCanonicalWssOrigin(origin);
+    const generationProvider = env.PALANCAR_GENERATION_PROVIDER;
+    if (generationProvider !== 'mock' && generationProvider !== 'litellm') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    const baseConfig = {
+      environment: env.PALANCAR_RELAY_ENVIRONMENT ?? DEFAULT_ENVIRONMENT,
+      origin,
+      port,
+      bindHost: parseBindHost(env.PALANCAR_RELAY_BIND_HOST),
+      gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION
+    };
+    if (generationProvider === 'mock') {
+      const generationService = defaultGenerationService();
+      return Object.freeze({
+        ...baseConfig,
+        generationService,
+        generationReadiness: defaultGenerationReadiness(generationService)
+      });
+    }
+
+    const baseUrl = requiredEnvironmentString(env, 'PALANCAR_LITELLM_BASE_URL');
+    const apiKey = requiredEnvironmentString(env, 'PALANCAR_LITELLM_API_KEY');
+    const model = requiredEnvironmentString(env, 'PALANCAR_LITELLM_MODEL');
+    const expectedBackend = requiredEnvironmentString(
+      env,
+      'PALANCAR_LITELLM_EXPECTED_BACKEND'
+    );
+    const expectedUpstreamModel = requiredEnvironmentString(
+      env,
+      'PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL'
+    );
+    const metadataUrl = requiredEnvironmentString(env, 'PALANCAR_LITELLM_METADATA_URL');
+    const timeoutMs = parseOptionalTimeout(env.PALANCAR_LITELLM_TIMEOUT_MS);
+    const normalizedBaseUrl = normalizedReadinessUrl(baseUrl);
+    const normalizedMetadataUrl = normalizedReadinessUrl(metadataUrl);
+    const provider = new LiteLLMChatGenerationProvider({
+      baseUrl,
+      apiKey,
+      model,
+      ...(timeoutMs === undefined ? {} : { timeoutMs })
+    });
+    const generationService = new GenerationService(provider);
+    const generationReadiness: LiteLLMGenerationReadiness = Object.freeze({
+      provider: 'litellm',
+      providerId: generationService.provider.id,
+      model,
+      backend: expectedBackend,
+      upstreamModel: expectedUpstreamModel,
+      check: () => checkLiteLLMReadiness({
+        baseUrl: normalizedBaseUrl,
+        apiKey,
+        model,
+        metadataUrl: normalizedMetadataUrl,
+        backend: expectedBackend,
+        upstreamModel: expectedUpstreamModel
+      })
+    });
+    return Object.freeze({
+      ...baseConfig,
+      generationService,
+      generationReadiness
+    });
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
 }
 
 export function createRelayHost(config: RelayHostConfig): RelayHost {
@@ -311,6 +626,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const ids = config.ids ?? systemIds();
   const transcriptionAdapter = config.transcriptionAdapter ?? defaultTranscriptionAdapter();
   const generationService = config.generationService ?? defaultGenerationService();
+  const generationReadiness = config.generationReadiness ??
+    defaultGenerationReadiness(generationService);
   const audience: RelayUpgradeAudience = Object.freeze({
     environment,
     origin,
@@ -344,7 +661,43 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       return;
     }
     if (pathname === '/readyz' && request.method === 'GET') {
-      writeJson(response, 200, { ready: true });
+      if (generationReadiness.provider === 'mock') {
+        writeJson(response, 200, {
+          ready: true,
+          generation: {
+            provider: generationReadiness.provider,
+            providerId: generationReadiness.providerId,
+            model: generationReadiness.model,
+            upstreamReady: true
+          }
+        });
+        return;
+      }
+      void generationReadiness.check().then((upstreamReady) => {
+        writeJson(response, upstreamReady ? 200 : 503, {
+          ready: upstreamReady,
+          generation: {
+            provider: generationReadiness.provider,
+            providerId: generationReadiness.providerId,
+            model: generationReadiness.model,
+            backend: generationReadiness.backend,
+            upstreamModel: generationReadiness.upstreamModel,
+            upstreamReady
+          }
+        });
+      }).catch(() => {
+        writeJson(response, 503, {
+          ready: false,
+          generation: {
+            provider: generationReadiness.provider,
+            providerId: generationReadiness.providerId,
+            model: generationReadiness.model,
+            backend: generationReadiness.backend,
+            upstreamModel: generationReadiness.upstreamModel,
+            upstreamReady: false
+          }
+        });
+      });
       return;
     }
     if (pathname === SESSION_TICKET_PATH) {

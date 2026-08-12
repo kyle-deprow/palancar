@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
@@ -23,6 +24,7 @@ import { WebSocket, type RawData } from 'ws';
 import {
   DevelopmentTicketStore,
   createRelayHost,
+  parseRelayHostConfig,
   type RelayHost,
   type RelayUpgradeAudience
 } from '../src/index.js';
@@ -362,6 +364,420 @@ function createAsyncCallbackAdapter(): TranscriptionAdapter {
   };
 }
 
+const LITELLM_API_KEY = 'relay-host-test-litellm-key';
+const LITELLM_MODEL = 'palancar-generation';
+const LITELLM_BACKEND = 'openrouter';
+const LITELLM_UPSTREAM_MODEL = 'openrouter/openai/gpt-5.6-luna';
+const READINESS_CANARY = 'relay-host-readiness-provider-canary';
+
+interface ReadinessFixtureOptions {
+  readonly catalogStatus?: number;
+  readonly catalogBody?: unknown;
+  readonly metadataStatus?: number;
+  readonly metadataBody?: unknown;
+  readonly hangCatalog?: boolean;
+  readonly hangMetadata?: boolean;
+  readonly redirectCatalog?: boolean;
+  readonly redirectMetadata?: boolean;
+}
+
+interface ReadinessFixture {
+  readonly server: HttpServer;
+  readonly baseUrl: string;
+  readonly metadataUrl: string;
+  readonly getCatalogAuthorization: () => string | undefined;
+  readonly getMetadataAuthorization: () => string | undefined;
+  readonly getCatalogRedirectAuthorization: () => string | undefined;
+  readonly getMetadataRedirectAuthorization: () => string | undefined;
+  readonly getCatalogRedirectRequests: () => number;
+  readonly getMetadataRedirectRequests: () => number;
+  close(): Promise<void>;
+}
+
+async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Promise<ReadinessFixture> {
+  let catalogAuthorization: string | undefined;
+  let metadataAuthorization: string | undefined;
+  let catalogRedirectAuthorization: string | undefined;
+  let metadataRedirectAuthorization: string | undefined;
+  let catalogRedirectRequests = 0;
+  let metadataRedirectRequests = 0;
+  const server = createHttpServer((request, response) => {
+    if (request.url === '/v1/models') {
+      catalogAuthorization = request.headers.authorization;
+      if (options.hangCatalog === true) {
+        return;
+      }
+      if (options.redirectCatalog === true) {
+        response.statusCode = 302;
+        response.setHeader('location', '/v1/models-redirect-target');
+        response.end(READINESS_CANARY);
+        return;
+      }
+      const body = options.catalogBody ?? { data: [{ id: LITELLM_MODEL }] };
+      const text = typeof body === 'string' ? body : JSON.stringify(body);
+      response.statusCode = options.catalogStatus ?? 200;
+      response.setHeader('content-type', 'application/json');
+      response.end(text);
+      return;
+    }
+    if (request.url === '/v1/models-redirect-target') {
+      catalogRedirectRequests += 1;
+      catalogRedirectAuthorization = request.headers.authorization;
+      response.statusCode = 200;
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ data: [{ id: LITELLM_MODEL }] }));
+      return;
+    }
+    if (request.url === '/palancar/provider') {
+      metadataAuthorization = request.headers.authorization;
+      if (options.hangMetadata === true) {
+        return;
+      }
+      if (options.redirectMetadata === true) {
+        response.statusCode = 302;
+        response.setHeader('location', '/palancar/provider-redirect-target');
+        response.end(READINESS_CANARY);
+        return;
+      }
+      const body = options.metadataBody ?? {
+        alias: LITELLM_MODEL,
+        backend: LITELLM_BACKEND,
+        upstreamModel: LITELLM_UPSTREAM_MODEL
+      };
+      const text = typeof body === 'string' ? body : JSON.stringify(body);
+      response.statusCode = options.metadataStatus ?? 200;
+      response.setHeader('content-type', 'application/json');
+      response.end(text);
+      return;
+    }
+    if (request.url === '/palancar/provider-redirect-target') {
+      metadataRedirectRequests += 1;
+      metadataRedirectAuthorization = request.headers.authorization;
+      response.statusCode = 200;
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        alias: LITELLM_MODEL,
+        backend: LITELLM_BACKEND,
+        upstreamModel: LITELLM_UPSTREAM_MODEL
+      }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  expect(address).not.toBeNull();
+  expect(typeof address).toBe('object');
+  const port = (address as { readonly port: number }).port;
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${port}`,
+    metadataUrl: `http://127.0.0.1:${port}`,
+    getCatalogAuthorization: () => catalogAuthorization,
+    getMetadataAuthorization: () => metadataAuthorization,
+    getCatalogRedirectAuthorization: () => catalogRedirectAuthorization,
+    getMetadataRedirectAuthorization: () => metadataRedirectAuthorization,
+    getCatalogRedirectRequests: () => catalogRedirectRequests,
+    getMetadataRedirectRequests: () => metadataRedirectRequests,
+    close: () => new Promise<void>((resolve, reject) => {
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close((error) => error === undefined ? resolve() : reject(error));
+    })
+  };
+}
+
+function mockEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    PALANCAR_GENERATION_PROVIDER: 'mock',
+    ...overrides
+  };
+}
+
+function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    PALANCAR_GENERATION_PROVIDER: 'litellm',
+    PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000',
+    PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY,
+    PALANCAR_LITELLM_MODEL: LITELLM_MODEL,
+    PALANCAR_LITELLM_EXPECTED_BACKEND: LITELLM_BACKEND,
+    PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL: LITELLM_UPSTREAM_MODEL,
+    PALANCAR_LITELLM_METADATA_URL: 'http://127.0.0.1:4001',
+    ...overrides
+  };
+}
+
+function hostPort(host: RelayHost): number {
+  return (host.server.address() as { readonly port: number }).port;
+}
+
+function expectedLiteLLMReadiness(upstreamReady: boolean): JsonObject {
+  return {
+    ready: upstreamReady,
+    generation: {
+      provider: 'litellm',
+      providerId: 'litellm-chat',
+      model: LITELLM_MODEL,
+      backend: LITELLM_BACKEND,
+      upstreamModel: LITELLM_UPSTREAM_MODEL,
+      upstreamReady
+    }
+  };
+}
+
+async function expectFailedLiteLLMReadiness(host: RelayHost): Promise<void> {
+  const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+  expect(ready.status).toBe(503);
+  const readyBody = await responseJson(ready);
+  expect(readyBody).toEqual(expectedLiteLLMReadiness(false));
+  expect(JSON.stringify(readyBody)).not.toContain(READINESS_CANARY);
+  expect(JSON.stringify(readyBody)).not.toContain(LITELLM_API_KEY);
+}
+
+describe('relay host configuration and readiness', () => {
+  it('parses an explicit mock generation provider', () => {
+    const config = parseRelayHostConfig(mockEnvironment());
+
+    expect(config.generationService?.provider).toEqual({
+      id: 'deterministic-mock-generation',
+      version: '1.0.0'
+    });
+    expect(config.generationReadiness).toMatchObject({
+      provider: 'mock',
+      providerId: 'deterministic-mock-generation',
+      model: 'mock'
+    });
+  });
+
+  it('rejects executable configuration without an explicit generation provider generically', () => {
+    expect(() => parseRelayHostConfig({})).toThrow('Invalid relay host configuration.');
+    expect(() => parseRelayHostConfig({})).not.toThrow(LITELLM_API_KEY);
+  });
+
+  it('creates LiteLLM provider identity without exposing its API key', () => {
+    const config = parseRelayHostConfig(litellmEnvironment());
+
+    expect(config.generationService?.provider).toEqual({ id: 'litellm-chat', version: '1.0.0' });
+    expect(JSON.stringify(config)).not.toContain(LITELLM_API_KEY);
+  });
+
+  it.each([
+    ['missing base URL', { PALANCAR_LITELLM_BASE_URL: undefined }],
+    ['missing API key', { PALANCAR_LITELLM_API_KEY: undefined }],
+    ['missing model', { PALANCAR_LITELLM_MODEL: undefined }],
+    ['missing expected backend', { PALANCAR_LITELLM_EXPECTED_BACKEND: undefined }],
+    ['missing expected upstream model', { PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL: undefined }],
+    ['missing metadata URL', { PALANCAR_LITELLM_METADATA_URL: undefined }],
+    ['malformed base URL', { PALANCAR_LITELLM_BASE_URL: 'not-a-url' }],
+    ['malformed metadata URL', { PALANCAR_LITELLM_METADATA_URL: 'http://metadata/?secret=1' }],
+    ['malformed timeout', { PALANCAR_LITELLM_TIMEOUT_MS: 'not-a-number' }]
+  ])('rejects %s with a generic config error', (_name, override) => {
+    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it('keeps health process-only while LiteLLM readiness is failing', async () => {
+    const fixture = await startReadinessFixture({
+      catalogStatus: 503,
+      catalogBody: JSON.stringify({ error: READINESS_CANARY })
+    });
+    let host: RelayHost | undefined;
+    try {
+      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
+        PORT: '0',
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
+        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+      })));
+      await host.start();
+      const health = await fetch(`http://127.0.0.1:${hostPort(host)}/healthz`);
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+
+      expect(health.status).toBe(200);
+      expect(await responseJson(health)).toEqual({ ok: true });
+      expect(ready.status).toBe(503);
+      const readyBody = await responseJson(ready);
+      expect(readyBody).toEqual(expectedLiteLLMReadiness(false));
+      expect(JSON.stringify(readyBody)).not.toContain(READINESS_CANARY);
+      expect(JSON.stringify(readyBody)).not.toContain(LITELLM_API_KEY);
+    } finally {
+      await host?.stop();
+      await fixture.close();
+    }
+  });
+
+  it('returns content-free ready status for a valid LiteLLM catalog and metadata response', async () => {
+    const fixture = await startReadinessFixture();
+    let host: RelayHost | undefined;
+    try {
+      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
+        PORT: '0',
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
+        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+      })));
+      await host.start();
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+
+      expect(ready.status).toBe(200);
+      expect(await responseJson(ready)).toEqual(expectedLiteLLMReadiness(true));
+      expect(fixture.getCatalogAuthorization()).toBe(`Bearer ${LITELLM_API_KEY}`);
+      expect(fixture.getMetadataAuthorization()).toBeUndefined();
+    } finally {
+      await host?.stop();
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    ['catalog non-2xx', {
+      catalogStatus: 503,
+      catalogBody: { data: [{ id: LITELLM_MODEL }] }
+    }],
+    ['catalog timeout', { hangCatalog: true }],
+    ['catalog malformed JSON', { catalogBody: `{not-json:${READINESS_CANARY}` }],
+    ['catalog body over 16 KiB', {
+      catalogBody: JSON.stringify({
+        data: [{ id: LITELLM_MODEL }],
+        padding: `${READINESS_CANARY}${'x'.repeat(16_384)}`
+      })
+    }],
+    ['duplicate alias', {
+      catalogBody: {
+        data: [{ id: LITELLM_MODEL }, { id: LITELLM_MODEL }],
+        error: READINESS_CANARY
+      }
+    }],
+    ['missing alias', {
+      catalogBody: { data: [{ id: 'other-model' }], error: READINESS_CANARY }
+    }],
+    ['metadata non-2xx', {
+      metadataStatus: 503,
+      metadataBody: {
+        alias: LITELLM_MODEL,
+        backend: LITELLM_BACKEND,
+        upstreamModel: LITELLM_UPSTREAM_MODEL
+      }
+    }],
+    ['metadata timeout', { hangMetadata: true }],
+    ['metadata malformed JSON', { metadataBody: `{not-json:${READINESS_CANARY}` }],
+    ['metadata body over 16 KiB', {
+      metadataBody: `${JSON.stringify({
+        alias: LITELLM_MODEL,
+        backend: LITELLM_BACKEND,
+        upstreamModel: LITELLM_UPSTREAM_MODEL
+      })}${' '.repeat(16_384)}`
+    }],
+    ['backend mismatch', { metadataBody: {
+      alias: LITELLM_MODEL,
+      backend: 'azure',
+      upstreamModel: LITELLM_UPSTREAM_MODEL,
+      error: READINESS_CANARY
+    } }],
+    ['alias mismatch', { metadataBody: {
+      alias: 'other-model',
+      backend: LITELLM_BACKEND,
+      upstreamModel: LITELLM_UPSTREAM_MODEL,
+      error: READINESS_CANARY
+    } }],
+    ['upstream mismatch', { metadataBody: {
+      alias: LITELLM_MODEL,
+      backend: LITELLM_BACKEND,
+      upstreamModel: 'openrouter/other-model',
+      error: READINESS_CANARY
+    } }]
+  ])('returns exact content-free 503 for LiteLLM readiness failure: %s', async (_name, options) => {
+    const fixture = await startReadinessFixture(options);
+    let host: RelayHost | undefined;
+    try {
+      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
+        PORT: '0',
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
+        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+      })));
+      await host.start();
+      await expectFailedLiteLLMReadiness(host);
+    } finally {
+      await host?.stop();
+      await fixture.close();
+    }
+  });
+
+  it('rejects a redirect from the LiteLLM models endpoint without forwarding the bearer key', async () => {
+    const fixture = await startReadinessFixture({ redirectCatalog: true });
+    let host: RelayHost | undefined;
+    try {
+      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
+        PORT: '0',
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
+        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+      })));
+      await host.start();
+      await expectFailedLiteLLMReadiness(host);
+      expect(fixture.getCatalogRedirectRequests()).toBe(0);
+      expect(fixture.getCatalogRedirectAuthorization()).toBeUndefined();
+    } finally {
+      await host?.stop();
+      await fixture.close();
+    }
+  });
+
+  it('rejects a redirect from the LiteLLM metadata endpoint', async () => {
+    const fixture = await startReadinessFixture({ redirectMetadata: true });
+    let host: RelayHost | undefined;
+    try {
+      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
+        PORT: '0',
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
+        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+      })));
+      await host.start();
+      await expectFailedLiteLLMReadiness(host);
+      expect(fixture.getMetadataRedirectRequests()).toBe(0);
+      expect(fixture.getMetadataRedirectAuthorization()).toBeUndefined();
+    } finally {
+      await host?.stop();
+      await fixture.close();
+    }
+  });
+
+  it('returns content-free ready status for mock generation', async () => {
+    const generationService = parseRelayHostConfig(mockEnvironment()).generationService;
+    expect(generationService).toBeDefined();
+    const host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      generationService: generationService as NonNullable<typeof generationService>
+    });
+    await host.start();
+    try {
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      expect(ready.status).toBe(200);
+      expect(await responseJson(ready)).toEqual({
+        ready: true,
+        generation: {
+          provider: 'mock',
+          providerId: 'deterministic-mock-generation',
+          model: 'mock',
+          upstreamReady: true
+        }
+      });
+    } finally {
+      await host.stop();
+    }
+  });
+});
+
 describe('relay HTTP/WebSocket host', () => {
   let host: RelayHost;
 
@@ -387,7 +803,15 @@ describe('relay HTTP/WebSocket host', () => {
     expect(health.status).toBe(200);
     expect(await responseJson(health)).toEqual({ ok: true });
     expect(ready.status).toBe(200);
-    expect(await responseJson(ready)).toEqual({ ready: true });
+    expect(await responseJson(ready)).toEqual({
+      ready: true,
+      generation: {
+        provider: 'mock',
+        providerId: 'deterministic-mock-generation',
+        model: 'mock',
+        upstreamReady: true
+      }
+    });
   });
 
   it('issues a contract-valid development ticket and rejects malformed requests generically', async () => {
