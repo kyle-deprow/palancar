@@ -11,6 +11,7 @@ import type {
   EventDeliveryFailureStatus,
   FinalizeResult,
   NormalizedTranscriptionEvent,
+  NormalizedTranscriptionFinal,
   PushAudioResult,
   TranscriptionAdapter,
   TranscriptionSession,
@@ -124,11 +125,15 @@ function frame(
   return encodeAudioFrame({ utteranceId, sequence, offset, payload });
 }
 
+function pcmSamples(sampleCount: number) {
+  return new Uint8Array(sampleCount * 2);
+}
+
 function finalEvent(
   category: 'target' | 'english' | 'supported-unselected' | 'mixed' | 'unsupported' | 'uncertain' = 'target',
   utteranceId = TEST_UTTERANCE_ID,
   revision = 1
-): NormalizedTranscriptionEvent {
+): NormalizedTranscriptionFinal {
   const evidence = {
     detectorVersion: 'test-detector-1.0.0',
     source: 'controlled-fixture' as const,
@@ -198,7 +203,8 @@ interface RecordingAdapter extends TranscriptionAdapter {
 function recordingAdapter(
   configuration = DETERMINISTIC_MOCK_CAPABILITIES,
   pushResult?: (input: { readonly utteranceId: string; readonly originalSampleOffset: number; readonly pcm: Uint8Array }) => PushAudioResult,
-  pushError?: Error
+  pushError?: Error,
+  finalizeBehavior: FinalizeResult | Error = { status: 'finalized', event: finalEvent() }
 ): RecordingAdapter {
   const sessions: RecordingSession[] = [];
   const adapter: RecordingAdapter = {
@@ -244,7 +250,10 @@ function recordingAdapter(
         },
         finalize: (utteranceId): FinalizeResult => {
           finalizeCalls.push(utteranceId);
-          return { status: 'already-cancelled' };
+          if (finalizeBehavior instanceof Error) {
+            throw finalizeBehavior;
+          }
+          return finalizeBehavior;
         },
         cancel: (utteranceId): CancelResult => {
           cancelCalls.push(utteranceId);
@@ -499,18 +508,83 @@ describe('relay session core', () => {
     expect(core.handleBinary(frame()).close).toEqual({ code: 1002, reason: 'protocol_error' });
   });
 
-  it('forwards accepted audio once and acknowledges duplicates', () => {
+  it('throttles normal ACKs by the default sample threshold', () => {
     const { core, adapter } = openNew();
     core.handleText(utteranceStartText());
-    const first = core.handleBinary(frame());
-    const accepted = core.handleBinary(frame(TEST_UTTERANCE_ID, 1, 1, new Uint8Array([3, 4])));
-    const duplicate = core.handleBinary(frame());
-    expect(first.outgoing).toMatchObject([{ type: 'audio.ack', highestContiguousExclusiveOffset: 1 }]);
-    expect(accepted.outgoing).toMatchObject([{ type: 'audio.ack', highestContiguousExclusiveOffset: 2 }]);
-    expect(duplicate.outgoing).toMatchObject([{ type: 'audio.ack', highestContiguousExclusiveOffset: 2 }]);
+    const first = core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(960)));
+    const accepted = core.handleBinary(frame(TEST_UTTERANCE_ID, 1, 960, pcmSamples(960)));
+    const next = core.handleBinary(frame(TEST_UTTERANCE_ID, 2, 1920, pcmSamples(960)));
+    expect(first.outgoing).toEqual([]);
+    expect(accepted.outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1920 }
+    ]);
+    expect(next.outgoing).toEqual([]);
+    expect(adapter.sessions[0]?.pushCalls).toHaveLength(3);
+    expect(adapter.sessions[0]?.pushCalls.map((call) => call.originalSampleOffset)).toEqual([0, 960, 1920]);
+  });
+
+  it('does not redundantly ACK the first valid commit after a normal ACK, then re-ACKs repeats', () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    expect(core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(960))).outgoing).toEqual([]);
+    expect(core.handleBinary(frame(TEST_UTTERANCE_ID, 1, 960, pcmSamples(960))).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1920 }
+    ]);
+
+    expect(core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1920)).outgoing).toEqual([]);
+    expect(core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1920)).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1920 }
+    ]);
+    expect(adapter.sessions[0]?.finalizeCalls).toEqual([TEST_UTTERANCE_ID]);
+  });
+
+  it('ACKs exact retained duplicates immediately without a second provider push', () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    const firstFrame = frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(960));
+    const secondFrame = frame(TEST_UTTERANCE_ID, 1, 960, pcmSamples(960));
+
+    expect(core.handleBinary(firstFrame).outgoing).toEqual([]);
+    expect(core.handleBinary(firstFrame).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 960 }
+    ]);
+    expect(core.handleBinary(secondFrame).outgoing).toEqual([]);
+    expect(core.handleBinary(secondFrame).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1920 }
+    ]);
+    expect(core.handleBinary(secondFrame).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1920 }
+    ]);
     expect(adapter.sessions[0]?.pushCalls).toHaveLength(2);
-    expect(adapter.sessions[0]?.pushCalls[1]?.originalSampleOffset).toBe(1);
-    expect(Array.from(adapter.sessions[0]?.pushCalls[0]?.pcm ?? [])).toEqual([1, 2]);
+  });
+
+  it('lowers the normal ACK threshold with ack interval and replay limits', () => {
+    const cases = [
+      {
+        limits: { ...DEFAULT_NEGOTIATED_LIMITS, ackIntervalMs: 1 },
+        sampleCount: 8,
+        expectedOffset: 16
+      },
+      {
+        limits: { ...DEFAULT_NEGOTIATED_LIMITS, maxRetainedReplaySamples: 8 },
+        sampleCount: 4,
+        expectedOffset: 8
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      const { core } = openNew(recordingAdapter(), 'es', { serverLimits: testCase.limits });
+      core.handleText(utteranceStartText());
+      expect(core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(testCase.sampleCount))).outgoing).toEqual([]);
+      expect(core.handleBinary(frame(
+        TEST_UTTERANCE_ID,
+        1,
+        testCase.sampleCount,
+        pcmSamples(testCase.sampleCount)
+      )).outgoing).toMatchObject([
+        { type: 'audio.ack', highestContiguousExclusiveOffset: testCase.expectedOffset }
+      ]);
+    }
   });
 
   it('maps ordered-frame failures to the required abort/error closes', () => {
@@ -533,6 +607,7 @@ describe('relay session core', () => {
       core.handleText(utteranceStartText());
       const result = core.handleBinary(testCase.frame);
       expect(result.close?.code).toBe(testCase.close);
+      expect(result.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
       if (testCase.category !== undefined) {
         expect(result.outgoing).toMatchObject([{ type: 'utterance.aborted', category: testCase.category }]);
       }
@@ -550,6 +625,7 @@ describe('relay session core', () => {
     payloadCase.core.handleText(utteranceStartText());
     const payloadResult = payloadCase.core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, new Uint8Array([1, 2, 3, 4])));
     expect(payloadResult.outgoing).toMatchObject([{ type: 'error', code: 'flow_control' }]);
+    expect(payloadResult.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
     expect(payloadResult.close?.code).toBe(1002);
   });
 
@@ -612,34 +688,89 @@ describe('relay session core', () => {
     core.handleBinary(frame());
     const mismatch = core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 0));
     expect(mismatch.outgoing).toMatchObject([{ type: 'error', code: 'flow_control' }]);
+    expect(mismatch.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
     expect(mismatch.close?.code).toBe(1002);
 
     const second = openNew();
     second.core.handleText(utteranceStartText());
     second.core.handleBinary(frame());
-    expect(second.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1))).toEqual({ outgoing: [] });
+    expect(second.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1)).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1 }
+    ]);
     expect(second.adapter.sessions[0]?.finalizeCalls).toEqual([TEST_UTTERANCE_ID]);
-    expect(second.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1))).toEqual({ outgoing: [] });
+    expect(second.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1)).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1 }
+    ]);
     expect(second.adapter.sessions[0]?.finalizeCalls).toEqual([TEST_UTTERANCE_ID]);
     expect(adapter.sessions[0]?.finalizeCalls).toHaveLength(0);
 
     const conflict = openNew();
     conflict.core.handleText(utteranceStartText());
     conflict.core.handleBinary(frame());
-    expect(conflict.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1))).toEqual({ outgoing: [] });
+    expect(conflict.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1)).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1 }
+    ]);
     const conflictResult = conflict.core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 2));
     expect(conflictResult.outgoing).toMatchObject([
       { type: 'error', code: 'flow_control', scope: 'audio', recoverable: false }
     ]);
+    expect(conflictResult.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
     expect(conflictResult.close).toEqual({ code: 1002, reason: 'protocol_error' });
     expect(conflict.adapter.sessions[0]?.closeCalls).toBe(1);
+  });
+
+  it('maps an already-cancelled finalize to provider loss without committing or ACKing', () => {
+    const { core, adapter } = openNew(
+      recordingAdapter(
+        DETERMINISTIC_MOCK_CAPABILITIES,
+        undefined,
+        undefined,
+        { status: 'already-cancelled' }
+      )
+    );
+    core.handleText(utteranceStartText());
+    core.handleBinary(frame());
+
+    const result = core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1));
+    expect(result.outgoing.map((message) => message.type)).toEqual(['utterance.aborted', 'error']);
+    expect(result.outgoing).toMatchObject([
+      { type: 'utterance.aborted', category: 'provider_loss' },
+      { type: 'error', code: 'provider_unavailable' }
+    ]);
+    expect(result.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
+    expect(result.close).toEqual({ code: 4503, reason: 'provider_unavailable' });
+    expect(adapter.sessions[0]?.finalizeCalls).toEqual([TEST_UTTERANCE_ID]);
+    expect(adapter.sessions[0]?.closeCalls).toBe(1);
+  });
+
+  it('maps a thrown finalize to provider loss without committing or ACKing', () => {
+    const finalizeError = new Error('finalize provider secret');
+    const { core, adapter } = openNew(
+      recordingAdapter(DETERMINISTIC_MOCK_CAPABILITIES, undefined, undefined, finalizeError)
+    );
+    core.handleText(utteranceStartText());
+    core.handleBinary(frame());
+
+    const result = core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1));
+    expect(result.outgoing.map((message) => message.type)).toEqual(['utterance.aborted', 'error']);
+    expect(result.outgoing).toMatchObject([
+      { type: 'utterance.aborted', category: 'provider_loss' },
+      { type: 'error', code: 'provider_unavailable' }
+    ]);
+    expect(result.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
+    expect(result.close).toEqual({ code: 4503, reason: 'provider_unavailable' });
+    expect(JSON.stringify(result)).not.toContain('finalize provider secret');
+    expect(adapter.sessions[0]?.finalizeCalls).toEqual([TEST_UTTERANCE_ID]);
+    expect(adapter.sessions[0]?.closeCalls).toBe(1);
   });
 
   it('rejects audio after commit without forwarding or acknowledging it', () => {
     const { core, adapter } = openNew();
     core.handleText(utteranceStartText());
     core.handleBinary(frame());
-    expect(core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1))).toEqual({ outgoing: [] });
+    expect(core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1)).outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1 }
+    ]);
 
     const result = core.handleBinary(frame(TEST_UTTERANCE_ID, 1, 1));
     expect(result.outgoing).toMatchObject([
@@ -908,6 +1039,7 @@ describe('relay session core', () => {
     throwing.core.handleText(utteranceStartText());
     const thrown = throwing.core.handleBinary(frame());
     expect(thrown.outgoing.map((message) => message.type)).toEqual(['utterance.aborted', 'error']);
+    expect(thrown.outgoing.some((message) => message.type === 'audio.ack')).toBe(false);
     expect(thrown.outgoing[0]).toMatchObject({ category: 'provider_loss' });
     expect(thrown.outgoing[1]).toMatchObject({ code: 'provider_unavailable' });
     expect(thrown.close?.code).toBe(4503);

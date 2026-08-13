@@ -70,6 +70,7 @@ interface ActiveUtterance {
   readonly utteranceId: string;
   readonly acceptor: RelayOrderedFrameAcceptor;
   readonly transcription: TranscriptionSession;
+  lastAcknowledgedOriginalSampleOffset: number;
   committed: boolean;
   committedFinalOriginalSampleOffset: number | undefined;
   finalAccepted: boolean;
@@ -352,6 +353,13 @@ export class RelaySessionCore {
       return this.#providerLoss(active);
     }
 
+    if (
+      accepted.highestContiguousExclusiveOffset -
+        active.lastAcknowledgedOriginalSampleOffset <
+      this.#ackThreshold()
+    ) {
+      return this.#result([]);
+    }
     return this.#result([
       this.#audioAck(active, accepted.highestContiguousExclusiveOffset)
     ]);
@@ -825,6 +833,7 @@ export class RelaySessionCore {
           maxUtteranceSamples: limits.maxUtteranceSamples
         }),
         transcription,
+        lastAcknowledgedOriginalSampleOffset: 0,
         committed: false,
         committedFinalOriginalSampleOffset: undefined,
         finalAccepted: false,
@@ -870,7 +879,9 @@ export class RelaySessionCore {
           'protocol_error'
         );
       }
-      return this.#result([]);
+      return this.#result([
+        this.#audioAck(active, message.finalOriginalSampleOffset)
+      ]);
     }
     if (
       active.acceptor.state.highestContiguousExclusiveOffset !==
@@ -882,15 +893,26 @@ export class RelaySessionCore {
         'protocol_error'
       );
     }
+    let finalized: ReturnType<TranscriptionSession['finalize']>;
+    try {
+      finalized = active.transcription.finalize(message.utteranceId);
+    } catch {
+      return this.#providerLoss(active);
+    }
+    if (finalized.status !== 'finalized' && finalized.status !== 'already-finalized') {
+      return this.#providerLoss(active);
+    }
     active.committed = true;
     active.committedFinalOriginalSampleOffset = message.finalOriginalSampleOffset;
-    try {
-      active.transcription.finalize(message.utteranceId);
-    } catch {
-      this.#finishActive(false);
-      return this.#result([this.#error('provider_unavailable', 'server', true)]);
+    if (
+      message.finalOriginalSampleOffset <=
+      active.lastAcknowledgedOriginalSampleOffset
+    ) {
+      return this.#result([]);
     }
-    return this.#result([]);
+    return this.#result([
+      this.#audioAck(active, message.finalOriginalSampleOffset)
+    ]);
   }
 
   #handleUtteranceCancel(message: ReturnType<typeof assertUtteranceCancel>): RelayStepResult {
@@ -976,7 +998,7 @@ export class RelaySessionCore {
   }
 
   #audioAck(active: ActiveUtterance, offset: number): ServerControlMessage {
-    return assertServerControlMessage({
+    const ack = assertServerControlMessage({
       type: 'audio.ack',
       sessionId: this.#sessionId,
       sessionEpoch: this.#sessionEpoch,
@@ -984,6 +1006,23 @@ export class RelaySessionCore {
       highestContiguousExclusiveOffset: offset,
       flowState: 'normal'
     });
+    active.lastAcknowledgedOriginalSampleOffset = offset;
+    return ack;
+  }
+
+  #ackThreshold(): number {
+    const limits = this.#effectiveLimits;
+    if (limits === undefined) {
+      return 1;
+    }
+    return Math.max(
+      1,
+      Math.min(
+        16 * limits.ackIntervalMs,
+        limits.maxRetainedReplaySamples,
+        limits.maxUnacknowledgedSamples
+      )
+    );
   }
 
   #identity(active: ActiveUtterance): UtteranceIdentity {
