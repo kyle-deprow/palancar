@@ -11,7 +11,7 @@ import type {
 } from '@palancar/contracts';
 import type { TargetLanguage } from '@palancar/language-registry';
 
-export type GenerationOperation = 'translate' | 'suggest';
+export type GenerationOperation = 'complete' | 'translate' | 'suggest';
 
 export type GenerationErrorCategory =
   | 'invalid-input'
@@ -56,22 +56,8 @@ export interface GenerationCorrelation {
   readonly gatePolicyVersion: Version;
 }
 
-export interface GenerationProviderIdentity {
-  readonly id: string;
-  readonly version: string;
-}
-
-export interface GenerationProviderTranslateInput extends GenerationCorrelation {
+export interface GenerationProviderCompletionInput extends GenerationCorrelation {
   readonly targetTranscript: BoundedTranscriptText;
-}
-
-export interface GenerationProviderSuggestInput extends GenerationCorrelation {
-  readonly targetTranscript: BoundedTranscriptText;
-  readonly englishTranslation: BoundedEnglishText;
-}
-
-export interface GenerationProviderTranslation {
-  readonly englishTranslation: string;
 }
 
 export interface SuggestionPhrasePair {
@@ -79,34 +65,36 @@ export interface SuggestionPhrasePair {
   readonly selectedTargetText: BoundedTargetText;
 }
 
+export interface GenerationProviderCompletion {
+  readonly englishTranslation: string;
+  readonly suggestions:
+    | readonly [SuggestionPhrasePair, SuggestionPhrasePair]
+    | readonly [SuggestionPhrasePair, SuggestionPhrasePair, SuggestionPhrasePair];
+}
+
 export interface GenerationProvider {
   readonly id: string;
   readonly version: string;
-  translate(
-    input: GenerationProviderTranslateInput
-  ): Promise<GenerationProviderTranslation | string>;
-  suggest(
-    input: GenerationProviderSuggestInput
-  ): Promise<readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] }>;
+  complete(
+    input: GenerationProviderCompletionInput,
+    context: { readonly signal: AbortSignal }
+  ): Promise<GenerationProviderCompletion>;
 }
 
-export interface GenerationTranslation extends GenerationCorrelation {
+export interface GenerationCompletion extends GenerationCorrelation {
   readonly englishTranslation: BoundedEnglishText;
+  readonly suggestions:
+    | readonly [SuggestionPhrasePair, SuggestionPhrasePair]
+    | readonly [SuggestionPhrasePair, SuggestionPhrasePair, SuggestionPhrasePair];
 }
 
-export interface GenerationSuggestions extends GenerationCorrelation {
-  readonly suggestions: readonly [SuggestionPhrasePair, SuggestionPhrasePair] | readonly [
-    SuggestionPhrasePair,
-    SuggestionPhrasePair,
-    SuggestionPhrasePair
-  ];
+export interface GenerationCompletionOptions {
+  readonly signal?: AbortSignal;
 }
-
-export type GenerationOutput = GenerationTranslation | GenerationSuggestions;
 
 export interface GenerationEvidenceRecord extends GenerationCorrelation {
   readonly operation: GenerationOperation;
-  readonly status: 'success' | 'failure';
+  readonly status: 'success' | 'failure' | 'cancelled';
   readonly failureCategory?: GenerationErrorCategory;
   readonly providerId: string;
   readonly providerVersion: string;
@@ -122,6 +110,6 @@ export interface GenerationServiceOptions {
 }
 
 export interface MetadataOnlyEvidenceCollectorLike {
-  add(record: GenerationEvidenceRecord): GenerationEvidenceRecord;
+  add(input: unknown): GenerationEvidenceRecord;
   readonly records: readonly GenerationEvidenceRecord[];
 }

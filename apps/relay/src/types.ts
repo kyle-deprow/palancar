@@ -1,6 +1,6 @@
 import type { WEBSOCKET_SUBPROTOCOL } from '@palancar/contracts';
 import type { NegotiatedLimits, ServerControlMessage } from '@palancar/contracts';
-import type { GenerationService } from '@palancar/generation';
+import type { GenerationCompletion, GenerationService } from '@palancar/generation';
 import type { NormalizedTranscriptionEvent, TranscriptionAdapter } from '@palancar/transcription';
 
 export interface RelayUpgradeAudience {
@@ -70,7 +70,24 @@ export interface RelaySessionCoreOptions {
   readonly generationService: GenerationService;
   readonly gatePolicyVersion: string;
   readonly serverLimits?: NegotiatedLimits;
+  readonly onAsyncEventsAvailable?: () => void;
 }
+
+export interface FinalProcessingToken {
+  readonly sessionId: string;
+  readonly sessionEpoch: number;
+  readonly utteranceId: string;
+  readonly segmentId: string;
+  readonly acceptedFinalRevision: number;
+  readonly selectedTargetLanguage: string;
+  readonly gatePolicyVersion: string;
+  readonly targetTranscript: string;
+}
+
+export type RelayAsyncEvent =
+  | { readonly kind: 'transcription'; readonly event: NormalizedTranscriptionEvent }
+  | { readonly kind: 'generation.completed'; readonly token: FinalProcessingToken; readonly result: GenerationCompletion }
+  | { readonly kind: 'generation.failed'; readonly token: FinalProcessingToken };
 
 export type RelayCloseCode =
   | 1000

@@ -3,39 +3,42 @@ import { GenerationError } from './errors.js';
 import { MetadataOnlyEvidenceCollector } from './evidence.js';
 import type {
   AcceptedTargetTurn,
+  GenerationCompletion,
+  GenerationCompletionOptions,
   GenerationCorrelation,
   GenerationEvidenceRecord,
   GenerationProvider,
-  GenerationProviderSuggestInput,
-  GenerationProviderTranslateInput,
-  GenerationProviderTranslation,
+  GenerationProviderCompletion,
+  GenerationProviderCompletionInput,
   GenerationServiceOptions,
-  GenerationSuggestions,
-  GenerationTranslation,
   MetadataOnlyEvidenceCollectorLike,
   SuggestionPhrasePair
 } from './types.js';
 
-const TEXT_LIMIT = 1_024;
+const ENGLISH_TRANSLATION_LIMIT = 256;
+const SUGGESTION_TEXT_LIMIT = 160;
 const PROVIDER_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
-const translationResults = new WeakSet<object>();
 
-type ProviderTranslate = GenerationProvider['translate'];
-type ProviderSuggest = GenerationProvider['suggest'];
+type ProviderComplete = GenerationProvider['complete'];
 
 interface ProviderSnapshot {
   readonly id: string;
   readonly version: string;
-  readonly translate: ProviderTranslate;
-  readonly suggest: ProviderSuggest;
+  readonly complete: ProviderComplete;
 }
 
-function invalid(category: 'forged-value' | 'correlation-mismatch' | 'invalid-provider'): never {
+interface CompletionEntry {
+  readonly promise: Promise<GenerationCompletion>;
+  readonly controller: AbortController;
+  readonly listeners: Map<AbortSignal, () => void>;
+}
+
+function invalid(category: 'forged-value' | 'invalid-provider'): never {
   throw new GenerationError(category);
 }
 
-function isBoundedText(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= TEXT_LIMIT;
+function invalidProviderResult(): never {
+  throw new GenerationError('invalid-provider-result');
 }
 
 function descriptorFor(value: object, key: string): PropertyDescriptor | undefined {
@@ -46,7 +49,6 @@ function descriptorFor(value: object, key: string): PropertyDescriptor | undefin
       throw new GenerationError('invalid-provider');
     }
     visited.add(current);
-
     let descriptors: Record<PropertyKey, PropertyDescriptor>;
     try {
       descriptors = Object.getOwnPropertyDescriptors(current) as Record<
@@ -75,18 +77,16 @@ function providerSnapshot(value: unknown): ProviderSnapshot {
 
   let idDescriptor: PropertyDescriptor | undefined;
   let versionDescriptor: PropertyDescriptor | undefined;
-  let translateDescriptor: PropertyDescriptor | undefined;
-  let suggestDescriptor: PropertyDescriptor | undefined;
+  let completeDescriptor: PropertyDescriptor | undefined;
   try {
     idDescriptor = descriptorFor(value, 'id');
     versionDescriptor = descriptorFor(value, 'version');
-    translateDescriptor = descriptorFor(value, 'translate');
-    suggestDescriptor = descriptorFor(value, 'suggest');
+    completeDescriptor = descriptorFor(value, 'complete');
   } catch (error) {
     if (error instanceof GenerationError) {
       throw error;
     }
-    throw new GenerationError('invalid-provider');
+    invalid('invalid-provider');
   }
 
   if (
@@ -94,25 +94,21 @@ function providerSnapshot(value: unknown): ProviderSnapshot {
     !Object.hasOwn(idDescriptor, 'value') ||
     versionDescriptor === undefined ||
     !Object.hasOwn(versionDescriptor, 'value') ||
-    translateDescriptor === undefined ||
-    !Object.hasOwn(translateDescriptor, 'value') ||
-    suggestDescriptor === undefined ||
-    !Object.hasOwn(suggestDescriptor, 'value')
+    completeDescriptor === undefined ||
+    !Object.hasOwn(completeDescriptor, 'value')
   ) {
     invalid('invalid-provider');
   }
 
   const id = idDescriptor.value;
   const version = versionDescriptor.value;
-  const translate = translateDescriptor.value;
-  const suggest = suggestDescriptor.value;
+  const complete = completeDescriptor.value;
   if (
     typeof id !== 'string' ||
     !PROVIDER_VALUE.test(id) ||
     typeof version !== 'string' ||
     !PROVIDER_VALUE.test(version) ||
-    typeof translate !== 'function' ||
-    typeof suggest !== 'function'
+    typeof complete !== 'function'
   ) {
     invalid('invalid-provider');
   }
@@ -121,64 +117,15 @@ function providerSnapshot(value: unknown): ProviderSnapshot {
     return Object.freeze({
       id,
       version,
-      translate: Function.prototype.bind.call(translate, value) as ProviderTranslate,
-      suggest: Function.prototype.bind.call(suggest, value) as ProviderSuggest
+      complete: Function.prototype.bind.call(complete, value) as ProviderComplete
     });
   } catch {
-    throw new GenerationError('invalid-provider');
+    invalid('invalid-provider');
   }
 }
 
-function keyFor(
-  correlation: GenerationCorrelation,
-  targetTranscript: string,
-  englishTranslation?: string
-): string {
-  const key = [
-    correlation.sessionId,
-    correlation.sessionEpoch,
-    correlation.utteranceId,
-    correlation.segmentId,
-    correlation.acceptedFinalRevision,
-    correlation.selectedTargetLanguage,
-    targetTranscript,
-    correlation.gatePolicyVersion
-  ];
-  if (englishTranslation !== undefined) {
-    key.push(englishTranslation);
-  }
-  return JSON.stringify(key);
-}
-
-function correlationFromTurn(turn: AcceptedTargetTurn): GenerationCorrelation {
-  return {
-    sessionId: turn.sessionId,
-    sessionEpoch: turn.sessionEpoch,
-    utteranceId: turn.utteranceId,
-    segmentId: turn.segmentId,
-    acceptedFinalRevision: turn.acceptedFinalRevision,
-    selectedTargetLanguage: turn.selectedTargetLanguage,
-    gatePolicyVersion: turn.gatePolicyVersion
-  };
-}
-
-function sameCorrelation(
-  left: GenerationCorrelation,
-  right: GenerationCorrelation
-): boolean {
-  return (
-    left.sessionId === right.sessionId &&
-    left.sessionEpoch === right.sessionEpoch &&
-    left.utteranceId === right.utteranceId &&
-    left.segmentId === right.segmentId &&
-    left.acceptedFinalRevision === right.acceptedFinalRevision &&
-    left.selectedTargetLanguage === right.selectedTargetLanguage &&
-    left.gatePolicyVersion === right.gatePolicyVersion
-  );
-}
-
-function invalidProviderResult(): never {
-  throw new GenerationError('invalid-provider-result');
+function isBoundedText(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maximum;
 }
 
 function snapshotPlainObject(
@@ -188,7 +135,6 @@ function snapshotPlainObject(
   if (Array.isArray(value)) {
     invalidProviderResult();
   }
-
   let prototype: object | null;
   let descriptors: Record<PropertyKey, PropertyDescriptor>;
   try {
@@ -222,6 +168,11 @@ function snapshotPlainObject(
     }
     invalidProviderResult();
   }
+  for (const key of allowedKeys) {
+    if (!Object.hasOwn(copy, key)) {
+      invalidProviderResult();
+    }
+  }
   return copy;
 }
 
@@ -229,7 +180,6 @@ function snapshotArray(value: unknown): readonly unknown[] {
   if (!Array.isArray(value)) {
     invalidProviderResult();
   }
-
   let prototype: object | null;
   let descriptors: Record<PropertyKey, PropertyDescriptor>;
   try {
@@ -244,7 +194,6 @@ function snapshotArray(value: unknown): readonly unknown[] {
   if (prototype !== Array.prototype) {
     invalidProviderResult();
   }
-
   const lengthDescriptor = descriptors.length;
   if (
     lengthDescriptor === undefined ||
@@ -291,57 +240,77 @@ function snapshotArray(value: unknown): readonly unknown[] {
   return Object.freeze(copy);
 }
 
-const TRANSLATION_KEYS = new Set(['englishTranslation']);
-const SUGGESTIONS_KEYS = new Set(['suggestions']);
-const PHRASE_KEYS = new Set(['englishText', 'selectedTargetText']);
-
-function providerTranslation(value: unknown): string {
-  if (typeof value === 'string') {
-    if (!isBoundedText(value)) {
-      invalidProviderResult();
-    }
-    return value;
-  }
+function validateCompletion(value: unknown): GenerationProviderCompletion {
   if (typeof value !== 'object' || value === null) {
     invalidProviderResult();
   }
-  const snapshot = snapshotPlainObject(value, TRANSLATION_KEYS);
-  const candidate = snapshot.englishTranslation;
-  if (!isBoundedText(candidate)) {
+  const completion = snapshotPlainObject(value, new Set(['englishTranslation', 'suggestions']));
+  if (!isBoundedText(completion.englishTranslation, ENGLISH_TRANSLATION_LIMIT)) {
     invalidProviderResult();
   }
-  return candidate;
+  const rawSuggestions = snapshotArray(completion.suggestions);
+  if (rawSuggestions.length !== 2 && rawSuggestions.length !== 3) {
+    invalidProviderResult();
+  }
+  const suggestions: SuggestionPhrasePair[] = [];
+  for (const rawPair of rawSuggestions) {
+    if (typeof rawPair !== 'object' || rawPair === null) {
+      invalidProviderResult();
+    }
+    const pair = snapshotPlainObject(rawPair, new Set(['englishText', 'selectedTargetText']));
+    if (
+      !isBoundedText(pair.englishText, SUGGESTION_TEXT_LIMIT) ||
+      !isBoundedText(pair.selectedTargetText, SUGGESTION_TEXT_LIMIT)
+    ) {
+      invalidProviderResult();
+    }
+    suggestions.push(Object.freeze({
+      englishText: pair.englishText,
+      selectedTargetText: pair.selectedTargetText
+    }));
+  }
+
+  return Object.freeze({
+    englishTranslation: completion.englishTranslation,
+    suggestions: Object.freeze(suggestions) as GenerationProviderCompletion['suggestions']
+  });
 }
 
-function providerSuggestions(value: unknown): readonly SuggestionPhrasePair[] {
-  let candidate: readonly unknown[];
-  if (Array.isArray(value)) {
-    candidate = snapshotArray(value);
-  } else {
-    if (typeof value !== 'object' || value === null) {
-      invalidProviderResult();
-    }
-    const wrapper = snapshotPlainObject(value, SUGGESTIONS_KEYS);
-    candidate = snapshotArray(wrapper.suggestions);
-  }
-  if (candidate.length !== 2 && candidate.length !== 3) {
-    invalidProviderResult();
-  }
+function correlationFromTurn(turn: AcceptedTargetTurn): GenerationCorrelation {
+  return {
+    sessionId: turn.sessionId,
+    sessionEpoch: turn.sessionEpoch,
+    utteranceId: turn.utteranceId,
+    segmentId: turn.segmentId,
+    acceptedFinalRevision: turn.acceptedFinalRevision,
+    selectedTargetLanguage: turn.selectedTargetLanguage,
+    gatePolicyVersion: turn.gatePolicyVersion
+  };
+}
 
-  const copy: SuggestionPhrasePair[] = [];
-  for (const pair of candidate) {
-    if (typeof pair !== 'object' || pair === null) {
-      invalidProviderResult();
-    }
-    const valuePair = snapshotPlainObject(pair, PHRASE_KEYS);
-    const englishText = valuePair.englishText;
-    const selectedTargetText = valuePair.selectedTargetText;
-    if (!isBoundedText(englishText) || !isBoundedText(selectedTargetText)) {
-      invalidProviderResult();
-    }
-    copy.push(Object.freeze({ englishText, selectedTargetText }));
-  }
-  return Object.freeze(copy);
+function keyFor(correlation: GenerationCorrelation, targetTranscript: string): string {
+  return JSON.stringify([
+    correlation.sessionId,
+    correlation.sessionEpoch,
+    correlation.utteranceId,
+    correlation.segmentId,
+    correlation.acceptedFinalRevision,
+    correlation.selectedTargetLanguage,
+    correlation.gatePolicyVersion,
+    targetTranscript
+  ]);
+}
+
+function sameCorrelation(left: GenerationCorrelation, right: GenerationCorrelation): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.sessionEpoch === right.sessionEpoch &&
+    left.utteranceId === right.utteranceId &&
+    left.segmentId === right.segmentId &&
+    left.acceptedFinalRevision === right.acceptedFinalRevision &&
+    left.selectedTargetLanguage === right.selectedTargetLanguage &&
+    left.gatePolicyVersion === right.gatePolicyVersion
+  );
 }
 
 function now(): number {
@@ -351,9 +320,7 @@ function now(): number {
 export class GenerationService {
   readonly #provider: ProviderSnapshot;
   readonly #evidence: MetadataOnlyEvidenceCollectorLike;
-  readonly #translations = new WeakSet<object>();
-  readonly #translationPromises = new Map<string, Promise<GenerationTranslation>>();
-  readonly #suggestionPromises = new Map<string, Promise<GenerationSuggestions>>();
+  readonly #completionPromises = new Map<string, CompletionEntry>();
 
   constructor(provider: GenerationProvider, evidenceCollector?: MetadataOnlyEvidenceCollectorLike);
   constructor(options: GenerationServiceOptions);
@@ -390,186 +357,146 @@ export class GenerationService {
     return this.#evidence.records;
   }
 
-  translate(turn: AcceptedTargetTurn): Promise<GenerationTranslation> {
-    if (!isAcceptedTargetTurn(turn)) {
-      throw new GenerationError('forged-value');
-    }
-    const correlation = correlationFromTurn(turn);
-    const key = keyFor(correlation, turn.targetTranscript);
-    const existing = this.#translationPromises.get(key);
-    if (existing !== undefined) {
-      return existing;
-    }
-
-    const promise = this.#executeTranslate(turn, correlation);
-    this.#translationPromises.set(key, promise);
-    void promise.then(
-      () => {
-        if (this.#translationPromises.get(key) === promise) {
-          this.#translationPromises.delete(key);
-        }
-      },
-      () => {
-        if (this.#translationPromises.get(key) === promise) {
-          this.#translationPromises.delete(key);
-        }
-      }
-    );
-    return promise;
-  }
-
-  suggest(
+  complete(
     turn: AcceptedTargetTurn,
-    translation: GenerationTranslation
-  ): Promise<GenerationSuggestions> {
+    options: GenerationCompletionOptions = {}
+  ): Promise<GenerationCompletion> {
     if (!isAcceptedTargetTurn(turn)) {
       throw new GenerationError('forged-value');
     }
     if (
-      typeof translation !== 'object' ||
-      translation === null ||
-      !this.#translations.has(translation) ||
-      !translationResults.has(translation)
+      typeof options !== 'object' ||
+      options === null ||
+      (options.signal !== undefined && !(options.signal instanceof AbortSignal))
     ) {
       throw new GenerationError('forged-value');
     }
-    const turnCorrelation = correlationFromTurn(turn);
-    if (!sameCorrelation(turnCorrelation, translation)) {
-      throw new GenerationError('correlation-mismatch');
-    }
-    const key = keyFor(
-      turnCorrelation,
-      turn.targetTranscript,
-      translation.englishTranslation
-    );
-    const existing = this.#suggestionPromises.get(key);
+
+    const correlation = correlationFromTurn(turn);
+    const key = keyFor(correlation, turn.targetTranscript);
+    const existing = this.#completionPromises.get(key);
     if (existing !== undefined) {
-      return existing;
+      this.#attachSignal(existing, options.signal);
+      return existing.promise;
     }
 
-    const promise = this.#executeSuggest(
-      turn.targetTranscript,
-      turnCorrelation,
-      translation
-    );
-    this.#suggestionPromises.set(key, promise);
+    const controller = new AbortController();
+    let resolvePromise!: (value: GenerationCompletion) => void;
+    let rejectPromise!: (reason?: unknown) => void;
+    const promise = new Promise<GenerationCompletion>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    const entry: CompletionEntry = {
+      promise,
+      controller,
+      listeners: new Map()
+    };
+    this.#completionPromises.set(key, entry);
+    this.#attachSignal(entry, options.signal);
+
+    void this.#executeComplete(turn, correlation, controller).then(resolvePromise, rejectPromise);
     void promise.then(
-      () => {
-        if (this.#suggestionPromises.get(key) === promise) {
-          this.#suggestionPromises.delete(key);
-        }
-      },
-      () => {
-        if (this.#suggestionPromises.get(key) === promise) {
-          this.#suggestionPromises.delete(key);
-        }
-      }
+      () => this.#settle(key, entry),
+      () => this.#settle(key, entry)
     );
     return promise;
   }
 
-  async #executeTranslate(
+  #attachSignal(entry: CompletionEntry, signal: AbortSignal | undefined): void {
+    if (signal === undefined || entry.listeners.has(signal)) {
+      return;
+    }
+    const onAbort = (): void => {
+      if (!entry.controller.signal.aborted) {
+        entry.controller.abort();
+      }
+    };
+    entry.listeners.set(signal, onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+  }
+
+  #settle(key: string, entry: CompletionEntry): void {
+    if (this.#completionPromises.get(key) === entry) {
+      this.#completionPromises.delete(key);
+    }
+    for (const [signal, listener] of entry.listeners) {
+      signal.removeEventListener('abort', listener);
+    }
+    entry.listeners.clear();
+  }
+
+  async #executeComplete(
     turn: AcceptedTargetTurn,
-    correlation: GenerationCorrelation
-  ): Promise<GenerationTranslation> {
+    correlation: GenerationCorrelation,
+    controller: AbortController
+  ): Promise<GenerationCompletion> {
     const start = now();
-    let status: 'success' | 'failure' = 'failure';
+    let status: GenerationEvidenceRecord['status'] = 'failure';
     let failureCategory: GenerationEvidenceRecord['failureCategory'];
     try {
-      const providerInput: GenerationProviderTranslateInput = Object.freeze({
+      if (controller.signal.aborted) {
+        throw new GenerationError('provider-failure');
+      }
+      const input: GenerationProviderCompletionInput = Object.freeze({
         ...correlation,
         targetTranscript: turn.targetTranscript
       });
-      let raw: GenerationProviderTranslation | string;
+      let raw: GenerationProviderCompletion;
       try {
-        raw = await this.#provider.translate(providerInput);
+        raw = await this.#provider.complete(input, { signal: controller.signal });
       } catch {
         throw new GenerationError('provider-failure');
       }
+      if (controller.signal.aborted) {
+        throw new GenerationError('provider-failure');
+      }
+      const parsed = validateCompletion(raw);
       const result = Object.freeze({
         ...correlation,
-        englishTranslation: providerTranslation(raw)
+        englishTranslation: parsed.englishTranslation,
+        suggestions: parsed.suggestions
       });
-      this.#translations.add(result);
-      translationResults.add(result);
+      if (!sameCorrelation(correlation, result)) {
+        throw new GenerationError('correlation-mismatch');
+      }
       status = 'success';
       return result;
     } catch (error) {
       const publicError = error instanceof GenerationError
         ? error
         : new GenerationError('provider-failure');
-      failureCategory = publicError.category;
-      throw publicError;
-    } finally {
-      const end = now();
-      this.#recordEvidence({
-        ...correlation,
-        operation: 'translate',
-        status,
-        ...(failureCategory === undefined ? {} : { failureCategory }),
-        providerId: this.#provider.id,
-        providerVersion: this.#provider.version,
-        startMonotonicMs: start,
-        endMonotonicMs: end,
-        latencyMs: Math.max(0, end - start)
-      });
-    }
-  }
-
-  async #executeSuggest(
-    targetTranscript: AcceptedTargetTurn['targetTranscript'],
-    correlation: GenerationCorrelation,
-    translation: GenerationTranslation
-  ): Promise<GenerationSuggestions> {
-    const start = now();
-    let status: 'success' | 'failure' = 'failure';
-    let failureCategory: GenerationEvidenceRecord['failureCategory'];
-    try {
-      const providerInput: GenerationProviderSuggestInput = Object.freeze({
-        ...correlation,
-        targetTranscript,
-        englishTranslation: translation.englishTranslation
-      });
-      let raw: readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] };
-      try {
-        raw = await this.#provider.suggest(providerInput);
-      } catch {
-        throw new GenerationError('provider-failure');
+      if (controller.signal.aborted) {
+        status = 'cancelled';
+        failureCategory = undefined;
+      } else {
+        failureCategory = publicError.category;
       }
-      const suggestions = providerSuggestions(raw);
-      const result = Object.freeze({
-        ...correlation,
-        suggestions
-      });
-      status = 'success';
-      return result as GenerationSuggestions;
-    } catch (error) {
-      const publicError = error instanceof GenerationError
-        ? error
-        : new GenerationError('provider-failure');
-      failureCategory = publicError.category;
       throw publicError;
     } finally {
       const end = now();
-      this.#recordEvidence({
-        ...correlation,
-        operation: 'suggest',
-        status,
-        ...(failureCategory === undefined ? {} : { failureCategory }),
-        providerId: this.#provider.id,
-        providerVersion: this.#provider.version,
-        startMonotonicMs: start,
-        endMonotonicMs: end,
-        latencyMs: Math.max(0, end - start)
-      });
+      try {
+        this.#recordEvidence({
+          ...correlation,
+          operation: 'complete',
+          status,
+          ...(failureCategory === undefined ? {} : { failureCategory }),
+          providerId: this.#provider.id,
+          providerVersion: this.#provider.version,
+          startMonotonicMs: start,
+          endMonotonicMs: end,
+          latencyMs: Math.max(0, end - start)
+        });
+      } catch {
+        // Evidence collection is best effort and must not alter the operation result.
+      }
     }
   }
 
   #recordEvidence(record: GenerationEvidenceRecord): void {
-    try {
-      this.#evidence.add(record);
-    } catch {
-      // Evidence is diagnostic only. It must never replace the operation result.
-    }
+    this.#evidence.add(record);
   }
 }

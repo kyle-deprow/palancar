@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_NEGOTIATED_LIMITS, encodeAudioFrame } from '@palancar/contracts';
-import { GenerationService, type GenerationProvider } from '@palancar/generation';
+import {
+  GenerationService,
+  type GenerationProvider,
+  type GenerationProviderCompletion
+} from '@palancar/generation';
 import type {
   CancelResult,
   CloseResult,
@@ -30,6 +34,10 @@ import {
 } from '../src/index.js';
 
 const START_LIMITS = DEFAULT_NEGOTIATED_LIMITS;
+
+async function flushAsyncEvents(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
 
 function startText(
   targetLanguage: 'es' | 'tr' = 'es',
@@ -276,6 +284,17 @@ function openNew(
   const ready = core.openWithFirstText(startText(targetLanguage));
   expect(ready.outgoing[0]?.type).toBe('session.ready');
   return { core, adapter };
+}
+
+function pendingGenerationProvider(onSignal: (signal: AbortSignal) => void): GenerationProvider {
+  return {
+    id: 'pending-generation-provider',
+    version: '1.0.0',
+    complete: async (_input, context) => new Promise<GenerationProviderCompletion>((_resolve, reject) => {
+      onSignal(context.signal);
+      context.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    })
+  };
 }
 
 describe('relay protocol helpers', () => {
@@ -649,50 +668,186 @@ describe('relay session core', () => {
     expect(endedCore.close()).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
   });
 
+  it('cancels pending generation when the utterance is cancelled', async () => {
+    let providerSignal: AbortSignal | undefined;
+    const { core } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+        providerSignal = signal;
+      }))
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+
+    expect(providerSignal).toBeDefined();
+    expect(core.handleText(utteranceCancelText())).toMatchObject({
+      outgoing: [{ type: 'utterance.aborted', category: 'cancellation' }]
+    });
+    expect(providerSignal?.aborted).toBe(true);
+  });
+
+  it('cancels pending generation when the session ends', async () => {
+    let providerSignal: AbortSignal | undefined;
+    const { core } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+        providerSignal = signal;
+      }))
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+
+    expect(providerSignal).toBeDefined();
+    expect(core.handleText(sessionEndText())).toEqual({
+      outgoing: [],
+      close: { code: 1000, reason: 'closed' }
+    });
+    expect(providerSignal?.aborted).toBe(true);
+  });
+
+  it('cancels pending generation on a terminal utterance conflict', async () => {
+    let providerSignal: AbortSignal | undefined;
+    const { core } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+        providerSignal = signal;
+      }))
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+
+    expect(providerSignal).toBeDefined();
+    expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toMatchObject({
+      outgoing: [{ type: 'error', code: 'utterance_conflict' }],
+      close: { code: 4409, reason: 'utterance_conflict' }
+    });
+    expect(providerSignal?.aborted).toBe(true);
+  });
+
   it('forwards partials only and orders target final generation output', async () => {
-    const { core } = openNew();
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService({
+        id: 'one-call-provider',
+        version: '1.0.0',
+        complete
+      })
+    });
     core.handleText(utteranceStartText());
     const partial = await core.handleTranscriptionEvent(partialEvent());
     expect(partial.outgoing.map((message) => message.type)).toEqual(['transcript.partial']);
     const final = await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 2));
     expect(final.outgoing.map((message) => message.type)).toEqual([
       'transcript.final',
-      'language.decision',
+      'language.decision'
+    ]);
+    await flushAsyncEvents();
+    const generated = await core.drainAsyncEvents();
+    expect(generated.outgoing.map((message) => message.type)).toEqual([
       'translation.ready',
       'suggestions.ready'
     ]);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves final ordering when a late same-segment partial replaces a queued partial', async () => {
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    }));
+    const { core, adapter } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService({
+        id: 'ordered-queue-provider',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+    const session = adapter.sessions[0];
+    expect(session).toBeDefined();
+    session?.emit(partialEvent(1));
+    session?.emit(finalEvent('target', TEST_UTTERANCE_ID, 2));
+    session?.emit(partialEvent(3));
+
+    const firstDrain = await core.drainAsyncEvents();
+    expect(firstDrain.outgoing.slice(0, 2).map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+    expect(firstDrain.outgoing.some((message) => message.type === 'transcript.partial')).toBe(false);
+    await flushAsyncEvents();
+    const secondDrain = await core.drainAsyncEvents();
+    const generatedTypes = [...firstDrain.outgoing, ...secondDrain.outgoing]
+      .map((message) => message.type)
+      .filter((type) => type === 'translation.ready' || type === 'suggestions.ready');
+    expect(generatedTypes).toEqual(['translation.ready', 'suggestions.ready']);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a target final active until generation completes', async () => {
+    const { core } = openNew();
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toMatchObject({
+      outgoing: [{ type: 'error', code: 'utterance_conflict' }],
+      close: { code: 4409, reason: 'utterance_conflict' }
+    });
   });
 
   it('clears target finals after generation and permits the next utterance', async () => {
     const { core, adapter } = openNew();
     core.handleText(utteranceStartText());
     await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    await core.drainAsyncEvents();
     expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toEqual({ outgoing: [] });
     expect(adapter.sessions).toHaveLength(2);
   });
 
   it('suppresses generated output when the final processing token becomes stale', async () => {
-    let resolveTranslation: ((value: { readonly englishTranslation: string }) => void) | undefined;
-    const translation = new Promise<{ readonly englishTranslation: string }>((resolve) => {
-      resolveTranslation = resolve;
+    let resolveCompletion: ((value: {
+      readonly englishTranslation: string;
+      readonly suggestions: readonly [
+        { readonly englishText: string; readonly selectedTargetText: string },
+        { readonly englishText: string; readonly selectedTargetText: string }
+      ];
+    }) => void) | undefined;
+    const completion = new Promise<GenerationProviderCompletion>((resolve) => {
+      resolveCompletion = resolve;
     });
+    let providerSignal: AbortSignal | undefined;
     const provider: GenerationProvider = {
       id: 'provider',
       version: '1.0.0',
-      translate: async () => translation,
-      suggest: async () => [
-        { englishText: 'hello', selectedTargetText: 'hola' },
-        { englishText: 'hi', selectedTargetText: 'buenas' }
-      ]
+      complete: async (_input, context) => {
+        providerSignal = context.signal;
+        return completion;
+      }
     };
     const { core } = openNew(recordingAdapter(), 'es', {
       generationService: new GenerationService(provider)
     });
     core.handleText(utteranceStartText());
     const finalPromise = core.handleTranscriptionEvent(finalEvent());
-    await Promise.resolve();
+    await flushAsyncEvents();
     expect(core.close()).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
-    resolveTranslation?.({ englishTranslation: 'hello' });
+    expect(providerSignal?.aborted).toBe(true);
+    resolveCompletion?.({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    });
     const result = await finalPromise;
     expect(result.outgoing.map((message) => message.type)).toEqual([
       'transcript.final',
@@ -703,12 +858,14 @@ describe('relay session core', () => {
 
   it('does not generate for every non-target final decision', async () => {
     for (const category of ['english', 'supported-unselected', 'unsupported', 'mixed', 'uncertain'] as const) {
-      const translate = vi.fn(async () => ({ englishTranslation: 'hello' }));
-      const suggest = vi.fn(async () => [
+      const complete = vi.fn(async () => ({
+        englishTranslation: 'hello',
+        suggestions: [
         { englishText: 'hello', selectedTargetText: 'hola' },
         { englishText: 'hi', selectedTargetText: 'buenas' }
-      ]);
-      const provider: GenerationProvider = { id: 'provider', version: '1.0.0', translate, suggest };
+        ] as const
+      }));
+      const provider: GenerationProvider = { id: 'provider', version: '1.0.0', complete };
       const { core } = openNew(recordingAdapter(), 'es', {
         generationService: new GenerationService(provider)
       });
@@ -719,8 +876,7 @@ describe('relay session core', () => {
         'language.decision'
       ]);
       expect(result.outgoing[1]).toMatchObject({ decision: category === 'uncertain' ? 'uncertain' : category === 'supported-unselected' ? 'supported_unselected' : category });
-      expect(translate).not.toHaveBeenCalled();
-      expect(suggest).not.toHaveBeenCalled();
+      expect(complete).not.toHaveBeenCalled();
     }
   });
 
@@ -731,7 +887,7 @@ describe('relay session core', () => {
     expect(stale).toEqual({ outgoing: [] });
     expect((await core.handleTranscriptionEvent(partialEvent(2))).outgoing).toHaveLength(1);
     expect((await core.handleTranscriptionEvent(partialEvent(1))).outgoing).toHaveLength(0);
-    expect((await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 3))).outgoing).toHaveLength(4);
+    expect((await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 3))).outgoing).toHaveLength(2);
     expect((await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 4))).outgoing).toHaveLength(0);
   });
 
@@ -788,12 +944,11 @@ describe('relay session core', () => {
     expect(result.close?.code).toBe(4401);
   });
 
-  it('returns translation then generic provider error when suggestions fail', async () => {
+  it('returns a generic provider error when generation completion fails', async () => {
     const provider: GenerationProvider = {
       id: 'provider',
       version: '1.0.0',
-      translate: async () => ({ englishTranslation: 'hello' }),
-      suggest: async () => {
+      complete: async () => {
         throw new Error('suggestion secret');
       }
     };
@@ -801,13 +956,14 @@ describe('relay session core', () => {
       generationService: new GenerationService(provider)
     });
     core.handleText(utteranceStartText());
-    const result = await core.handleTranscriptionEvent(finalEvent());
-    expect(result.outgoing.map((message) => message.type)).toEqual([
+    const staged = await core.handleTranscriptionEvent(finalEvent());
+    expect(staged.outgoing.map((message) => message.type)).toEqual([
       'transcript.final',
-      'language.decision',
-      'translation.ready',
-      'error'
+      'language.decision'
     ]);
+    await flushAsyncEvents();
+    const result = await core.drainAsyncEvents();
+    expect(result.outgoing.map((message) => message.type)).toEqual(['error']);
     expect(JSON.stringify(result)).not.toContain('secret');
   });
 
@@ -816,8 +972,79 @@ describe('relay session core', () => {
     core.handleText(utteranceStartText());
     const session = adapter.sessions[0];
     session?.emit(partialEvent());
-    const result = await core.drainTranscriptionEvents();
+    const result = await core.drainAsyncEvents();
     expect(result.outgoing.map((message) => message.type)).toEqual(['transcript.partial']);
+  });
+
+  it('partially evicts distinct-segment partials to admit a final at queue capacity', async () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    for (let revision = 1; revision <= 64; revision += 1) {
+      adapter.sessions[0]?.emit({
+        ...partialEvent(revision),
+        segmentId: `segment-${revision}`
+      });
+    }
+    adapter.sessions[0]?.emit(finalEvent('target', TEST_UTTERANCE_ID, 65));
+
+    const drained = await core.drainAsyncEvents();
+    expect(drained.close).toBeUndefined();
+    expect(drained.outgoing.some((message) => message.type === 'transcript.final')).toBe(true);
+    expect(drained.outgoing.some((message) => message.type === 'language.decision')).toBe(true);
+    expect(drained.outgoing.some((message) => message.type === 'error' && message.code === 'state_unavailable')).toBe(false);
+  });
+
+  it('emits one terminal state error when non-partials overflow the bounded queue', async () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    for (let revision = 1; revision <= 65; revision += 1) {
+      adapter.sessions[0]?.emit({
+        ...finalEvent('english', TEST_UTTERANCE_ID, revision),
+        segmentId: `segment-${revision}`
+      });
+    }
+
+    expect(core.hasPendingAsyncEvents()).toBe(true);
+    const drained = await core.drainAsyncEvents();
+    expect(drained.outgoing).toMatchObject([{ type: 'error', code: 'state_unavailable' }]);
+    expect(drained.close).toEqual({ code: 1011, reason: 'server_error' });
+    expect((await core.drainAsyncEvents()).close).toEqual({ code: 1000, reason: 'closed' });
+  });
+
+  it('admits a generation result when partials fill the queue', async () => {
+    let resolveCompletion: ((value: GenerationProviderCompletion) => void) | undefined;
+    const completion = new Promise<GenerationProviderCompletion>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const provider: GenerationProvider = {
+      id: 'deferred-provider',
+      version: '1.0.0',
+      complete: async () => completion
+    };
+    const { core, adapter } = openNew(recordingAdapter(), 'es', {
+      generationService: new GenerationService(provider)
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    for (let revision = 1; revision <= 64; revision += 1) {
+      adapter.sessions[0]?.emit({
+        ...partialEvent(revision),
+        segmentId: `segment-${revision}`
+      });
+    }
+    resolveCompletion?.({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    });
+    await flushAsyncEvents();
+
+    const drained = await core.drainAsyncEvents();
+    expect(drained.outgoing.map((message) => message.type)).toContain('translation.ready');
+    expect(drained.outgoing.map((message) => message.type)).toContain('suggestions.ready');
+    expect(drained.close).toBeUndefined();
   });
 
   it('redacts hostile inbound and provider error values', async () => {
@@ -825,10 +1052,9 @@ describe('relay session core', () => {
     const provider: GenerationProvider = {
       id: 'provider',
       version: '1.0.0',
-      translate: async () => {
+      complete: async () => {
         throw new Error(hostile);
-      },
-      suggest: async () => []
+      }
     };
     const malformedCore = openNew().core;
     const malformed = malformedCore.handleText(JSON.stringify({ type: 'utterance.start', hostile }));
@@ -839,7 +1065,10 @@ describe('relay session core', () => {
     });
     const event = finalEvent();
     core.handleText(utteranceStartText());
-    const result = await core.handleTranscriptionEvent(event);
+    const staged = await core.handleTranscriptionEvent(event);
+    expect(JSON.stringify(staged)).not.toContain(hostile);
+    await flushAsyncEvents();
+    const result = await core.drainAsyncEvents();
     expect(JSON.stringify(result)).not.toContain(hostile);
     expect(result.outgoing.some((message) => message.type === 'error' && message.code === 'provider_unavailable')).toBe(true);
   });

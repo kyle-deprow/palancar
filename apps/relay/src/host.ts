@@ -6,7 +6,8 @@ import {
   WEBSOCKET_SUBPROTOCOL,
   assertCanonicalWssOrigin,
   assertSessionTicketRequest,
-  assertSessionTicketResponse
+  assertSessionTicketResponse,
+  type ServerControlMessage
 } from '@palancar/contracts';
 import {
   DeterministicMockProvider,
@@ -15,9 +16,7 @@ import {
 } from '@palancar/generation';
 import {
   DeterministicMockTranscriptionAdapter,
-  type CreateTranscriptionSessionInput,
-  type TranscriptionAdapter,
-  type TranscriptionSession
+  type TranscriptionAdapter
 } from '@palancar/transcription';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -76,6 +75,7 @@ export interface RelayHostConfig {
   readonly transcriptionAdapter?: TranscriptionAdapter;
   readonly generationService?: GenerationService;
   readonly generationReadiness?: RelayGenerationReadiness;
+  readonly beforeServerMessageDelivery?: (message: ServerControlMessage) => void | Promise<void>;
 }
 
 export interface RelayHost {
@@ -91,6 +91,7 @@ interface RelayConnection {
   queue: Promise<void>;
   closed: boolean;
   coreClosed: boolean;
+  drainScheduled: boolean;
 }
 
 interface BodyReadResult {
@@ -117,12 +118,14 @@ function defaultGenerationService(): GenerationService {
   return new GenerationService(
     new DeterministicMockProvider({
       id: 'deterministic-mock-generation',
-      translate: { result: { englishTranslation: 'hello' } },
-      suggest: {
-        result: [
+      complete: {
+        result: {
+          englishTranslation: 'hello',
+          suggestions: [
           { englishText: 'hello', selectedTargetText: 'hola' },
           { englishText: 'hi', selectedTargetText: 'merhaba' }
-        ]
+          ]
+        }
       }
     })
   );
@@ -526,21 +529,6 @@ function rawDataBuffer(data: unknown): Buffer | undefined {
   return undefined;
 }
 
-function withWakeup(adapter: TranscriptionAdapter, wakeup: () => void): TranscriptionAdapter {
-  return {
-    capabilities: adapter.capabilities,
-    createSession(input: CreateTranscriptionSessionInput): TranscriptionSession {
-      return adapter.createSession({
-        ...input,
-        onEvent: (event) => {
-          input.onEvent(event);
-          wakeup();
-        }
-      });
-    }
-  };
-}
-
 export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): RelayHostConfig {
   try {
     const port = parsePort(env.PORT);
@@ -626,6 +614,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const ids = config.ids ?? systemIds();
   const transcriptionAdapter = config.transcriptionAdapter ?? defaultTranscriptionAdapter();
   const generationService = config.generationService ?? defaultGenerationService();
+  const beforeServerMessageDelivery = config.beforeServerMessageDelivery;
   const generationReadiness = config.generationReadiness ??
     defaultGenerationReadiness(generationService);
   const audience: RelayUpgradeAudience = Object.freeze({
@@ -773,6 +762,9 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const deliver = async (connection: RelayConnection, result: RelayStepResult): Promise<void> => {
     if (connection.socket.readyState === WebSocket.OPEN) {
       for (const message of result.outgoing) {
+        if (beforeServerMessageDelivery !== undefined) {
+          await beforeServerMessageDelivery(message);
+        }
         connection.socket.send(JSON.stringify(message));
       }
     }
@@ -801,33 +793,49 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       return;
     }
 
-    let wakeup: () => void = () => undefined;
-    const adapter = withWakeup(transcriptionAdapter, () => wakeup());
+    let requestDrain: () => void = () => undefined;
     const core = new RelaySessionCore({
       ticketClaim,
       clock,
       ids,
-      transcriptionAdapter: adapter,
+      transcriptionAdapter,
       generationService,
-      gatePolicyVersion
+      gatePolicyVersion,
+      onAsyncEventsAvailable: () => requestDrain()
     });
     const connection: RelayConnection = {
       socket,
       core,
       queue: Promise.resolve(),
       closed: false,
-      coreClosed: false
+      coreClosed: false,
+      drainScheduled: false
     };
     connections.add(connection);
 
-    wakeup = () => {
+    const scheduleDrain = (): void => {
+      if (connection.closed || connection.drainScheduled) {
+        return;
+      }
+      connection.drainScheduled = true;
       enqueue(connection, async () => {
-        if (connection.socket.readyState !== WebSocket.OPEN) {
-          return;
+        try {
+          if (connection.socket.readyState === WebSocket.OPEN) {
+            await deliver(connection, await core.drainAsyncEvents());
+          }
+        } finally {
+          connection.drainScheduled = false;
         }
-        await deliver(connection, await core.drainTranscriptionEvents());
+        if (
+          !connection.closed &&
+          connection.socket.readyState === WebSocket.OPEN &&
+          core.hasPendingAsyncEvents()
+        ) {
+          scheduleDrain();
+        }
       });
     };
+    requestDrain = scheduleDrain;
 
     socket.on('message', (data, isBinary) => {
       enqueue(connection, async () => {
@@ -851,11 +859,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
           result = core.handleText(bytes.toString('utf8'));
         }
         await deliver(connection, result);
-        if (
-          result.close === undefined &&
-          connection.socket.readyState === WebSocket.OPEN
-        ) {
-          await deliver(connection, await core.drainTranscriptionEvents());
+        if (result.close === undefined && connection.socket.readyState === WebSocket.OPEN) {
+          scheduleDrain();
         }
       });
     });

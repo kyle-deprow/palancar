@@ -23,8 +23,7 @@ import { RelayOrderedFrameAcceptor } from '@palancar/audio';
 import {
   createAcceptedTargetTurn,
   type GenerationService,
-  type GenerationSuggestions,
-  type GenerationTranslation
+  type GenerationCompletion
 } from '@palancar/generation';
 import {
   LANGUAGE_REGISTRY_VERSION,
@@ -44,7 +43,9 @@ import type {
   RelayIdGenerator,
   RelaySessionCoreOptions,
   RelayStepResult,
-  RelayCloseCode
+  RelayCloseCode,
+  FinalProcessingToken,
+  RelayAsyncEvent
 } from './types.js';
 
 const SESSION_EPOCH = 1;
@@ -73,14 +74,6 @@ interface ActiveUtterance {
   committedFinalOriginalSampleOffset: number | undefined;
   finalAccepted: boolean;
   lastRevision: number;
-}
-
-interface FinalProcessingToken {
-  readonly sessionId: string;
-  readonly sessionEpoch: number;
-  readonly utteranceId: string;
-  readonly segmentId: string;
-  readonly revision: number;
 }
 
 interface UtteranceIdentity {
@@ -144,7 +137,10 @@ function sameFinalToken(left: FinalProcessingToken, right: FinalProcessingToken)
     left.sessionEpoch === right.sessionEpoch &&
     left.utteranceId === right.utteranceId &&
     left.segmentId === right.segmentId &&
-    left.revision === right.revision
+    left.acceptedFinalRevision === right.acceptedFinalRevision &&
+    left.selectedTargetLanguage === right.selectedTargetLanguage &&
+    left.gatePolicyVersion === right.gatePolicyVersion &&
+    left.targetTranscript === right.targetTranscript
   );
 }
 
@@ -156,6 +152,7 @@ export class RelaySessionCore {
   readonly #generationService: GenerationService;
   readonly #gatePolicyVersion: string;
   readonly #serverLimits: NegotiatedLimits;
+  readonly #onAsyncEventsAvailable: () => void;
   #opened = false;
   #ready = false;
   #terminal = false;
@@ -164,8 +161,11 @@ export class RelaySessionCore {
   #selectedTargetLanguage: TargetLanguage | undefined;
   #effectiveLimits: NegotiatedLimits | undefined;
   #active: ActiveUtterance | undefined;
-  #eventQueue: NormalizedTranscriptionEvent[] = [];
+  #eventQueue: RelayAsyncEvent[] = [];
+  #queueHead = 0;
+  #terminalOverflow = false;
   #finalToken: FinalProcessingToken | undefined;
+  #finalController: AbortController | undefined;
   #lastCancelled: UtteranceIdentity | undefined;
 
   constructor(options: RelaySessionCoreOptions) {
@@ -175,6 +175,7 @@ export class RelaySessionCore {
     this.#transcriptionAdapter = options.transcriptionAdapter;
     this.#generationService = options.generationService;
     this.#gatePolicyVersion = options.gatePolicyVersion;
+    this.#onAsyncEventsAvailable = options.onAsyncEventsAvailable ?? (() => undefined);
     this.#serverLimits = negotiateLimits(
       options.serverLimits ?? DEFAULT_NEGOTIATED_LIMITS
     );
@@ -454,9 +455,11 @@ export class RelaySessionCore {
       sessionEpoch: event.sessionEpoch,
       utteranceId: event.utteranceId,
       segmentId: event.segmentId,
-      revision: event.revision
+      acceptedFinalRevision: event.revision,
+      selectedTargetLanguage: this.#selectedTargetLanguage ?? 'es',
+      gatePolicyVersion: this.#gatePolicyVersion,
+      targetTranscript: event.text
     };
-    this.#finalToken = token;
 
     let turn: ReturnType<typeof createAcceptedTargetTurn>;
     try {
@@ -480,58 +483,71 @@ export class RelaySessionCore {
       return this.#result(outgoing);
     }
 
-    let translation: GenerationTranslation;
     try {
-      translation = await this.#generationService.translate(turn);
+      active.transcription.close();
+    } catch {
+      // Transcription has ended at the accepted final boundary. Generation is independent.
+    }
+
+    const controller = new AbortController();
+    this.#finalToken = token;
+    this.#finalController = controller;
+    let completion: Promise<GenerationCompletion>;
+    try {
+      completion = this.#generationService.complete(turn, { signal: controller.signal });
     } catch {
       if (!this.#isCurrent(active, token)) {
         return this.#result(outgoing);
       }
-      outgoing.push(this.#error('provider_unavailable', 'server', true));
-      this.#finishActive(false);
-      return this.#result(outgoing);
-    }
-    if (!this.#isCurrent(active, token)) {
-      return this.#result(outgoing);
+      completion = Promise.reject(new Error('generation_start_failed'));
     }
 
-    outgoing.push(this.#translationReady(translation));
-    let suggestions: GenerationSuggestions;
-    try {
-      suggestions = await this.#generationService.suggest(turn, translation);
-    } catch {
-      if (!this.#isCurrent(active, token)) {
-        return this.#result(outgoing);
+    void completion.then(
+      (result) => {
+        if (this.#isCurrent(active, token) && !controller.signal.aborted) {
+          this.#appendAsyncEvent({ kind: 'generation.completed', token, result });
+        }
+      },
+      () => {
+        if (this.#isCurrent(active, token) && !controller.signal.aborted) {
+          this.#appendAsyncEvent({ kind: 'generation.failed', token });
+        }
       }
-      outgoing.push(this.#error('provider_unavailable', 'server', true));
-      this.#finishActive(false);
-      return this.#result(outgoing);
-    }
-    if (!this.#isCurrent(active, token)) {
-      return this.#result(outgoing);
-    }
-
-    outgoing.push(this.#suggestionsReady(suggestions));
-    this.#finishActive(false);
+    );
     return this.#result(outgoing);
   }
 
-  async drainTranscriptionEvents(): Promise<RelayStepResult> {
+  hasPendingAsyncEvents(): boolean {
+    return this.#terminalOverflow || this.#queueHead < this.#eventQueue.length;
+  }
+
+  async drainAsyncEvents(): Promise<RelayStepResult> {
     if (this.#terminal) {
       return this.#terminalResult();
     }
+    if (this.#terminalOverflow) {
+      this.#terminalOverflow = false;
+      return this.#terminate(
+        [this.#error('state_unavailable', 'server', false)],
+        1011,
+        'server_error'
+      );
+    }
     const outgoing: ServerControlMessage[] = [];
-    while (this.#eventQueue.length > 0 && !this.#terminal) {
-      const event = this.#eventQueue.shift();
+    const batchEnd = this.#eventQueue.length;
+    while (this.#queueHead < batchEnd && !this.#terminal) {
+      const event = this.#eventQueue[this.#queueHead];
+      this.#queueHead += 1;
       if (event === undefined) {
-        break;
+        continue;
       }
-      const result = await this.handleTranscriptionEvent(event);
+      const result = await this.#handleAsyncEvent(event);
       outgoing.push(...result.outgoing);
       if (result.close !== undefined) {
         return this.#result(outgoing, result.close);
       }
     }
+    this.#compactEventQueue();
     return this.#result(outgoing);
   }
 
@@ -784,7 +800,7 @@ export class RelaySessionCore {
         this.#active?.transcription === ownedSession &&
         this.#active.utteranceId === message.utteranceId
       ) {
-        this.#eventQueue.push(event);
+        this.#appendAsyncEvent({ kind: 'transcription', event });
       }
     };
     let transcription: TranscriptionSession;
@@ -1032,7 +1048,7 @@ export class RelaySessionCore {
     });
   }
 
-  #translationReady(translation: GenerationTranslation): ServerControlMessage {
+  #translationReady(translation: GenerationCompletion): ServerControlMessage {
     return assertServerControlMessage({
       type: 'translation.ready',
       sessionId: translation.sessionId,
@@ -1044,7 +1060,7 @@ export class RelaySessionCore {
     });
   }
 
-  #suggestionsReady(suggestions: GenerationSuggestions): ServerControlMessage {
+  #suggestionsReady(suggestions: GenerationCompletion): ServerControlMessage {
     return assertServerControlMessage({
       type: 'suggestions.ready',
       sessionId: suggestions.sessionId,
@@ -1056,9 +1072,112 @@ export class RelaySessionCore {
     });
   }
 
-  #isCurrent(active: ActiveUtterance, token: FinalProcessingToken): boolean {
+  async #handleAsyncEvent(event: RelayAsyncEvent): Promise<RelayStepResult> {
+    if (event.kind === 'transcription') {
+      return this.handleTranscriptionEvent(event.event);
+    }
+    if (!this.#isCurrent(this.#active, event.token)) {
+      return this.#result([]);
+    }
+    if (event.kind === 'generation.failed') {
+      const outgoing = [this.#error('provider_unavailable', 'server', true)];
+      this.#finishActive(false);
+      return this.#result(outgoing);
+    }
+
+    let translation: ServerControlMessage;
+    let suggestions: ServerControlMessage;
+    try {
+      translation = this.#translationReady(event.result);
+      suggestions = this.#suggestionsReady(event.result);
+    } catch {
+      // The result is all-or-nothing: do not emit either generated event.
+      const outgoing = [this.#error('provider_unavailable', 'server', true)];
+      this.#finishActive(false);
+      return this.#result(outgoing);
+    }
+    this.#finishActive(false);
+    return this.#result([translation, suggestions]);
+  }
+
+  #queueLength(): number {
+    return this.#eventQueue.length - this.#queueHead;
+  }
+
+  #appendAsyncEvent(event: RelayAsyncEvent): void {
+    if (this.#terminal || this.#terminalOverflow) {
+      return;
+    }
+    this.#compactEventQueue();
+    if (event.kind === 'transcription' && event.event.type === 'transcript.partial') {
+      for (let index = this.#queueHead; index < this.#eventQueue.length; index += 1) {
+        const queued = this.#eventQueue[index];
+        if (
+          queued?.kind === 'transcription' &&
+          queued.event.type === 'transcript.partial' &&
+          queued.event.sessionId === event.event.sessionId &&
+          queued.event.sessionEpoch === event.event.sessionEpoch &&
+          queued.event.utteranceId === event.event.utteranceId &&
+          queued.event.segmentId === event.event.segmentId
+        ) {
+          this.#eventQueue.splice(index, 1);
+          this.#eventQueue.push(event);
+          this.#onAsyncEventsAvailable();
+          return;
+        }
+      }
+    }
+
+    if (this.#queueLength() >= 64) {
+      let partialIndex = -1;
+      for (let index = this.#queueHead; index < this.#eventQueue.length; index += 1) {
+        const queued = this.#eventQueue[index];
+        if (queued?.kind === 'transcription' && queued.event.type === 'transcript.partial') {
+          partialIndex = index;
+          break;
+        }
+      }
+      if (partialIndex >= 0) {
+        this.#eventQueue.splice(partialIndex, 1);
+      } else if (event.kind === 'transcription' && event.event.type === 'transcript.partial') {
+        return;
+      } else {
+        this.#terminalOverflow = true;
+        this.#abortPendingGeneration();
+        this.#onAsyncEventsAvailable();
+        return;
+      }
+    }
+    this.#eventQueue.push(event);
+    this.#onAsyncEventsAvailable();
+  }
+
+  #compactEventQueue(): void {
+    if (this.#queueHead === 0) {
+      return;
+    }
+    if (this.#queueHead >= this.#eventQueue.length) {
+      this.#eventQueue = [];
+      this.#queueHead = 0;
+      return;
+    }
+    if (this.#queueHead >= 32 || this.#queueHead * 2 >= this.#eventQueue.length) {
+      this.#eventQueue = this.#eventQueue.slice(this.#queueHead);
+      this.#queueHead = 0;
+    }
+  }
+
+  #abortPendingGeneration(): void {
+    const controller = this.#finalController;
+    if (controller !== undefined && !controller.signal.aborted) {
+      controller.abort();
+    }
+  }
+
+  #isCurrent(active: ActiveUtterance | undefined, token: FinalProcessingToken): boolean {
     return (
       !this.#terminal &&
+      active !== undefined &&
       this.#active === active &&
       this.#finalToken !== undefined &&
       sameFinalToken(this.#finalToken, token)
@@ -1067,9 +1186,12 @@ export class RelaySessionCore {
 
   #finishActive(cancel: boolean): void {
     const active = this.#active;
+    this.#abortPendingGeneration();
     this.#active = undefined;
     this.#finalToken = undefined;
+    this.#finalController = undefined;
     this.#eventQueue = [];
+    this.#queueHead = 0;
     if (active === undefined) {
       return;
     }

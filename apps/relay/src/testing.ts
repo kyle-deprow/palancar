@@ -3,7 +3,11 @@ import {
   createWebSocketSubprotocols,
   type NegotiatedLimits
 } from '@palancar/contracts';
-import { GenerationService, type GenerationProvider } from '@palancar/generation';
+import {
+  GenerationService,
+  type GenerationProvider,
+  type GenerationProviderCompletion
+} from '@palancar/generation';
 import { DeterministicMockTranscriptionAdapter } from '@palancar/transcription';
 
 import type {
@@ -52,11 +56,13 @@ export function createTestGenerationService(
   provider: GenerationProvider = {
     id: 'test-provider',
     version: '1.0.0',
-    translate: async () => ({ englishTranslation: 'hello' }),
-    suggest: async () => [
-      { englishText: 'hello', selectedTargetText: 'hola' },
-      { englishText: 'hi', selectedTargetText: 'buenas' }
-    ]
+    complete: async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    })
   }
 ): GenerationService {
   return new GenerationService(provider);

@@ -11,14 +11,19 @@ import {
   encodeAudioFrame
 } from '@palancar/contracts';
 import { LANGUAGE_REGISTRY_VERSION } from '@palancar/language-registry';
-import { DeterministicMockProvider, GenerationService } from '@palancar/generation';
+import {
+  DeterministicMockProvider,
+  GenerationService,
+  type GenerationProvider,
+  type GenerationProviderCompletion,
+} from '@palancar/generation';
 import {
   DETERMINISTIC_MOCK_CAPABILITIES,
   type NormalizedTranscriptionEvent,
   type TranscriptionAdapter,
   type TranscriptionSession
 } from '@palancar/transcription';
-import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, type RawData } from 'ws';
 
 import {
@@ -361,6 +366,190 @@ function createAsyncCallbackAdapter(): TranscriptionAdapter {
       };
       return session;
     }
+  };
+}
+
+function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
+  return {
+    capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    createSession(input): TranscriptionSession {
+      return {
+        capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+        configuration: input.configuration,
+        state: {
+          closed: false,
+          acceptedThroughOriginalSampleOffset: 0,
+          audioStateEpoch: 0
+        },
+        deliveryFailures: { failureCount: 0 },
+        start: ({ utteranceId }) => {
+          input.onEvent({
+            type: 'transcript.final',
+            sessionId: input.sessionId,
+            sessionEpoch: input.sessionEpoch,
+            utteranceId,
+            segmentId: `${utteranceId}:0`,
+            revision: 1,
+            text: 'synchronous final',
+            providerEventTime: '2026-08-10T12:00:00.000Z',
+            languageEvidence: {
+              detectorVersion: 'synchronous-final-test-1.0.0',
+              source: 'controlled-fixture',
+              detectedLanguage: 'es',
+              confidence: 0.95
+            },
+            acceptedThroughOriginalSampleOffset: 0,
+            finalizationReason: 'explicit'
+          });
+          return { status: 'started' };
+        },
+        pushAudio: ({ pcm, originalSampleOffset }) => ({
+          status: 'accepted',
+          acceptedSamples: pcm.byteLength / 2,
+          acceptedThroughOriginalSampleOffset: originalSampleOffset + pcm.byteLength / 2
+        }),
+        finalize: () => ({ status: 'already-cancelled' }),
+        cancel: () => ({ status: 'cancelled' }),
+        close: () => ({ status: 'closed' })
+      };
+    }
+  };
+}
+
+function createTwoAsyncEventAdapter(mode: 'microtask' | 'immediate'): TranscriptionAdapter {
+  return {
+    capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    createSession(input): TranscriptionSession {
+      let closed = false;
+      const event = (utteranceId: string, revision: number): NormalizedTranscriptionEvent => ({
+        type: 'transcript.partial',
+        sessionId: input.sessionId,
+        sessionEpoch: input.sessionEpoch,
+        utteranceId,
+        segmentId: `${utteranceId}:0`,
+        revision,
+        text: `asynchronous partial ${revision}`,
+        providerEventTime: '2026-08-10T12:00:00.000Z',
+        languageEvidence: {
+          detectorVersion: 'async-wakeup-test-1.0.0',
+          source: 'controlled-fixture',
+          detectedLanguage: 'es',
+          confidence: 0.95
+        },
+        acceptedThroughOriginalSampleOffset: 0
+      });
+      const session: TranscriptionSession = {
+        capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+        configuration: input.configuration,
+        state: {
+          closed: false,
+          acceptedThroughOriginalSampleOffset: 0,
+          audioStateEpoch: 0
+        },
+        deliveryFailures: { failureCount: 0 },
+        start: ({ utteranceId }) => {
+          input.onEvent(event(utteranceId, 1));
+          const emitSecond = (): void => {
+            if (!closed) {
+              input.onEvent(event(utteranceId, 2));
+            }
+          };
+          if (mode === 'microtask') {
+            queueMicrotask(emitSecond);
+          } else {
+            setImmediate(emitSecond);
+          }
+          return { status: 'started' };
+        },
+        pushAudio: ({ pcm, originalSampleOffset }) => ({
+          status: 'accepted',
+          acceptedSamples: pcm.byteLength / 2,
+          acceptedThroughOriginalSampleOffset: originalSampleOffset + pcm.byteLength / 2
+        }),
+        finalize: () => ({ status: 'already-cancelled' }),
+        cancel: () => ({ status: 'cancelled' }),
+        close: () => {
+          closed = true;
+          return { status: 'closed' };
+        }
+      };
+      return session;
+    }
+  };
+}
+
+function createBlockedDeliveryAdapter(): {
+  readonly adapter: TranscriptionAdapter;
+  readonly sessionStarted: Promise<void>;
+  readonly emitFirstEvent: () => void;
+  readonly emitSecondEvent: () => void;
+} {
+  const sessionStarted = createDeferred();
+  let emitFirstEvent: (() => void) | undefined;
+  let emitSecondEvent: (() => void) | undefined;
+  let closed = false;
+  const adapter: TranscriptionAdapter = {
+    capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    createSession(input): TranscriptionSession {
+      const event = (utteranceId: string, revision: number): NormalizedTranscriptionEvent => ({
+        type: 'transcript.partial',
+        sessionId: input.sessionId,
+        sessionEpoch: input.sessionEpoch,
+        utteranceId,
+        segmentId: `${utteranceId}:0`,
+        revision,
+        text: `blocked delivery partial ${revision}`,
+        providerEventTime: '2026-08-10T12:00:00.000Z',
+        languageEvidence: {
+          detectorVersion: 'blocked-delivery-test-1.0.0',
+          source: 'controlled-fixture',
+          detectedLanguage: 'es',
+          confidence: 0.95
+        },
+        acceptedThroughOriginalSampleOffset: 0
+      });
+      return {
+        capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+        configuration: input.configuration,
+        state: {
+          closed: false,
+          acceptedThroughOriginalSampleOffset: 0,
+          audioStateEpoch: 0
+        },
+        deliveryFailures: { failureCount: 0 },
+        start: ({ utteranceId }) => {
+          emitFirstEvent = (): void => {
+            if (!closed) {
+              input.onEvent(event(utteranceId, 1));
+            }
+          };
+          emitSecondEvent = (): void => {
+            if (!closed) {
+              input.onEvent(event(utteranceId, 2));
+            }
+          };
+          sessionStarted.resolve();
+          return { status: 'started' };
+        },
+        pushAudio: ({ pcm, originalSampleOffset }) => ({
+          status: 'accepted',
+          acceptedSamples: pcm.byteLength / 2,
+          acceptedThroughOriginalSampleOffset: originalSampleOffset + pcm.byteLength / 2
+        }),
+        finalize: () => ({ status: 'already-cancelled' }),
+        cancel: () => ({ status: 'cancelled' }),
+        close: () => {
+          closed = true;
+          return { status: 'closed' };
+        }
+      };
+    }
+  };
+  return {
+    adapter,
+    sessionStarted: sessionStarted.promise,
+    emitFirstEvent: () => emitFirstEvent?.(),
+    emitSecondEvent: () => emitSecondEvent?.()
   };
 }
 
@@ -976,6 +1165,100 @@ describe('relay HTTP/WebSocket host', () => {
     await closed;
   });
 
+  it('delivers final transcript and language before deferred generation output', async () => {
+    await host.stop();
+    let resolveCompletion: ((value: GenerationProviderCompletion) => void) | undefined;
+    const completion = new Promise<GenerationProviderCompletion>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const provider: GenerationProvider = {
+      id: 'deferred-host-provider',
+      version: '1.0.0',
+      complete: async () => completion
+    };
+    host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      generationService: new GenerationService(provider)
+    });
+    await host.start();
+
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const seenTypes: string[] = [];
+    const seenListener = (data: RawData): void => {
+      try {
+        const message = asObject(JSON.parse(rawDataText(data)) as unknown);
+        if (typeof message.type === 'string') {
+          seenTypes.push(message.type);
+        }
+      } catch {
+        // Ignore non-JSON frames; the protocol test only tracks control messages.
+      }
+    };
+    socket.on('message', seenListener);
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const sessionId = String(ready.sessionId);
+    const sessionEpoch = Number(ready.sessionEpoch);
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId,
+      sessionEpoch,
+      utteranceId: UTTERANCE_ID
+    }));
+    for (let sequence = 0; sequence < 18; sequence += 1) {
+      const ack = nextMessage(
+        socket,
+        (message) => message.type === 'audio.ack' && message.highestContiguousExclusiveOffset === (sequence + 1) * 1_600
+      );
+      socket.send(frame(sequence, sequence * 1_600), { binary: true });
+      await ack;
+    }
+
+    const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
+    const language = nextMessage(socket, (message) => message.type === 'language.decision');
+    const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
+    const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
+    socket.send(JSON.stringify({
+      type: 'utterance.commit',
+      sessionId,
+      sessionEpoch,
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 28_800
+    }));
+
+    await Promise.all([transcript, language]);
+    expect(seenTypes).toContain('transcript.final');
+    expect(seenTypes).toContain('language.decision');
+    expect(seenTypes).not.toContain('translation.ready');
+    expect(seenTypes).not.toContain('suggestions.ready');
+
+    resolveCompletion?.({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    });
+    await Promise.all([translation, suggestions]);
+    const transcriptIndex = seenTypes.indexOf('transcript.final');
+    const languageIndex = seenTypes.indexOf('language.decision');
+    const translationIndex = seenTypes.indexOf('translation.ready');
+    const suggestionsIndex = seenTypes.indexOf('suggestions.ready');
+    expect(transcriptIndex).toBeGreaterThanOrEqual(0);
+    expect(languageIndex).toBeGreaterThan(transcriptIndex);
+    expect(translationIndex).toBeGreaterThan(languageIndex);
+    expect(suggestionsIndex).toBeGreaterThan(translationIndex);
+    socket.off('message', seenListener);
+    const closed = waitForClose(socket);
+    socket.close(1000, 'test_done');
+    await closed;
+  });
+
   it('does not reuse a consumed ticket and keeps errors content-free', async () => {
     const issued = await issueTicket(host);
     const ticket = String(issued.ticket);
@@ -1010,7 +1293,7 @@ describe('relay HTTP/WebSocket host', () => {
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
       generationService: new GenerationService(new DeterministicMockProvider({
-        translate: { failure: new Error(CANARY) }
+        complete: { failure: new Error(CANARY) }
       }))
     });
     await host.start();
@@ -1071,6 +1354,150 @@ describe('relay HTTP/WebSocket host', () => {
     const closed = waitForClose(socket);
     socket.close(1000, 'test_done');
     await closed;
+  });
+
+  it('does not lose an event arriving while an async drain is already scheduled', async () => {
+    await host.stop();
+    host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createTwoAsyncEventAdapter('microtask')
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const partial = nextMessage(
+      socket,
+      (message) => message.type === 'transcript.partial' && message.revision === 2
+    );
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+
+    await expect(partial).resolves.toMatchObject({ text: 'asynchronous partial 2' });
+    socket.close(1000, 'test_done');
+    await waitForClose(socket);
+  });
+
+  it('keeps consecutive production sends synchronous when delivery hook is omitted', async () => {
+    await host.stop();
+    host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createSynchronousFinalEventAdapter()
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const originalSend = WebSocket.prototype.send;
+    let observingServerSends = false;
+    let serverSendCount = 0;
+    let microtaskRan = false;
+    let microtaskRanBetweenConsecutiveSends = false;
+    const sendSpy = vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (
+      this: WebSocket,
+      ...args: Parameters<typeof originalSend>
+    ) {
+      if (this !== socket && observingServerSends) {
+        if (serverSendCount === 0) {
+          queueMicrotask(() => {
+            microtaskRan = true;
+          });
+        }
+        serverSendCount += 1;
+        if (serverSendCount === 2) {
+          microtaskRanBetweenConsecutiveSends = microtaskRan;
+          observingServerSends = false;
+        }
+      }
+      return Reflect.apply(originalSend, this, args);
+    });
+    try {
+      const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+      socket.send(sessionStartText());
+      const ready = await readyPromise;
+      observingServerSends = true;
+      const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
+      const language = nextMessage(socket, (message) => message.type === 'language.decision');
+      socket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID
+      }));
+
+      await Promise.all([transcript, language]);
+      expect(serverSendCount).toBe(2);
+      expect(microtaskRanBetweenConsecutiveSends).toBe(false);
+    } finally {
+      sendSpy.mockRestore();
+      const closed = waitForClose(socket);
+      socket.close(1000, 'test_done');
+      await closed;
+    }
+  });
+
+  it('reschedules an event enqueued while the first async delivery is blocked', async () => {
+    await host.stop();
+    const fixture = createBlockedDeliveryAdapter();
+    const deliveryReleased = createDeferred();
+    const firstDeliveryStarted = createDeferred();
+    let blocked = false;
+    host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: fixture.adapter,
+      beforeServerMessageDelivery: async (message) => {
+        if (!blocked && message.type === 'transcript.partial' && message.revision === 1) {
+          blocked = true;
+          firstDeliveryStarted.resolve();
+          await deliveryReleased.promise;
+        }
+      }
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const firstPartial = nextMessage(
+      socket,
+      (message) => message.type === 'transcript.partial' && message.revision === 1
+    );
+    const secondPartial = nextMessage(
+      socket,
+      (message) => message.type === 'transcript.partial' && message.revision === 2
+    );
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+    await fixture.sessionStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    fixture.emitFirstEvent();
+
+    await firstDeliveryStarted.promise;
+    fixture.emitSecondEvent();
+    deliveryReleased.resolve();
+    await expect(firstPartial).resolves.toMatchObject({ text: 'blocked delivery partial 1' });
+    await expect(secondPartial).resolves.toMatchObject({ text: 'blocked delivery partial 2' });
+    socket.close(1000, 'test_done');
+    await waitForClose(socket);
   });
 
   it('stops the HTTP server and closes active sockets', async () => {

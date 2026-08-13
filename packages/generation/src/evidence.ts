@@ -133,8 +133,12 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
   const snapshot = snapshotEvidence(input);
   validateCorrelation(snapshot);
   if (
-    (snapshot.operation !== 'translate' && snapshot.operation !== 'suggest') ||
-    (snapshot.status !== 'success' && snapshot.status !== 'failure') ||
+    (snapshot.operation !== 'complete' &&
+      snapshot.operation !== 'translate' &&
+      snapshot.operation !== 'suggest') ||
+    (snapshot.status !== 'success' &&
+      snapshot.status !== 'failure' &&
+      snapshot.status !== 'cancelled') ||
     typeof snapshot.providerId !== 'string' ||
     !PROVIDER_VALUE.test(snapshot.providerId) ||
     typeof snapshot.providerVersion !== 'string' ||
@@ -156,6 +160,9 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
     invalid();
   }
   if (snapshot.status === 'success' && snapshot.failureCategory !== undefined) {
+    invalid();
+  }
+  if (snapshot.status === 'cancelled' && snapshot.failureCategory !== undefined) {
     invalid();
   }
 
@@ -182,16 +189,8 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
 export class MetadataOnlyEvidenceCollector implements MetadataOnlyEvidenceCollectorLike {
   readonly #records: GenerationEvidenceRecord[] = [];
 
-  add(input: GenerationEvidenceRecord): GenerationEvidenceRecord {
-    let record: GenerationEvidenceRecord;
-    try {
-      record = createGenerationEvidenceRecord(input);
-    } catch (error) {
-      if (error instanceof GenerationError) {
-        throw error;
-      }
-    throw new GenerationError('invalid-evidence');
-    }
+  add(input: unknown): GenerationEvidenceRecord {
+    const record = createGenerationEvidenceRecord(input);
     this.#records.push(record);
     return record;
   }

@@ -3,9 +3,8 @@ import { isTargetLanguage } from '@palancar/language-registry';
 
 import type {
   GenerationProvider,
-  GenerationProviderSuggestInput,
-  GenerationProviderTranslateInput,
-  GenerationProviderTranslation,
+  GenerationProviderCompletion,
+  GenerationProviderCompletionInput,
   SuggestionPhrasePair
 } from './types.js';
 
@@ -15,28 +14,19 @@ export interface DeterministicMockOperationStep<T> {
   readonly delayMs?: number;
 }
 
-export type DeterministicMockTranslationStep = DeterministicMockOperationStep<
-  GenerationProviderTranslation | string
->;
-
-export type DeterministicMockSuggestionStep = DeterministicMockOperationStep<
-  readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] }
->;
+export type DeterministicMockCompletionStep =
+  DeterministicMockOperationStep<GenerationProviderCompletion>;
 
 export interface DeterministicMockProviderConfiguration {
   readonly id?: string;
   readonly version?: string;
-  readonly translate?:
-    | DeterministicMockTranslationStep
-    | readonly DeterministicMockTranslationStep[];
-  readonly suggest?:
-    | DeterministicMockSuggestionStep
-    | readonly DeterministicMockSuggestionStep[];
+  readonly complete?:
+    | DeterministicMockCompletionStep
+    | readonly DeterministicMockCompletionStep[];
 }
 
 export interface DeterministicMockCallCounts {
-  readonly translate: number;
-  readonly suggest: number;
+  readonly complete: number;
 }
 
 const PROVIDER_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
@@ -45,9 +35,8 @@ const SEGMENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const VERSION = new RegExp(VERSION_PATTERN);
 const MAX_UINT32 = 4_294_967_295;
 const MAX_TRANSCRIPT_LENGTH = 4_096;
-const MAX_TEXT_LENGTH = 1_024;
 
-const TRANSLATE_INPUT_KEYS = new Set([
+const INPUT_KEYS = new Set([
   'sessionId',
   'sessionEpoch',
   'utteranceId',
@@ -56,11 +45,6 @@ const TRANSLATE_INPUT_KEYS = new Set([
   'selectedTargetLanguage',
   'gatePolicyVersion',
   'targetTranscript'
-]);
-
-const SUGGEST_INPUT_KEYS = new Set([
-  ...TRANSLATE_INPUT_KEYS,
-  'englishTranslation'
 ]);
 
 function failConfiguration(): never {
@@ -75,37 +59,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return false;
   }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
 }
 
-function snapshotInput(
-  value: unknown,
-  allowedKeys: ReadonlySet<string>
-): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+function snapshotInput(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
     failInput();
   }
-
-  let prototype: object | null;
   let descriptors: Record<PropertyKey, PropertyDescriptor>;
   try {
-    prototype = Object.getPrototypeOf(value) as object | null;
-    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<
+    descriptors = Object.getOwnPropertyDescriptors(value) as Record<
       PropertyKey,
       PropertyDescriptor
     >;
   } catch {
     failInput();
   }
-  if (prototype !== Object.prototype && prototype !== null) {
-    failInput();
-  }
-
   const copy: Record<string, unknown> = {};
   try {
     for (const key of Reflect.ownKeys(descriptors)) {
-      if (typeof key !== 'string' || !allowedKeys.has(key)) {
+      if (typeof key !== 'string' || !INPUT_KEYS.has(key)) {
         failInput();
       }
       const descriptor = descriptors[key];
@@ -117,7 +95,7 @@ function snapshotInput(
   } catch {
     failInput();
   }
-  for (const key of allowedKeys) {
+  for (const key of INPUT_KEYS) {
     if (!Object.hasOwn(copy, key)) {
       failInput();
     }
@@ -134,96 +112,57 @@ function isPositiveUint32(value: unknown): value is number {
   );
 }
 
-function isBoundedString(value: unknown, maximum: number): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= maximum;
-}
-
-function isValidCorrelation(input: Record<string, unknown>): boolean {
-  return (
-    typeof input.sessionId === 'string' &&
-    CANONICAL_V4_ID.test(input.sessionId) &&
-    isPositiveUint32(input.sessionEpoch) &&
-    typeof input.utteranceId === 'string' &&
-    CANONICAL_V4_ID.test(input.utteranceId) &&
-    typeof input.segmentId === 'string' &&
-    SEGMENT_ID.test(input.segmentId) &&
-    isPositiveUint32(input.acceptedFinalRevision) &&
-    typeof input.selectedTargetLanguage === 'string' &&
-    isTargetLanguage(input.selectedTargetLanguage) &&
-    typeof input.gatePolicyVersion === 'string' &&
-    input.gatePolicyVersion.length >= 5 &&
-    input.gatePolicyVersion.length <= 32 &&
-    VERSION.test(input.gatePolicyVersion)
-  );
-}
-
-function validateTranslateInput(input: unknown): GenerationProviderTranslateInput {
-  const candidate = snapshotInput(input, TRANSLATE_INPUT_KEYS);
+function validateInput(value: unknown): GenerationProviderCompletionInput {
+  const input = snapshotInput(value);
   if (
-    !isValidCorrelation(candidate) ||
-    !isBoundedString(candidate.targetTranscript, MAX_TRANSCRIPT_LENGTH)
+    typeof input.sessionId !== 'string' ||
+    !CANONICAL_V4_ID.test(input.sessionId) ||
+    !isPositiveUint32(input.sessionEpoch) ||
+    typeof input.utteranceId !== 'string' ||
+    !CANONICAL_V4_ID.test(input.utteranceId) ||
+    typeof input.segmentId !== 'string' ||
+    !SEGMENT_ID.test(input.segmentId) ||
+    !isPositiveUint32(input.acceptedFinalRevision) ||
+    typeof input.selectedTargetLanguage !== 'string' ||
+    !isTargetLanguage(input.selectedTargetLanguage) ||
+    typeof input.gatePolicyVersion !== 'string' ||
+    input.gatePolicyVersion.length < 5 ||
+    input.gatePolicyVersion.length > 32 ||
+    !VERSION.test(input.gatePolicyVersion) ||
+    typeof input.targetTranscript !== 'string' ||
+    input.targetTranscript.length === 0 ||
+    input.targetTranscript.length > MAX_TRANSCRIPT_LENGTH
   ) {
     failInput();
   }
   return Object.freeze({
-    sessionId: candidate.sessionId,
-    sessionEpoch: candidate.sessionEpoch,
-    utteranceId: candidate.utteranceId,
-    segmentId: candidate.segmentId,
-    acceptedFinalRevision: candidate.acceptedFinalRevision,
-    selectedTargetLanguage: candidate.selectedTargetLanguage,
-    gatePolicyVersion: candidate.gatePolicyVersion,
-    targetTranscript: candidate.targetTranscript
-  }) as unknown as GenerationProviderTranslateInput;
+    sessionId: input.sessionId,
+    sessionEpoch: input.sessionEpoch,
+    utteranceId: input.utteranceId,
+    segmentId: input.segmentId,
+    acceptedFinalRevision: input.acceptedFinalRevision,
+    selectedTargetLanguage: input.selectedTargetLanguage,
+    gatePolicyVersion: input.gatePolicyVersion,
+    targetTranscript: input.targetTranscript
+  }) as GenerationProviderCompletionInput;
 }
 
-function validateSuggestInput(input: unknown): GenerationProviderSuggestInput {
-  const candidate = snapshotInput(input, SUGGEST_INPUT_KEYS);
-  if (
-    !isValidCorrelation(candidate) ||
-    !isBoundedString(candidate.targetTranscript, MAX_TRANSCRIPT_LENGTH) ||
-    !isBoundedString(candidate.englishTranslation, MAX_TEXT_LENGTH)
-  ) {
-    failInput();
+function copyCompletion(value: GenerationProviderCompletion): GenerationProviderCompletion {
+  if (!isRecord(value)) {
+    failConfiguration();
   }
   return Object.freeze({
-    sessionId: candidate.sessionId,
-    sessionEpoch: candidate.sessionEpoch,
-    utteranceId: candidate.utteranceId,
-    segmentId: candidate.segmentId,
-    acceptedFinalRevision: candidate.acceptedFinalRevision,
-    selectedTargetLanguage: candidate.selectedTargetLanguage,
-    gatePolicyVersion: candidate.gatePolicyVersion,
-    targetTranscript: candidate.targetTranscript,
-    englishTranslation: candidate.englishTranslation
-  }) as unknown as GenerationProviderSuggestInput;
-}
-
-function copySuggestions(
-  value: readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] }
-): readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] } {
-  if (!('suggestions' in value)) {
-    return Object.freeze(value.map((pair) => Object.freeze({ ...pair })));
-  }
-  return Object.freeze({
-    suggestions: Object.freeze(
-      value.suggestions.map((pair: SuggestionPhrasePair) => Object.freeze({ ...pair }))
-    )
+    englishTranslation: value.englishTranslation,
+    suggestions: Object.freeze(value.suggestions.map((pair: SuggestionPhrasePair) => Object.freeze({
+      englishText: pair.englishText,
+      selectedTargetText: pair.selectedTargetText
+    }))) as GenerationProviderCompletion['suggestions']
   });
 }
 
-function copyTranslation(
-  value: GenerationProviderTranslation | string
-): GenerationProviderTranslation | string {
-  if (typeof value === 'string') {
-    return value;
-  }
-  return Object.freeze({ englishTranslation: value.englishTranslation });
-}
-
-function normalizeSteps<T>(
-  value: DeterministicMockOperationStep<T> | readonly DeterministicMockOperationStep<T>[] | undefined
-): readonly DeterministicMockOperationStep<T>[] {
+function normalizeSteps(
+  value: DeterministicMockCompletionStep | readonly DeterministicMockCompletionStep[] | undefined
+): readonly DeterministicMockCompletionStep[] {
   if (value === undefined) {
     return Object.freeze([]);
   }
@@ -244,42 +183,43 @@ function normalizeSteps<T>(
       failConfiguration();
     }
   }
-  return Object.freeze(steps.map((step) => Object.freeze({ ...step })));
+  return Object.freeze(steps.map((step) => Object.freeze({
+    ...step,
+    ...(step.result === undefined ? {} : { result: copyCompletion(step.result) })
+  })));
 }
 
-function hasOwn(value: object, key: string): boolean {
-  return Object.hasOwn(value, key);
-}
-
-function delay(milliseconds: number | undefined): Promise<void> {
+function delay(milliseconds: number | undefined, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new Error('aborted'));
+  }
   if (milliseconds === undefined || milliseconds === 0) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(new Error('aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-function throwFailure(failure: unknown): never {
-  throw failure;
 }
 
 export class DeterministicMockProvider implements GenerationProvider {
   readonly id: string;
   readonly version: string;
-  readonly #translateSteps: readonly DeterministicMockTranslationStep[];
-  readonly #suggestSteps: readonly DeterministicMockSuggestionStep[];
-  readonly #translateInputs: GenerationProviderTranslateInput[] = [];
-  readonly #suggestInputs: GenerationProviderSuggestInput[] = [];
-  #translateCalls = 0;
-  #suggestCalls = 0;
+  readonly #completeSteps: readonly DeterministicMockCompletionStep[];
+  readonly #completeInputs: GenerationProviderCompletionInput[] = [];
+  readonly #signals: AbortSignal[] = [];
+  #completeCalls = 0;
 
   constructor(configuration: DeterministicMockProviderConfiguration = {}) {
-    if (
-      typeof configuration !== 'object' ||
-      configuration === null ||
-      Array.isArray(configuration)
-    ) {
+    if (!isRecord(configuration)) {
       failConfiguration();
     }
     const configured = configuration as DeterministicMockProviderConfiguration;
@@ -295,87 +235,46 @@ export class DeterministicMockProvider implements GenerationProvider {
     }
     this.id = id;
     this.version = version;
-    this.#translateSteps = Object.freeze(
-      normalizeSteps(configured.translate).map((step) => {
-        if (!hasOwn(step, 'result') || step.result === undefined) {
-          return Object.freeze({ ...step });
-        }
-        return Object.freeze({ ...step, result: copyTranslation(step.result) });
-      })
-    );
-    this.#suggestSteps = Object.freeze(
-      normalizeSteps(configured.suggest).map((step) => {
-        if (!hasOwn(step, 'result') || step.result === undefined) {
-          return Object.freeze({ ...step });
-        }
-        return Object.freeze({ ...step, result: copySuggestions(step.result) });
-      })
-    );
+    this.#completeSteps = normalizeSteps(configured.complete);
   }
 
   get callCounts(): DeterministicMockCallCounts {
-    return Object.freeze({
-      translate: this.#translateCalls,
-      suggest: this.#suggestCalls
-    });
+    return Object.freeze({ complete: this.#completeCalls });
   }
 
-  get translateCalls(): number {
-    return this.#translateCalls;
+  get completeCalls(): number {
+    return this.#completeCalls;
   }
 
-  get suggestCalls(): number {
-    return this.#suggestCalls;
+  get completeInputs(): readonly GenerationProviderCompletionInput[] {
+    return Object.freeze([...this.#completeInputs]);
   }
 
-  get translateInputs(): readonly GenerationProviderTranslateInput[] {
-    return Object.freeze([...this.#translateInputs]);
+  get signals(): readonly AbortSignal[] {
+    return Object.freeze([...this.#signals]);
   }
 
-  get suggestInputs(): readonly GenerationProviderSuggestInput[] {
-    return Object.freeze([...this.#suggestInputs]);
-  }
-
-  async translate(
-    input: GenerationProviderTranslateInput
-  ): Promise<GenerationProviderTranslation | string> {
-    const validatedInput = validateTranslateInput(input);
-    this.#translateInputs.push(validatedInput);
-    const index = this.#translateCalls;
-    this.#translateCalls += 1;
-    const step = this.#translateSteps[index] ?? this.#translateSteps.at(-1);
+  async complete(
+    input: GenerationProviderCompletionInput,
+    context: { readonly signal: AbortSignal }
+  ): Promise<GenerationProviderCompletion> {
+    const validatedInput = validateInput(input);
+    this.#completeInputs.push(validatedInput);
+    this.#signals.push(context.signal);
+    const index = this.#completeCalls;
+    this.#completeCalls += 1;
+    const step = this.#completeSteps[index] ?? this.#completeSteps.at(-1);
     if (step === undefined) {
-      throw new Error('No deterministic translation script step');
+      throw new Error('No deterministic completion script step');
     }
-    await delay(step.delayMs);
-    if (hasOwn(step, 'failure')) {
-      throwFailure(step.failure);
+    await delay(step.delayMs, context.signal);
+    if (Object.hasOwn(step, 'failure')) {
+      throw step.failure;
     }
-    if (!hasOwn(step, 'result') || step.result === undefined) {
-      throw new Error('Missing deterministic translation script result');
+    if (!Object.hasOwn(step, 'result') || step.result === undefined) {
+      throw new Error('Missing deterministic completion script result');
     }
-    return copyTranslation(step.result);
-  }
-
-  async suggest(
-    input: GenerationProviderSuggestInput
-  ): Promise<readonly SuggestionPhrasePair[] | { readonly suggestions: readonly SuggestionPhrasePair[] }> {
-    const validatedInput = validateSuggestInput(input);
-    this.#suggestInputs.push(validatedInput);
-    const index = this.#suggestCalls;
-    this.#suggestCalls += 1;
-    const step = this.#suggestSteps[index] ?? this.#suggestSteps.at(-1);
-    if (step === undefined) {
-      throw new Error('No deterministic suggestion script step');
-    }
-    await delay(step.delayMs);
-    if (hasOwn(step, 'failure')) {
-      throwFailure(step.failure);
-    }
-    if (!hasOwn(step, 'result') || step.result === undefined) {
-      throw new Error('Missing deterministic suggestion script result');
-    }
-    return copySuggestions(step.result);
+    return copyCompletion(step.result);
   }
 }
 
