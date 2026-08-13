@@ -143,6 +143,17 @@ const isEventType = (
   expected: OsEventTypeList,
 ): boolean => eventType === expected;
 
+export function isPairedTurnEffects(
+  stopEffect: ClientEffect,
+  commitEffect: ClientEffect,
+): boolean {
+  return stopEffect.type === "stop-audio" &&
+    commitEffect.type === "commit-utterance" &&
+    stopEffect.sessionId === commitEffect.sessionId &&
+    stopEffect.sessionEpoch === commitEffect.sessionEpoch &&
+    stopEffect.utteranceId === commitEffect.utteranceId;
+}
+
 function randomUuidV4(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
@@ -366,6 +377,10 @@ export class G2BridgeRuntime {
   #pendingStartupCreation: Promise<StartUpPageCreateResult> | undefined;
   #startupTeardownPromise: Promise<void> | undefined;
   #audioCloseGeneration = 0;
+  #detachedAudioCloseMonitor: Promise<void> | undefined;
+  #detachedAudioCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  #detachedAudioCloseMonitorGeneration: number | undefined;
+  #detachedAudioCloseFailureGeneration: number | undefined;
 
   constructor(options: G2BridgeRuntimeOptions = {}) {
     this.#waitForBridge = options.waitForBridge ?? waitForEvenAppBridge;
@@ -917,18 +932,15 @@ export class G2BridgeRuntime {
   #scheduleCleanupForLateResource(): void {
     this.#cleanupState = "active";
     const cleanupPromise = this.#cleanupPromise;
+    const retry = (): void => {
+      if (this.#cleanupState === "cleaned" || this.#cleanupInProgress) return;
+      this.#requestCleanup();
+    };
     if (cleanupPromise !== undefined) {
-      void cleanupPromise.then(
-        () => {
-          if (this.#hasCleanupWork()) this.#requestCleanup();
-        },
-        () => {
-          if (this.#hasCleanupWork()) this.#requestCleanup();
-        },
-      );
+      void cleanupPromise.then(retry, retry);
       return;
     }
-    this.#requestCleanup();
+    retry();
   }
 
   #queueEvent(event: EvenHubEvent): void {
@@ -1142,9 +1154,22 @@ export class G2BridgeRuntime {
       ...effects.filter((effect) => effect.type === "start-utterance"),
       ...effects.filter((effect) => effect.type !== "start-utterance"),
     ];
-    for (const effect of orderedEffects) {
+    for (let index = 0; index < orderedEffects.length; index += 1) {
+      const effect = orderedEffects[index];
+      if (effect === undefined) continue;
       if (this.#isRuntimeInactive()) return;
       try {
+        const followingEffect = orderedEffects[index + 1];
+        if (followingEffect !== undefined && isPairedTurnEffects(effect, followingEffect)) {
+          this.#audioPcmEnabled = false;
+          try {
+            this.#transport?.commitUtterance();
+          } finally {
+            this.#startDetachedAudioClose();
+          }
+          index += 1;
+          continue;
+        }
         switch (effect.type) {
           case "persist-target":
             void this.#persistTarget(effect.targetLanguage);
@@ -1284,26 +1309,82 @@ export class G2BridgeRuntime {
     this.#queueTransportEvent(transport, event);
   }
 
+  #startDetachedAudioClose(): void {
+    let closing: Promise<boolean>;
+    try {
+      closing = this.#closeAudio();
+    } catch (error: unknown) {
+      this.#queueSerializedEvent(() => {
+        if (error !== undefined) this.#lastEventError = normalizeError(error, "G2 audio close failed");
+        this.#handleEffectFailure();
+      });
+      return;
+    }
+
+    const generation = this.#audioCloseGeneration;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finished = false;
+    let resolveMonitor: (() => void) | undefined;
+    const finish = (failed: boolean): void => {
+      if (finished) return;
+      finished = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        if (this.#detachedAudioCloseTimer === timer) {
+          this.#detachedAudioCloseTimer = undefined;
+        }
+        timer = undefined;
+      }
+
+      const isCurrent = this.#detachedAudioCloseMonitor === monitor &&
+        this.#detachedAudioCloseMonitorGeneration === generation &&
+        this.#audioCloseGeneration === generation;
+      if (isCurrent) {
+        this.#detachedAudioCloseMonitor = undefined;
+        this.#detachedAudioCloseTimer = undefined;
+        this.#detachedAudioCloseMonitorGeneration = undefined;
+      }
+      resolveMonitor?.();
+
+      if (failed && isCurrent) this.#queueDetachedAudioFailure(generation);
+    };
+    const monitor = new Promise<void>((resolve) => {
+      resolveMonitor = resolve;
+      timer = setTimeout(() => finish(true), AUDIO_CLOSE_TIMEOUT_MS);
+      this.#detachedAudioCloseTimer = timer;
+      this.#detachedAudioCloseMonitorGeneration = generation;
+      void closing.then(
+        (closed) => finish(!closed),
+        () => finish(true),
+      );
+    });
+    this.#detachedAudioCloseMonitor = monitor;
+  }
+
+  #queueDetachedAudioFailure(generation: number): void {
+    if (this.#isRuntimeInactive() || this.#detachedAudioCloseFailureGeneration === generation) return;
+    this.#detachedAudioCloseFailureGeneration = generation;
+    this.#queueSerializedEvent(() => {
+      if (this.#audioCloseGeneration !== generation) return;
+      this.#handleEffectFailure();
+    });
+  }
+
   async #startAudio(): Promise<void> {
-    if (this.#audioOpen || this.#isRuntimeInactive()) return;
-    const bridge = this.#bridge;
-    if (bridge === undefined) throw new Error("G2 bridge is unavailable");
+    if (this.#isRuntimeInactive()) return;
     const pendingAudioClose = this.#pendingAudioClose;
     if (pendingAudioClose !== undefined) {
-      let closed: boolean | typeof CLEANUP_PREEMPTED;
-      try {
-        closed = await this.#awaitWithCleanup(
-          pendingAudioClose,
-          "G2 audio close timed out",
-        );
-      } catch (error: unknown) {
-        this.#forgetPendingAudioClose(pendingAudioClose);
-        throw error;
-      }
+      const closed = await this.#awaitWithCleanup(
+        pendingAudioClose,
+        "G2 audio close timed out",
+      );
       if (closed === CLEANUP_PREEMPTED) return;
       if (!closed) throw new Error("G2 audio close failed");
       if (this.#isRuntimeInactive()) return;
     }
+    if (this.#audioOpen || this.#isRuntimeInactive()) return;
+    const bridge = this.#bridge;
+    if (bridge === undefined) throw new Error("G2 bridge is unavailable");
     this.#audioCloseRequired = true;
     const opening = Promise.resolve()
       .then(() => {
@@ -1345,7 +1426,6 @@ export class G2BridgeRuntime {
         this.#audioOpenUncertain = false;
       },
     );
-    void opening.catch(() => undefined);
     try {
       const result = await this.#awaitWithCleanup(
         opening,
@@ -1366,19 +1446,12 @@ export class G2BridgeRuntime {
     this.#audioPcmEnabled = false;
     this.#audioCloseRequired = true;
     const closing = this.#closeAudio();
-    let closed: boolean | typeof CLEANUP_PREEMPTED;
-    try {
-      closed = await this.#awaitWithCleanup(
-        closing,
-        "G2 audio close timed out",
-        AUDIO_CLOSE_TIMEOUT_MS,
-      );
-    } catch (error: unknown) {
-      this.#forgetPendingAudioClose(closing);
-      throw error;
-    }
+    const closed = await this.#awaitWithCleanup(
+      closing,
+      "G2 audio close timed out",
+      AUDIO_CLOSE_TIMEOUT_MS,
+    );
     if (closed === CLEANUP_PREEMPTED) {
-      this.#forgetPendingAudioClose(closing);
       return;
     }
     if (!closed) throw new Error("G2 audio close failed");
@@ -1411,20 +1484,8 @@ export class G2BridgeRuntime {
     if (this.#bridge === undefined) throw new Error("G2 bridge is unavailable");
 
     this.#audioPcmEnabled = false;
-    if (pendingAudioOpenError !== undefined) {
-      const pendingAudioClose = this.#pendingAudioClose;
-      if (pendingAudioClose !== undefined) {
-        this.#forgetPendingAudioClose(pendingAudioClose);
-      }
-    }
     const closePromise = this.#closeAudio();
-    let closed: boolean;
-    try {
-      closed = await this.#awaitWithTimeout(closePromise, "G2 audio close timed out");
-    } catch (error: unknown) {
-      this.#forgetPendingAudioClose(closePromise);
-      throw error;
-    }
+    const closed = await this.#awaitWithTimeout(closePromise, "G2 audio close timed out");
     if (!closed) throw new Error("G2 audio close failed");
     if (pendingAudioOpenError !== undefined) {
       this.#audioCloseRequired = true;
@@ -1442,7 +1503,11 @@ export class G2BridgeRuntime {
     const closing = Promise.resolve()
       .then(() => bridge.audioControl(false))
       .then((closed) => {
-        if (closed && this.#audioCloseGeneration === generation) {
+        if (
+          closed &&
+          this.#audioCloseGeneration === generation &&
+          this.#cleanupState !== "cleaned"
+        ) {
           this.#audioOpen = false;
           this.#audioPcmEnabled = false;
           this.#audioCloseRequired = false;
@@ -1450,27 +1515,35 @@ export class G2BridgeRuntime {
         }
         return closed;
       }, (error: unknown) => {
-        if (this.#audioCloseGeneration === generation) {
+        if (
+          this.#audioCloseGeneration === generation &&
+          this.#cleanupState !== "cleaned"
+        ) {
           this.#audioCloseRequired = true;
         }
         throw normalizeError(error, "G2 audio close failed");
       });
     this.#pendingAudioClose = closing;
     void closing.then(
-      () => {
-        if (this.#pendingAudioClose === closing) this.#pendingAudioClose = undefined;
-      },
-      () => {
-        if (this.#pendingAudioClose === closing) this.#pendingAudioClose = undefined;
-      },
+      () => this.#handleAudioCloseSettlement(closing, generation),
+      () => this.#handleAudioCloseSettlement(closing, generation),
     );
     return closing;
   }
 
-  #forgetPendingAudioClose(closing: Promise<boolean>): void {
-    if (this.#pendingAudioClose !== closing) return;
-    this.#pendingAudioClose = undefined;
-    this.#audioCloseGeneration += 1;
+  #handleAudioCloseSettlement(
+    closing: Promise<boolean>,
+    generation: number,
+  ): void {
+    if (this.#pendingAudioClose === closing) this.#pendingAudioClose = undefined;
+    if (
+      this.#cleanupRequested &&
+      !this.#cleanupInProgress &&
+      this.#cleanupState !== "cleaned" &&
+      this.#audioCloseGeneration === generation
+    ) {
+      this.#scheduleCleanupForLateResource();
+    }
   }
 
   async #awaitWithTimeout<T>(

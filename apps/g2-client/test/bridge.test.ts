@@ -18,6 +18,7 @@ import {
   DEFAULT_RELAY_ORIGIN,
   G2BridgeRuntime,
   PALANCAR_G2_READY,
+  isPairedTurnEffects,
   type G2BridgePort,
   type G2Transport,
 } from "../src/bridge/index.js";
@@ -136,6 +137,7 @@ class FakeTransport implements G2Transport {
   targetLanguage: string | undefined;
   closed = false;
   pushPcmImplementation: (() => void) | undefined;
+  commitImplementation: (() => void) | undefined;
   closeImplementation: (() => void) | undefined;
   readonly startSessionImplementation: ((targetLanguage: "es" | "tr") => Promise<void>) | undefined;
 
@@ -167,6 +169,7 @@ class FakeTransport implements G2Transport {
 
   commitUtterance(): void {
     this.calls.push("commit");
+    this.commitImplementation?.();
   }
 
   cancelUtterance(): void {
@@ -316,6 +319,10 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
 async function boot(harness: TestHarness): Promise<void> {
   await harness.runtime.boot();
   await harness.runtime.whenEventsIdle();
+}
+
+async function flushMicrotasks(count = 12): Promise<void> {
+  for (let index = 0; index < count; index += 1) await Promise.resolve();
 }
 
 async function selectSpanishAndStart(harness: TestHarness): Promise<FakeTransport> {
@@ -1097,7 +1104,153 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(transport.closed).toBe(true);
   });
 
-  it("stops audio before committing when Listening is pressed", async () => {
+  it("starts microphone shutdown even when commit throws", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseResults = [true];
+    transport.commitImplementation = () => {
+      throw new Error("commit failed");
+    };
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+  });
+
+  it("suppresses PCM injected synchronously by commit", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseResults = [true];
+    transport.commitImplementation = () => {
+      harness.bridge.emit({
+        audioEvent: new AudioEvent({ audioPcm: new Uint8Array([1, 2, 3]) }),
+      });
+    };
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    expect(transport.pcm).toHaveLength(0);
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+  });
+
+  it.each([
+    { field: "sessionId", value: "33333333-3333-4333-8333-333333333333" },
+    { field: "sessionEpoch", value: 2 },
+    { field: "utteranceId", value: "44444444-4444-4444-8444-444444444444" },
+  ])("does not pair effects when $field does not match", ({ field, value }) => {
+    const stopEffect = {
+      type: "stop-audio" as const,
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+    };
+    const commitEffect = {
+      type: "commit-utterance" as const,
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      [field]: value,
+    };
+
+    expect(isPairedTurnEffects(stopEffect, commitEffect)).toBe(false);
+  });
+
+  it("awaits a standalone stop before completing transport recovery", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseImplementation = () => pendingClose;
+
+    transport.emit({
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      clientLastAcknowledgedOffset: 0,
+      oldestRetainedOffset: 0,
+      nextCapturedOffset: 0,
+    } as unknown as RelayTransportCallbackEvent);
+    const idle = harness.runtime.whenEventsIdle();
+    let settled = false;
+    void idle.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+
+    expect(settled).toBe(false);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.runtime.snapshot.state).toBe("Recovering");
+
+    resolveClose?.(true);
+    await idle;
+    expect(settled).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Recovering");
+  });
+
+  it("blocks a recovery open until an unresolved standalone close settles", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseImplementation = () => pendingClose;
+
+    transport.emit({
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      clientLastAcknowledgedOffset: 0,
+      oldestRetainedOffset: 0,
+      nextCapturedOffset: 0,
+    } as unknown as RelayTransportCallbackEvent);
+    transport.emit({
+      type: "transport.resumed",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      resumable: true,
+    } as unknown as RelayTransportCallbackEvent);
+    await flushMicrotasks();
+
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
+
+    resolveClose?.(true);
+    await harness.runtime.whenEventsIdle();
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(2);
+    expect(harness.operations.indexOf("audio:close")).toBeLessThan(
+      harness.operations.lastIndexOf("audio:open"),
+    );
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+  });
+
+  it("commits immediately and starts a detached audio close", async () => {
     const harness = createHarness();
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
@@ -1110,32 +1263,60 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.runtime.snapshot.state).toBe("Finalizing");
     expect(harness.runtime.snapshot.audioOpen).toBe(false);
     expect(harness.bridge.audioCalls.at(-1)?.isOpen).toBe(false);
-    expect(harness.operations.at(-1)).toBe("commit");
-    expect(harness.operations.indexOf("audio:close")).toBeLessThan(
-      harness.operations.indexOf("commit"),
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(harness.operations.indexOf("commit")).toBeLessThan(
+      harness.operations.indexOf("audio:close"),
     );
     expect(harness.bridge.calls.indexOf("audio:close")).toBeGreaterThan(-1);
   });
 
-  it("does not commit after a failed audio close and closes the transport", async () => {
+  it("routes a false detached close through fatal handling after one commit", async () => {
     const harness = createHarness();
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseResults = [false];
+    harness.bridge.audioCloseResults = [false, true];
 
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
     expect(harness.runtime.snapshot.state).toBe("Error");
     expect(harness.runtime.snapshot.audioOpen).toBe(false);
-    expect(harness.operations).not.toContain("commit");
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(2);
     expect(transport.closed).toBe(true);
-    expect(harness.operations).toContain("end-session");
+    expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
   });
 
-  it("bounds a permanently pending normal audio close and does not commit", async () => {
+  it("routes a rejected detached close through fatal handling after one commit", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    let closeAttempts = 0;
+    harness.bridge.audioCloseImplementation = () => {
+      closeAttempts += 1;
+      return closeAttempts === 1
+        ? Promise.reject(new Error("detached close failed"))
+        : Promise.resolve(true);
+    };
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(closeAttempts).toBe(2);
+    expect(transport.closed).toBe(true);
+    expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
+  });
+
+  it("times out a detached close without overlapping SDK close calls", async () => {
     const pendingClose = new Promise<boolean>(() => undefined);
     const harness = createHarness();
     const transport = await selectSpanishAndStart(harness);
@@ -1151,67 +1332,36 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
       for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
         await Promise.resolve();
       }
+      await vi.advanceTimersByTimeAsync(0);
+      await harness.runtime.whenEventsIdle();
+      expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      for (let attempt = 0; attempt < 10; attempt += 1) await Promise.resolve();
       const idle = harness.runtime.whenEventsIdle();
       const idleExpectation = expect(idle).rejects.toThrow("G2 audio close timed out");
-      await vi.advanceTimersByTimeAsync(1_000);
-      for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 2; attempt += 1) {
-        await Promise.resolve();
-      }
+      for (let attempt = 0; attempt < 10; attempt += 1) await Promise.resolve();
       await vi.advanceTimersByTimeAsync(1_000);
       await idleExpectation;
-      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(2);
-      expect(harness.operations).not.toContain("commit");
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+      expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
       expect(transport.closed).toBe(true);
       expect(harness.runtime.snapshot.state).toBe("Error");
       expect(harness.runtime.snapshot.cleanupState).toBe("active");
+      expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
+      expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("retries with a fresh close after a normal audio close timeout", async () => {
-    let closeAttempts = 0;
-    const pendingClose = new Promise<boolean>(() => undefined);
-    const harness = createHarness();
-    const transport = await selectSpanishAndStart(harness);
-    transport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseImplementation = () => {
-      closeAttempts += 1;
-      return closeAttempts === 1 ? pendingClose : Promise.resolve(true);
-    };
-
-    vi.useFakeTimers();
-    try {
-      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-      for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
-        await Promise.resolve();
-      }
-      const idle = harness.runtime.whenEventsIdle();
-      const idleExpectation = expect(idle).resolves.toBeUndefined();
-      await vi.advanceTimersByTimeAsync(1_000);
-      for (let attempt = 0; attempt < 20 && closeAttempts < 2; attempt += 1) {
-        await Promise.resolve();
-      }
-      await idleExpectation;
-      expect(closeAttempts).toBe(2);
-      expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
-      expect(harness.operations).not.toContain("commit");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each([false, new Error("late audio close failed")])(
-    "ignores a stale timed-out audio close settlement: %s",
-    async (lateSettlement) => {
-      let resolveFirst: ((closed: boolean) => void) | undefined;
-      let rejectFirst: ((error: unknown) => void) | undefined;
-      const firstClose = new Promise<boolean>((resolve, reject) => {
-        resolveFirst = resolve;
-        rejectFirst = reject;
+  it.each(["success", "false", "reject"] as const)(
+    "reconciles a detached timeout followed by a late %s settlement",
+    async (settlement) => {
+      let resolveClose: ((closed: boolean) => void) | undefined;
+      let rejectClose: ((error: unknown) => void) | undefined;
+      const pendingClose = new Promise<boolean>((resolve, reject) => {
+        resolveClose = resolve;
+        rejectClose = reject;
       });
       let closeAttempts = 0;
       const harness = createHarness();
@@ -1222,7 +1372,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
       await harness.runtime.whenEventsIdle();
       harness.bridge.audioCloseImplementation = () => {
         closeAttempts += 1;
-        return closeAttempts === 1 ? firstClose : Promise.resolve(true);
+        return closeAttempts === 1 ? pendingClose : Promise.resolve(true);
       };
 
       vi.useFakeTimers();
@@ -1231,29 +1381,170 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
         for (let attempt = 0; attempt < 20 && closeAttempts < 1; attempt += 1) {
           await Promise.resolve();
         }
-        const idle = harness.runtime.whenEventsIdle();
+        expect(closeAttempts).toBe(1);
+
         await vi.advanceTimersByTimeAsync(1_000);
-        await idle;
+        await flushMicrotasks();
+        const idle = harness.runtime.whenEventsIdle();
+        const idleExpectation = expect(idle).rejects.toThrow("G2 audio close timed out");
+        await vi.advanceTimersByTimeAsync(1_000);
+        await idleExpectation;
+        expect(harness.runtime.snapshot.cleanupState).toBe("active");
+        expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
 
-        expect(closeAttempts).toBe(2);
-        expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
-        expect(harness.runtime.snapshot.audioOpen).toBe(false);
-
-        if (lateSettlement instanceof Error) {
-          rejectFirst?.(lateSettlement);
+        if (settlement === "success") {
+          resolveClose?.(true);
+        } else if (settlement === "false") {
+          resolveClose?.(false);
         } else {
-          resolveFirst?.(lateSettlement);
+          rejectClose?.(new Error("late detached close failed"));
         }
-        await Promise.resolve();
-        await Promise.resolve();
+        await flushMicrotasks(20);
+        await harness.runtime.cleanup();
+
         expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
         expect(harness.runtime.snapshot.audioOpen).toBe(false);
-        expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(2);
+        expect(closeAttempts).toBe(settlement === "success" ? 1 : 2);
+        expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(
+          settlement === "success" ? 1 : 2,
+        );
+        expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
+        expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
       } finally {
         vi.useRealTimers();
       }
     },
   );
+
+  it("adopts the same unresolved close after its detached timeout", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseImplementation = () => pendingClose;
+
+    vi.useFakeTimers();
+    try {
+      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+      for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
+        await Promise.resolve();
+      }
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+      const cleanup = harness.runtime.cleanup();
+      let settled = false;
+      void cleanup.then(() => { settled = true; }, () => { settled = true; });
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+
+      resolveClose?.(true);
+      await cleanup;
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+      expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+      expect(transport.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("adopts unresolved detached close work during cleanup", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseImplementation = () => {
+      return pendingClose;
+    };
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
+      await Promise.resolve();
+    }
+    const cleanup = harness.runtime.cleanup();
+    await Promise.resolve();
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+
+    resolveClose?.(true);
+    await cleanup;
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.runtime.snapshot.audioOpen).toBe(false);
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+    expect(transport.closed).toBe(true);
+  });
+
+  it("waits for a detached close before reopening audio for a fast next turn", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const firstTransport = await selectSpanishAndStart(harness);
+    firstTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.audioCloseImplementation = () => pendingClose;
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+
+    firstTransport.emit(utteranceEvent());
+    firstTransport.emit(languageDecision());
+    await harness.runtime.whenEventsIdle();
+    firstTransport.emit(translationReady());
+    firstTransport.emit(suggestionsReady());
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Results");
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    firstTransport.emit({
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+    } as unknown as RelayTransportCallbackEvent);
+    await harness.runtime.whenEventsIdle();
+    const secondTransport = harness.transports[1];
+    if (secondTransport === undefined) throw new Error("Replacement transport was not created");
+    secondTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    const idle = harness.runtime.whenEventsIdle();
+    let settled = false;
+    void idle.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+    expect(settled).toBe(false);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
+
+    resolveClose?.(true);
+    await idle;
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(2);
+    expect(harness.runtime.snapshot.audioOpen).toBe(true);
+
+    harness.bridge.emit({
+      audioEvent: new AudioEvent({ audioPcm: new Uint8Array([4, 5, 6]) }),
+    });
+    expect(secondTransport.pcm).toHaveLength(1);
+    expect([...secondTransport.pcm[0]!]).toEqual([4, 5, 6]);
+  });
 
   it("keeps cleanup active after a false audio close and retries without blocking transport close", async () => {
     const harness = createHarness();
