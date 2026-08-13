@@ -104,8 +104,9 @@ describe('PCM chunk normalization and framing', () => {
       fc.property(evenPcm, chunkSizes, (pcm, sizes) => {
         const framer = new PcmChunkFramer(64);
         const output = partition(pcm, sizes).flatMap((chunk) => framer.push(chunk));
-        expect(framer.flush()).toEqual({ status: 'complete' });
-        expect(concatenate(output)).toEqual(pcm);
+        const flushed = framer.flush();
+        expect(flushed.status).toBe('complete');
+        expect(concatenate([...output, ...flushed.payloads])).toEqual(pcm);
         for (const payload of output) {
           expect(payload.length).toBeGreaterThan(0);
           expect(payload.length % 2).toBe(0);
@@ -122,42 +123,235 @@ describe('PCM chunk normalization and framing', () => {
     const output = Array.from(pcm, (byte) => Uint8Array.of(byte)).flatMap((chunk) =>
       framer.push(chunk)
     );
-    expect(framer.flush()).toEqual({ status: 'complete' });
-    expect(concatenate(output)).toEqual(pcm);
+    const flushed = framer.flush();
+    expect(flushed.status).toBe('complete');
+    expect(concatenate([...output, ...flushed.payloads])).toEqual(pcm);
   });
 
   it('copies non-zero-offset views before the callback buffer can be reused', () => {
     const backing = Uint8Array.from([99, 1, 2, 3, 4, 88]);
-    const framer = new PcmChunkFramer();
+    const framer = new PcmChunkFramer({
+      maxPayloadBytes: 3_200,
+      coalescingTargetBytes: 4
+    });
     const output = framer.push(backing.subarray(1, 5));
     backing.fill(0);
     expect(output).toEqual([Uint8Array.from([1, 2, 3, 4])]);
   });
 
   it('carries and reports one trailing byte, then reset clears it', () => {
-    const framer = new PcmChunkFramer();
+    const framer = new PcmChunkFramer({
+      maxPayloadBytes: 3_200,
+      coalescingTargetBytes: 2
+    });
     expect(framer.push(Uint8Array.of(1))).toEqual([]);
     expect(framer.push(Uint8Array.of(2, 3))).toEqual([Uint8Array.of(1, 2)]);
     expect(framer.pendingByteCount).toBe(1);
-    expect(framer.flush()).toEqual({ status: 'incomplete-sample', trailingByte: 3 });
-    expect(framer.flush()).toEqual({ status: 'complete' });
+    expect(framer.flush()).toEqual({
+      status: 'incomplete-sample',
+      payloads: [],
+      trailingByte: 3
+    });
+    expect(framer.flush()).toEqual({ status: 'complete', payloads: [] });
     framer.push(Uint8Array.of(4));
     framer.reset();
     expect(framer.pendingByteCount).toBe(0);
-    expect(framer.flush()).toEqual({ status: 'complete' });
+    expect(framer.flush()).toEqual({ status: 'complete', payloads: [] });
   });
 
-  it('accepts the exact payload cap, splits one sample over, and rejects invalid limits', () => {
+  it('coalesces to 60 ms, splits oversized input at 1,920 bytes, and rejects invalid limits', () => {
     const framer = new PcmChunkFramer(3_200);
-    expect(framer.push(new Uint8Array(3_200)).map((part) => part.length)).toEqual([3_200]);
-    expect(framer.push(new Uint8Array(3_202)).map((part) => part.length)).toEqual([3_200, 2]);
+    expect(framer.targetBytes).toBe(1_920);
+    expect(framer.push(new Uint8Array(1_918))).toEqual([]);
+    expect(framer.push(new Uint8Array(2))).toHaveLength(1);
+    expect(framer.push(new Uint8Array(4_000)).map((part) => part.length)).toEqual([
+      1_920,
+      1_920
+    ]);
+    expect(framer.flush().payloads.map((part) => part.length)).toEqual([160]);
     for (const invalid of [0, 1, 3_201, 3_202]) {
       expect(() => new PcmChunkFramer(invalid)).toThrow(PcmFramerError);
     }
   });
+
+  it('coalesces six 10 ms callbacks into one 60 ms payload', () => {
+    const framer = new PcmChunkFramer();
+    const callback = Uint8Array.from({ length: 320 }, (_, index) => index % 251);
+    const emitted: Uint8Array[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      expect(framer.push(callback)).toEqual([]);
+      expect(framer.pendingSampleCount).toBe((index + 1) * 160);
+    }
+    emitted.push(...framer.push(callback));
+    expect(emitted.map((payload) => payload.length)).toEqual([1_920]);
+    expect(framer.pendingSampleCount).toBe(0);
+  });
+
+  it('derives the effective target from configured and negotiated bounds', () => {
+    expect(new PcmChunkFramer({
+      maxPayloadBytes: 3_200,
+      maxRetainedReplaySamples: 500,
+      maxUnacknowledgedSamples: 8_000
+    }).targetBytes).toBe(1_000);
+    expect(new PcmChunkFramer({
+      maxPayloadBytes: 800,
+      maxRetainedReplaySamples: 8_000,
+      maxUnacknowledgedSamples: 8_000
+    }).targetBytes).toBe(800);
+    expect(new PcmChunkFramer({
+      maxPayloadBytes: 3_200,
+      coalescingTargetBytes: 641
+    }).targetBytes).toBe(640);
+  });
+
+  it('flushes a complete tail with an odd byte and then stays empty', () => {
+    const framer = new PcmChunkFramer();
+    expect(framer.push(Uint8Array.of(10, 11, 12, 13, 14))).toEqual([]);
+    expect(framer.flush()).toEqual({
+      status: 'incomplete-sample',
+      payloads: [Uint8Array.of(10, 11, 12, 13)],
+      trailingByte: 14
+    });
+    expect(framer.pendingSampleCount).toBe(0);
+    expect(framer.pendingByteCount).toBe(0);
+    expect(framer.flush()).toEqual({ status: 'complete', payloads: [] });
+  });
 });
 
 describe('client retained and in-flight queue', () => {
+  it('counts callback-sized pending samples while coalescing at 60 ms', () => {
+    const queue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
+      maxAudioPayloadBytes: 3_200,
+      maxUnacknowledgedSamples: 8_000,
+      maxRetainedReplaySamples: 8_000,
+      maxUtteranceSamples: 480_000
+    });
+    const callback = new Uint8Array(320);
+    for (let index = 0; index < 5; index += 1) {
+      expect(queue.push(callback).status).toBe('accepted');
+    }
+    expect(queue.state).toMatchObject({
+      nextCapturedOffset: 800,
+      nextEncodedOffset: 0,
+      pendingSampleCount: 800,
+      inFlightSamples: 800
+    });
+    const frames = acceptedFrames(queue.push(callback));
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ sequence: 0, offset: 0, sampleCount: 960 });
+    expect(queue.state).toMatchObject({
+      nextCapturedOffset: 960,
+      nextEncodedOffset: 960,
+      pendingSampleCount: 0
+    });
+  });
+
+  it('counts pending complete samples in all limits and rejects atomically', () => {
+    const queue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
+      maxAudioPayloadBytes: 8,
+      maxUnacknowledgedSamples: 3,
+      maxRetainedReplaySamples: 3,
+      maxUtteranceSamples: 3
+    });
+    expect(queue.push(new Uint8Array(4)).status).toBe('accepted');
+    expect(queue.push(new Uint8Array(2)).status).toBe('accepted');
+    const before = queue.state;
+    expect(queue.push(Uint8Array.of(9, 10))).toEqual({
+      status: 'overflow',
+      attemptedSamples: 1,
+      exceededLimits: [
+        'maxUnacknowledgedSamples',
+        'maxRetainedReplaySamples',
+        'maxUtteranceSamples'
+      ]
+    });
+    expect(queue.state).toEqual(before);
+  });
+
+  it('flushes pending frames, isolates source bytes, and materializes replay once', () => {
+    const queue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
+      maxAudioPayloadBytes: 8,
+      maxUnacknowledgedSamples: 8,
+      maxRetainedReplaySamples: 8,
+      maxUtteranceSamples: 480_000
+    });
+    const source = Uint8Array.of(1, 2, 3, 4);
+    expect(queue.push(source)).toEqual({ status: 'accepted', frames: [] });
+    source.fill(99);
+    expect(queue.state).toMatchObject({
+      nextCapturedOffset: 2,
+      nextEncodedOffset: 0,
+      pendingSampleCount: 2
+    });
+
+    const first = queue.replay(0);
+    expect(first.status).toBe('replay');
+    expect(queue.state).toMatchObject({
+      nextCapturedOffset: 2,
+      nextEncodedOffset: 2,
+      nextSequence: 1,
+      pendingSampleCount: 0
+    });
+    if (first.status === 'replay') {
+      expect(decodeAudioFrame(first.frames[0]!.bytes).payload).toEqual(Uint8Array.of(1, 2, 3, 4));
+    }
+    const retainedBytes = first.status === 'replay' ? first.frames[0]!.bytes.slice() : undefined;
+    if (first.status === 'replay') {
+      first.frames[0]!.bytes.fill(99);
+    }
+    const afterFirst = queue.state;
+    const second = queue.replay(0);
+    expect(second.status).toBe('replay');
+    if (second.status === 'replay') {
+      expect(second.frames[0]!.bytes).toEqual(retainedBytes);
+    }
+    expect(queue.state).toEqual(afterFirst);
+
+    const tailQueue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
+      maxAudioPayloadBytes: 8,
+      maxUnacknowledgedSamples: 8,
+      maxRetainedReplaySamples: 8,
+      maxUtteranceSamples: 480_000
+    });
+    tailQueue.push(Uint8Array.of(5, 6, 7));
+    const flushed = tailQueue.flush();
+    expect(flushed).toMatchObject({ status: 'incomplete-sample', trailingByte: 7 });
+    if (flushed.status === 'incomplete-sample') {
+      expect(flushed.frames).toHaveLength(1);
+      expect(decodeAudioFrame(flushed.frames[0]!.bytes).payload).toEqual(Uint8Array.of(5, 6));
+    }
+    expect(tailQueue.flush()).toEqual({ status: 'complete', frames: [] });
+  });
+
+  it('keeps offsets, sequences, and ACKs on encoded boundaries with a pending tail', () => {
+    const queue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
+      maxAudioPayloadBytes: 4,
+      maxUnacknowledgedSamples: 8,
+      maxRetainedReplaySamples: 8,
+      maxUtteranceSamples: 480_000
+    });
+    const first = acceptedFrames(queue.push(Uint8Array.of(0, 1, 2, 3, 4, 5)));
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ sequence: 0, offset: 0, sampleCount: 2 });
+    expect(queue.state).toMatchObject({
+      nextCapturedOffset: 3,
+      nextEncodedOffset: 2,
+      pendingSampleCount: 1
+    });
+    expect(queue.acknowledge(3)).toEqual({
+      status: 'invalid',
+      reason: 'interior-frame',
+      acknowledgedOffset: 3
+    });
+    const flushed = queue.flush();
+    expect(flushed.status).toBe('complete');
+    if (flushed.status === 'complete') {
+      expect(flushed.frames[0]).toMatchObject({ sequence: 1, offset: 2, sampleCount: 1 });
+    }
+    expect(queue.acknowledge(2)).toMatchObject({ status: 'applied', releasedFrames: 1 });
+    expect(queue.acknowledge(3)).toMatchObject({ status: 'applied', releasedFrames: 1 });
+  });
+
   it('builds monotonic protocol sequences and original-sample offsets', () => {
     const queue = new ClientRetainedAudioQueue(UTTERANCE_ID, {
       maxAudioPayloadBytes: 4,
@@ -188,8 +382,8 @@ describe('client retained and in-flight queue', () => {
       maxUtteranceSamples: 480_000
     });
     expect(queue.push(new Uint8Array(16_000)).status).toBe('accepted');
-    const beforeState = queue.state;
     const beforeReplay = queue.replay(0);
+    const beforeState = queue.state;
     expect(queue.push(Uint8Array.of(1, 2))).toEqual({
       status: 'overflow',
       attemptedSamples: 1,
@@ -232,7 +426,13 @@ describe('client retained and in-flight queue', () => {
       .toEqual([34]);
     expect(acceptedFrames(payloadQueue.push(new Uint8Array(6))).map((frame) =>
       decodeAudioFrame(frame.bytes).payloadLength
-    )).toEqual([4, 2]);
+    )).toEqual([4]);
+    const payloadFlush = payloadQueue.flush();
+    expect(payloadFlush.status).toBe('complete');
+    if (payloadFlush.status === 'complete') {
+      expect(payloadFlush.frames.map((frame) => decodeAudioFrame(frame.bytes).payloadLength))
+        .toEqual([2]);
+    }
 
     const utteranceQueue = new ClientRetainedAudioQueue(NEXT_UTTERANCE_ID, {
       maxAudioPayloadBytes: 8,
@@ -359,14 +559,16 @@ describe('client retained and in-flight queue', () => {
       oldestRetainedOffset: 0,
       highestAcknowledgedOffset: 0,
       nextCapturedOffset: 0,
+      nextEncodedOffset: 0,
       inFlightSamples: 0,
       inFlightInterval: { startOffset: 0, endOffset: 0 },
       retainedReplaySamples: 0,
       replayInterval: { startOffset: 0, endOffset: 0 },
       retainedFrameCount: 0,
+      pendingSampleCount: 0,
       pendingByteCount: 0
     });
-    expect(queue.flush()).toEqual({ status: 'complete' });
+    expect(queue.flush()).toEqual({ status: 'complete', frames: [] });
   });
 
   it('keeps sequence and offset continuity across arbitrary chunking', () => {
@@ -386,15 +588,20 @@ describe('client retained and in-flight queue', () => {
           maxUtteranceSamples: 480_000
         });
         const frames = partition(pcm, sizes).flatMap((chunk) => acceptedFrames(queue.push(chunk)));
-        expect(queue.flush()).toEqual({ status: 'complete' });
+        const flushed = queue.flush();
+        expect(flushed.status).toBe('complete');
+        const allFrames = [
+          ...frames,
+          ...(flushed.status === 'complete' ? flushed.frames : [])
+        ];
         let expectedOffset = 0;
-        frames.forEach((frame, sequence) => {
+        allFrames.forEach((frame, sequence) => {
           const decoded = decodeAudioFrame(frame.bytes);
           expect(decoded.sequence).toBe(sequence);
           expect(decoded.offset).toBe(expectedOffset);
           expectedOffset += decoded.payloadLength / 2;
         });
-        expect(concatenate(frames.map((frame) => decodeAudioFrame(frame.bytes).payload))).toEqual(pcm);
+        expect(concatenate(allFrames.map((frame) => decodeAudioFrame(frame.bytes).payload))).toEqual(pcm);
         expect(queue.state.nextCapturedOffset).toBe(pcm.length / 2);
       }),
       { seed: 20260811, numRuns: 250, endOnFailure: true }

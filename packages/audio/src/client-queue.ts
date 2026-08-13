@@ -15,6 +15,8 @@ export interface ClientAudioQueueLimits {
   readonly maxUnacknowledgedSamples: number;
   readonly maxRetainedReplaySamples: number;
   readonly maxUtteranceSamples: number;
+  /** Optional coalescing target; the effective target is capped by all limits. */
+  readonly coalescingTargetBytes?: number;
 }
 
 export type ClientAudioQueueErrorReason = 'invalid-limits' | 'uuid';
@@ -46,11 +48,13 @@ export interface ClientAudioQueueState {
   readonly oldestRetainedOffset: number;
   readonly highestAcknowledgedOffset: number;
   readonly nextCapturedOffset: number;
+  readonly nextEncodedOffset: number;
   readonly inFlightSamples: number;
   readonly inFlightInterval: Readonly<SampleInterval>;
   readonly retainedReplaySamples: number;
   readonly replayInterval: Readonly<SampleInterval>;
   readonly retainedFrameCount: number;
+  readonly pendingSampleCount: number;
   readonly pendingByteCount: 0 | 1;
 }
 
@@ -70,6 +74,17 @@ export type QueuePushResult =
       readonly status: 'overflow';
       readonly attemptedSamples: number;
       readonly exceededLimits: readonly QueueLimitName[];
+    };
+
+export type QueueFlushResult =
+  | {
+      readonly status: 'complete';
+      readonly frames: readonly EncodedAudioFrame[];
+    }
+  | {
+      readonly status: 'incomplete-sample';
+      readonly frames: readonly EncodedAudioFrame[];
+      readonly trailingByte: number;
     };
 
 export type AcknowledgementResult =
@@ -121,7 +136,9 @@ function assertLimits(limits: ClientAudioQueueLimits): void {
     limits.maxRetainedReplaySamples > limits.maxUnacknowledgedSamples ||
     !Number.isInteger(limits.maxUtteranceSamples) ||
     limits.maxUtteranceSamples < 1 ||
-    limits.maxUtteranceSamples > MAX_UTTERANCE_SAMPLES
+    limits.maxUtteranceSamples > MAX_UTTERANCE_SAMPLES ||
+    (limits.coalescingTargetBytes !== undefined &&
+      (!Number.isFinite(limits.coalescingTargetBytes) || limits.coalescingTargetBytes <= 0))
   ) {
     throw new ClientAudioQueueError('invalid-limits');
   }
@@ -142,6 +159,7 @@ export class ClientRetainedAudioQueue {
   #nextSequence = 0;
   #highestAcknowledgedOffset = 0;
   #nextCapturedOffset = 0;
+  #nextEncodedOffset = 0;
   #retained: Array<RetainedAudioFrame | undefined> = [];
   #retainedHead = 0;
 
@@ -150,7 +168,14 @@ export class ClientRetainedAudioQueue {
     assertLimits(limits);
     this.#utteranceId = utteranceId;
     this.limits = Object.freeze({ ...limits });
-    this.#framer = new PcmChunkFramer(limits.maxAudioPayloadBytes);
+    this.#framer = new PcmChunkFramer({
+      maxPayloadBytes: limits.maxAudioPayloadBytes,
+      maxRetainedReplaySamples: limits.maxRetainedReplaySamples,
+      maxUnacknowledgedSamples: limits.maxUnacknowledgedSamples,
+      ...(limits.coalescingTargetBytes === undefined
+        ? {}
+        : { coalescingTargetBytes: limits.coalescingTargetBytes })
+    });
   }
 
   get state(): ClientAudioQueueState {
@@ -165,18 +190,20 @@ export class ClientRetainedAudioQueue {
       oldestRetainedOffset: this.#highestAcknowledgedOffset,
       highestAcknowledgedOffset: this.#highestAcknowledgedOffset,
       nextCapturedOffset: this.#nextCapturedOffset,
+      nextEncodedOffset: this.#nextEncodedOffset,
       inFlightSamples,
       inFlightInterval: interval,
       retainedReplaySamples: inFlightSamples,
       replayInterval: interval,
       retainedFrameCount: this.#retained.length - this.#retainedHead,
+      pendingSampleCount: this.#framer.pendingSampleCount,
       pendingByteCount: this.#framer.pendingByteCount
     };
   }
 
   push(input: Uint8Array): QueuePushResult {
     const newSamples = Math.floor((input.length + this.#framer.pendingByteCount) / 2);
-    const attemptedInFlight = this.state.inFlightSamples + newSamples;
+    const attemptedInFlight = this.#nextCapturedOffset - this.#highestAcknowledgedOffset + newSamples;
     const attemptedCaptured = this.#nextCapturedOffset + newSamples;
     const exceededLimits: QueueLimitName[] = [];
     if (attemptedInFlight > this.limits.maxUnacknowledgedSamples) {
@@ -193,30 +220,17 @@ export class ClientRetainedAudioQueue {
     }
 
     const payloads = this.#framer.push(input);
-    const pendingFrames: RetainedAudioFrame[] = [];
-    let sequence = this.#nextSequence;
-    let offset = this.#nextCapturedOffset;
-    for (const payload of payloads) {
-      const sampleCount = payload.length / 2;
-      const bytes = encodeAudioFrame({
-        utteranceId: this.#utteranceId,
-        sequence,
-        offset,
-        payload
-      });
-      pendingFrames.push({ sequence, offset, sampleCount, endOffset: offset + sampleCount, bytes });
-      sequence += 1;
-      offset += sampleCount;
-    }
-
-    this.#retained.push(...pendingFrames);
-    this.#nextSequence = sequence;
-    this.#nextCapturedOffset = offset;
+    const pendingFrames = this.#encodePayloads(payloads);
+    this.#nextCapturedOffset = attemptedCaptured;
     return { status: 'accepted', frames: pendingFrames.map(copyFrame) };
   }
 
-  flush(): PcmFlushResult {
-    return this.#framer.flush();
+  flush(): QueueFlushResult {
+    const result: PcmFlushResult = this.#framer.flush();
+    const frames = this.#encodePayloads(result.payloads).map(copyFrame);
+    return result.status === 'complete'
+      ? { status: 'complete', frames }
+      : { status: 'incomplete-sample', frames, trailingByte: result.trailingByte };
   }
 
   acknowledge(acknowledgedOffset: number): AcknowledgementResult {
@@ -231,6 +245,9 @@ export class ClientRetainedAudioQueue {
     }
     if (acknowledgedOffset > this.#nextCapturedOffset) {
       return { status: 'invalid', reason: 'beyond-captured', acknowledgedOffset };
+    }
+    if (acknowledgedOffset > this.#nextEncodedOffset) {
+      return { status: 'invalid', reason: 'interior-frame', acknowledgedOffset };
     }
 
     let nextHead = this.#retainedHead;
@@ -274,6 +291,15 @@ export class ClientRetainedAudioQueue {
       };
     }
 
+    if (!this.#isReplayBoundary(requestedOffset)) {
+      return { status: 'non-resumable', reason: 'interior-frame', requestedOffset };
+    }
+
+    // A callback-sized tail has already advanced captured high-water, but it
+    // is not a wire frame yet. Materializing it here gives replay and later
+    // ACKs a stable frame boundary without changing captured high-water.
+    this.#materializePending();
+
     let firstIndex = this.#retainedHead;
     while (this.#retained[firstIndex]?.offset !== undefined &&
       this.#retained[firstIndex]!.offset < requestedOffset) {
@@ -303,8 +329,53 @@ export class ClientRetainedAudioQueue {
     this.#nextSequence = 0;
     this.#highestAcknowledgedOffset = 0;
     this.#nextCapturedOffset = 0;
+    this.#nextEncodedOffset = 0;
     this.#retained = [];
     this.#retainedHead = 0;
+  }
+
+  #encodePayloads(payloads: readonly Uint8Array[]): RetainedAudioFrame[] {
+    if (payloads.length === 0) {
+      return [];
+    }
+
+    const pendingFrames: RetainedAudioFrame[] = [];
+    let sequence = this.#nextSequence;
+    let offset = this.#nextEncodedOffset;
+    for (const payload of payloads) {
+      const sampleCount = payload.length / 2;
+      const bytes = encodeAudioFrame({
+        utteranceId: this.#utteranceId,
+        sequence,
+        offset,
+        payload
+      });
+      pendingFrames.push({ sequence, offset, sampleCount, endOffset: offset + sampleCount, bytes });
+      sequence += 1;
+      offset += sampleCount;
+    }
+
+    this.#retained.push(...pendingFrames);
+    this.#nextSequence = sequence;
+    this.#nextEncodedOffset = offset;
+    return pendingFrames;
+  }
+
+  #materializePending(): readonly RetainedAudioFrame[] {
+    return this.#encodePayloads(this.#framer.drainCompleteSamples());
+  }
+
+  #isReplayBoundary(offset: number): boolean {
+    if (offset === this.#nextEncodedOffset) {
+      return true;
+    }
+    for (let index = this.#retainedHead; index < this.#retained.length; index += 1) {
+      const frame = this.#retained[index];
+      if (frame !== undefined && frame.offset === offset) {
+        return true;
+      }
+    }
+    return false;
   }
 
   #compactRetained(): void {
