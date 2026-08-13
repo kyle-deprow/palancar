@@ -419,8 +419,7 @@ export class RelayTransport {
       return;
     }
 
-    const input = new Uint8Array(pcm);
-    const result = active.queue.push(input);
+    const result = active.queue.push(pcm);
     if (result.status === "overflow") {
       this.#abortActive(
         `PCM queue overflow: ${result.exceededLimits.join(", ")}`,
@@ -439,8 +438,16 @@ export class RelayTransport {
     if (active === undefined || active.phase !== "streaming" || session === undefined) return;
 
     const flush = active.queue.flush();
+    for (const frame of flush.frames) {
+      if (!this.#sendAudioFrame(frame)) {
+        if (this.#active === active && active.phase === "streaming") {
+          active.phase = "cancelling";
+        }
+        return;
+      }
+    }
     if (flush.status === "incomplete-sample") {
-      this.#abortActive("PCM ended with an incomplete sample");
+      this.#abortActive("PCM ended with an incomplete sample", undefined, true);
       return;
     }
 
@@ -584,7 +591,7 @@ export class RelayTransport {
       return false;
     }
     try {
-      socket.send(frame.bytes.slice() as Uint8Array<ArrayBuffer>);
+      socket.send(frame.bytes as Uint8Array<ArrayBuffer>);
       return true;
     } catch (error: unknown) {
       this.#abortActive("Audio frame could not be sent", error);
@@ -726,13 +733,16 @@ export class RelayTransport {
     return true;
   }
 
-  #abortActive(message: string, cause?: unknown): void {
+  #abortActive(message: string, cause?: unknown, lockPhase = false): void {
     const active = this.#active;
     if (active === undefined) {
       this.#report(new RelayTransportError("audio", message, cause), false);
       return;
     }
     if (active.phase === "streaming") this.#sendUtteranceCancel();
+    if (lockPhase && this.#active === active && active.phase === "streaming") {
+      active.phase = "cancelling";
+    }
     this.#report(new RelayTransportError("audio", message, cause), false);
   }
 

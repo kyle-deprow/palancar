@@ -1,9 +1,10 @@
 import {
+  AUDIO_FRAME_HEADER_BYTES,
   DEFAULT_NEGOTIATED_LIMITS,
   decodeAudioFrame,
   type NegotiatedLimits,
 } from "@palancar/contracts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   RelayTransportError,
@@ -31,6 +32,7 @@ class FakeWebSocket implements BrowserWebSocket {
   readonly sent: SentMessage[] = [];
   readyState = 0;
   sendError: Error | undefined;
+  failNextSend: Error | undefined;
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
@@ -44,6 +46,9 @@ class FakeWebSocket implements BrowserWebSocket {
 
   send(data: string | Uint8Array<ArrayBuffer>): void {
     if (this.sendError !== undefined) throw this.sendError;
+    const failNextSend = this.failNextSend;
+    this.failNextSend = undefined;
+    if (failNextSend !== undefined) throw failNextSend;
     this.sent.push(data);
   }
 
@@ -183,6 +188,18 @@ function sentControl(socket: FakeWebSocket, index: number): Record<string, unkno
   return JSON.parse(value) as Record<string, unknown>;
 }
 
+function sentControlTypes(socket: FakeWebSocket): string[] {
+  return socket.sent.flatMap((value) => {
+    if (typeof value !== "string") return [];
+    const message = JSON.parse(value) as { readonly type: string };
+    return [message.type];
+  });
+}
+
+function pcmCallback(value: number): Uint8Array {
+  return Uint8Array.from({ length: 320 }, () => value);
+}
+
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await Promise.resolve();
 }
@@ -268,7 +285,7 @@ describe("G2 relay transport", () => {
     socket.message(JSON.stringify(readyMessage()));
 
     transport.startUtterance(UTTERANCE_ID);
-    const source = Uint8Array.of(1, 2, 3, 4);
+    const source = Uint8Array.from({ length: 1_920 }, (_, index) => index % 256);
     transport.pushPcm(source);
     source[0] = 99;
 
@@ -286,7 +303,7 @@ describe("G2 relay transport", () => {
       utteranceId: UTTERANCE_ID,
       sequence: 0,
       offset: 0,
-      payload: Uint8Array.of(1, 2, 3, 4),
+      payload: Uint8Array.from({ length: 1_920 }, (_, index) => index % 256),
     });
 
     socket.message(JSON.stringify({
@@ -294,10 +311,10 @@ describe("G2 relay transport", () => {
       sessionId: SESSION_ID,
       sessionEpoch: 1,
       utteranceId: UTTERANCE_ID,
-      highestContiguousExclusiveOffset: 2,
+      highestContiguousExclusiveOffset: 960,
       flowState: "normal",
     }));
-    expect(transport.snapshot.queue?.highestAcknowledgedOffset).toBe(2);
+    expect(transport.snapshot.queue?.highestAcknowledgedOffset).toBe(960);
     expect(transport.snapshot.queue?.inFlightSamples).toBe(0);
 
     transport.commitUtterance();
@@ -306,8 +323,140 @@ describe("G2 relay transport", () => {
       sessionId: SESSION_ID,
       sessionEpoch: 1,
       utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 960,
+    });
+  });
+
+  it("coalesces 10ms PCM callbacks until 60ms, then sends one audio frame", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    const callbacks = Array.from({ length: 6 }, (_, index) => pcmCallback(index + 1));
+    for (const callback of callbacks.slice(0, 5)) {
+      transport.pushPcm(callback);
+      expect(socket.sent).toHaveLength(2);
+    }
+
+    transport.pushPcm(callbacks[5]!);
+    expect(socket.sent).toHaveLength(3);
+    const frame = socket.sent[2];
+    if (typeof frame === "string" || frame === undefined) {
+      throw new Error("Expected a binary audio frame");
+    }
+    expect(decodeAudioFrame(frame).payload).toEqual(
+      Uint8Array.from(callbacks.flatMap((callback) => [...callback])),
+    );
+  });
+
+  it("flushes a buffered tail before commit with the exact final offset and original bytes", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    const source = Uint8Array.of(1, 2, 3, 4);
+    transport.pushPcm(source);
+    source[0] = 99;
+    expect(socket.sent).toHaveLength(2);
+
+    transport.commitUtterance();
+
+    const frame = socket.sent[2];
+    if (typeof frame === "string" || frame === undefined) {
+      throw new Error("Expected a binary audio frame");
+    }
+    expect(decodeAudioFrame(frame).payload).toEqual(Uint8Array.of(1, 2, 3, 4));
+    expect(sentControl(socket, 3)).toEqual({
+      type: "utterance.commit",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
       finalOriginalSampleOffset: 2,
     });
+
+    transport.commitUtterance();
+    transport.pushPcm(Uint8Array.of(5, 6));
+    expect(socket.sent).toHaveLength(4);
+  });
+
+  it("sends an even prefix before cancelling an incomplete sample and never commits", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.of(1, 2, 3));
+    transport.commitUtterance();
+
+    const frame = socket.sent[2];
+    if (typeof frame === "string" || frame === undefined) {
+      throw new Error("Expected an even-prefix audio frame");
+    }
+    expect(decodeAudioFrame(frame).payload).toEqual(Uint8Array.of(1, 2));
+    expect(sentControl(socket, 3)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 1,
+    });
+    expect(sentControlTypes(socket)).not.toContain("utterance.commit");
+    expect(errors.at(-1)?.kind).toBe("audio");
+
+    const sentAfterAbort = socket.sent.length;
+    transport.commitUtterance();
+    expect(socket.sent).toHaveLength(sentAfterAbort);
+  });
+
+  it("sends the queue-owned frame bytes without adding a transport copy", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+    const payload = Uint8Array.of(1, 2);
+    const frameByteLength = AUDIO_FRAME_HEADER_BYTES + payload.length;
+    const frameSizedSlices: Uint8Array[] = [];
+    const originalSlice = Uint8Array.prototype.slice;
+    const sliceSpy = vi.spyOn(Uint8Array.prototype, "slice").mockImplementation(
+      function (this: Uint8Array<ArrayBuffer>, start?: number, end?: number): Uint8Array<ArrayBuffer> {
+        const result = originalSlice.call(this, start, end);
+        if (result.length === frameByteLength) frameSizedSlices.push(result);
+        return result;
+      },
+    );
+
+    try {
+      transport.startUtterance(UTTERANCE_ID);
+      transport.pushPcm(payload);
+      transport.commitUtterance();
+
+      const frame = socket.sent[2];
+      if (typeof frame === "string" || frame === undefined) {
+        throw new Error("Expected a binary audio frame");
+      }
+      expect(frameSizedSlices).toHaveLength(1);
+      expect(frame).toBe(frameSizedSlices[0]);
+    } finally {
+      sliceSpy.mockRestore();
+    }
+  });
+
+  it("does not commit after a flush frame send fails", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.of(1, 2));
+    socket.failNextSend = new Error("flush send failed");
+    transport.commitUtterance();
+
+    expect(socket.sent).toHaveLength(3);
+    expect(sentControl(socket, 2)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
+    });
+    expect(socket.sent.some((value) => typeof value === "string" && value.includes('"utterance.commit"'))).toBe(false);
+    expect(errors.some((error) => error.kind === "audio")).toBe(true);
+
+    transport.commitUtterance();
+    expect(socket.sent.some((value) => typeof value === "string" && value.includes('"utterance.commit"'))).toBe(false);
   });
 
   it("reports malformed ticket and server control data, then closes safely", async () => {
@@ -400,9 +549,9 @@ describe("G2 relay transport", () => {
     const socket = await openReady(transport);
 
     transport.startUtterance(UTTERANCE_ID);
-    transport.pushPcm(Uint8Array.of(1, 2, 3, 4));
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
     transport.cancelUtterance();
-    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 2)));
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960)));
     expect(errors).toHaveLength(0);
     expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
 
@@ -463,7 +612,7 @@ describe("G2 relay transport", () => {
     transport.startUtterance(UTTERANCE_ID);
     socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
     const sentWhilePaused = socket.sent.length;
-    transport.pushPcm(Uint8Array.of(1, 2));
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
     expect(socket.sent).toHaveLength(sentWhilePaused + 1);
     expect(sentControl(socket, socket.sent.length - 1).type).toBe("utterance.cancel");
 
@@ -477,8 +626,8 @@ describe("G2 relay transport", () => {
     });
     const secondSocket = await openReady(second);
     second.startUtterance(UTTERANCE_ID);
-    second.pushPcm(Uint8Array.of(1, 2));
-    secondSocket.message(JSON.stringify(audioAck(UTTERANCE_ID, 1, "abort")));
+    second.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+    secondSocket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "abort")));
     expect(second.snapshot.activeUtteranceId).toBeUndefined();
     expect(errors.some((error) => error.kind === "audio")).toBe(true);
     expect(events.some((event) => event.type === "fatal")).toBe(false);
