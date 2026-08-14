@@ -3,9 +3,11 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import {
+  AudioResamplerError,
   ClientAudioQueueError,
   ClientRetainedAudioQueue,
   IdentityAudioResampler,
+  LinearPcm16To24AudioResampler,
   OrderedFrameAcceptorError,
   PcmChunkFramer,
   PcmFramerError,
@@ -41,6 +43,47 @@ function concatenate(parts: readonly Uint8Array[]): Uint8Array {
   for (const part of parts) {
     output.set(part, offset);
     offset += part.length;
+  }
+  return output;
+}
+
+function encodePcm16(samples: readonly number[]): Uint8Array {
+  const output = new Uint8Array(samples.length * 2);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index] ?? 0;
+    const unsigned = sample < 0 ? sample + 0x1_0000 : sample;
+    output[index * 2] = unsigned & 0xff;
+    output[index * 2 + 1] = unsigned >>> 8;
+  }
+  return output;
+}
+
+function decodePcm16(bytes: Uint8Array): number[] {
+  expect(bytes.length % 2).toBe(0);
+  const samples: number[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 2) {
+    const unsigned = (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8);
+    samples.push(unsigned < 0x8000 ? unsigned : unsigned - 0x1_0000);
+  }
+  return samples;
+}
+
+function referenceRoundRationalAwayFromZero(numerator: number, denominator: number): number {
+  const magnitude = Math.abs(numerator);
+  const roundedMagnitude = Math.floor((magnitude * 2 + denominator) / (denominator * 2));
+  return numerator < 0 ? -roundedMagnitude : roundedMagnitude;
+}
+
+function referenceResample(samples: readonly number[]): number[] {
+  const output: number[] = [];
+  for (let phase = 0; phase < samples.length * 3; phase += 2) {
+    const leftIndex = Math.floor(phase / 3);
+    const fraction = phase % 3;
+    const left = samples[leftIndex] ?? 0;
+    const right = samples[leftIndex + 1] ?? left;
+    const numerator = (3 - fraction) * left + fraction * right;
+    const rounded = referenceRoundRationalAwayFromZero(numerator, 3);
+    output.push(Math.min(32_767, Math.max(-32_768, rounded)));
   }
   return output;
 }
@@ -1164,5 +1207,123 @@ describe('stateful resampler abstraction', () => {
     const output = new IdentityAudioResampler().push(input);
     input.fill(9);
     expect(output).toEqual(Uint8Array.of(1, 2, 3, 4));
+  });
+
+  it('declares the fixed 16 kHz to 24 kHz contract and freezes capabilities', () => {
+    const resampler = new LinearPcm16To24AudioResampler();
+    expect(resampler.capabilities).toEqual({
+      inputSampleRateHz: 16_000,
+      outputSampleRateHz: 24_000,
+      channels: 1,
+      sampleFormat: 's16le',
+      stateful: true
+    });
+    expect(Object.isFrozen(resampler.capabilities)).toBe(true);
+  });
+
+  it('keeps a DC signal constant, including its flush endpoint', () => {
+    const resampler = new LinearPcm16To24AudioResampler();
+    const input = encodePcm16([1_234, 1_234, 1_234, 1_234, 1_234]);
+
+    const output = concatenate([resampler.push(input), resampler.flush()]);
+    expect(decodePcm16(output)).toEqual(new Array(8).fill(1_234));
+  });
+
+  it('uses the documented endpoint convention and exact ramp goldens', () => {
+    const resampler = new LinearPcm16To24AudioResampler();
+    expect(decodePcm16(resampler.push(encodePcm16([0, 3, 6, 9])))).toEqual([
+      0, 2, 4, 6, 8
+    ]);
+    expect(decodePcm16(resampler.flush())).toEqual([9]);
+  });
+
+  it('rounds negative interpolation deterministically and stays within int16 bounds', () => {
+    const negative = new LinearPcm16To24AudioResampler();
+    const negativeOutput = concatenate([
+      negative.push(encodePcm16([-3, -4, 0])),
+      negative.flush()
+    ]);
+    expect(decodePcm16(negativeOutput)).toEqual([-3, -4, -3, 0, 0]);
+
+    const bounded = new LinearPcm16To24AudioResampler();
+    const boundedOutput = concatenate([
+      bounded.push(encodePcm16([-32_768, 32_767, -32_768])),
+      bounded.flush()
+    ]);
+    const boundedSamples = decodePcm16(boundedOutput);
+    expect(boundedSamples).toEqual([-32_768, 10_922, 10_922, -32_768, -32_768]);
+    expect(boundedSamples.every((sample) => sample >= -32_768 && sample <= 32_767)).toBe(true);
+  });
+
+  it('is invariant to odd byte partitions and owns source and output buffers', () => {
+    const source = encodePcm16([-1_000, 0, 1_000, 2_000]);
+    const oneShot = new LinearPcm16To24AudioResampler();
+    const expected = concatenate([oneShot.push(source), oneShot.flush()]);
+
+    const streamed = new LinearPcm16To24AudioResampler();
+    const outputParts = partition(source, [1, 3, 1, 2, 1]).map((chunk) => streamed.push(chunk));
+    const actual = concatenate([...outputParts, streamed.flush()]);
+    expect(actual).toEqual(expected);
+
+    const firstByte = Uint8Array.of(0x34);
+    expect(streamed.push(firstByte)).toEqual(new Uint8Array(0));
+    firstByte[0] = 0;
+    const output = streamed.push(Uint8Array.of(0x12));
+    expect(decodePcm16(output)).toEqual([0x1234]);
+    output.fill(0);
+    expect(decodePcm16(streamed.flush())).toEqual([0x1234]);
+    expect(streamed.flush()).toEqual(new Uint8Array(0));
+  });
+
+  it.each([
+    { name: 'empty', samples: [], chunkSizes: [1] },
+    { name: 'single positive', samples: [12_345], chunkSizes: [1, 1] },
+    { name: 'single negative', samples: [-12_345], chunkSizes: [2] },
+    { name: 'ramp', samples: [-9, -6, -3, 0, 3, 6, 9], chunkSizes: [1, 3, 1, 2] },
+    { name: 'tie rounding', samples: [-3, -4, 0, 3, 4, 0], chunkSizes: [2, 1, 4] },
+    {
+      name: 'int16 limits',
+      samples: [-32_768, 32_767, -32_768, 32_767, 0],
+      chunkSizes: [3, 1, 1, 5]
+    },
+    {
+      name: 'varied deterministic values',
+      samples: [0, 32_767, -32_768, 1, -1, 16_384, -16_385, 7, -8, 2_048],
+      chunkSizes: [1, 7, 2, 3, 1]
+    }
+  ])('$name follows the independent rational reference across partitions', ({ samples, chunkSizes }) => {
+    const expected = encodePcm16(referenceResample(samples));
+    const input = encodePcm16(samples);
+    const resampler = new LinearPcm16To24AudioResampler();
+    const actual = concatenate([
+      ...partition(input, chunkSizes).map((chunk) => resampler.push(chunk)),
+      resampler.flush()
+    ]);
+
+    expect(actual).toEqual(expected);
+  });
+
+  it('flushes once, resets all phase and byte state, and reports incomplete samples', () => {
+    const resampler = new LinearPcm16To24AudioResampler();
+    resampler.push(encodePcm16([10, 20]));
+    expect(decodePcm16(resampler.flush())).toEqual([20]);
+    expect(resampler.flush()).toEqual(new Uint8Array(0));
+
+    resampler.push(Uint8Array.of(0xff));
+    resampler.reset();
+    expect(resampler.flush()).toEqual(new Uint8Array(0));
+    expect(decodePcm16(resampler.push(encodePcm16([30])))).toEqual([30]);
+    expect(decodePcm16(resampler.flush())).toEqual([30]);
+
+    resampler.push(Uint8Array.of(0x7f));
+    let thrown: unknown;
+    try {
+      resampler.flush();
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AudioResamplerError);
+    expect(thrown).toMatchObject({ reason: 'incomplete-sample' });
+    expect(resampler.flush()).toEqual(new Uint8Array(0));
   });
 });
