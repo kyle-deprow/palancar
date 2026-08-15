@@ -4,11 +4,15 @@ Status: Implementation planning
 Last updated: 2026-08-09
 Review status: GPT-5.6 Sol `READY` for planning and corrected Phase 0 ADRs
 
+Accepted ADRs and this active plan are normative. Historical `.codex` handoff
+documents are nonnormative working notes and cannot override an ADR or the
+active plan.
+
 Review loop summary:
 
 - Planning pass defined the package boundaries, Terraform stacks, dependency graph, and parallel lanes.
 - Adversarial review initially returned `NEEDS WORK` for authentication ordering, mixed-language evidence, protocol recovery limits, G2 lifecycle/packaging, Terraform identity/image ordering, compute-host assumptions, and weak transcription sample sizes.
-- The fix passes moved authentication/retention before real audio, reject mixed turns in v1, completed protocol limits and replay semantics, split image-pull/runtime identities, added provisional compute and provider gates, and aligned statistically sized physical-G2 evidence across both product and implementation plans.
+- The fix passes moved authentication/retention before real audio, reject mixed turns in v1, completed protocol limits and fresh-session recovery semantics, split image-pull/runtime identities, added provisional compute and provider gates, and aligned statistically sized physical-G2 evidence across both product and implementation plans.
 - The original planning re-review returned `READY`; the Phase 0 ADRs then closed
   all first-pass and re-review findings and received a final Sol `READY`.
 
@@ -23,7 +27,12 @@ Build Palancar as an npm-workspace TypeScript monorepo with four independently t
 
 The first supported wearer language is English. The target language is selected per session from Spanish (`es`) or Turkish (`tr`). Core code is registry-driven; neither language receives a special branch outside its registry data and conformance fixtures.
 
-The production transcription adapter is deliberately undecided until the Terraform-provisioned mini-transcribe deployment passes the realtime spike. Client, protocol, mocked relay, language gate, fixtures, and most infrastructure can be built in parallel without waiting for that result.
+The production transcription adapter is deliberately undecided until the
+candidate mini-transcribe deployment passes the realtime spike. Generation is
+provided now through LiteLLM/OpenRouter. Azure generation is only an optional
+future managed-identity mode and is not a required deployment. Client,
+protocol, mocked relay, language gate, fixtures, and most infrastructure can be
+built in parallel without waiting for the transcription result.
 
 ## Recommended technology baseline
 
@@ -34,8 +43,12 @@ The production transcription adapter is deliberately undecided until the Terrafo
 - Container build: Docker with pinned base-image digest and a production build containing only runtime dependencies.
 - Transcription: a provider interface with Azure Realtime and Azure Speech adapters; only the spike winner becomes active in production configuration.
 - Audio normalization: a provider capability. The Azure Realtime adapter owns one stateful, production-quality 16 kHz to 24 kHz resampler per active utterance; a provider that accepts native 16 kHz bypasses it. Select and pin the concrete native or WASM implementation only after continuity, image-build, and accuracy tests.
-- Translation and suggestions: separate typed operations against the requested Foundry Luna deployment so English translation can appear without waiting for suggestion generation.
-- IaC: Terraform with pinned AzureRM and AzAPI providers. Prefer AzureRM resources; use AzAPI only where current Foundry functionality is not represented by AzureRM.
+- Translation and suggestions: one validated combined completion through the
+  LiteLLM/OpenRouter generation path, with independently deliverable translation
+  and suggestions. Azure generation is a future optional managed-identity mode.
+- IaC: Terraform with pinned AzureRM and AzAPI providers. Prefer AzureRM
+  resources; use AzAPI only where current Azure functionality is not represented
+  by AzureRM.
 
 The repository requires npm rather than pnpm because the established G2 toolchain commits `package-lock.json` and uses npm commands.
 
@@ -77,7 +90,7 @@ palancar/
 │   ├── language-registry/           # registry, classifier interface, gate policy
 │   ├── audio/                       # framing, offsets, queues, resampler abstraction
 │   ├── transcription/               # provider contract and Azure adapters
-│   ├── generation/                  # Luna request/result schemas and service
+│   ├── generation/                  # LiteLLM/OpenRouter request/result schemas and service
 │   ├── telemetry/                   # metric names, traces, redaction helpers
 │   └── test-fixtures/               # PCM and es/tr/en transcript/audio corpora
 ├── tools/
@@ -120,7 +133,7 @@ palancar/
 
 `packages/contracts` is the first merge gate. TypeBox schemas are the single source for runtime validation and inferred TypeScript types; generated artifacts are limited to formats that an external consumer actually needs.
 
-- `session.start`, `session.resume`, `session.ready`, `session.rejected`, and
+- `session.start`, `session.ready`, `session.rejected`, and
   `session.end`.
 - Idempotent `utterance.start`, `utterance.commit`, `utterance.cancel`, and `utterance.aborted`.
 - `audio.ack` with highest contiguous accepted 16 kHz sample offset and flow-control state.
@@ -128,14 +141,13 @@ palancar/
 - `language.decision` with `target`, `mixed`, `english`, `supported_unselected`, `unsupported`, or `uncertain`.
 - `translation.ready`, `suggestions.ready`, and versioned error envelopes.
 
-The first control message is exactly `session.start` for new intent or
-`session.resume` for exact resume intent. Both carry `protocolVersion`,
-`wearerLanguage`, explicitly confirmed `targetLanguage`, language-registry and
-`gatePolicyVersion`, client build, and common limit negotiation. Only
-`session.resume` carries session/utterance IDs and last-acknowledged,
-oldest-retained, and next-captured offsets. Unknown versions or unsupported
-targets are rejected before audio capture. `session.ready` may lower negotiable
-limits but never advertises above the hard v1 maxima.
+The first control message is exactly `session.start` for new intent. It carries
+`protocolVersion`, `wearerLanguage`, explicitly confirmed `targetLanguage`,
+language-registry and `gatePolicyVersion`, client build, and common limit
+negotiation. It never carries an earlier session/utterance identity or retained
+audio offsets. Unknown versions or unsupported targets are rejected before audio
+capture. `session.ready` may lower negotiable limits but never advertises above
+the hard v1 maxima.
 
 Binary frames use a documented fixed header containing protocol version, utterance identity, sequence number, absolute starting sample offset, payload length, and flags followed by PCM bytes. The exact byte layout is frozen in ADR 0001 and golden fixtures. Odd-byte payloads, overlaps, gaps, duplicates, stale utterances, and queue overflow are explicit protocol outcomes.
 
@@ -146,34 +158,64 @@ ADR 0001 must close these semantics before protocol v1 is frozen:
   control message, 8,000 unacknowledged samples/500 ms, one active utterance per
   session, a 30-second utterance, a 30-minute session, and a 5-minute
   user-inactivity timeout. ADR 0001 is authoritative.
-- The client retains unacknowledged frames within the negotiated replay window. The server advertises maximum frame size, in-flight samples, ACK cadence, and session limits in `session.ready`.
+- The client retains unacknowledged frames only as a bounded live-connection queue for flow control and exact duplicate safety. The server advertises maximum frame size, in-flight samples, ACK cadence, and session limits in `session.ready`.
 - ACKs are emitted at least every 100 ms of accepted audio and whenever flow-control state changes.
-- Reconnect uses `session.resume`. A requested offset is valid in the inclusive
-  range `[oldestRetainedOffset, nextCapturedOffset]`; the client replays
-  `[requestedOffset, nextCapturedOffset)`, which may be empty. Otherwise both
-  sides visibly abort the utterance.
-- Versioned error/close codes cover malformed size, unsupported version, integer overflow, gap, overlap, stale turn, flow-control violation, authentication expiry, and non-resumable reconnect.
+- A disconnect aborts the active turn, cancels transcription and generation,
+  clears retained PCM/transcript/results, and never replays or regenerates
+  interrupted work. Bounded-jitter reconnect obtains a new single-use ticket,
+  creates a new session, and advances the session epoch; the client returns to
+  `Ready` only after the new `session.ready`.
+- Versioned error/close codes cover malformed size, unsupported version, integer overflow, gap, overlap, stale turn, flow-control violation, authentication expiry, and fresh-session reconnect failure.
 
-The relay also persists a per-installation/session original-sample token bucket
-in `RateState`: refill 16,000 samples/second, capacity 8,000, charge only first
-acceptance and not exact duplicate replay. Its ETag update succeeds before
-provider forwarding; state outage fails closed. First overrun aborts the turn,
-and repeated/deliberate overrun closes `4408`. This is independent of the 8,000
-unacknowledged-sample limit.
+The relay authorizes audio through durable `RateState` reservation grants of at
+most 8,000 original 16 kHz samples per installation/session/turn. The grant is
+consumed locally for newly accepted ranges; exact duplicates within the live
+connection do not consume it and unused grant capacity is never refunded. A
+durable renewal with the exact current ETag must succeed before provider
+forwarding beyond the current grant. The renewal-before-forward race is
+fail-closed: state outage creates or renews no grant and forwards no newly
+authorized audio. This is independent of the 8,000 unacknowledged-sample limit.
 
-Golden and fuzz tests cover maximum/minimum lengths, integer boundaries, floods, duplicate/out-of-order frames, retained-window replay, and abort when the requested server offset is older than retained audio.
+Disconnect cleanup has two independent owners. The client stops capture and
+clears local PCM, transcript, translation, suggestions, and pending results.
+The relay socket-close path independently aborts transcription and generation
+providers and releases unstarted execution claims; it does not wait for a client
+message or cleanup callback. Generation authorization is a durable `RateState`
+row claimed atomically with an ETag immediately before one provider call. Only a
+`target` final can claim it; a duplicate final reuses the existing consumed
+claim and never makes a second call. The opening lease is 10 seconds, the active
+lease is 35 seconds, and the 20-second heartbeat renews it. Provider start marks
+the claim consumed forever; lease expiry releases an unstarted or active
+execution lease but never refunds or retries a consumed provider call. The row
+persists the model-attempt and turn counters.
+
+Golden and fuzz tests cover maximum/minimum lengths, integer boundaries, floods,
+live-connection duplicate/out-of-order frames, disconnect cancellation and
+clearing, fresh-session reconnect ordering, and the absence of replay or
+regeneration for interrupted work.
 
 ### Authentication and session ticket
 
 ADR 0003 is a prerequisite to client and relay lane implementation. A browser WebSocket cannot attach an arbitrary `Authorization` header, so Palancar uses a two-step contract:
 
-1. The WebView enrolls once with an operator-issued, high-entropy, one-time
-   pairing code. Input accepts only the canonical 26-character Crockford Base32
-   representation and rejects aliases/noncanonical forms before hashing; the
-   resulting revocable per-installation credential is stored in IndexedDB.
+1. An Entra-authenticated operator uses the approved Azure CLI/Entra CLI runbook
+   to generate a high-entropy, one-time pairing code, insert its SHA-256 hash
+   into Azure Table, and receive the plaintext exactly once. The relay does not
+   issue pairing codes; it only redeems the submitted plaintext. Input accepts
+   only the canonical 26-character Crockford Base32 representation and rejects
+   aliases/noncanonical forms before hashing; the resulting revocable
+   per-installation credential is stored in IndexedDB.
 2. The WebView authenticates HTTPS `POST /v1/session-tickets` with that bearer credential. The relay returns an opaque, audience-bound, single-use ticket with an exact 60-second lifetime.
 3. The client opens `wss://<relay>/v1/stream` and offers `palancar.v1` plus `palancar.ticket.<ticket>` in `Sec-WebSocket-Protocol`. Query-string tickets are prohibited in protocol v1.
 4. Before HTTP 101, the relay atomically consumes the ticket in Azure Table Storage, rejects reuse/expiry/wrong audience or credential version, and returns only `palancar.v1` as the selected protocol.
+
+Ticket consumption claims the installation's one-active-session lock and opens
+the session with an exact 10-second opening lease. Only a valid matching
+`session.start` transitions it atomically to an exact 35-second active lease.
+Every 20-second heartbeat renews the session and installation lock with the
+exact current ETags and uses the returned ETags for the next update. Lease
+expiry and cleanup atomically release the installation lock; a state outage
+does not renew the lease and closes the affected socket.
 
 Pre-upgrade authentication/audience/replay, origin, rate, conflict, and state
 failures use generic HTTP `401`/`403`/`409`/`429`/`503` responses. Custom `44xx`
@@ -184,7 +226,20 @@ platform-controlled peer/forwarded data and never an arbitrary client
 
 ADR 0003 is authoritative for enrollment, IndexedDB storage, rotation/revocation, state-store atomicity, fallback ordering, a possible `null` WebView origin, and ticket redaction across candidate-host access logs, Application Insights, structured logs, exception/error payloads, client diagnostics, and browser-visible history. A same-origin secure HttpOnly cookie or strictly limited first-message flow is considered only if physical-host evidence rejects subprotocol transport; a URL ticket is not a fallback.
 
-Development authentication is now decided. Production migrates operator pairing to an approved Entra External ID or equivalent authorization-code-plus-PKCE flow while preserving installation registration and single-use tickets. Baseline authentication, replay protection, per-installation/session rate limits, maximum session duration, raw-audio non-retention, and zero application conversation retention must be operational before Phase 4 sends real conversation audio. Phase 7 hardens and productionizes those controls rather than introducing them for the first time.
+Mode boundary: `local-mock` is loopback-only, uses mock transcription and
+generation providers, and is unpaid. It is not a deployment or a paid-mode
+fallback. Any deployed or paid mode requires the persistent Azure Table
+`SecurityState` and `RateState` design from ADR 0003; Azure Table outage fails
+closed and may not fall back to Azurite, in-memory state, or another store.
+
+Development authentication is now decided. Production migrates operator pairing to
+an approved Entra External ID or equivalent authorization-code-plus-PKCE flow
+while preserving installation registration and single-use tickets. Baseline
+authentication, replay protection, installation-scoped rolling recovery-window
+limits, maximum session duration, raw-audio non-retention, and zero application
+conversation retention must be operational before Phase 4 sends real
+conversation audio. Phase 7 hardens and productionizes those controls rather
+than introducing them for the first time.
 
 ### Target-language registry and gate
 
@@ -239,14 +294,15 @@ Gate rules:
 - `waitForEvenAppBridge()` initialization and exactly one `createStartUpPageContainer()` call per WebView lifetime. Failure enters an error state without retrying that one-shot call.
 - Typed routing of R1/temple press, `CLICK_EVENT` together with normalized `undefined`, double-press exit, lifecycle, device status, and `audioEvent.audioPcm`.
 - A state machine for Starting, TargetSelection, Ready, Listening, Finalizing,
-  Translating, Results, Recovering, and Error. Starting restores the last target
+  Translating, Results, and Error. Starting restores the last target
   only as highlighted; TargetSelection says “press to confirm, swipe to change”
   and confirmation precedes session start or microphone access. Results uses
   swipe to cycle and press to start the next turn.
 - Chunk-agnostic PCM handling, sample alignment, a 500 ms bounded queue, binary framing, acknowledgements, and visible utterance abort on overflow.
 - Eager persistence of selected target language and safe session preferences.
 - A single latest-wins display queue with 150–200 ms transcript scheduling and serialized `textContainerUpgrade()` calls.
-- Reconnection that either resumes from an explicitly confirmed offset or aborts the current utterance; no silent continuation.
+- Reconnection that obtains a new ticket and fresh session after aborting the
+  current utterance; no replay, regeneration, or silent continuation.
 - `audioControl(false)`, retained unsubscribe callbacks, timer/socket cleanup, and cleanup after `SYSTEM_EXIT_EVENT` or `ABNORMAL_EXIT_EVENT`.
 - Root double-press through `shutDownPageContainer(1)` without premature teardown, because the wearer can cancel the system confirmation.
 
@@ -301,12 +357,15 @@ speech. Spike evidence is metadata-only under the allow-list above.
 
 ### Generation
 
-`packages/generation` exposes two typed methods:
-
-- `translate(finalAcceptedTurn)` returns the English translation.
-- `suggestResponses(finalAcceptedTurn)` returns two or three concise `{ english, targetLanguage }` pairs.
-
-Both requests include selected target language, accepted final revision, and bounded conversational context. They use strict runtime validation and small output budgets. Translation and suggestions emit independent protocol events and have independent timeout/retry behavior. Neither operation is available to provisional or rejected turns.
+`packages/generation` exposes one typed combined-completion method for an
+accepted final turn. It returns the English translation and two or three concise
+`{ english, targetLanguage }` pairs in one LiteLLM/OpenRouter provider call;
+translation and suggestions may still be emitted as independent protocol events
+after that response is validated. The request includes selected target language,
+accepted final revision, and bounded conversational context, with strict runtime
+validation and a small output budget. No provisional or rejected turn reaches
+the method, and the durable ADR 0003 authorization claim permits exactly one
+provider call.
 
 ## Terraform and Azure plan
 
@@ -337,21 +396,34 @@ The dev environment has two explicit applies. The foundation apply composes modu
 - Azure Container Registry, a dedicated pre-created user-assigned image-pull identity, and its `AcrPull` assignment before any Container App exists.
 - Log Analytics, Application Insights, diagnostic settings, latency/error/cost metrics, alerts, and dashboards.
 - Azure Container Apps environment without the relay workload.
-- A separate runtime identity with least-privilege Foundry inference access and
-  Storage Table Data Contributor on the workload-state account. Application
-  configuration names this identity's client ID; application code never
-  requests tokens through the image-pull identity. Table RBAC is complete before
-  workload readiness.
+- A separate runtime identity with least-privilege access to the selected
+  transcription service and Storage Table Data Contributor on the workload-state
+  account. Application configuration names this identity's client ID; application
+  code never requests tokens through the image-pull identity. LiteLLM/OpenRouter
+  is the current generation boundary. Azure generation is only a future optional
+  managed-identity mode. Table RBAC is complete before workload readiness.
 - A managed daily expiry-cleanup Container Apps Job for expired `SecurityState`
   and `RateState` rows.
-- Foundry/Azure AI account, the mini-transcribe candidate deployment, and the
-  requested Luna deployment, only after budget and alerts exist.
+- The mini-transcribe candidate deployment, only after budget and alerts exist.
+  No Azure generation deployment is required by the current LiteLLM/OpenRouter
+  path.
 - Key Vault only for a credential that cannot use managed identity; the module stays disabled otherwise.
 - Optional VNet, private endpoints, private DNS, custom domain, and managed certificate after networking and DNS decisions are made.
 
 After a relay image is pushed, a provisional workload apply creates the candidate Container App with both identities assigned for their separate platform/runtime purposes, external HTTPS/WebSocket ingress, health probes, single revision mode, minimum one replica, development maximum one replica, explicit immutable image digest, and candidate heartbeat/session configuration. Container Apps `identitySettings` sets the ACR-pull identity lifecycle to `None` and the runtime identity to `Main`, so workload code cannot obtain an ACR-pull token. ADR 0005 verifies this negative control as well as successful runtime-identity access. If the candidate passes, the same resource is promoted as the dev workload; if it fails, it is destroyed and the immutable relay image is deployed to the next compute candidate.
 
-Current Microsoft guidance supports Foundry resources and model deployments through AzureRM and AzAPI Terraform providers. AzureRM exclusively owns resource groups, Terraform-state Storage, the separate workload-state Storage account and Tables, ACR, identities/RBAC, Log Analytics/Application Insights, Key Vault, budgets, the supported Foundry account, and `azurerm_cognitive_deployment` resources. The pinned provider owns the cleanup Container Apps Job when it exposes every required property; otherwise AzAPI owns that entire Job resource. AzureRM owns the relay Container App only if the pinned provider exposes required `identitySettings`; otherwise AzAPI owns the entire Container App at a pinned `Microsoft.App/containerApps` API version while AzureRM continues to own its environment and dependencies. AzAPI can also own a named Foundry project/capability gap. Providers never overlap ownership of one resource or its properties. Model name, model version, deployment SKU, and capacity remain variables because availability and quota are subscription/region dependent. [Terraform Foundry guidance](https://learn.microsoft.com/en-us/azure/ai-services/create-account-terraform), [Container Apps identity lifecycle](https://learn.microsoft.com/en-us/azure/container-apps/managed-identity)
+AzureRM/AzAPI own the selected transcription resources only where required by
+the realtime provider contract. The current generation path is LiteLLM through
+OpenRouter and has no Azure generation deployment prescription. A future Azure
+generation mode may be added only as an explicitly optional managed-identity
+mode; it must not become a prerequisite for the current plan. The pinned
+provider owns the cleanup Container Apps Job when it exposes every required
+property; otherwise AzAPI owns that entire Job resource. AzureRM owns the relay
+Container App only if the pinned provider exposes required `identitySettings`;
+otherwise AzAPI owns the entire Container App at a pinned
+`Microsoft.App/containerApps` API version while AzureRM continues to own its
+environment and dependencies. Providers never overlap ownership of one
+resource or its properties. [Container Apps identity lifecycle](https://learn.microsoft.com/en-us/azure/container-apps/managed-identity)
 
 Azure Container Apps supports WebSockets and managed identity, but it remains a candidate until ADR 0005 passes. The default HTTP ingress documentation lists a 240-second request timeout; heartbeats alone do not prove how an upgraded WebSocket behaves. The protocol matrix runs active v1 sessions to expected termination at 30 minutes, accepts no new turn at or after 29:30, and permits no unexplained close or audio gap. A heartbeat-only v1 session must close at five minutes with `4408`. Platform longevity is measured separately with a 35-minute synthetic transport probe that is explicitly not protocol v1 and is exempt from product inactivity/session enforcement. The gate also tests trusted-source mapping, state transactions/outage, concurrent-session limits, replica restart, single-revision rollout, graceful termination, reconnect/visible-abort behavior, warm latency, and cost with one minimum replica. If any required behavior fails, the same relay image and full host-specific matrix are tested on App Service or another documented candidate before compute is selected. [Container Apps ingress](https://learn.microsoft.com/en-us/azure/container-apps/ingress-overview), [managed identity and image pull](https://learn.microsoft.com/en-us/azure/container-apps/managed-identity-image-pull)
 
@@ -365,7 +437,9 @@ Terraform provisions ACR before the first relay image exists. The deployment seq
 2. Apply the dev foundation in dependency order: budget/alerts and observability;
    separate workload-state Storage with `SecurityState`/`RateState`; ACR;
    image-pull/runtime identities and ACR/Table RBAC; Container Apps environment;
-   managed daily expiry-cleanup Job; then Foundry and model deployments.
+   managed daily expiry-cleanup Job; then only the selected transcription
+   resources. LiteLLM/OpenRouter generation is configured separately and does
+   not require an Azure generation deployment.
 3. Build, test, scan, and push the relay image with an immutable digest.
 4. Provision a provisional candidate Container App workload with that digest and
    pre-created identities only after Table RBAC and state readiness pass.
@@ -375,7 +449,12 @@ Terraform provisions ACR before the first relay image exists. The deployment seq
 6. Promote the passing candidate as dev, or destroy it and test the next compute host with the same digest.
 7. Build the G2 package using the selected workload's `relay_origin` output for the Even network whitelist.
 
-Terraform outputs include only non-secret integration values: relay origin, ACR server, workload Table endpoint/names, cleanup Job name, Foundry endpoint, deployment names, Key Vault URI when enabled, observability identifiers, and managed-identity IDs. Application builds consume an explicit reviewed output artifact; they do not parse arbitrary Terraform state.
+Terraform outputs include only non-secret integration values: relay origin, ACR
+server, workload Table endpoint/names, cleanup Job name, selected transcription
+endpoint/deployment names, Key Vault URI when enabled, observability identifiers,
+and managed-identity IDs. LiteLLM/OpenRouter configuration is supplied through
+its reviewed provider configuration; application builds do not parse arbitrary
+Terraform state.
 
 ## Dependency and phase graph
 
@@ -440,7 +519,7 @@ already exists.
 Work:
 
 - Create npm workspace, strict TS configuration, lint/test/build commands, and dependency lock.
-- Implement protocol-v1 schemas and all size/limit/ACK/reconnect semantics from ADR 0001, binary-frame fixtures, target-language registry, classifier interface, deterministic mixed rejection, and mock events.
+- Implement protocol-v1 schemas and all size/limit/ACK/fresh-session reconnect semantics from ADR 0001, binary-frame fixtures, target-language registry, classifier interface, deterministic mixed rejection, and mock events.
 - Add symmetric English/Spanish/Turkish conformance fixtures.
 
 Exit evidence:
@@ -448,7 +527,7 @@ Exit evidence:
 - Both selected targets accept their own final fixtures and reject English and the other target.
 - Partial events cannot call generation by construction and test.
 - Single-source schemas, external artifacts, and golden binary fixtures are reproducible.
-- Malformed-size, integer-boundary, flood, replay-window, and non-resumable reconnect tests pass.
+- Malformed-size, integer-boundary, flood, live-connection duplicate, disconnect-cancellation, and fresh-session reconnect tests pass.
 
 ### Phase 2: four parallel construction lanes
 
@@ -457,8 +536,8 @@ The lanes have different entry gates. Infrastructure foundation starts as soon a
 - 2A Infrastructure: bootstrap state; budgets/alerts; observability; dedicated
   workload-state Storage with `SecurityState`/`RateState`; ACR; separate
   pre-created image-pull/runtime identities and ACR/Table RBAC; Container Apps
-  environment; managed daily expiry-cleanup Job; then Foundry deployments. A
-  provisional workload is deployed after an immutable relay image exists and
+  environment; managed daily expiry-cleanup Job; then only selected
+  transcription resources. A provisional workload is deployed after an immutable relay image exists and
   state/RBAC readiness passes, then ADR 0005 selects or rejects that host.
 - 2B G2 client: bridge lifecycle, input state machine, mocked audio sender, target selector, display scheduler, recovery, and simulator automation.
 - 2C Relay skeleton: authenticated WSS, protocol validation, mock transcription provider, acknowledgements, queue policy, language gate, and mock generation.
@@ -495,7 +574,10 @@ Exit evidence: physical G2 useful partial under 1.5 seconds p95, final under 1.2
 
 ### Phase 5: translation and response suggestions
 
-Work: integrate managed-identity Luna access, strict schemas, independent translation/suggestion events, target-language response checks, phrase limits, timeouts, and cost telemetry.
+Work: integrate the LiteLLM/OpenRouter generation path, strict schemas,
+independent translation/suggestion events, target-language response checks,
+phrase limits, timeouts, and cost telemetry. Keep Azure generation as an
+optional future managed-identity mode, not a current deployment dependency.
 
 Exit evidence: English translation arrives independently; two or three validated responses use the selected target language; malformed or late results cannot overwrite a newer turn.
 
@@ -547,11 +629,11 @@ Merge rules:
 | Terraform | `terraform fmt -check -recursive`, provider lock, `terraform validate`, static/security checks, reviewed saved plan |
 | Azure | Identity-only inference; active v1 termination at 30 minutes/no new turn at 29:30; heartbeat-only v1 `4408` at five minutes; separate exempt 35-minute transport probe; state/source/compute gates; statistically sized transcription trials; telemetry/cost records |
 | Physical G2 | p95 latency, audio cadence, BLE display behavior, R1/temples, suspension/recovery, private `.ehpk` |
-| Security | Generic pre-upgrade HTTP failures, unauthorized WSS rejection, expiry/replay, trusted-source mapping, fixed-window and 16,000-sample/second token-bucket races, no secrets or conversation content in any deployed sink |
+| Security | Generic pre-upgrade HTTP failures, unauthorized WSS rejection, expiry/replay, trusted-source mapping, durable at-most-8,000-sample reservation grants, local consumption with no refund, exact-ETag renewal-before-forward races and state-outage closure, no secrets or conversation content in any deployed sink |
 
 ## Phase 0 decision status
 
-`docs/phase-0-decisions.md` records the completed development decisions for the subscription, East US 2 region, model candidates, naming direction, operator pairing, local Azure CLI apply identity, Azure-provided ingress, target confirmation, start/stop/results interaction, duration limits, retention, workload state, and provisional compute gate. ADRs 0001, 0003, 0004, and 0005 are authoritative for implementation and remain `NEEDS WORK` until the new Sol re-review.
+`docs/phase-0-decisions.md` records the completed development decisions for the subscription, East US 2 region, model candidates, naming direction, operator pairing, local Azure CLI apply identity, Azure-provided ingress, target confirmation, start/stop/results interaction, duration limits, retention, workload state, and provisional compute gate. ADRs 0001, 0003, 0004, and 0005 are authoritative for implementation; ADR 0001 and ADR 0003 carry the corrected fresh-session and durable-state contract, while physical WebView evidence and the remaining ADR gates still control real-audio and paid deployment.
 
 The development cloud apply may proceed with local Azure CLI identity and Azure-provided ingress. CI federation, custom DNS, and private networking remain deliberately optional until a repository/zone and measured need exist. Every reviewed Terraform plan must set explicit budget thresholds and model capacity; no default silently spends the subscription credit.
 

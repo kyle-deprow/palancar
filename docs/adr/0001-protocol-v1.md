@@ -20,16 +20,19 @@ is disabled. One session has at most one active utterance. Unknown fields are
 rejected on inbound control objects unless a later schema explicitly marks an
 extension point.
 
-The first control message is exactly `session.start` for a ticket with new-session
-intent or exactly `session.resume` for a ticket bound to exact resume intent.
-Both messages declare protocol version `1`, wearer language `en`, one explicitly
-confirmed target language from the current registry, registry and
-`gatePolicyVersion`, client build, and common limit negotiation. Only
-`session.resume` carries session ID, utterance ID, client last-acknowledged
-offset, oldest retained offset, and next captured offset. The server rejects an
-unsupported version or target before the client opens the microphone.
+The first control message is exactly `session.start` for a ticket with
+new-session intent. It declares protocol version `1`, wearer language `en`, one
+explicitly confirmed target language from the current registry, registry and
+`gatePolicyVersion`, client build, and common limit negotiation. A session start
+never identifies or continues an earlier session or utterance. The server
+rejects an unsupported version or target before the client opens the microphone.
 `session.ready` may lower a negotiable limit but must never advertise a value
 above any hard v1 maximum.
+
+The earlier true-resume decision is superseded. Protocol v1 uses explicit
+fresh-session recovery: a disconnect aborts the active turn, clears retained PCM,
+transcript, translation, suggestions, and other results, cancels transcription
+and generation, and never replays or regenerates interrupted work.
 
 Only an accepted `transcript.final` revision may produce `translation.ready` or
 `suggestions.ready`. Segment revisions increase monotonically. Session,
@@ -69,23 +72,26 @@ exclusive sample offset accepted by the relay.
 | JSON control message | 16,384 UTF-8 bytes after fragment reassembly |
 | Audio payload | 3,200 bytes |
 | Unacknowledged audio | 8,000 samples / 500 milliseconds |
-| Client retained replay window | At most 8,000 unacknowledged samples |
+| Client retained live-connection duplicate window | At most 8,000 unacknowledged samples |
 | ACK cadence | Within each 100 milliseconds of accepted audio and on every flow-state change |
 | Utterance | 480,000 samples / 30 seconds |
 | Session | 30 minutes |
 | User inactivity | 5 minutes; transport heartbeat does not reset it |
 | Heartbeat | Server ping every 20 seconds; terminate after 10 seconds without pong |
 
-These transport limits are separate from the realtime audio-rate limit. For
-each installation/session, the relay enforces an original-input-sample token
-bucket that refills at 16,000 samples per second and has capacity 8,000 samples.
-Only the first acceptance of a sample range is charged; an exact idempotent
-duplicate replay is not charged again. Before forwarding newly accepted audio
-to a transcription provider, the relay conditionally updates the session bucket
-row in `RateState` using its ETag. State outage or exhausted conditional-update
-retries fail closed. The first overrun aborts the active turn; repeated or
-deliberate overrun closes the connection with `4408`. This rate bucket does not
-replace or relax the independent 8,000-sample unacknowledged/replay limit.
+These transport limits are separate from audio authorization. As defined by ADR
+0003, each installation/session/turn receives a durable `RateState` reservation
+grant for up to 8,000 original-input samples; grant capacity refills at 16,000
+original samples per second but never exceeds 8,000 reserved samples. The relay
+consumes that grant locally for newly accepted ranges; an exact duplicate within the live
+connection is not consumed again, and unused grant capacity is never refunded.
+When local consumption would exceed the current grant, an ETag-conditional
+renewal must durably succeed before the relay forwards any sample beyond the
+grant to a transcription provider. State outage or exhausted conditional-update
+retries produce no grant and fail closed. The first overrun aborts the active
+turn; repeated or deliberate overrun closes the connection with `4408`. The
+reservation grant does not replace or relax the independent 8,000-sample
+unacknowledged limit.
 
 The relay advertises `normal`, `pause`, or `abort` flow state. If the client
 would exceed the in-flight or local 500-millisecond queue limit, it stops audio
@@ -99,29 +105,38 @@ Reaching 30 seconds finalizes the valid accepted utterance audio. User actions
 reset inactivity; ping/pong and provider traffic do not. A heartbeat-only v1
 session therefore terminates for inactivity at five minutes with `4408`.
 
-## Idempotence, reconnection, and replay
+## Idempotence, disconnect, and fresh-session recovery
 
 `utterance.start`, `utterance.commit`, and `utterance.cancel` are idempotent for
 the same session epoch and utterance ID. Conflicting reuse is rejected. Commit
 or cancel for an earlier turn cannot affect the active turn.
 
-On socket loss the client immediately stops capture and retains only its bounded
-unacknowledged window. It obtains a new single-use ticket with exact resume intent
-and reports session ID, utterance ID, client last-acknowledged offset, oldest
-retained offset, and next captured offset. Resume succeeds only when the relay
-proves the same active session epoch and requests an offset in the inclusive
-range `[oldestRetainedOffset, nextCapturedOffset]`. The client then replays
-`[requestedOffset, nextCapturedOffset)`, which is validly empty when the
-requested offset equals the next captured offset. Otherwise both sides emit an
-explicit `utterance.aborted: non_resumable`, clear the turn, and start fresh. Replica or
-provider-state loss is non-resumable by design.
+On socket loss the client immediately stops capture, clears its local retained
+PCM, transcript, translation, suggestions, and pending results, and aborts the
+active turn. Independently, the relay's socket-close handler aborts all
+transcription and generation provider work and releases any unstarted execution
+claim; it does not rely on the client cleanup arriving. Interrupted audio or
+provider work is never replayed or regenerated. A bounded-jitter reconnect
+obtains a new single-use ticket with new-session intent, opens a new session,
+and advances the installation's session epoch. The client enters `Ready` only
+after that new session emits `session.ready`; it never presents results from the
+interrupted turn. The retained queue exists only for flow control and exact
+duplicate safety while the original connection is live.
+
+Generation authorization follows ADR 0003: an accepted target final receives an
+atomic ETag claim immediately before one provider call. Its opening lease is 10
+seconds; once the provider starts, the claim is consumed and has a 35-second
+active lease, renewed by the 20-second heartbeat. Lease expiry releases the
+unstarted or active execution lease, but a claim consumed at provider start is
+never refunded or retried. Duplicate finals reuse the existing claim outcome and
+make no second call; non-target finals create no claim.
 
 ## Control families
 
 The TypeBox schemas in `packages/contracts` are the runtime and TypeScript source
 of truth for:
 
-- `session.start`, `session.resume`, `session.ready`, `session.rejected`, and
+- `session.start`, `session.ready`, `session.rejected`, and
   `session.end`.
 - `utterance.start`, `utterance.commit`, `utterance.cancel`, and
   `utterance.aborted`.
@@ -163,21 +178,23 @@ fallback after its socket has upgraded.
 | 4429 | Rate limit |
 
 Close reasons are generic and contain no ticket, credential, identifier, or
-conversation text. A non-resumable utterance normally remains a typed abort and
-does not close an otherwise healthy session.
+conversation text. An aborted utterance normally remains a typed abort and does
+not close an otherwise healthy session.
 
 ## Verification
 
 Golden byte fixtures cover both target languages and every field boundary.
 Tests cover minimum/maximum and odd payloads, incorrect lengths, integer
 wraparound, fragmentation, unknown flags, duplicate/gap/overlap frames, stale
-IDs and revisions, flood and queue limits, exact retained replay, and mandatory
-abort when requested replay data is unavailable. Fuzzing also covers invalid
+IDs and revisions, flood and queue limits, live-connection duplicate handling,
+disconnect cancellation and clearing, fresh-session reconnect ordering, and the
+absence of replay or regeneration for interrupted work. Fuzzing also covers invalid
 UTF-8/JSON, nesting, compression attempts, and message-size checks after
-reassembly. Fake-clock tests cover the audio token bucket at exact refill and
-capacity boundaries, duplicate replay without double charge, process restart,
-concurrent ETag races, state outage, first-overrun turn abort, and repeated
-overrun closure.
+reassembly. Fake-clock tests cover durable audio-grant reservation and renewal
+boundaries, live-connection duplicates without double consumption, unused-grant
+non-refund, process restart, concurrent ETag races, state outage/no-grant
+behavior, generation claim/lease expiry, duplicate-final reuse, non-target
+no-claim behavior, first-overrun turn abort, and repeated overrun closure.
 
 ## Consequences
 
@@ -185,4 +202,5 @@ Protocol v1 favors explicit aborts over pretending recovery succeeded. Active
 resampler and provider state stays process-local, so replica loss loses the
 current turn but not protocol correctness. Any incompatible field, limit, close
 code, or mixed-language authorization change requires a new protocol version or
-an explicitly backward-compatible extension.
+an explicitly backward-compatible extension. This ADR's fresh-session recovery
+decision supersedes the prior true-resume proposal.

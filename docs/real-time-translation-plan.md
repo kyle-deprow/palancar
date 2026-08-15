@@ -3,6 +3,10 @@
 Status: Initial product and architecture planning
 Last updated: 2026-08-09
 
+Accepted ADRs and this active plan are normative. Historical `.codex` handoff
+documents are nonnormative working notes and cannot override an ADR or the
+active plan.
+
 ## Product objective
 
 Palancar is an Even Realities G2 application that helps an English-speaking wearer understand and respond during a conversation in another language.
@@ -28,14 +32,17 @@ Palancar is a visual aid only in the initial version. The G2 has no speaker, so 
 - Pin `@evenrealities/evenhub-cli` to `0.1.13` and use simulator `0.8.0`.
 - Capture audio with the G2 microphone through `audioControl(true, AudioInputSource.Glasses)`.
 - Use `gpt-4o-mini-transcribe-2025-12-15` as the first transcription model to benchmark.
-- Use the planned Azure AI Foundry `gpt-5.6-luna` deployment for English translation and contextual response suggestions.
+- Use LiteLLM/OpenRouter for the combined English translation and contextual
+  response completion. Azure generation is an optional future managed-identity
+  mode, not a current deployment prerequisite.
 - Use Terraform for all Azure infrastructure as code.
 - Configure each session with an explicit wearer language and one selected target language. The first release supports an English wearer with either Spanish or Turkish selected (`wearerLanguage: en`, `targetLanguage: es | tr`).
 - Send only accepted target-language turns into translation and response generation. Mixed-language turns are rejected in the first release until richer evidence is defined.
 - Treat a useful target-language partial visible on physical G2 within 1.5 seconds p95 of speech onset as the initial realtime acceptance threshold.
 - Keep Azure credentials and model access on the backend. No Azure secrets will be shipped in the G2 bundle.
 - Connect the Even App WebView to the backend over HTTPS and a secure WebSocket.
-- Keep the WebView-to-backend and backend-to-Foundry WebSockets warm for the listening session rather than reconnecting per utterance.
+- Keep the WebView-to-backend and selected transcription-provider connection
+  warm for the listening session rather than reconnecting per utterance.
 - Package the G2 application as an `.ehpk` for Even Hub distribution. Azure deployment is a separate backend deployment concern.
 
 The transcription model choice is provisional. We will test its accuracy, latency, language coverage, and cost with real G2 microphone audio before treating it as a production decision.
@@ -84,13 +91,17 @@ Azure Palancar backend
           |      - partial target-language transcript
           |      - final target-language utterance
           |
-          +--> gpt-5.6-luna
+          +--> LiteLLM --> OpenRouter
                  - English translation
                  - 2-3 contextual responses
                  - English and target-language text for each response
 ```
 
-The backend returns partial transcription events immediately. It sends the final transcript to Luna once the utterance is finalized. The English translation should be emitted to the client as soon as it is available, without waiting for all response suggestions. Luna returns validated structured data rather than display-formatted prose.
+The backend returns partial transcription events immediately. It sends the
+accepted final transcript through LiteLLM/OpenRouter once the utterance is
+finalized. The English translation should be emitted to the client as soon as
+it is available, without waiting for all response suggestions. The provider
+returns validated structured data rather than display-formatted prose.
 
 ## Initial interaction states
 
@@ -128,7 +139,8 @@ The backend returns partial transcription events immediately. It sends the final
 
 - Stop or pause microphone capture for the completed turn.
 - Preserve and display the final target-language transcript.
-- Request the English translation and response suggestions from Luna.
+- Request the English translation and response suggestions through
+  LiteLLM/OpenRouter.
 - Deliver the English translation before suggestions if the model response can be safely streamed or split without degrading correctness.
 - Show a compact progress state without discarding the transcript.
 
@@ -139,12 +151,16 @@ The backend returns partial transcription events immediately. It sends the final
 - Each choice contains concise English text and its target-language equivalent.
 - Swipe cycles the two or three choices; press starts the next listening turn.
 
-### Recovering or error
+### Fresh-session reconnect or error
 
-- Distinguish microphone permission, G2 connection, backend connection, transcription, and Luna failures.
+- Distinguish microphone permission, G2 connection, backend connection,
+  transcription, and LiteLLM/OpenRouter failures.
 - Keep error text short and actionable on the glasses.
 - Retry only operations that are safe to repeat.
-- Restore a usable Ready state whenever possible.
+- After a disconnect, abort the active turn, clear retained PCM/transcript/results,
+  cancel transcription and generation, obtain a new ticket with bounded jitter,
+  and restore `Ready` only after a new `session.ready`. Never replay or
+  regenerate interrupted work.
 
 ## Display strategy
 
@@ -164,8 +180,12 @@ The backend needs long-lived WebSocket support and low-latency streaming. The ex
 
 Expected Azure resources include:
 
-- A Foundry/OpenAI resource with `gpt-4o-mini-transcribe-2025-12-15` and `gpt-5.6-luna` deployments.
-- A dedicated pre-created user-assigned identity for ACR image pull and a separate runtime identity for Foundry access. Application code is configured to request only the runtime identity.
+- The selected Azure realtime transcription resource and deployment for
+  `gpt-4o-mini-transcribe-2025-12-15`.
+- A dedicated pre-created user-assigned identity for ACR image pull and a
+  separate runtime identity for transcription and Table access. The current
+  LiteLLM/OpenRouter generation path does not require an Azure generation
+  deployment; a future Azure generation mode must use managed identity.
 - A dedicated workload-state Storage account/module, separate from Terraform
   state, with shared-key access disabled, `SecurityState` and `RateState` Tables,
   and runtime Storage Table Data Contributor assigned before workload readiness.
@@ -176,6 +196,11 @@ Expected Azure resources include:
   custom DNS is deferred.
 - Resource-group budget and spending/anomaly alerts created before model
   deployments or the warm workload.
+
+`local-mock` is limited to loopback tests with mock transcription/generation and
+no paid endpoint. Any deployed or paid mode requires Azure Table-backed
+`SecurityState` and `RateState`; Table unavailability fails closed with no
+Azurite, in-memory, or other state fallback.
 
 Infrastructure will be represented as Terraform. It will use pinned provider versions, a committed dependency lock file, reusable modules, environment-specific variables, remote state with locking and encryption, and reviewed `terraform plan` output before apply. Service-to-service access should use managed identity and least-privilege RBAC.
 
@@ -199,9 +224,11 @@ Backend and model deployments must not depend on manual portal-only configuratio
 
 The foundation sequence is budget/alerts and observability; workload-state
 account/Tables; ACR and separate identities; ACR/Table RBAC; Container Apps
-environment and cleanup Job; then Foundry/model deployments. The relay workload
-is not ready until both Tables and runtime Table RBAC pass point-read and ETag
-update checks. Terraform state storage remains separate.
+environment and cleanup Job; then the selected transcription resources. The
+LiteLLM/OpenRouter generation path is configured separately and does not require
+an Azure generation deployment. The relay workload is not ready until both
+Tables and runtime Table RBAC pass point-read and ETag update checks. Terraform
+state storage remains separate.
 
 Container Apps promotion uses two different duration tests. Active protocol-v1
 sessions run to expected termination at 30 minutes, with no new turn at or after
@@ -216,13 +243,11 @@ The protocol should be versioned and distinguish binary audio from JSON control/
 
 Client to backend:
 
-- Send exactly `session.start` first for new intent or exactly `session.resume`
-  first for exact resume intent.
-- Both carry common `wearerLanguage`, explicitly confirmed `targetLanguage`,
-  protocol/registry/client negotiation, and `gatePolicyVersion`; the client does
-  not choose mixed policy. Server protocol-v1 mixed policy is `reject`.
-- Only `session.resume` carries session/utterance identity and
-  last-acknowledged, oldest-retained, and next-captured offsets.
+- Send exactly `session.start` first for new intent. It carries common
+  `wearerLanguage`, explicitly confirmed `targetLanguage`, protocol/registry/
+  client negotiation, and `gatePolicyVersion`; it never carries an earlier
+  session/utterance identity or retained-audio offsets. The client does not
+  choose mixed policy. Server protocol-v1 mixed policy is `reject`.
 - Start an utterance.
 - Send ordered binary PCM chunks with an absolute starting sample offset.
 - Commit or cancel an utterance.
@@ -244,11 +269,12 @@ Backend to client:
 
 Sequence numbers, absolute sample offsets, and utterance IDs will prevent late
 events from a previous turn from overwriting the current display and make
-accepted-audio gaps observable. Reconnection does not silently continue: a
-resume request is valid only in inclusive
-`[oldestRetainedOffset, nextCapturedOffset]` and replays
-`[requestedOffset, nextCapturedOffset)`, which may be empty. Otherwise the turn
-aborts visibly.
+accepted-audio gaps observable. The retained queue is only for flow control and
+exact duplicate safety within one live connection. Reconnection never continues
+an interrupted turn: the client aborts it, clears PCM/transcript/results, cancels
+transcription and generation, obtains a new one-time ticket, creates a new
+session with an advanced epoch, and waits for the new `session.ready` before
+returning to `Ready`.
 
 Before HTTP 101, authentication/audience/replay, origin, rate-limit, conflict,
 and state-outage failures use generic HTTP `401`, `403`, `409`, `429`, or `503`
@@ -285,18 +311,33 @@ The client/backend WebSocket carries PCM as binary rather than base64. Session, 
 
 The client queue must be bounded by audio duration, initially 500 ms. If that limit is exceeded, Palancar aborts the active utterance and surfaces a recoverable error. It must not silently drop audio or pause capture while presenting the resulting transcript as complete.
 
-Separately, the relay enforces a durable original-input-sample token bucket per
-installation/session: refill 16,000 samples/second and capacity 8,000. It charges
-only first acceptance, not exact duplicate replay, and conditionally updates the
-`RateState` session row before provider forwarding. State outage fails closed;
-first overrun aborts the turn and repeated/deliberate overrun closes `4408`.
-This is not the 8,000-sample unacknowledged/replay limit.
+Separately, the relay enforces durable `RateState` audio authorization through
+reservation grants of up to 8,000 original 16 kHz samples per
+installation/session/turn. Grant capacity refills at 16,000 original samples
+per second but never exceeds 8,000 reserved samples. The relay consumes the grant locally; exact
+duplicates within the live connection do not consume it, and unused grant
+capacity is never refunded. Renewal must durably succeed with an ETag before
+provider forwarding beyond the current grant. State outage creates or renews
+no grant and fails closed. This is not the 8,000-sample unacknowledged limit.
 
-### Backend normalization and Foundry append events
+Disconnect cleanup has independent owners. The client stops capture and clears
+local PCM, transcript, translation, suggestions, and pending results. Relay
+socket close independently aborts transcription and generation providers and
+releases unstarted execution claims. Reconnect is fresh-session only and is
+limited per installation in a rolling recovery window.
 
-The candidate Foundry Realtime transcription contract requires PCM16 at 24 kHz, mono, little-endian. For that adapter, G2's 16 kHz audio passes through a stateful streaming resampler; resampling each callback independently would create boundary artifacts. Resampler state continues across all frames in the active utterance. A fallback provider such as Azure Speech can advertise native 16 kHz input and bypass this normalization.
+### Backend normalization and Azure Realtime append events
 
-The Foundry Realtime adapter keeps one resampler state per active utterance and flushes/resets it only at a confirmed utterance boundary. At 24 kHz, its initial transport targets contain:
+The candidate Azure Realtime transcription contract requires PCM16 at 24 kHz,
+mono, little-endian. For that adapter, G2's 16 kHz audio passes through a
+stateful streaming resampler; resampling each callback independently would
+create boundary artifacts. Resampler state continues across all frames in the
+active utterance. A fallback provider such as Azure Speech can advertise native
+16 kHz input and bypass this normalization.
+
+The Azure Realtime adapter keeps one resampler state per active utterance and
+flushes/resets it only at a confirmed utterance boundary. At 24 kHz, its
+initial transport targets contain:
 
 - 40 ms: 960 samples or 1,920 bytes.
 - 80 ms: 1,920 samples or 3,840 bytes.
@@ -354,7 +395,7 @@ Initial p95 budget, measured from speech onset to useful target-language text vi
 | Enough acoustic evidence for first lexical output | 350 ms | 450 ms | fixture speech onset to model-eligible audio duration |
 | Client accumulation | 60 ms | 100 ms | G2 callback receipt to WebSocket send |
 | Client to backend | 50 ms | 100 ms | client send to backend receive |
-| Resample, queue, and Foundry append | 20 ms | 40 ms | backend receive to upstream send |
+| Resample, queue, and Azure Realtime append | 20 ms | 40 ms | backend receive to upstream send |
 | Recognition to useful delta | 450 ms | 550 ms | eligible upstream audio to usable delta |
 | Backend and client relay | 40 ms | 60 ms | Azure event receive to WebView receipt |
 | Coalescing, bridge, and BLE display | 160 ms | 200 ms | WebView receipt to visible physical display |
@@ -419,7 +460,9 @@ The gate is driven by a versioned target-language registry rather than Spanish- 
   Spanish must not accept Turkish turns.
 - An uncertain segment is held until finalization or additional context; it cannot generate suggested responses.
 - A mixed English/target-language segment is rejected from generation in the first release because a single language label cannot prove how much selected-target content it contains. Future acceptance requires calibrated per-language span/probability evidence and symmetric Spanish/Turkish fixtures.
-- Provisional probable-target-language text may be displayed for realtime feedback, but only the authoritative final gate decision can invoke Luna.
+- Provisional probable-target-language text may be displayed for realtime
+  feedback, but only the authoritative final gate decision can invoke
+  LiteLLM/OpenRouter.
 - Raw audio is streamed to transcription because language cannot be reliably known before recognition. The gate controls downstream text and model calls; it does not pretend to filter the microphone signal itself.
 
 Confidence thresholds are versioned server configuration per target language rather than client constants. An initial `0.80` value is only a benchmark candidate for each language. If the selected transcription API does not return reliable language metadata, the backend will use a small language-identification component on finalized text and measure false-accept and false-reject rates separately for Spanish and Turkish. Model prompting or a configured source-language hint can bias recognition toward the selected language, but it is not treated as an enforcement boundary. The spike compares automatic-language transcription against `es`- and `tr`-hinted sessions because a hard hint could incorrectly transform or accept English speech.
@@ -431,14 +474,14 @@ Language-gate acceptance criteria for the English/Spanish and English/Turkish pr
 - At least 95% of fixtures with `supported_unselected` decisions are prevented
   from reaching translation and suggestion generation.
 - Mixed-language turns are deterministically rejected from generation in the first release.
-- No provisional revision triggers a Luna request.
+- No provisional revision triggers a LiteLLM/OpenRouter request.
 - Every downstream request records the utterance ID, final transcript revision,
   detected language, confidence when available, and gate-policy version without
   logging audio or conversation content in any deployed sink.
 
-## Luna result contract
+## LiteLLM/OpenRouter result contract
 
-The initial Luna response should contain data equivalent to:
+The initial LiteLLM/OpenRouter response should contain data equivalent to:
 
 ```json
 {
@@ -456,11 +499,14 @@ The initial Luna response should contain data equivalent to:
 
 The backend will validate this structure, limit response count to three, constrain phrase length for the G2 display, and reject malformed model output. The exact schema will be versioned when implementation begins.
 
-For interactive latency, Luna should initially use standard mode with little or no reasoning and a small output budget. We will measure quality before increasing reasoning effort.
+For interactive latency, LiteLLM/OpenRouter should initially use a small output
+budget and the configured low-latency model. We will measure quality before
+changing model or reasoning settings.
 
 ## Cost baseline
 
-Current public list-price planning estimates, excluding backend compute and Luna usage:
+Current public list-price planning estimates, excluding backend compute and
+LiteLLM/OpenRouter usage:
 
 - `gpt-4o-mini-transcribe`: approximately $0.003 per audio minute or $0.18 per audio hour.
 - `gpt-4o-transcribe`: approximately $0.006 per audio minute or $0.36 per audio hour.
@@ -470,7 +516,8 @@ The mini-transcribe estimate is token-based and must be validated against actual
 
 ## Security and privacy requirements
 
-- Never put Foundry keys, deployment credentials, or reusable Azure access tokens in the WebView bundle.
+- Never put provider keys, deployment credentials, or reusable Azure access
+  tokens in the WebView bundle.
 - Authenticate the Palancar client to the backend before accepting audio.
 - Use TLS for all production HTTP and WebSocket traffic.
 - Prefer managed identity between the backend and Azure AI services.
@@ -483,6 +530,17 @@ The mini-transcribe estimate is token-based and must be validated against actual
   deployed telemetry and evidence paths.
 - Add abuse controls, request limits, session-duration limits, and cost budgets.
 - Treat spoken content as potentially sensitive user data.
+
+Generation authorization is durable `RateState` state, not an in-process guard.
+Only an accepted `target` final can create a row. Immediately before one
+LiteLLM/OpenRouter provider call, the relay takes one atomic ETag claim keyed by
+session epoch, utterance, accepted revision, target, gate-policy version, and
+transcript hash. Duplicate finals reuse the existing consumed claim and make no
+second call; non-target finals create no claim. The opening lease is 10 seconds,
+provider start consumes it permanently, the active lease is 35 seconds, and a
+20-second heartbeat renews it. Lease expiry releases an unstarted or active
+execution lease but never refunds or retries a consumed call. The row records
+the model-attempt and turn counters.
 
 ## Validation strategy
 
@@ -513,9 +571,9 @@ The mini-transcribe estimate is token-based and must be validated against actual
 - Stream generated synthetic non-conversation 16 kHz PCM fixtures through the
   real backend.
 - Measure first-partial, final-transcript, translation, and total-result latency.
-- Verify structured Luna output and malformed-output recovery.
+- Verify structured LiteLLM/OpenRouter output and malformed-output recovery.
 - Verify exact `english`, `target`, `supported_unselected`, `mixed`,
-  `unsupported`, and `uncertain` decisions before Luna invocation.
+  `unsupported`, and `uncertain` decisions before LiteLLM/OpenRouter invocation.
 - Assert that no provisional transcript revision can trigger translation or suggestions.
 - Track token usage and estimated cost per audio hour.
 
@@ -537,12 +595,13 @@ Simulator success alone is not release evidence.
 1. Use the completed Phase 0 development decisions for cloud preflight,
    operator pairing, retention, start/stop, TargetSelection, Results, and
    duration limits; production CIAM/CI/DNS/private networking remain deferred.
-2. Build the language registry/gate, then freeze protocol limits, authentication ticket transport, acknowledgements, recovery, and backpressure behavior.
-3. In parallel, build the mocked G2 client, relay skeleton, Terraform dev foundation, and transcription/replay evidence tooling against the frozen contracts.
+2. Build the language registry/gate, then freeze protocol limits, authentication ticket transport, acknowledgements, fresh-session reconnect, and backpressure behavior.
+3. In parallel, build the loopback-only mocked G2 client and relay, the Terraform dev foundation, and metadata-only transcription evidence tooling against the frozen contracts.
 4. Push an immutable relay image and deploy a provisional compute candidate; run the compute-host ADR before promotion. In parallel, run exploratory and statistically sized transcription spikes using in-memory physical-G2 speech that is discarded after scoring.
 5. Record the selected compute host and transcription provider, or test App Service/Azure Speech fallbacks when a candidate fails.
 6. Integrate the selected transcription adapter into the authenticated end-to-end G2/relay slice with partial/final display updates and language gating.
-7. Integrate Luna translation and structured response suggestions, delivering translation independently when possible.
+7. Integrate LiteLLM/OpenRouter translation and structured response suggestions,
+   delivering translation independently when possible.
 8. Validate with physical G2/R1 hardware across English, Spanish, and Turkish and collect metadata-only latency, accuracy, gate, and cost evidence.
 9. Harden already-present authentication, privacy, observability, recovery, packaging, deployment, and operations controls.
 
@@ -571,7 +630,9 @@ Detailed protocol, authentication, retention, and compute decisions are in ADRs 
 ## Remaining measured decisions
 
 - ADR 0002 must select mini-transcribe or Azure Speech from physical Spanish and Turkish latency, accuracy, boundary, and gate evidence.
-- The English translation and suggestion p95 targets will be frozen after the first Luna integration benchmark rather than guessed before measurement.
+- The English translation and suggestion p95 targets will be frozen after the
+  first LiteLLM/OpenRouter integration benchmark rather than guessed before
+  measurement.
 - Initial responses prioritize concise, polite, contextually likely phrases. Tone presets remain deferred.
 - Custom DNS, private networking, and CI federation remain optional until their owning repository/zone and operational need are known.
 

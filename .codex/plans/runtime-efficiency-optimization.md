@@ -15,7 +15,8 @@ configuration-consistent and tested.
 
 ## Guardrails
 
-- Luna implements only the bounded slices below with explicit file ownership.
+- Delegated workers implement only the bounded slices below with explicit file
+  ownership.
 - Sol reviews every meaningful slice. No slice is committed until Sol reports
   `READY` after any required fix loop.
 - The parent agent owns integration tests, Terraform plans/applies, Azure
@@ -26,9 +27,13 @@ configuration-consistent and tested.
   serialized display updates, system-confirmed exit, and cleanup behavior.
 - Do not claim physical-G2 latency or release readiness without hardware
   evidence.
-- Do not enable a paid endpoint before authenticated ticket issuance and
-  persisted rate enforcement are connected or an explicitly isolated smoke
-  configuration is used.
+- Do not enable a paid endpoint before authenticated new-session ticket issuance,
+  Azure Table-backed durable rate enforcement, and generation authorization are
+  connected. `local-mock` is loopback-only with mock providers and no paid
+  endpoint; Azure Table is mandatory for paid/deployed modes with no fallback.
+- Historical `.codex` handoff documents are nonnormative working notes; they
+  cannot override accepted ADRs or this active plan and are out of scope for
+  this correction.
 
 ## Slice 1: one-call cancellable generation with staged delivery
 
@@ -208,30 +213,32 @@ Requirements:
   initial target is 60 ms / 1,920 bytes at 16 kHz S16LE mono and never exceeds
   negotiated maximum payload bytes.
 - The effective target is the largest even byte count no greater than 1,920,
-  the negotiated payload maximum, or the negotiated replay/backpressure sample
+  the negotiated payload maximum, or the negotiated live-queue/backpressure sample
   limits. The framer owns callback bytes immediately and buffers complete
   samples until that target.
-- Pending complete samples count against utterance, replay, and unacknowledged
+- Pending complete samples count against utterance, live-connection queue, and unacknowledged
   limits before queue mutation. Failed pushes are atomic, and captured and
   encoded high-water offsets are tracked separately.
 - Commit flush emits every remaining complete sample before the commit control
   message. An odd trailing byte sends its even prefix, visibly cancels/aborts,
   and never sends `utterance.commit`; repeated flushes are empty and idempotent.
-- Replay materializes an even pending tail once without changing the captured
-  high-water and remains byte-for-byte deterministic. ACKs remain valid only at
-  encoded frame boundaries.
+- Live-connection duplicate handling materializes an even pending tail once
+  without changing the captured high-water and remains byte-for-byte
+  deterministic. ACKs remain valid only at encoded frame boundaries.
 - Derive the sample-driven ACK threshold as
-  `max(1, min(16 * ackIntervalMs, maxRetainedReplaySamples,
+  `max(1, min(16 * ackIntervalMs, maxRetainedLiveQueueSamples,
   maxUnacknowledgedSamples))`; the default is 100 ms / 1,600 samples. Emit a
   normal ACK only after successful transcription acceptance crosses the
-  threshold. Exact duplicates and valid recovery/commit boundaries may force
+  threshold. Exact duplicates within the live connection and valid commit
+  boundaries may force
   an immediate ACK; malformed, conflicting, stale, gap, provider-failed, or
   high-water-mismatch paths never ACK.
-- Preserve the 500 ms replay/backpressure bound, exact sample offsets,
-  duplicate detection, and deterministic replay.
+- Preserve the 500 ms flow-control bound, exact sample offsets, live-connection
+  duplicate detection, and deterministic framing. Do not retain audio for
+  cross-connection recovery.
 - Remove the redundant transport input copy and send isolated queue-returned
-  frame bytes directly. Retain ownership copies at the SDK callback and replay
-  retention boundaries, and do not share relay duplicate fingerprints with
+  frame bytes directly. Retain ownership copies at the SDK callback and
+  live-connection duplicate boundaries, and do not share relay duplicate fingerprints with
   provider-forward buffers.
 - Do not add timer-based ACK/flush wakeups, cross-cutting telemetry plumbing, or
   weaken resampler ownership semantics. Treat 60 ms as a configurable rollout
@@ -272,18 +279,92 @@ Requirements:
   deterministic protocol double and record the exact external deployment
   blocker; do not fabricate a live success.
 
-## Slice 5: authenticated spend controls and recovery
+Reviewed Azure Realtime contract (2026-08-13):
 
-Expected scope after Sol design review:
+- Use the GA Entra-authenticated endpoint
+  `/openai/v1/realtime?intent=transcription`, configure a transcription session
+  with the Azure deployment name, `turn_detection: null`, automatic language,
+  and 24 kHz mono PCM. Never send the selected target as a language hint.
+- Own 16-to-24 kHz stateful resampling in the transcription layer so all
+  Palancar protocol offsets remain original 16 kHz sample offsets.
+- Open/configure one provider socket before a Palancar session is considered
+  ready. Append audio and commit every 9,600 original samples (600 ms) without
+  timers, then commit any final tail on the G2 boundary.
+- Maintain a FIFO commit ledger that binds `input_audio_buffer.committed` item
+  IDs to original sample intervals. Assemble delta/completed items in commit
+  order into one cumulative transcript; provider IDs never leave the adapter.
+- Bound internal queued provider audio plus WebSocket buffered bytes. Clearing
+  uncommitted audio is sufficient only before a provider commit; cancellation
+  with pending committed work closes the socket, advances its epoch, suppresses
+  late events, and reconnects before another turn.
+- Mini-transcribe token log probabilities are ASR confidence, not calibrated
+  language evidence. Use an independent classifier that never receives the
+  selected target. Missing, unhealthy, short, mixed, or uncertain classifier
+  output suppresses partials and makes zero generation calls.
+- Classify only on meaningful completed increments/finalization, not every
+  token delta. Spanish and Turkish policies remain registry data.
+- A parent-owned metadata spike must verify nested session configuration,
+  600 ms delta behavior, event ordering, Entra scope/expiry, logprob shape, and
+  close/cancellation behavior before live inference is enabled.
 
-- replace unconditional development ticket issuance in deployed paid mode
-- connect persistent ticket consumption and sample/token rate state
-- implement client/relay resume or explicitly abort retained turns without
-  continuing paid work
-- add abuse, replay, expiry, cancellation, and state-outage tests
+Current external gate:
+
+- The account model catalog lists `gpt-4o-mini-transcribe` `2025-12-15` in
+  East US 2, but the inspected Terraform creation still fails with Azure
+  support code `715-123420` (unusual-activity restriction). Deterministic
+  implementation may proceed; live transcription cannot be claimed until the
+  support restriction is removed.
+
+## Slice 5: authenticated spend controls and fresh-session recovery
+
+Owned contract requirements:
+
+- Replace unconditional development ticket issuance in every deployed paid
+  mode. Tickets are one-time and new-session-only; consuming one atomically
+  binds the installation, credential version, audience, and a newly advanced
+  session epoch in Azure Table `SecurityState`.
+- Keep pairing, credential rotation/revocation, ticket consumption, session
+  epochs, and rate limits in the persistent ADR 0003 state design. `local-mock`
+  may use Azurite/fake-clock state only for loopback tests with mock providers
+  and no paid endpoint. Paid/deployed modes require Azure Table and fail closed
+  on Table outage; no in-memory or alternate-store fallback is allowed.
+- Before accepting paid audio, create or renew a durable Azure Table `RateState`
+  reservation grant for up to 8,000 original 16 kHz samples. Grant capacity
+  refills at 16,000 original samples per second but never exceeds 8,000 reserved
+  samples. The relay consumes the grant locally for newly accepted ranges; exact duplicates are free only
+  within the same live connection, and unused grant capacity is never refunded.
+  Renewal must durably succeed with an ETag before provider forwarding beyond
+  the grant. A state outage creates or renews no grant and fails closed.
+- On any disconnect, the client stops capture and clears local PCM, transcript,
+  translation, suggestions, and pending results. Independently, relay socket
+  close aborts transcription and generation providers and releases unstarted
+  execution claims. Never replay audio, continue a provider turn, or regenerate
+  an interrupted result. Reconnect uses bounded jitter to obtain a new one-time
+  ticket, create a new session, and advance the epoch; the client becomes
+  `Ready` only after the new `session.ready`. Reconnect limits are scoped per
+  installation in a rolling recovery window and are not reset by the new epoch.
+- Authorize generation only for the current live session epoch and utterance
+  whose final transcript has an accepted target-language gate decision. A
+  non-target final creates no authorization row. Immediately before one
+  provider call, atomically claim one durable Azure Table generation-
+  authorization row with an ETag, keyed by session epoch, utterance, accepted
+  final revision, target language, gate-policy version, and transcript hash.
+  The row persists model-attempt and turn counters. Duplicate finals reuse the
+  existing consumed claim and never create another request. The opening lease is
+  10 seconds; provider start consumes the claim permanently, the active lease
+  is 35 seconds, and the 20-second heartbeat renews it. Lease expiry releases
+  an unstarted or active execution lease, but never refunds or retries a
+  consumed provider call. Table outage, cancellation, revocation, stale epoch,
+  or failed gate prevents authorization.
+- Add abuse, single-use ticket, expiry, audience, epoch, grant-reservation,
+  duplicate-within-live-connection, cancellation, disconnect-cleanup,
+  generation-authorization, duplicate-final, revocation, and state-outage
+  tests. Prove `session.ready` precedes `Ready` after fresh reconnect and that
+  interrupted turns produce zero replayed audio and zero regenerated requests.
 
 No paid production-mode generation or transcription deployment is accepted
-until this slice is ready.
+until every requirement in this slice is implemented and verified against
+Azure Table; a local mock is not a paid-mode fallback.
 
 ## Slice 6: Terraform efficiency and provider correctness
 
@@ -291,7 +372,7 @@ Owned files:
 
 - `infra/modules/container-app-workload/**`
 - `infra/environments/dev/**`
-- affected Foundry/identity/Key Vault module files only if required
+- affected transcription identity/Key Vault module files only if required
 - `apps/litellm-proxy/**` only if needed for managed-identity authentication
 
 Requirements:
@@ -301,8 +382,9 @@ Requirements:
 - Keep one active replica maximum until session ownership is externalized.
 - OpenRouter generation must not require unrelated Azure generation
   deployments.
-- Azure generation mode must match the Foundry local-auth policy, preferring
-  managed identity/AAD instead of an API key.
+- Azure generation is an optional future mode only; if enabled, it uses managed
+  identity/AAD instead of an API key. The current generation path is
+  LiteLLM/OpenRouter and requires no Azure generation deployment.
 - Remove static helper processes or readiness work only when equivalent
   configuration attestation remains.
 - Terraform plans must be saved and JSON-inspected before apply; no unrelated
@@ -322,8 +404,8 @@ Requirements:
 - deployed `/healthz` and `/readyz`
 - one isolated real OpenRouter request proving exactly one upstream generation
   request for one accepted target turn
-- restore non-paid/mock or scale-to-zero baseline after smoke unless the user
-  explicitly requests a paid always-on deployment
+- restore the loopback-only non-paid `local-mock` or scale-to-zero baseline
+  after smoke unless the user explicitly requests a paid always-on deployment
 - clean worktree and reviewed commits for every slice
 
 Physical G2 microphone timing, display latency, background recovery, and
