@@ -35,11 +35,6 @@ variable "deployments" {
   }))
 
   validation {
-    condition     = length(var.deployments) == 2
-    error_message = "deployments must contain exactly two distinctly named entries."
-  }
-
-  validation {
     condition = alltrue([
       for deployment_name, deployment in var.deployments :
       can(regex("^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$", deployment_name)) &&

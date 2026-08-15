@@ -143,7 +143,7 @@ variable "retention_in_days" {
 }
 
 variable "foundry_deployments" {
-  description = "Required reviewed map of exactly two pinned OpenAI model deployments."
+  description = "Reviewed map of pinned OpenAI model deployments."
   type = map(object({
     model_name             = string
     model_version          = string
@@ -152,11 +152,6 @@ variable "foundry_deployments" {
     capacity               = number
     version_upgrade_option = string
   }))
-
-  validation {
-    condition     = length(var.foundry_deployments) == 2
-    error_message = "foundry_deployments must contain exactly two distinctly named entries."
-  }
 
   validation {
     condition = alltrue([

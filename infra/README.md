@@ -81,9 +81,43 @@ terraform -chdir=infra/environments/dev plan
 ```
 
 The dev plan requires live first-of-month UTC budget dates, at least one real
-notification address, and an explicit reviewed two-entry Foundry deployment
-map. `owner@example.com` is retained only in `terraform.tfvars.example` and is
+notification address, and an explicit reviewed Foundry deployment map.
+`owner@example.com` is retained only in `terraform.tfvars.example` and is
 deliberately rejected by live validation.
+
+## Saved-plan and Foundry plan guard
+
+Always inspect the exact saved plan before applying it. The guard reads only
+Terraform's JSON plan from standard input and never prints plan values:
+
+```sh
+terraform -chdir=infra/environments/dev plan \
+  -out=/tmp/palancar-dev.tfplan
+terraform -chdir=infra/environments/dev show -json /tmp/palancar-dev.tfplan \
+  | node infra/scripts/assert-dev-plan.mjs --mode=full-deploy
+terraform -chdir=infra/environments/dev apply /tmp/palancar-dev.tfplan
+```
+
+For the isolated Foundry model spike, save a targeted plan and require the
+single pinned transcription deployment create:
+
+```sh
+terraform -chdir=infra/environments/dev plan \
+  -target='module.foundry.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"]' \
+  -out=/tmp/palancar-foundry.tfplan
+terraform -chdir=infra/environments/dev show -json /tmp/palancar-foundry.tfplan \
+  | node infra/scripts/assert-dev-plan.mjs --mode=model-spike
+terraform -chdir=infra/environments/dev apply /tmp/palancar-foundry.tfplan
+```
+
+`model-spike` allows exactly one create action at the pinned
+`gpt-4o-mini-transcribe` deployment and no other mutations. `full-deploy`
+allows only that deployment create/no-op and the relay Container App
+update/no-op; it rejects deletes, replacements, failed checks, resource drift,
+the retired `gpt-5-6-luna` deployment, and other mutations. When the saved
+plan includes the Container App scale configuration, the guard requires
+`minReplicas = 0` and `maxReplicas = 1`. Keep saved plans local and apply the
+same file that was inspected.
 
 ## State recovery verification
 

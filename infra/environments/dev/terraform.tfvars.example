@@ -26,14 +26,6 @@ foundry_deployments = {
     capacity               = 1
     version_upgrade_option = "NoAutoUpgrade"
   }
-  "gpt-5-6-luna" = {
-    model_name             = "gpt-5.6-luna"
-    model_version          = "2026-07-09"
-    model_format           = "OpenAI"
-    sku_name               = "GlobalStandard"
-    capacity               = 1
-    version_upgrade_option = "NoAutoUpgrade"
-  }
 }
 
 # Optional LiteLLM sidecar. Keep these disabled/empty for the default mock relay.
@@ -54,6 +46,6 @@ litellm_memory               = "0.5Gi"
 # image must be the built Palancar LiteLLM proxy image, not an upstream base image.
 # enable_litellm_sidecar = true
 # litellm_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-litellm-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-# litellm_upstream_model = "openrouter/openai/gpt-5.6-luna"
+# litellm_upstream_model = "openrouter/openai/gpt-4o-mini"
 # openrouter_api_key_secret_url = "https://<vault-name>.vault.azure.net/secrets/openrouter-api-key/<version>"
 # litellm_master_key_secret_url = "https://<vault-name>.vault.azure.net/secrets/litellm-master-key/<version>"
