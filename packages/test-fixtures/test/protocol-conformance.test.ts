@@ -8,6 +8,7 @@ import {
   AudioFrameError,
   BINARY_MAGIC,
   ClientControlMessageSchema,
+  ControlMessageSchema,
   DEFAULT_NEGOTIATED_LIMITS,
   ErrorEnvelopeSchema,
   HttpErrorResponseSchema,
@@ -34,12 +35,16 @@ import {
   TranscriptFinalSchema,
   TranscriptPartialSchema,
   TranslationReadySchema,
+  UtteranceAbortedSchema,
   WEBSOCKET_SUBPROTOCOL,
   assertClientControlMessage,
   assertControlMessage,
   assertInstallationCredentialResponse,
   assertRotationConfirmationResponse,
   assertServerControlMessage,
+  assertErrorEnvelope,
+  assertSessionTicketRequest,
+  assertUtteranceAborted,
   createWebSocketSubprotocols,
   decodeAudioFrame,
   encodeAudioFrame,
@@ -54,11 +59,11 @@ import {
   isRotationConfirmationResponse,
   isServerControlMessage,
   isSessionReady,
-  isSessionResume,
   isSessionTicketRequest,
   isSessionTicketResponse,
   isTranscriptFinal,
   isTranscriptPartial,
+  isUtteranceAborted,
   type AudioFrameInput
 } from '@palancar/contracts';
 import {
@@ -84,10 +89,6 @@ import {
   PAIRING_REDEMPTION_REQUEST,
   PROTOCOL_CLIENT_FIXTURES,
   PROTOCOL_SERVER_FIXTURES,
-  RESUMED_SESSION_JOURNEY,
-  RESUMED_SESSION_READY,
-  RESUMED_SESSION_RESUME,
-  RESUME_SESSION_TICKET_REQUEST,
   ROTATION_BEGIN_RESPONSE,
   ROTATION_CONFIRMATION_RESPONSE,
   SESSION_REJECTED_FIXTURES,
@@ -123,7 +124,6 @@ describe('complete controlled message matrix', () => {
     expect(new Set(PROTOCOL_CLIENT_FIXTURES.map((message) => message.type))).toEqual(
       new Set([
         'session.start',
-        'session.resume',
         'utterance.start',
         'utterance.commit',
         'utterance.cancel',
@@ -193,14 +193,11 @@ describe('complete controlled message matrix', () => {
     }
   });
 
-  it('includes valid new and exact-resume journeys', () => {
+  it('includes the valid new-only journey', () => {
     expect(NEW_SESSION_JOURNEY.request).toBe(NEW_SESSION_START);
     expect(NEW_SESSION_JOURNEY.ready).toBe(NEW_SESSION_READY);
-    expect(RESUMED_SESSION_JOURNEY.request).toBe(RESUMED_SESSION_RESUME);
-    expect(RESUMED_SESSION_JOURNEY.ready).toBe(RESUMED_SESSION_READY);
     expect(isClientControlMessage(NEW_SESSION_JOURNEY.request)).toBe(true);
-    expect(isSessionResume(RESUMED_SESSION_JOURNEY.request)).toBe(true);
-    expect(isSessionReady(RESUMED_SESSION_JOURNEY.ready)).toBe(true);
+    expect(isSessionReady(NEW_SESSION_JOURNEY.ready)).toBe(true);
   });
 });
 
@@ -293,24 +290,12 @@ describe('strict schema and semantic boundaries', () => {
         highestContiguousExclusiveOffset: boundary,
         requestedReplayOffset: boundary
       })).toBe(true);
+      expect(isSessionReady(NEW_SESSION_READY)).toBe(true);
       expect(isSessionReady({
-        ...RESUMED_SESSION_READY,
+        ...NEW_SESSION_READY,
         requestedReplayOffset: boundary
-      })).toBe(true);
+      })).toBe(false);
     }
-
-    expect(isSessionResume({
-      ...RESUMED_SESSION_RESUME,
-      oldestRetainedOffset: 472_000,
-      clientLastAcknowledgedOffset: 480_000,
-      nextCapturedOffset: 480_000
-    })).toBe(true);
-    expect(isSessionResume({
-      ...RESUMED_SESSION_RESUME,
-      oldestRetainedOffset: 471_999,
-      clientLastAcknowledgedOffset: 480_000,
-      nextCapturedOffset: 480_000
-    })).toBe(false);
 
     expect(isClientControlMessage({
       ...NEW_SESSION_UTTERANCE_COMMIT,
@@ -330,8 +315,13 @@ describe('strict schema and semantic boundaries', () => {
       requestedReplayOffset: 10_001
     })).toBe(false);
     expect(isSessionReady({
-      ...RESUMED_SESSION_READY,
+      ...NEW_SESSION_READY,
       requestedReplayOffset: 480_001
+    })).toBe(false);
+    expect(isSessionReady({
+      ...NEW_SESSION_READY,
+      result: 'resumed',
+      requestedReplayOffset: 0
     })).toBe(false);
   });
 
@@ -359,7 +349,18 @@ describe('authentication and semantic timestamps', () => {
     );
     expect(isInstallationCredentialResponse(INSTALLATION_CREDENTIAL_RESPONSE)).toBe(true);
     expect(Value.Check(SessionTicketRequestSchema, NEW_SESSION_TICKET_REQUEST)).toBe(true);
-    expect(Value.Check(SessionTicketRequestSchema, RESUME_SESSION_TICKET_REQUEST)).toBe(true);
+    expect(Value.Check(SessionTicketRequestSchema, {
+      protocolVersion: 1,
+      intent: 'resume',
+      sessionId: '11111111-1111-4111-8111-111111111111'
+    })).toBe(false);
+    const legacyResumeTicket = {
+      protocolVersion: 1,
+      intent: 'resume',
+      sessionId: '11111111-1111-4111-8111-111111111111'
+    } as const;
+    expect(isSessionTicketRequest(legacyResumeTicket)).toBe(false);
+    expect(() => assertSessionTicketRequest(legacyResumeTicket)).toThrow();
     expect(isSessionTicketRequest(NEW_SESSION_TICKET_REQUEST)).toBe(true);
     expect(isSessionTicketResponse(SESSION_TICKET_RESPONSE)).toBe(true);
     expect(Value.Check(SessionTicketResponseSchema, SESSION_TICKET_RESPONSE)).toBe(true);
@@ -370,6 +371,32 @@ describe('authentication and semantic timestamps', () => {
       true
     );
     expect(Value.Check(HttpErrorResponseSchema, HTTP_ERROR_RESPONSE)).toBe(true);
+  });
+
+  it('rejects legacy non-resumable error and abort envelopes from leaf and aggregate validators', () => {
+    const legacyError = {
+      ...ERROR_ENVELOPE_FIXTURES[0]!,
+      code: 'non_resumable'
+    } as const;
+    const legacyAbort = {
+      ...UTTERANCE_ABORTED_FIXTURES[0]!,
+      category: 'non_resumable'
+    } as const;
+
+    for (const [schema, runtime, value, assert] of [
+      [ErrorEnvelopeSchema, isErrorEnvelope, legacyError, assertErrorEnvelope],
+      [UtteranceAbortedSchema, isUtteranceAborted, legacyAbort, assertUtteranceAborted]
+    ] as const) {
+      expect(Value.Check(schema, value)).toBe(false);
+      expect(runtime(value)).toBe(false);
+      expect(() => assert(value)).toThrow();
+      expect(Value.Check(ServerControlMessageSchema, value)).toBe(false);
+      expect(isServerControlMessage(value)).toBe(false);
+      expect(() => assertServerControlMessage(value)).toThrow();
+      expect(Value.Check(ControlMessageSchema, value)).toBe(false);
+      expect(isControlMessage(value)).toBe(false);
+      expect(() => assertControlMessage(value)).toThrow();
+    }
   });
 
   it('rejects impossible timestamps in every timestamp-bearing validator and aggregate', () => {

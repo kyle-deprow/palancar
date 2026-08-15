@@ -18,7 +18,6 @@ import {
   type SessionReady,
   type SessionRejected,
   type SessionRejectionCode,
-  type SessionResume,
   type SessionStart,
   type SessionTicketRequest,
   type SessionTicketResponse,
@@ -59,7 +58,6 @@ export const CONTROLLED_PAIRING_CODE = '0123456789ABCDEFGHJKMNPQRS';
 
 export const FIXTURE_SESSION_ID = '11111111-1111-4111-8111-111111111111';
 export const FIXTURE_UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
-export const FIXTURE_RESUMED_UTTERANCE_ID = '33333333-3333-4333-8333-333333333333';
 export const FIXTURE_ERROR_ID = '44444444-4444-4444-8444-444444444444';
 
 export const FIXTURE_NEGOTIATION = deepFreeze({
@@ -119,31 +117,6 @@ export const NEW_SESSION_READY: SessionReady = deepFreeze({
   serverTime: '2026-08-09T12:00:00Z'
 });
 
-export const RESUMED_SESSION_RESUME: SessionResume = deepFreeze({
-  type: 'session.resume',
-  ...FIXTURE_NEGOTIATION,
-  targetLanguage: 'tr',
-  sessionId: FIXTURE_SESSION_ID,
-  sessionEpoch: 2,
-  utteranceId: FIXTURE_RESUMED_UTTERANCE_ID,
-  clientLastAcknowledgedOffset: 32_000,
-  oldestRetainedOffset: 32_000,
-  nextCapturedOffset: 36_000
-});
-
-export const RESUMED_SESSION_READY: SessionReady = deepFreeze({
-  type: 'session.ready',
-  result: 'resumed',
-  sessionId: FIXTURE_SESSION_ID,
-  sessionEpoch: 2,
-  targetLanguage: 'tr',
-  languageRegistryVersion: '1.0.0',
-  gatePolicyVersion: '1.0.0',
-  effectiveLimits: DEFAULT_NEGOTIATED_LIMITS,
-  serverTime: '2026-08-09T12:00:01Z',
-  requestedReplayOffset: 32_000
-});
-
 export const PAIRING_REDEMPTION_REQUEST: PairingRedemptionRequest = deepFreeze({
   pairingCode: CONTROLLED_PAIRING_CODE
 });
@@ -157,11 +130,6 @@ export const INSTALLATION_CREDENTIAL_RESPONSE: InstallationCredentialResponse = 
 export const NEW_SESSION_TICKET_REQUEST: SessionTicketRequest = deepFreeze({
   protocolVersion: 1,
   intent: 'new'
-});
-export const RESUME_SESSION_TICKET_REQUEST: SessionTicketRequest = deepFreeze({
-  protocolVersion: 1,
-  intent: 'resume',
-  sessionId: FIXTURE_SESSION_ID
 });
 export const SESSION_TICKET_RESPONSE: SessionTicketResponse = deepFreeze({
   ticket: CONTROLLED_SESSION_TICKET,
@@ -208,7 +176,6 @@ export const SESSION_REJECTED_FIXTURES: readonly SessionRejected[] = deepFreeze(
 );
 
 export const UTTERANCE_ABORT_CATEGORIES: readonly UtteranceAbortCategory[] = deepFreeze([
-  'non_resumable',
   'flow',
   'duration',
   'rate',
@@ -243,7 +210,6 @@ export const ERROR_CODES: readonly ErrorCode[] = deepFreeze([
   'session_conflict',
   'utterance_conflict',
   'stale_result',
-  'non_resumable',
   'flow_control',
   'duration_limit',
   'rate_limit',
@@ -403,7 +369,6 @@ export const TURKISH_PROTOCOL_JOURNEY = createLanguageJourney('tr');
 
 export const PROTOCOL_CLIENT_FIXTURES: readonly ClientControlMessage[] = deepFreeze([
   NEW_SESSION_START,
-  RESUMED_SESSION_RESUME,
   NEW_SESSION_UTTERANCE_START,
   NEW_SESSION_UTTERANCE_COMMIT,
   UTTERANCE_CANCEL_FIXTURE,
@@ -411,7 +376,6 @@ export const PROTOCOL_CLIENT_FIXTURES: readonly ClientControlMessage[] = deepFre
 ]);
 export const PROTOCOL_SERVER_FIXTURES: readonly ServerControlMessage[] = deepFreeze([
   NEW_SESSION_READY,
-  RESUMED_SESSION_READY,
   ...SESSION_REJECTED_FIXTURES,
   ...UTTERANCE_ABORTED_FIXTURES,
   AUDIO_ACK_FIXTURE,
@@ -430,10 +394,6 @@ export const NEW_SESSION_JOURNEY = deepFreeze({
   utteranceStart: NEW_SESSION_UTTERANCE_START,
   utteranceCommit: NEW_SESSION_UTTERANCE_COMMIT,
   results: SPANISH_PROTOCOL_JOURNEY
-});
-export const RESUMED_SESSION_JOURNEY = deepFreeze({
-  request: RESUMED_SESSION_RESUME,
-  ready: RESUMED_SESSION_READY
 });
 
 export const GOLDEN_MINIMUM_AUDIO_FRAME_INPUT: AudioFrameInput = Object.freeze({

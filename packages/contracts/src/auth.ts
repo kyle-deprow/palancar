@@ -5,7 +5,6 @@ import {
   BoundedDisplayMessageSchema,
   PositiveRevisionSchema,
   ProtocolVersionSchema,
-  SessionIdSchema,
   UtcTimestampSchema,
   UuidSchema
 } from './schemas.js';
@@ -64,24 +63,11 @@ export const NewSessionTicketIntentSchema = Type.Object(
 );
 export type NewSessionTicketIntent = Static<typeof NewSessionTicketIntentSchema>;
 
-export const ResumeSessionTicketIntentSchema = Type.Object(
-  {
-    protocolVersion: ProtocolVersionSchema,
-    intent: Type.Literal('resume'),
-    sessionId: SessionIdSchema
-  },
-  { additionalProperties: false }
-);
-export type ResumeSessionTicketIntent = Static<typeof ResumeSessionTicketIntentSchema>;
+export const SessionTicketIntentSchema = NewSessionTicketIntentSchema;
+export type SessionTicketIntent = NewSessionTicketIntent;
 
-export const SessionTicketIntentSchema = Type.Union([
-  NewSessionTicketIntentSchema,
-  ResumeSessionTicketIntentSchema
-]);
-export type SessionTicketIntent = Static<typeof SessionTicketIntentSchema>;
-
-export const SessionTicketRequestSchema = SessionTicketIntentSchema;
-export type SessionTicketRequest = Static<typeof SessionTicketRequestSchema>;
+export const SessionTicketRequestSchema = NewSessionTicketIntentSchema;
+export type SessionTicketRequest = NewSessionTicketIntent;
 
 export const WssOriginSchema = Type.String({
   pattern: '^wss://\\S+$',

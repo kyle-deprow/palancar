@@ -11,9 +11,7 @@ import {
   NegotiatedLimitsSchema,
   SessionEndSchema,
   SessionReadyNewSchema,
-  SessionReadyResumedSchema,
   SessionRejectedSchema,
-  SessionResumeSchema,
   SessionStartSchema,
   SuggestionsReadySchema,
   TranscriptFinalSchema,
@@ -34,7 +32,6 @@ import {
   type SessionEnd,
   type SessionReady,
   type SessionRejected,
-  type SessionResume,
   type SessionStart,
   type SuggestionsReady,
   type TranscriptFinal,
@@ -182,28 +179,6 @@ export function assertSessionStart(value: unknown): SessionStart {
   return value;
 }
 
-export function isSessionResume(value: unknown): value is SessionResume {
-  if (!isSchema(SessionResumeSchema, value)) {
-    return false;
-  }
-
-  return (
-    isNegotiatedLimits(value.requestedLimits) &&
-    value.oldestRetainedOffset <= value.clientLastAcknowledgedOffset &&
-    value.clientLastAcknowledgedOffset <= value.nextCapturedOffset &&
-    value.nextCapturedOffset - value.oldestRetainedOffset <=
-      value.requestedLimits.maxRetainedReplaySamples
-  );
-}
-
-export function assertSessionResume(value: unknown): SessionResume {
-  if (!isSessionResume(value)) {
-    throw new ContractValidationError('session.resume');
-  }
-
-  return value;
-}
-
 export function isUtteranceStart(value: unknown): value is UtteranceStart {
   return isSchema(UtteranceStartSchema, value);
 }
@@ -249,8 +224,6 @@ export function isClientControlMessage(value: unknown): value is ClientControlMe
   switch (controlType(value)) {
     case 'session.start':
       return isSessionStart(value);
-    case 'session.resume':
-      return isSessionResume(value);
     case 'utterance.start':
       return isUtteranceStart(value);
     case 'utterance.commit':
@@ -281,10 +254,6 @@ export function isSessionReady(value: unknown): value is SessionReady {
   if (result === 'new' && isSchema(SessionReadyNewSchema, value)) {
     return isNegotiatedLimits(value.effectiveLimits) && isUtcTimestamp(value.serverTime);
   }
-  if (result === 'resumed' && isSchema(SessionReadyResumedSchema, value)) {
-    return isNegotiatedLimits(value.effectiveLimits) && isUtcTimestamp(value.serverTime);
-  }
-
   return false;
 }
 

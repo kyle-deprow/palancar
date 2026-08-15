@@ -2,17 +2,23 @@ import { Value } from '@sinclair/typebox/value';
 import { describe, expect, it } from 'vitest';
 import {
   AudioFrameError,
+  ClientControlMessageSchema,
+  ControlMessageSchema,
   DEFAULT_NEGOTIATED_LIMITS,
+  ErrorEnvelopeSchema,
   InstallationCredentialResponseSchema,
-  OriginalSampleOffsetSchema,
-  SessionResumeSchema,
+  ServerControlMessageSchema,
   SessionStartSchema,
   SessionTicketRequestSchema,
+  UtteranceAbortedSchema,
   UuidSchema,
   assertClientControlMessage,
   assertControlMessage,
+  assertErrorEnvelope,
   assertServerControlMessage,
+  assertSessionTicketRequest,
   assertSessionTicketResponse,
+  assertUtteranceAborted,
   createWebSocketSubprotocols,
   decodeAudioFrame,
   encodeAudioFrame,
@@ -20,15 +26,16 @@ import {
   isCanonicalWssOrigin,
   isClientControlMessage,
   isControlMessage,
+  isErrorEnvelope,
   isNegotiatedLimits,
   isServerControlMessage,
-  isSessionResume,
+  isSessionTicketRequest,
   isSessionTicketResponse,
-  isUtcTimestamp
+  isUtcTimestamp,
+  isUtteranceAborted
 } from '../src/index.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
-const UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
 const CANONICAL_SECRET = 'A'.repeat(43);
 
 const sessionStart = {
@@ -40,18 +47,6 @@ const sessionStart = {
   gatePolicyVersion: '1.0.0',
   clientBuild: 'contract-test-0.1.0',
   requestedLimits: DEFAULT_NEGOTIATED_LIMITS
-} as const;
-
-const sessionResume = {
-  ...sessionStart,
-  type: 'session.resume',
-  targetLanguage: 'tr',
-  sessionId: SESSION_ID,
-  sessionEpoch: 1,
-  utteranceId: UTTERANCE_ID,
-  oldestRetainedOffset: 0,
-  clientLastAcknowledgedOffset: 4_000,
-  nextCapturedOffset: 8_000
 } as const;
 
 const sessionReady = {
@@ -136,61 +131,68 @@ describe('semantic aggregate validation', () => {
     }
   });
 
-  it('dispatches every invalid resume relationship through aggregate validators', () => {
-    const invalidResumes = [
-      { ...sessionResume, oldestRetainedOffset: 4_001 },
-      { ...sessionResume, clientLastAcknowledgedOffset: 8_001 },
-      { ...sessionResume, nextCapturedOffset: 8_001 }
-    ];
-    for (const message of invalidResumes) {
-      expect(Value.Check(SessionResumeSchema, message)).toBe(true);
-      expect(isSessionResume(message)).toBe(false);
-      expect(isClientControlMessage(message)).toBe(false);
-      expect(isControlMessage(message)).toBe(false);
-      expect(() => assertClientControlMessage(message)).toThrow();
-      expect(() => assertControlMessage(message)).toThrow();
+  it('rejects removed resume messages from every strict control validator', () => {
+    const legacySessionResume = {
+      ...sessionStart,
+      type: 'session.resume',
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: '22222222-2222-4222-8222-222222222222',
+      clientLastAcknowledgedOffset: 0,
+      oldestRetainedOffset: 0,
+      nextCapturedOffset: 0
+    } as const;
+    expect(Value.Check(ClientControlMessageSchema, legacySessionResume)).toBe(false);
+    expect(Value.Check(ControlMessageSchema, legacySessionResume)).toBe(false);
+    expect(isClientControlMessage(legacySessionResume)).toBe(false);
+    expect(isControlMessage(legacySessionResume)).toBe(false);
+    expect(() => assertClientControlMessage(legacySessionResume)).toThrow();
+    expect(() => assertControlMessage(legacySessionResume)).toThrow();
+
+    const legacySessionReady = {
+      ...sessionReady,
+      result: 'resumed',
+      requestedReplayOffset: 0
+    } as const;
+    expect(Value.Check(ServerControlMessageSchema, legacySessionReady)).toBe(false);
+    expect(isServerControlMessage(legacySessionReady)).toBe(false);
+    expect(isControlMessage(legacySessionReady)).toBe(false);
+    expect(() => assertServerControlMessage(legacySessionReady)).toThrow();
+    expect(() => assertControlMessage(legacySessionReady)).toThrow();
+  });
+
+  it('rejects legacy non-resumable error and abort envelopes from leaf and aggregate validators', () => {
+    const legacyError = {
+      type: 'error',
+      code: 'non_resumable',
+      scope: 'session',
+      recoverable: false,
+      displaySafeMessage: 'The request could not be completed.',
+      errorId: '44444444-4444-4444-8444-444444444444',
+      time: '2026-08-09T12:00:04Z'
+    } as const;
+    const legacyAbort = {
+      type: 'utterance.aborted',
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: '22222222-2222-4222-8222-222222222222',
+      category: 'non_resumable'
+    } as const;
+
+    for (const [schema, runtime, value, assert] of [
+      [ErrorEnvelopeSchema, isErrorEnvelope, legacyError, assertErrorEnvelope],
+      [UtteranceAbortedSchema, isUtteranceAborted, legacyAbort, assertUtteranceAborted]
+    ] as const) {
+      expect(Value.Check(schema, value)).toBe(false);
+      expect(runtime(value)).toBe(false);
+      expect(() => assert(value)).toThrow();
+      expect(Value.Check(ServerControlMessageSchema, value)).toBe(false);
+      expect(isServerControlMessage(value)).toBe(false);
+      expect(() => assertServerControlMessage(value)).toThrow();
+      expect(Value.Check(ControlMessageSchema, value)).toBe(false);
+      expect(isControlMessage(value)).toBe(false);
+      expect(() => assertControlMessage(value)).toThrow();
     }
-  });
-
-  it('enforces the negotiated retained replay window at its lowered boundary', () => {
-    const requestedLimits = {
-      ...DEFAULT_NEGOTIATED_LIMITS,
-      maxRetainedReplaySamples: 4_000
-    };
-    const atBoundary = {
-      ...sessionResume,
-      requestedLimits,
-      oldestRetainedOffset: 1_000,
-      clientLastAcknowledgedOffset: 3_000,
-      nextCapturedOffset: 5_000
-    };
-    const beyondBoundary = { ...atBoundary, nextCapturedOffset: 5_001 };
-
-    expect(Value.Check(SessionResumeSchema, atBoundary)).toBe(true);
-    expect(isSessionResume(atBoundary)).toBe(true);
-    expect(isClientControlMessage(atBoundary)).toBe(true);
-    expect(isControlMessage(atBoundary)).toBe(true);
-
-    expect(Value.Check(SessionResumeSchema, beyondBoundary)).toBe(true);
-    expect(isSessionResume(beyondBoundary)).toBe(false);
-    expect(isClientControlMessage(beyondBoundary)).toBe(false);
-    expect(isControlMessage(beyondBoundary)).toBe(false);
-    expect(() => assertClientControlMessage(beyondBoundary)).toThrow();
-    expect(() => assertControlMessage(beyondBoundary)).toThrow();
-  });
-
-  it('accepts exact original-sample and replay-window boundaries', () => {
-    expect(Value.Check(OriginalSampleOffsetSchema, 0)).toBe(true);
-    expect(Value.Check(OriginalSampleOffsetSchema, 480_000)).toBe(true);
-    expect(Value.Check(OriginalSampleOffsetSchema, 480_001)).toBe(false);
-    expect(isSessionResume(sessionResume)).toBe(true);
-    expect(isSessionResume({
-      ...sessionResume,
-      oldestRetainedOffset: 472_000,
-      clientLastAcknowledgedOffset: 480_000,
-      nextCapturedOffset: 480_000
-    })).toBe(true);
-    expect(isSessionResume({ ...sessionResume, nextCapturedOffset: 8_001 })).toBe(false);
   });
 });
 
@@ -206,14 +208,26 @@ describe('canonical auth values', () => {
     expect(isBase64UrlSecret(canonical)).toBe(true);
   });
 
-  it('requires protocol version in both ticket intents and separate credential expiries', () => {
+  it('requires the exact new-only ticket request and separate credential expiries', () => {
     expect(Value.Check(SessionTicketRequestSchema, { protocolVersion: 1, intent: 'new' })).toBe(true);
     expect(Value.Check(SessionTicketRequestSchema, { intent: 'new' })).toBe(false);
     expect(Value.Check(SessionTicketRequestSchema, {
       protocolVersion: 1,
       intent: 'resume',
       sessionId: SESSION_ID
-    })).toBe(true);
+    })).toBe(false);
+    const legacyResumeTicket = {
+      protocolVersion: 1,
+      intent: 'resume',
+      sessionId: SESSION_ID
+    } as const;
+    expect(isSessionTicketRequest(legacyResumeTicket)).toBe(false);
+    expect(() => assertSessionTicketRequest(legacyResumeTicket)).toThrow();
+    expect(Value.Check(SessionTicketRequestSchema, {
+      protocolVersion: 1,
+      intent: 'new',
+      sessionId: SESSION_ID
+    })).toBe(false);
     expect(Value.Check(InstallationCredentialResponseSchema, {
       installationId: SESSION_ID,
       credential: CANONICAL_SECRET,

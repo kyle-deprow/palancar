@@ -196,21 +196,6 @@ export const SessionStartSchema = Type.Object(
 );
 export type SessionStart = Static<typeof SessionStartSchema>;
 
-export const SessionResumeSchema = Type.Object(
-  {
-    type: Type.Literal('session.resume'),
-    ...CommonNegotiationSchema.properties,
-    sessionId: SessionIdSchema,
-    sessionEpoch: PositiveEpochSchema,
-    utteranceId: UtteranceIdSchema,
-    clientLastAcknowledgedOffset: OriginalSampleOffsetSchema,
-    oldestRetainedOffset: OriginalSampleOffsetSchema,
-    nextCapturedOffset: OriginalSampleOffsetSchema
-  },
-  CLOSED_OBJECT
-);
-export type SessionResume = Static<typeof SessionResumeSchema>;
-
 export const UtteranceStartSchema = Type.Object(
   {
     type: Type.Literal('utterance.start'),
@@ -264,7 +249,6 @@ export type SessionEnd = Static<typeof SessionEndSchema>;
 
 export const ClientControlMessageSchema = Type.Union([
   SessionStartSchema,
-  SessionResumeSchema,
   UtteranceStartSchema,
   UtteranceCommitSchema,
   UtteranceCancelSchema,
@@ -289,19 +273,7 @@ export const SessionReadyNewSchema = Type.Object(
   CLOSED_OBJECT
 );
 export type SessionReadyNew = Static<typeof SessionReadyNewSchema>;
-
-export const SessionReadyResumedSchema = Type.Object(
-  {
-    type: Type.Literal('session.ready'),
-    result: Type.Literal('resumed'),
-    ...SessionReadyProperties,
-    requestedReplayOffset: OriginalSampleOffsetSchema
-  },
-  CLOSED_OBJECT
-);
-export type SessionReadyResumed = Static<typeof SessionReadyResumedSchema>;
-
-export const SessionReadySchema = Type.Union([SessionReadyNewSchema, SessionReadyResumedSchema]);
+export const SessionReadySchema = SessionReadyNewSchema;
 export type SessionReady = Static<typeof SessionReadySchema>;
 
 export const SessionRejectionCodeSchema = Type.Union([
@@ -329,7 +301,6 @@ export const SessionRejectedSchema = Type.Object(
 export type SessionRejected = Static<typeof SessionRejectedSchema>;
 
 export const UtteranceAbortCategorySchema = Type.Union([
-  Type.Literal('non_resumable'),
   Type.Literal('flow'),
   Type.Literal('duration'),
   Type.Literal('rate'),
@@ -470,7 +441,6 @@ export const ErrorCodeSchema = Type.Union([
   Type.Literal('session_conflict'),
   Type.Literal('utterance_conflict'),
   Type.Literal('stale_result'),
-  Type.Literal('non_resumable'),
   Type.Literal('flow_control'),
   Type.Literal('duration_limit'),
   Type.Literal('rate_limit'),
@@ -526,7 +496,6 @@ export type ServerControlMessages = ServerControlMessage;
 
 export const ControlMessageSchema = Type.Union([
   SessionStartSchema,
-  SessionResumeSchema,
   UtteranceStartSchema,
   UtteranceCommitSchema,
   UtteranceCancelSchema,
