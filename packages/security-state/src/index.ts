@@ -18,9 +18,11 @@ export {
 } from './crypto.js';
 export * from './errors.js';
 export {
+  createAzureCliTableOperations,
   createAzureTableBootstrapStore,
   createAzureTableOperatorStore,
   createAzureTableRuntimeStore,
+  type AzureCliTableOperationsOptions,
   type AzureTableBootstrapStore,
   type AzureTableRuntimeStoreOptions
 } from './azure-store.js';

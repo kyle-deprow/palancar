@@ -4,7 +4,7 @@ import {
   type TableEntity,
   type TableEntityResult
 } from '@azure/data-tables';
-import { ManagedIdentityCredential } from '@azure/identity';
+import { AzureCliCredential, ManagedIdentityCredential, type TokenCredential } from '@azure/identity';
 import { types as utilTypes } from 'node:util';
 
 import {
@@ -257,11 +257,25 @@ export interface ProductionAzureClientsOptions {
   readonly managedIdentityClientId: string;
 }
 
-export function createProductionAzureClients(options: ProductionAzureClientsOptions): Readonly<{
+export interface AzureCliOperatorClientsOptions {
+  readonly endpoint: string;
+  readonly securityTableName: string;
+  readonly rateTableName: string;
+}
+
+interface AzureTableClientsOptions {
+  readonly endpoint: string;
+  readonly securityTableName: string;
+  readonly rateTableName: string;
+}
+
+function createClients(
+  options: AzureTableClientsOptions,
+  credential: TokenCredential
+): Readonly<{
   security: AzureTableClientLike;
   rate: AzureTableClientLike;
 }> {
-  const credential = new ManagedIdentityCredential({ clientId: options.managedIdentityClientId });
   const clientOptions = Object.freeze({ retryOptions: { maxRetries: 0 } });
   return Object.freeze({
     security: new SdkAzureTableClient(new TableClient(
@@ -277,4 +291,21 @@ export function createProductionAzureClients(options: ProductionAzureClientsOpti
       clientOptions
     ))
   });
+}
+
+export function createProductionAzureClients(options: ProductionAzureClientsOptions): Readonly<{
+  security: AzureTableClientLike;
+  rate: AzureTableClientLike;
+}> {
+  return createClients(
+    options,
+    new ManagedIdentityCredential({ clientId: options.managedIdentityClientId })
+  );
+}
+
+export function createAzureCliOperatorClients(options: AzureCliOperatorClientsOptions): Readonly<{
+  security: AzureTableClientLike;
+  rate: AzureTableClientLike;
+}> {
+  return createClients(options, new AzureCliCredential());
 }

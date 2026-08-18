@@ -11,6 +11,7 @@ import {
   OPENING_LEASE_MS,
   REVOCATION_TOMBSTONE_TTL_MS,
   SecurityStateError,
+  createAzureCliTableOperations,
   createAzureTableRuntimeStore,
   hashCorrelationKey,
   hashPairingCode,
@@ -43,6 +44,40 @@ const OTHER_AUDIENCE: SecurityAudience = Object.freeze({
   origin: 'wss://other-relay.example.test',
   path: '/v1/stream',
   protocol: 'palancar.v1'
+});
+
+const AZURE_CLI_OPTIONS = Object.freeze({
+  endpoint: 'https://palancarunit.table.core.windows.net',
+  securityTableName: 'SecurityState',
+  rateTableName: 'RateState',
+  environment: ENVIRONMENT,
+  audience: AUDIENCE
+});
+
+describe('Azure CLI operator capability boundary', () => {
+  it('exposes only separated bootstrap, pairing, and maintenance capabilities', () => {
+    const operations = createAzureCliTableOperations(AZURE_CLI_OPTIONS);
+    expect(Object.keys(operations)).toEqual(['bootstrap', 'operator', 'maintenance']);
+    expect(Object.keys(operations.bootstrap)).toEqual(['initializeState']);
+    expect(Object.keys(operations.operator)).toEqual(['issuePairing', 'revokePairing']);
+    expect(Object.keys(operations.maintenance)).toEqual(['checkReadiness', 'cleanupExpired']);
+    expect('redeemPairing' in operations.operator).toBe(false);
+    expect('issueSessionTicket' in operations.operator).toBe(false);
+    expect('reserveAudio' in operations.maintenance).toBe(false);
+    expect(Object.isFrozen(operations)).toBe(true);
+  });
+
+  it.each([
+    {},
+    { ...AZURE_CLI_OPTIONS, unexpected: true },
+    { ...AZURE_CLI_OPTIONS, endpoint: 'http://palancarunit.table.core.windows.net' },
+    { ...AZURE_CLI_OPTIONS, securityTableName: 'RateState' },
+    { ...AZURE_CLI_OPTIONS, environment: 'INVALID' }
+  ])('rejects invalid or expanded operator options', (options) => {
+    expect(() => createAzureCliTableOperations(options as typeof AZURE_CLI_OPTIONS)).toThrow(
+      new SecurityStateError('invalid-input')
+    );
+  });
 });
 
 function uuid(index: number): string {

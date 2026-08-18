@@ -13,7 +13,10 @@ import {
   type CanonicalUuid
 } from './crypto.js';
 import { createSystemClock, createSystemIdFactory, createSystemTokenFactory } from './clock.js';
-import { createProductionAzureClients } from './azure-table-client.js';
+import {
+  createAzureCliOperatorClients,
+  createProductionAzureClients
+} from './azure-table-client.js';
 import {
   AZURE_CAS_ATTEMPTS,
   AzureTableBoundaryError,
@@ -306,6 +309,14 @@ export interface AzureTableRuntimeStoreOptions {
   readonly managedIdentityClientId: string;
 }
 
+export interface AzureCliTableOperationsOptions {
+  readonly endpoint: string;
+  readonly securityTableName: string;
+  readonly rateTableName: string;
+  readonly environment: string;
+  readonly audience: SecurityAudience;
+}
+
 export interface AzureTableTestingOptions {
   readonly environment: string;
   readonly audience: SecurityAudience;
@@ -439,6 +450,23 @@ function parseProductionOptions(value: unknown): AzureTableRuntimeStoreOptions {
     environment: parseEnvironment(input.environment),
     audience: canonicalAudience(input.audience),
     managedIdentityClientId: input.managedIdentityClientId
+  });
+}
+
+function parseAzureCliOperationsOptions(value: unknown): AzureCliTableOperationsOptions {
+  const input = exactDataObject(value, [
+    'endpoint', 'securityTableName', 'rateTableName', 'environment', 'audience'
+  ]);
+  const parsed = parseProductionOptions({
+    ...input,
+    managedIdentityClientId: '00000000-0000-4000-8000-000000000000'
+  });
+  return freeze({
+    endpoint: parsed.endpoint,
+    securityTableName: parsed.securityTableName,
+    rateTableName: parsed.rateTableName,
+    environment: parsed.environment,
+    audience: parsed.audience
   });
 }
 
@@ -3617,9 +3645,47 @@ class AzureBootstrapStore implements AzureTableBootstrapStore {
   initializeState = (signal?: AbortSignal): Promise<void> => this.#core.initializeState(signal);
 }
 
+class AzurePairingOnlyStore implements PairingOperatorStore {
+  readonly #core: AzureSecurityStateCore;
+
+  constructor(core: AzureSecurityStateCore) {
+    this.#core = core;
+    Object.freeze(this);
+  }
+
+  issuePairing = (input: IssuePairingInput): Promise<PairingIssueResult> => this.#core.issuePairing(input);
+  revokePairing = (input: RevokePairingInput): Promise<void> => this.#core.revokePairing(input);
+}
+
+class AzureMaintenanceStore implements SecurityStateMaintenanceStore {
+  readonly #core: AzureSecurityStateCore;
+
+  constructor(core: AzureSecurityStateCore) {
+    this.#core = core;
+    Object.freeze(this);
+  }
+
+  checkReadiness = (signal?: AbortSignal): Promise<void> => this.#core.checkReadiness(signal);
+  cleanupExpired = (input: CleanupInput): Promise<CleanupResult> => this.#core.cleanupExpired(input);
+}
+
 function productionCore(value: AzureTableRuntimeStoreOptions): AzureSecurityStateCore {
   const options = parseProductionOptions(value);
   const clients = createProductionAzureClients(options);
+  return new AzureSecurityStateCore({
+    environment: options.environment,
+    audience: options.audience,
+    security: clients.security,
+    rate: clients.rate,
+    clock: createSystemClock(),
+    ids: createSystemIdFactory(),
+    tokens: createSystemTokenFactory()
+  });
+}
+
+function azureCliOperatorCore(value: AzureCliTableOperationsOptions): AzureSecurityStateCore {
+  const options = parseAzureCliOperationsOptions(value);
+  const clients = createAzureCliOperatorClients(options);
   return new AzureSecurityStateCore({
     environment: options.environment,
     audience: options.audience,
@@ -3647,6 +3713,21 @@ export function createAzureTableBootstrapStore(
   options: AzureTableRuntimeStoreOptions
 ): AzureTableBootstrapStore {
   return new AzureBootstrapStore(productionCore(options));
+}
+
+export function createAzureCliTableOperations(
+  options: AzureCliTableOperationsOptions
+): Readonly<{
+  bootstrap: AzureTableBootstrapStore;
+  operator: PairingOperatorStore;
+  maintenance: SecurityStateMaintenanceStore;
+}> {
+  const core = azureCliOperatorCore(options);
+  return freeze({
+    bootstrap: new AzureBootstrapStore(core),
+    operator: new AzurePairingOnlyStore(core),
+    maintenance: new AzureMaintenanceStore(core)
+  });
 }
 
 export function createAzureTableStoresForTesting(options: AzureTableTestingOptions): Readonly<{
