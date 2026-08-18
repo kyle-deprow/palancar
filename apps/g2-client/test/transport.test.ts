@@ -21,6 +21,34 @@ const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_UTTERANCE_ID = "33333333-3333-4333-8333-333333333333";
 const ERROR_ID = "44444444-4444-4444-8444-444444444444";
 const SESSION_READY_TIME = "2026-08-10T12:00:00.000Z";
+const RETRYABLE_CLOSE_CODES = [
+  0,
+  1001,
+  1005,
+  1006,
+  1011,
+  1012,
+  1013,
+  1014,
+  1015,
+  4503,
+] as const;
+const TERMINAL_CLOSE_CODES = [
+  1000,
+  1002,
+  1003,
+  1008,
+  1009,
+  4400,
+  4401,
+  4403,
+  4406,
+  4408,
+  4409,
+  4410,
+  4429,
+  4499,
+] as const;
 
 type SentMessage = string | Uint8Array<ArrayBuffer>;
 
@@ -31,6 +59,7 @@ class FakeWebSocket implements BrowserWebSocket {
   readonly protocols: readonly string[];
   readonly sent: SentMessage[] = [];
   readyState = 0;
+  closeCalls = 0;
   sendError: Error | undefined;
   failNextSend: Error | undefined;
   onopen: ((event: Event) => void) | null = null;
@@ -52,9 +81,10 @@ class FakeWebSocket implements BrowserWebSocket {
     this.sent.push(data);
   }
 
-  close(): void {
+  close(code?: number): void {
+    this.closeCalls += 1;
     this.readyState = 3;
-    this.onclose?.({} as CloseEvent);
+    this.onclose?.({ code } as CloseEvent);
   }
 
   open(): void {
@@ -64,6 +94,15 @@ class FakeWebSocket implements BrowserWebSocket {
 
   message(data: unknown): void {
     this.onmessage?.({ data } as MessageEvent<unknown>);
+  }
+
+  error(): void {
+    this.onerror?.({} as Event);
+  }
+
+  unexpectedClose(code: number): void {
+    this.readyState = 3;
+    this.onclose?.({ code } as CloseEvent);
   }
 }
 
@@ -80,6 +119,14 @@ function ticketResponse(): Response {
       protocolVersion: 1,
       expiresAt: "2026-08-10T12:01:00.000Z",
     }),
+  } as Response;
+}
+
+function ticketHttpResponse(status: number): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => ({}),
   } as Response;
 }
 
@@ -163,6 +210,7 @@ async function openSocket(transport: RelayTransport): Promise<FakeWebSocket> {
 function createTransport(
   onEvent?: (event: RelayTransportEvent) => void,
   onTransportError?: (error: RelayTransportError) => void,
+  onCallbackEvent?: (event: RelayTransportCallbackEvent) => void,
 ): {
   readonly transport: RelayTransport;
   readonly requests: Array<{ readonly input: RequestInfo | URL; readonly init: RequestInit | undefined }>;
@@ -177,6 +225,7 @@ function createTransport(
     },
     WebSocket: fakeWebSocketConstructor,
     ...(onEvent === undefined ? {} : { onServerEvent: onEvent }),
+    ...(onCallbackEvent === undefined ? {} : { onEvent: onCallbackEvent }),
     ...(onTransportError === undefined ? {} : { onTransportError }),
   });
   return { transport, requests };
@@ -202,6 +251,39 @@ function pcmCallback(value: number): Uint8Array {
 
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await Promise.resolve();
+}
+
+function expectClosedEmpty(transport: RelayTransport): void {
+  expect(transport.snapshot).toEqual({
+    connectionState: "closed",
+    sessionReady: false,
+  });
+}
+
+function expectRedactedError(
+  error: RelayTransportError,
+  expected: {
+    readonly kind: RelayTransportError["kind"];
+    readonly disposition: RelayTransportError["recoveryDisposition"];
+    readonly message: string;
+  },
+  canary: string,
+): void {
+  expect(error).toMatchObject({
+    name: "RelayTransportError",
+    kind: expected.kind,
+    recoveryDisposition: expected.disposition,
+    message: expected.message,
+  });
+  expect("cause" in error).toBe(false);
+  expect(Reflect.ownKeys(error)).not.toContain("cause");
+  expect(Object.keys(error)).toEqual(["kind", "recoveryDisposition"]);
+  expect(error.stack).not.toContain(canary);
+  expect(JSON.stringify(error)).toBe(JSON.stringify({
+    kind: expected.kind,
+    recoveryDisposition: expected.disposition,
+  }));
+  expect(JSON.stringify(error)).not.toContain(canary);
 }
 
 describe("G2 relay transport", () => {
@@ -272,6 +354,356 @@ describe("G2 relay transport", () => {
     });
     expect(Object.isFrozen(events[0])).toBe(true);
     expect(Object.isFrozen(transport.snapshot)).toBe(true);
+  });
+
+  it("classifies pre-ready ticket failures for retry without emitting transport.lost", async () => {
+    const cases: Array<{
+      readonly name: string;
+      readonly fetch: typeof globalThis.fetch;
+      readonly disposition: "retry" | "stop";
+    }> = [
+      {
+        name: "network",
+        fetch: async () => { throw new Error("offline"); },
+        disposition: "retry",
+      },
+      ...[0, 409, 500, 502, 503, 599].map((status) => ({
+        name: `HTTP ${status}`,
+        fetch: async () => ticketHttpResponse(status),
+        disposition: "retry" as const,
+      })),
+      ...[400, 401, 403, 429].map((status) => ({
+        name: `HTTP ${status}`,
+        fetch: async () => ticketHttpResponse(status),
+        disposition: "stop" as const,
+      })),
+    ];
+
+    for (const testCase of cases) {
+      FakeWebSocket.instances.length = 0;
+      const errors: RelayTransportError[] = [];
+      const events: RelayTransportCallbackEvent[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        fetch: testCase.fetch,
+        WebSocket: fakeWebSocketConstructor,
+        onEvent: (event) => events.push(event),
+        onTransportError: (error) => errors.push(error),
+      });
+
+      await transport.startSession("es");
+
+      expect(errors, testCase.name).toHaveLength(1);
+      expect(errors[0]?.kind, testCase.name).toBe("ticket");
+      expect(errors[0]?.recoveryDisposition, testCase.name).toBe(testCase.disposition);
+      expect(events.filter((event) => event.type === "transport.lost"), testCase.name)
+        .toHaveLength(0);
+      expectClosedEmpty(transport);
+    }
+  });
+
+  it("normalizes every ticket response.json failure exactly once as stop", async () => {
+    const canary = "RAW_JSON_CANARY";
+    const jsonFailures: Array<() => unknown> = [
+      () => { throw new Error(canary); },
+      () => Promise.reject(new Error(canary)),
+      () => Promise.reject(canary),
+    ];
+
+    for (const json of jsonFailures) {
+      FakeWebSocket.instances.length = 0;
+      const errors: RelayTransportError[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        fetch: async () => ({ ok: true, status: 200, json } as unknown as Response),
+        WebSocket: fakeWebSocketConstructor,
+        onTransportError: (error) => errors.push(error),
+      });
+
+      await transport.startSession("es");
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ kind: "ticket", recoveryDisposition: "stop" });
+      expectClosedEmpty(transport);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+    }
+  });
+
+  it("exposes fixed redacted transport errors without cause or raw failures", async () => {
+    const canary = "RAW_FAILURE_CANARY";
+    const errors: RelayTransportError[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => { throw new Error(canary); },
+      WebSocket: fakeWebSocketConstructor,
+      onTransportError: (error) => errors.push(error),
+    });
+
+    await transport.startSession("es");
+
+    expect(errors).toHaveLength(1);
+    const error = errors[0];
+    if (error === undefined) throw new Error("Transport error missing");
+    expectRedactedError(error, {
+      kind: "ticket",
+      disposition: "retry",
+      message: "Relay session ticket request failed",
+    }, canary);
+
+    const constructed = new RelayTransportError("protocol", "stop");
+    expectRedactedError(constructed, {
+      kind: "protocol",
+      disposition: "stop",
+      message: "Relay protocol failed",
+    }, canary);
+  });
+
+  it("rejects unsafe ready timeouts with a fixed configuration error", () => {
+    for (const readyTimeoutMs of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      2_147_483_648,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      expect(() => new RelayTransport({
+        relayOrigin: "https://relay.example",
+        fetch: async () => ticketResponse(),
+        WebSocket: fakeWebSocketConstructor,
+        readyTimeoutMs,
+      }), String(readyTimeoutMs)).toThrowError(RelayTransportError);
+    }
+
+    expect(() => new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      readyTimeoutMs: 2_147_483_647,
+    })).not.toThrow();
+  });
+
+  it("classifies WebSocket construction and ready timeout as pre-ready retry", async () => {
+    const constructionErrors: RelayTransportError[] = [];
+    const throwingWebSocketConstructor = function (): never {
+      throw new Error("constructor failed");
+    } as unknown as BrowserWebSocketConstructor;
+    const constructionTransport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: throwingWebSocketConstructor,
+      onTransportError: (error) => constructionErrors.push(error),
+    });
+
+    await constructionTransport.startSession("es");
+    expect(constructionErrors).toHaveLength(1);
+    expect(constructionErrors[0]?.kind).toBe("websocket");
+    expect(constructionErrors[0]?.recoveryDisposition).toBe("retry");
+
+    vi.useFakeTimers();
+    try {
+      FakeWebSocket.instances.length = 0;
+      const timeoutErrors: RelayTransportError[] = [];
+      const timeoutEvents: RelayTransportCallbackEvent[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        fetch: async () => ticketResponse(),
+        WebSocket: fakeWebSocketConstructor,
+        readyTimeoutMs: 25,
+        onEvent: (event) => timeoutEvents.push(event),
+        onTransportError: (error) => timeoutErrors.push(error),
+      });
+      const start = transport.startSession("es");
+      await flushMicrotasks();
+      const socket = FakeWebSocket.instances[0];
+      if (socket === undefined) throw new Error("WebSocket was not constructed");
+      socket.open();
+      await start;
+      vi.advanceTimersByTime(25);
+
+      expect(timeoutErrors).toHaveLength(1);
+      expect(timeoutErrors[0]?.kind).toBe("websocket");
+      expect(timeoutErrors[0]?.recoveryDisposition).toBe("retry");
+      expect(timeoutEvents.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("owns ready timer handles per generation and leaves zero timers after lifecycle exits", async () => {
+    vi.useFakeTimers();
+    try {
+      FakeWebSocket.instances.length = 0;
+      const errors: RelayTransportError[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        fetch: async () => ticketResponse(),
+        WebSocket: fakeWebSocketConstructor,
+        readyTimeoutMs: 30,
+        onTransportError: (error) => errors.push(error),
+      });
+
+      const firstStart = transport.startSession("es");
+      await flushMicrotasks();
+      const firstSocket = FakeWebSocket.instances[0];
+      if (firstSocket === undefined) throw new Error("First WebSocket missing");
+      firstSocket.open();
+      await firstStart;
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(10);
+      const replacementStart = transport.startSession("tr");
+      await flushMicrotasks();
+      const replacementSocket = FakeWebSocket.instances[1];
+      if (replacementSocket === undefined) throw new Error("Replacement WebSocket missing");
+      replacementSocket.open();
+      await replacementStart;
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(20);
+      expect(errors).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(10);
+      expect(errors).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+      expectClosedEmpty(transport);
+
+      const readyStart = transport.startSession("es");
+      await flushMicrotasks();
+      const readySocket = FakeWebSocket.instances[2];
+      if (readySocket === undefined) throw new Error("Ready WebSocket missing");
+      readySocket.open();
+      await readyStart;
+      expect(vi.getTimerCount()).toBe(1);
+      readySocket.message(JSON.stringify(readyMessage()));
+      expect(vi.getTimerCount()).toBe(0);
+      transport.endSession();
+      expect(vi.getTimerCount()).toBe(0);
+      expectClosedEmpty(transport);
+
+      const rejectedStart = transport.startSession("es");
+      await flushMicrotasks();
+      const rejectedSocket = FakeWebSocket.instances[3];
+      if (rejectedSocket === undefined) throw new Error("Rejected WebSocket missing");
+      rejectedSocket.open();
+      await rejectedStart;
+      expect(vi.getTimerCount()).toBe(1);
+      rejectedSocket.message(JSON.stringify({
+        type: "session.rejected",
+        code: "authentication_failed",
+        displaySafeMessage: "The session could not be started.",
+      }));
+      expect(vi.getTimerCount()).toBe(0);
+      expectClosedEmpty(transport);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports pre-ready WebSocket errors and retryable closes through onTransportError", async () => {
+    for (const failure of ["error", ...RETRYABLE_CLOSE_CODES] as const) {
+      const errors: RelayTransportError[] = [];
+      const events: RelayTransportCallbackEvent[] = [];
+      const { transport } = createTransport(
+        undefined,
+        (error) => errors.push(error),
+        (event) => events.push(event),
+      );
+      const start = transport.startSession("es");
+      await flushMicrotasks();
+      const socket = FakeWebSocket.instances[0];
+      if (socket === undefined) throw new Error("WebSocket was not constructed");
+      socket.open();
+      await start;
+
+      if (failure === "error") {
+        socket.error();
+        socket.unexpectedClose(1013);
+      } else {
+        socket.unexpectedClose(failure);
+        socket.error();
+      }
+
+      expect(errors, String(failure)).toHaveLength(1);
+      expect(errors[0]?.kind, String(failure)).toBe("websocket");
+      expect(errors[0]?.recoveryDisposition, String(failure)).toBe("retry");
+      expect(events.filter((event) => event.type === "transport.lost"), String(failure))
+        .toHaveLength(0);
+      expectClosedEmpty(transport);
+    }
+  });
+
+  it("emits one identity-only loss for every retryable post-ready socket failure", async () => {
+    for (const failure of ["error", ...RETRYABLE_CLOSE_CODES] as const) {
+      const events: RelayTransportCallbackEvent[] = [];
+      const serverEvents: RelayTransportEvent[] = [];
+      const errors: RelayTransportError[] = [];
+      const { transport } = createTransport(
+        (event) => serverEvents.push(event),
+        (error) => errors.push(error),
+        (event) => events.push(event),
+      );
+      const socket = await openReady(transport);
+      transport.startUtterance(UTTERANCE_ID);
+      transport.pushPcm(Uint8Array.of(1, 2));
+
+      if (failure === "error") {
+        socket.error();
+        socket.unexpectedClose(1013);
+      } else {
+        socket.unexpectedClose(failure);
+        socket.error();
+      }
+
+      const lostEvents = events.filter((event) => event.type === "transport.lost");
+      expect(lostEvents, String(failure)).toHaveLength(1);
+      expect(lostEvents[0], String(failure)).toEqual({
+        type: "transport.lost",
+        sessionId: SESSION_ID,
+        sessionEpoch: 1,
+      });
+      expect(Object.isFrozen(lostEvents[0]), String(failure)).toBe(true);
+      expect(serverEvents, String(failure)).toHaveLength(1);
+      expect(errors, String(failure)).toHaveLength(0);
+      expect(transport.snapshot, String(failure)).toEqual({
+        connectionState: "closed",
+        sessionReady: false,
+      });
+    }
+  });
+
+  it("routes every terminal relay close code to stop after synchronous cleanup", async () => {
+    for (const code of TERMINAL_CLOSE_CODES) {
+      const events: RelayTransportCallbackEvent[] = [];
+      const errors: RelayTransportError[] = [];
+      let snapshotInCallback: RelayTransport["snapshot"] | undefined;
+      const created = createTransport(
+        undefined,
+        (error) => {
+          errors.push(error);
+          snapshotInCallback = created.transport.snapshot;
+        },
+        (event) => events.push(event),
+      );
+      const { transport } = created;
+      const socket = await openReady(transport);
+      transport.startUtterance(UTTERANCE_ID);
+      transport.pushPcm(Uint8Array.of(1, 2));
+      socket.unexpectedClose(code);
+      socket.error();
+
+      expect(events.filter((event) => event.type === "transport.lost"), String(code))
+        .toHaveLength(0);
+      expect(errors, String(code)).toHaveLength(1);
+      expect(errors[0]?.kind, String(code)).toBe("websocket");
+      expect(errors[0]?.recoveryDisposition, String(code)).toBe("stop");
+      expect(snapshotInCallback, String(code)).toEqual({
+        connectionState: "closed",
+        sessionReady: false,
+      });
+      expectClosedEmpty(transport);
+    }
   });
 
   it("sends utterance audio in offset order, applies audio.ack, and commits the final offset", async () => {
@@ -437,26 +869,30 @@ describe("G2 relay transport", () => {
     }
   });
 
-  it("does not commit after a flush frame send fails", async () => {
+  it("turns a persistent audio send failure into one loss with no trailing error", async () => {
     const errors: RelayTransportError[] = [];
-    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(
+      undefined,
+      (error) => errors.push(error),
+      (event) => events.push(event),
+    );
     const socket = await openReady(transport);
 
     transport.startUtterance(UTTERANCE_ID);
-    transport.pushPcm(Uint8Array.of(1, 2));
-    socket.failNextSend = new Error("flush send failed");
-    transport.commitUtterance();
+    socket.sendError = new Error("PERSISTENT_AUDIO_SEND_CANARY");
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+    socket.error();
+    socket.unexpectedClose(4503);
 
-    expect(socket.sent).toHaveLength(3);
-    expect(sentControl(socket, 2)).toMatchObject({
-      type: "utterance.cancel",
-      utteranceId: UTTERANCE_ID,
-    });
-    expect(socket.sent.some((value) => typeof value === "string" && value.includes('"utterance.commit"'))).toBe(false);
-    expect(errors.some((error) => error.kind === "audio")).toBe(true);
-
-    transport.commitUtterance();
-    expect(socket.sent.some((value) => typeof value === "string" && value.includes('"utterance.commit"'))).toBe(false);
+    expect(events.filter((event) => event.type === "transport.lost")).toEqual([{
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+    }]);
+    expect(errors).toHaveLength(0);
+    expectClosedEmpty(transport);
+    expect(socket.sent).toHaveLength(2);
   });
 
   it("reports malformed ticket and server control data, then closes safely", async () => {
@@ -470,10 +906,16 @@ describe("G2 relay transport", () => {
     await malformedTicketTransport.startSession("es");
     expect(ticketErrors).toHaveLength(1);
     expect(ticketErrors[0]?.kind).toBe("ticket");
+    expect(ticketErrors[0]?.recoveryDisposition).toBe("stop");
     expect(malformedTicketTransport.snapshot.connectionState).toBe("closed");
 
     const protocolErrors: RelayTransportError[] = [];
-    const { transport } = createTransport(undefined, (error) => protocolErrors.push(error));
+    let protocolSnapshot: RelayTransport["snapshot"] | undefined;
+    const created = createTransport(undefined, (error) => {
+      protocolErrors.push(error);
+      protocolSnapshot = created.transport.snapshot;
+    });
+    const { transport } = created;
     const start = transport.startSession("es");
     await flushMicrotasks();
     const socket = FakeWebSocket.instances[0];
@@ -484,8 +926,10 @@ describe("G2 relay transport", () => {
 
     expect(protocolErrors).toHaveLength(1);
     expect(protocolErrors[0]?.kind).toBe("protocol");
+    expect(protocolErrors[0]?.recoveryDisposition).toBe("stop");
     expect(socket.readyState).toBe(3);
-    expect(transport.snapshot.connectionState).toBe("closed");
+    expect(protocolSnapshot).toEqual({ connectionState: "closed", sessionReady: false });
+    expectClosedEmpty(transport);
   });
 
   it("does not send PCM before ready, without an utterance, or after commit", async () => {
@@ -633,7 +1077,7 @@ describe("G2 relay transport", () => {
     expect(events.some((event) => event.type === "fatal")).toBe(false);
   });
 
-  it("routes recoverable server errors to onTransportError and makes terminal errors expected", async () => {
+  it("follows the relay recoverable error to 4503 flow with exactly one fresh loss", async () => {
     const errors: RelayTransportError[] = [];
     const events: RelayTransportCallbackEvent[] = [];
     FakeWebSocket.instances.length = 0;
@@ -645,73 +1089,112 @@ describe("G2 relay transport", () => {
       onTransportError: (error) => errors.push(error),
     });
     const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.of(1, 2));
+    socket.message(JSON.stringify(utteranceAborted()));
     socket.message(JSON.stringify(serverError(true)));
-    expect(errors.at(-1)?.kind).toBe("protocol");
+    expect(errors).toHaveLength(0);
     expect(events.some((event) => event.type === "fatal")).toBe(false);
+    expect(transport.snapshot.sessionReady).toBe(true);
 
-    socket.message(JSON.stringify(serverError(false)));
-    expect(events.filter((event) => event.type === "fatal")).toHaveLength(1);
-    expect(socket.readyState).toBe(3);
-    expect(transport.snapshot.connectionState).toBe("closed");
-    expect(errors.filter((error) => error.kind === "websocket")).toHaveLength(0);
+    socket.unexpectedClose(4503);
+    socket.error();
+
+    expect(events.filter((event) => event.type === "transport.lost")).toEqual([{
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+    }]);
+    expect(errors).toHaveLength(0);
+    expectClosedEmpty(transport);
   });
 
-  it("clears a committed utterance before recoverable server-error callbacks", async () => {
+  it("clears all retained state before a terminal server error emits fatal", async () => {
     const errors: RelayTransportError[] = [];
     const events: RelayTransportCallbackEvent[] = [];
-    let activeInCallback: string | undefined;
-    const created = createTransport(
-      (event) => events.push(event),
-      (error) => {
-        errors.push(error);
-        if (error.kind === "protocol") {
-          activeInCallback = created.transport.snapshot.activeUtteranceId;
-          created.transport.startUtterance(SECOND_UTTERANCE_ID);
+    let snapshotInFatal: RelayTransport["snapshot"] | undefined;
+    FakeWebSocket.instances.length = 0;
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => {
+        events.push(event);
+        if (event.type === "fatal") {
+          snapshotInFatal = transport.snapshot;
         }
       },
-    );
-    const transport = created.transport;
+      onTransportError: (error) => errors.push(error),
+    });
     const socket = await openReady(transport);
 
     transport.startUtterance(UTTERANCE_ID);
     transport.pushPcm(Uint8Array.of(1, 2));
     transport.commitUtterance();
-    socket.message(JSON.stringify(serverError(true, "server")));
+    socket.message(JSON.stringify(serverError(false, "server")));
+    socket.error();
+    socket.unexpectedClose(1011);
 
-    expect(activeInCallback).toBeUndefined();
-    expect(events.filter((event) => event.type === "fatal")).toHaveLength(0);
-    expect(socket.readyState).toBe(1);
-    expect(transport.snapshot.activeUtteranceId).toBe(SECOND_UTTERANCE_ID);
-    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
-      type: "utterance.start",
-      utteranceId: SECOND_UTTERANCE_ID,
+    expect(events.filter((event) => event.type === "fatal")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    expect(snapshotInFatal).toEqual({
+      connectionState: "closed",
+      sessionReady: false,
     });
-    expect(errors.at(-1)?.kind).toBe("protocol");
+    expect(socket.readyState).toBe(3);
+    expect(socket.closeCalls).toBe(1);
+    expect(errors).toHaveLength(0);
+    expectClosedEmpty(transport);
   });
 
-  it("reports required control send failures while retaining the unsent boundary state", async () => {
+  it("turns post-ready control send failures into one fresh transport loss", async () => {
     const errors: RelayTransportError[] = [];
-    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(
+      undefined,
+      (error) => errors.push(error),
+      (event) => events.push(event),
+    );
     const socket = await openReady(transport);
     transport.startUtterance(UTTERANCE_ID);
     socket.sendError = new Error("send failed");
     transport.commitUtterance();
-    expect(errors.some((error) => error.kind === "websocket")).toBe(true);
-    expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+    expect(errors).toHaveLength(0);
+    expect(events.filter((event) => event.type === "transport.lost")).toEqual([{
+      type: "transport.lost",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+    }]);
+    expect(transport.snapshot).toEqual({
+      connectionState: "closed",
+      sessionReady: false,
+    });
 
     FakeWebSocket.instances.length = 0;
     const endErrors: RelayTransportError[] = [];
+    const endEvents: RelayTransportCallbackEvent[] = [];
     const endTransport = new RelayTransport({
       relayOrigin: "https://relay.example",
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => endEvents.push(event),
       onTransportError: (error) => endErrors.push(error),
     });
     const endSocket = await openReady(endTransport);
     endSocket.sendError = new Error("end failed");
     endTransport.endSession();
-    expect(endErrors.some((error) => error.kind === "websocket")).toBe(true);
-    expect(endTransport.snapshot.sessionReady).toBe(true);
+    expect(endErrors).toHaveLength(1);
+    expect(endErrors[0]?.recoveryDisposition).toBe("retry");
+    expect(endEvents.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    const endError = endErrors[0];
+    if (endError === undefined) throw new Error("End transport error missing");
+    expectRedactedError(endError, {
+      kind: "websocket",
+      disposition: "retry",
+      message: "Relay WebSocket transport failed",
+    }, "end failed");
+    expect(endSocket.closeCalls).toBe(1);
+    expectClosedEmpty(endTransport);
   });
 
   it("does not let a stale ticket failure close a newer session generation", async () => {
@@ -748,21 +1231,147 @@ describe("G2 relay transport", () => {
     expect(transport.snapshot.connectionState).toBe("open");
   });
 
-  it("marks endSession and session.rejected closes as expected", async () => {
+  it("does not let a stale socket loss clear or report a replacement generation", async () => {
+    FakeWebSocket.instances.length = 0;
     const errors: RelayTransportError[] = [];
-    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const events: RelayTransportCallbackEvent[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => events.push(event),
+      onTransportError: (error) => errors.push(error),
+    });
+
+    const firstSocket = await openReady(transport);
+    const replacementStart = transport.startSession("tr");
+    await flushMicrotasks();
+    const secondSocket = FakeWebSocket.instances[1];
+    if (secondSocket === undefined) throw new Error("Replacement WebSocket was not constructed");
+
+    firstSocket.error();
+    firstSocket.unexpectedClose(1013);
+    secondSocket.open();
+    await replacementStart;
+    secondSocket.message(JSON.stringify(readyMessage(DEFAULT_NEGOTIATED_LIMITS, {
+      targetLanguage: "tr",
+    })));
+
+    expect(errors).toHaveLength(0);
+    expect(events.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      targetLanguage: "tr",
+    });
+  });
+
+  it("drops displaced event delivery when the first callback replaces its source", async () => {
+    FakeWebSocket.instances.length = 0;
+    const serverEvents: RelayTransportEvent[] = [];
+    const callbackEvents: RelayTransportCallbackEvent[] = [];
+    const errors: RelayTransportError[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onServerEvent: (event) => {
+        serverEvents.push(event);
+        if (event.type === "utterance.aborted") {
+          void transport.startSession("tr");
+        }
+      },
+      onEvent: (event) => callbackEvents.push(event),
+      onTransportError: (error) => errors.push(error),
+    });
+    const firstSocket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+
+    firstSocket.message(JSON.stringify(utteranceAborted()));
+    firstSocket.message(JSON.stringify(readyMessage()));
+    await flushMicrotasks();
+
+    expect(serverEvents.filter((event) => event.type === "utterance.aborted"))
+      .toHaveLength(1);
+    expect(callbackEvents.filter((event) => event.type === "utterance.aborted"))
+      .toHaveLength(0);
+    expect(errors).toHaveLength(0);
+    const replacementSocket = FakeWebSocket.instances[1];
+    if (replacementSocket === undefined) throw new Error("Replacement WebSocket missing");
+    replacementSocket.open();
+    replacementSocket.message(JSON.stringify(readyMessage(DEFAULT_NEGOTIATED_LIMITS, {
+      targetLanguage: "tr",
+    })));
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      targetLanguage: "tr",
+    });
+  });
+
+  it("does not let terminal error callbacks clear a reentrant replacement", async () => {
+    FakeWebSocket.instances.length = 0;
+    const errors: RelayTransportError[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onTransportError: (error) => {
+        errors.push(error);
+        void transport.startSession("tr");
+      },
+    });
+    const firstSocket = await openReady(transport);
+
+    firstSocket.unexpectedClose(1000);
+    firstSocket.error();
+    await flushMicrotasks();
+
+    expect(errors).toHaveLength(1);
+    const replacementSocket = FakeWebSocket.instances[1];
+    if (replacementSocket === undefined) throw new Error("Replacement WebSocket missing");
+    replacementSocket.open();
+    replacementSocket.message(JSON.stringify(readyMessage(DEFAULT_NEGOTIATED_LIMITS, {
+      targetLanguage: "tr",
+    })));
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      targetLanguage: "tr",
+    });
+  });
+
+  it("proactively detaches and closes after endSession and session.rejected", async () => {
+    const errors: RelayTransportError[] = [];
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(
+      undefined,
+      (error) => errors.push(error),
+      (event) => events.push(event),
+    );
     const socket = await openReady(transport);
     transport.endSession();
     expect(sentControl(socket, 1)).toMatchObject({ type: "session.end" });
-    socket.close();
+    expect(socket.readyState).toBe(3);
+    expect(socket.closeCalls).toBe(1);
     expect(errors).toHaveLength(0);
+    expect(events.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    expectClosedEmpty(transport);
 
     FakeWebSocket.instances.length = 0;
     const rejectedErrors: RelayTransportError[] = [];
+    const rejectedEvents: RelayTransportCallbackEvent[] = [];
+    let rejectedSnapshot: RelayTransport["snapshot"] | undefined;
     const rejected = new RelayTransport({
       relayOrigin: "https://relay.example",
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => {
+        rejectedEvents.push(event);
+        if (event.type === "session.rejected") {
+          rejectedSnapshot = rejected.snapshot;
+        }
+      },
       onTransportError: (error) => rejectedErrors.push(error),
     });
     const rejectedSocket = await openSocket(rejected);
@@ -771,11 +1380,18 @@ describe("G2 relay transport", () => {
       code: "authentication_failed",
       displaySafeMessage: "The session could not be started.",
     }));
-    rejectedSocket.close();
+    expect(rejectedSocket.readyState).toBe(3);
+    expect(rejectedSocket.closeCalls).toBe(1);
     expect(rejectedErrors).toHaveLength(0);
+    expect(rejectedEvents.filter((event) => event.type === "transport.lost")).toHaveLength(0);
+    expect(rejectedEvents.filter((event) => event.type === "session.rejected"))
+      .toHaveLength(1);
+    expect(rejectedSnapshot).toEqual({ connectionState: "closed", sessionReady: false });
+    expectClosedEmpty(rejected);
   });
 
   it("isolates callbacks and defensively clones object server messages", async () => {
+    const canary = "RAW_CALLBACK_CANARY";
     const errors: RelayTransportError[] = [];
     const events: RelayTransportCallbackEvent[] = [];
     FakeWebSocket.instances.length = 0;
@@ -784,7 +1400,7 @@ describe("G2 relay transport", () => {
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onServerEvent: () => {
-        throw new Error("server callback failed");
+        throw new Error(canary);
       },
       onEvent: (event) => events.push(event),
       onTransportError: (error) => errors.push(error),
@@ -799,14 +1415,22 @@ describe("G2 relay transport", () => {
     expect(Object.isFrozen(event)).toBe(true);
     expect(Object.isFrozen(event.effectiveLimits)).toBe(true);
     expect(errors.some((error) => error.kind === "callback")).toBe(true);
+    const callbackError = errors.find((error) => error.kind === "callback");
+    if (callbackError === undefined) throw new Error("Callback error missing");
+    expectRedactedError(callbackError, {
+      kind: "callback",
+      disposition: "stop",
+      message: "Relay transport callback failed",
+    }, canary);
   });
 
-  it("rejects a duplicate session.ready without changing negotiated session state", async () => {
+  it("rejects a duplicate session.ready and synchronously clears negotiated state", async () => {
     const errors: RelayTransportError[] = [];
     const { transport } = createTransport(undefined, (error) => errors.push(error));
     const socket = await openSocket(transport);
     socket.message(JSON.stringify(readyMessage()));
-    const beforeDuplicate = transport.snapshot;
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.of(1, 2));
     const duplicateLimits = {
       ...DEFAULT_NEGOTIATED_LIMITS,
       maxAudioPayloadBytes: 2,
@@ -819,9 +1443,7 @@ describe("G2 relay transport", () => {
 
     expect(errors.at(-1)?.kind).toBe("protocol");
     expect(socket.readyState).toBe(3);
-    expect(transport.snapshot.sessionId).toBe(beforeDuplicate.sessionId);
-    expect(transport.snapshot.sessionEpoch).toBe(beforeDuplicate.sessionEpoch);
-    expect(transport.snapshot.negotiatedLimits).toEqual(beforeDuplicate.negotiatedLimits);
+    expectClosedEmpty(transport);
   });
 
   it("rejects session.ready messages that violate this generation's negotiation", async () => {
