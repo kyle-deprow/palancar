@@ -2,13 +2,25 @@ import { randomBytes } from 'node:crypto';
 
 import { assertBase64UrlSecret, TICKET_LIFETIME_MS } from '@palancar/contracts';
 
-import type {
-  ConsumedRelayTicket,
-  RelayTicketIntent,
-  RelayUpgradeAudience,
-  TicketConsumer,
-  TicketConsumeResult
-} from './types.js';
+import type { RelayUpgradeAudience } from './types.js';
+
+/** Legacy test-only ticket utility. Production host composition never uses it. */
+export type RelayTicketIntent =
+  | { readonly intent: 'new' }
+  | { readonly intent: 'resume'; readonly sessionId: string };
+export interface ConsumedRelayTicket {
+  readonly installationId: string;
+  readonly credentialVersion: number;
+  readonly intent: RelayTicketIntent;
+  readonly expiresAt: string;
+}
+export type TicketConsumeResult =
+  | { readonly status: 'accepted'; readonly claim: ConsumedRelayTicket }
+  | {
+      readonly status: 'rejected';
+      readonly reason: 'authentication_failed' | 'ticket_expired' | 'origin_rejected' |
+        'session_conflict' | 'rate_limited' | 'state_unavailable';
+    };
 
 const DEVELOPMENT_INSTALLATION_ID = '00000000-0000-4000-8000-000000000001';
 
@@ -32,14 +44,13 @@ interface StoredTicket {
 
 function sameAudience(left: RelayUpgradeAudience, right: RelayUpgradeAudience): boolean {
   return (
-    left.environment === right.environment &&
     left.origin === right.origin &&
     left.path === right.path &&
     left.protocol === right.protocol
   );
 }
 
-export class DevelopmentTicketStore implements TicketConsumer {
+export class DevelopmentTicketStore {
   readonly #clock: () => number;
   readonly #ticketLifetimeMs: number;
   readonly #tickets = new Map<string, StoredTicket>();

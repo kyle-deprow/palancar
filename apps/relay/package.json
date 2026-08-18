@@ -16,6 +16,7 @@
     "@palancar/contracts": "0.1.0",
     "@palancar/generation": "0.1.0",
     "@palancar/language-registry": "0.1.0",
+    "@palancar/security-state": "0.1.0",
     "@palancar/transcription": "0.1.0",
     "ws": "8.21.3"
   },

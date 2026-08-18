@@ -5,6 +5,13 @@ import {
   type GenerationProvider,
   type GenerationProviderCompletion
 } from '@palancar/generation';
+import {
+  CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+  CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  LANGUAGE_REGISTRY_VERSION,
+  type ClassifiedLanguageEvidence,
+  type TextLanguageClassifier
+} from '@palancar/language-registry';
 import type {
   CancelResult,
   CloseResult,
@@ -20,11 +27,16 @@ import type {
 } from '@palancar/transcription';
 import { DETERMINISTIC_MOCK_CAPABILITIES } from '@palancar/transcription';
 import {
+  SecurityStateError,
+  assertCanonicalUuid,
+  type CompleteGenerationInput
+} from '@palancar/security-state';
+import {
   RelaySessionCore,
-  type ConsumedRelayTicket,
   createTestOptions,
+  createTestSecurityRuntime,
+  createTestSessionLease,
   createTestSubprotocols,
-  createTestTicketClaim,
   TEST_GATE_POLICY_VERSION,
   TEST_SECOND_UTTERANCE_ID,
   TEST_SESSION_ID,
@@ -41,6 +53,20 @@ async function flushAsyncEvents(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
+function deferredValue<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolvePromise: (value: T) => void = () => undefined;
+  let rejectPromise: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
 function startText(
   targetLanguage: 'es' | 'tr' = 'es',
   requestedLimits = START_LIMITS
@@ -50,7 +76,7 @@ function startText(
     protocolVersion: 1,
     wearerLanguage: 'en',
     targetLanguage,
-    languageRegistryVersion: '1.0.0',
+    languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
     gatePolicyVersion: TEST_GATE_POLICY_VERSION,
     clientBuild: 'relay-test-1.0.0',
     requestedLimits
@@ -114,7 +140,8 @@ function pcmSamples(sampleCount: number) {
 function finalEvent(
   category: 'target' | 'english' | 'supported-unselected' | 'mixed' | 'unsupported' | 'uncertain' = 'target',
   utteranceId = TEST_UTTERANCE_ID,
-  revision = 1
+  revision = 1,
+  fixtureLanguage: 'es' | 'tr' = 'es'
 ): NormalizedTranscriptionFinal {
   const evidence = {
     detectorVersion: 'test-detector-1.0.0',
@@ -138,7 +165,7 @@ function finalEvent(
     utteranceId,
     segmentId: 'segment-1',
     revision,
-    text: category === 'target' ? 'hola' : 'hostile transcript',
+    text: `${fixtureLanguage}-${category === 'target' ? 'selected-target' : category}-final`,
     providerEventTime: '2026-08-10T12:00:00.000Z',
     languageEvidence: evidence,
     acceptedThroughOriginalSampleOffset: 0,
@@ -154,7 +181,7 @@ function partialEvent(revision = 1): NormalizedTranscriptionEvent {
     utteranceId: TEST_UTTERANCE_ID,
     segmentId: 'segment-1',
     revision,
-    text: 'partial text',
+    text: `es-selected-target-partial-${revision}`,
     providerEventTime: '2026-08-10T12:00:00.000Z',
     languageEvidence: {
       detectorVersion: 'test-detector-1.0.0',
@@ -168,6 +195,7 @@ function partialEvent(revision = 1): NormalizedTranscriptionEvent {
 
 interface RecordingSession extends TranscriptionSession {
   readonly emit: (event: NormalizedTranscriptionEvent) => void;
+  readonly fail: () => void;
   readonly pushCalls: readonly Readonly<{
     readonly utteranceId: string;
     readonly originalSampleOffset: number;
@@ -186,12 +214,17 @@ function recordingAdapter(
   configuration = DETERMINISTIC_MOCK_CAPABILITIES,
   pushResult?: (input: { readonly utteranceId: string; readonly originalSampleOffset: number; readonly pcm: Uint8Array }) => PushAudioResult,
   pushError?: Error,
-  finalizeBehavior: FinalizeResult | Error = { status: 'finalized', event: finalEvent() }
+  finalizeBehavior: FinalizeResult | Error = { status: 'finalization-requested' }
 ): RecordingAdapter {
   const sessions: RecordingSession[] = [];
   const adapter: RecordingAdapter = {
     capabilities: configuration,
     sessions,
+    checkReadiness: async () => ({
+      ready: true,
+      provider: 'recording',
+      model: 'recording'
+    }),
     createSession: (input): RecordingSession => {
       let closed = false;
       const pushCalls: Array<Readonly<{
@@ -249,6 +282,9 @@ function recordingAdapter(
         emit: (event): void => {
           input.onEvent(event);
         },
+        fail: (): void => {
+          input.onFailure({ reason: 'provider', audioStateEpoch: 1 });
+        },
         pushCalls,
         finalizeCalls,
         cancelCalls,
@@ -288,6 +324,16 @@ function pendingGenerationProvider(onSignal: (signal: AbortSignal) => void): Gen
   };
 }
 
+function calibratedEvidence(detectedLanguage: string): ClassifiedLanguageEvidence {
+  return {
+    status: 'calibrated',
+    detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+    calibrationVersion: CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+    detectedLanguage,
+    confidence: 0.95
+  };
+}
+
 describe('relay protocol helpers', () => {
   it('accepts exactly one base protocol and one valid ticket and selects only the base', () => {
     const selection = selectStreamSubprotocols(createTestSubprotocols());
@@ -323,9 +369,8 @@ describe('relay protocol helpers', () => {
   });
 
   it('burns a valid ticket only after validation and maps consumption failures', async () => {
-    const consume = vi.fn(async () => ({ status: 'accepted' as const, claim: createTestTicketClaim() }));
+    const consume = vi.fn(async () => createTestSessionLease());
     const audience = {
-      environment: 'test',
       origin: 'wss://relay.test',
       path: '/v1/stream' as const,
       protocol: 'palancar.v1' as const
@@ -333,145 +378,211 @@ describe('relay protocol helpers', () => {
     const accepted = await prepareStreamUpgrade({
       offeredSubprotocols: createTestSubprotocols(),
       audience,
-      ticketConsumer: { consume }
+      environment: 'test',
+      securityRuntime: createTestSecurityRuntime({ consumeSessionTicket: consume })
     });
     expect(accepted.status).toBe('accepted');
-    expect(consume).toHaveBeenCalledWith(TEST_TICKET, audience);
+    expect(consume).toHaveBeenCalledWith({
+      ticket: TEST_TICKET,
+      environment: 'test',
+      audience,
+      intent: 'new'
+    });
     consume.mockClear();
     await prepareStreamUpgrade({
       offeredSubprotocols: ['palancar.v1', 'bad'],
       audience,
-      ticketConsumer: { consume }
+      environment: 'test',
+      securityRuntime: createTestSecurityRuntime({ consumeSessionTicket: consume })
     });
     expect(consume).not.toHaveBeenCalled();
 
-    for (const [reason, httpStatus] of [
-      ['authentication_failed', 401],
-      ['ticket_expired', 401],
-      ['origin_rejected', 403],
-      ['session_conflict', 409],
-      ['rate_limited', 429],
-      ['state_unavailable', 503]
+    for (const [category, httpStatus] of [
+      ['invalid-ticket', 401],
+      ['session-rejected', 409],
+      ['rate-limited', 429],
+      ['state-unavailable', 503]
     ] as const) {
       const result = await prepareStreamUpgrade({
         offeredSubprotocols: createTestSubprotocols(),
         audience,
-        ticketConsumer: {
-          consume: async () => ({ status: 'rejected' as const, reason })
-        }
+        environment: 'test',
+        securityRuntime: createTestSecurityRuntime({
+          consumeSessionTicket: async () => { throw new SecurityStateError(category); }
+        })
       });
       expect(result).toEqual({ status: 'rejected', httpStatus });
     }
   });
 
-  it('rejects a legacy consumed ticket claim generically', async () => {
-    const legacyClaim = {
-      ...createTestTicketClaim(),
-      intent: { intent: 'resume', sessionId: TEST_SESSION_ID }
-    } as unknown as ConsumedRelayTicket;
+  it('fails closed when ticket consumption throws an unknown error', async () => {
     const result = await prepareStreamUpgrade({
       offeredSubprotocols: createTestSubprotocols(),
       audience: {
-        environment: 'test',
         origin: 'wss://relay.test',
         path: '/v1/stream',
         protocol: 'palancar.v1'
       },
-      ticketConsumer: {
-        consume: async () => ({ status: 'accepted', claim: legacyClaim })
-      }
-    });
-
-    expect(result).toEqual({ status: 'rejected', httpStatus: 401 });
-  });
-
-  it('fails closed on malformed consumed ticket intent shapes without invoking accessors', async () => {
-    const baseClaim = createTestTicketClaim();
-    let getterCalls = 0;
-    const outerAccessorClaim = { ...baseClaim };
-    Object.defineProperty(outerAccessorClaim, 'intent', {
-      configurable: true,
-      enumerable: true,
-      get: () => {
-        getterCalls += 1;
-        return { intent: 'new' };
-      }
-    });
-    const innerAccessorIntent = {};
-    Object.defineProperty(innerAccessorIntent, 'intent', {
-      configurable: true,
-      enumerable: true,
-      get: () => {
-        getterCalls += 1;
-        return 'new';
-      }
-    });
-    const inheritedClaim = Object.create({ intent: { intent: 'new' } }) as Record<string, unknown>;
-    Object.assign(inheritedClaim, {
-      installationId: baseClaim.installationId,
-      credentialVersion: baseClaim.credentialVersion,
-      expiresAt: baseClaim.expiresAt
-    });
-    const nullPrototypeIntent = Object.assign(Object.create(null) as object, { intent: 'new' });
-    const customPrototypeIntent = Object.assign(Object.create({ legacy: true }) as object, {
-      intent: 'new'
-    });
-    const malformedClaims: readonly unknown[] = [
-      null,
-      { ...baseClaim, intent: null },
-      { ...baseClaim, intent: 'new' },
-      { ...baseClaim, intent: { intent: 'new', sessionId: TEST_SESSION_ID } },
-      { ...baseClaim, intent: nullPrototypeIntent },
-      { ...baseClaim, intent: customPrototypeIntent },
-      { ...baseClaim, intent: innerAccessorIntent },
-      inheritedClaim,
-      outerAccessorClaim
-    ];
-    const audience = {
       environment: 'test',
-      origin: 'wss://relay.test',
-      path: '/v1/stream' as const,
-      protocol: 'palancar.v1' as const
-    };
+      securityRuntime: createTestSecurityRuntime({
+        consumeSessionTicket: async () => { throw new Error('secret'); }
+      })
+    });
 
-    for (const claim of malformedClaims) {
-      const result = await prepareStreamUpgrade({
-        offeredSubprotocols: createTestSubprotocols(),
-        audience,
-        ticketConsumer: {
-          consume: async () => ({
-            status: 'accepted' as const,
-            claim: claim as ConsumedRelayTicket
-          })
-        }
-      });
-      expect(result).toEqual({ status: 'rejected', httpStatus: 401 });
-    }
-    expect(getterCalls).toBe(0);
+    expect(result).toEqual({ status: 'rejected', httpStatus: 503 });
   });
 });
 
 describe('relay session core', () => {
-  it('rejects a legacy ticket claim before creating a new session', () => {
-    const adapter = recordingAdapter();
-    const legacyClaim = {
-      ...createTestTicketClaim(),
-      intent: { intent: 'resume', sessionId: TEST_SESSION_ID }
-    } as unknown as ConsumedRelayTicket;
-    const core = new RelaySessionCore(createTestOptions({
-      ticketClaim: legacyClaim,
-      transcriptionAdapter: adapter
+  it('spends durable generation state exactly once only for an accepted target final', async () => {
+    const baseSecurity = createTestSecurityRuntime();
+    const authorizeGeneration = vi.fn(baseSecurity.authorizeGeneration);
+    const providerStart = vi.fn(baseSecurity.providerStart);
+    const completeGeneration = vi.fn(baseSecurity.completeGeneration);
+    const providerComplete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
     }));
+    const securityRuntime = createTestSecurityRuntime({
+      authorizeGeneration,
+      providerStart,
+      completeGeneration
+    });
+    const { core } = openNew(recordingAdapter(), 'es', {
+      securityRuntime,
+      generationService: new GenerationService({
+        id: 'durable-generation-test',
+        version: '1.0.0',
+        complete: providerComplete
+      })
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent('target'));
+    await flushAsyncEvents();
+    await core.drainAsyncEvents();
 
-    const result = core.openWithFirstText(startText());
+    expect(authorizeGeneration).toHaveBeenCalledTimes(1);
+    expect(providerStart).toHaveBeenCalledTimes(1);
+    expect(providerComplete).toHaveBeenCalledTimes(1);
+    expect(completeGeneration).toHaveBeenCalledTimes(1);
 
-    expect(result.outgoing).toMatchObject([
-      { type: 'session.rejected', code: 'authentication_failed' }
-    ]);
-    expect(result.outgoing.some((message) => message.type === 'session.ready')).toBe(false);
-    expect(result.close).toEqual({ code: 4401, reason: 'authentication_failed' });
-    expect(adapter.sessions).toHaveLength(0);
+    const rejectedSecurity = createTestSecurityRuntime({
+      authorizeGeneration: vi.fn(baseSecurity.authorizeGeneration)
+    });
+    const rejected = openNew(recordingAdapter(), 'es', {
+      securityRuntime: rejectedSecurity,
+      generationService: new GenerationService({
+        id: 'suppressed-generation-test',
+        version: '1.0.0',
+        complete: providerComplete
+      })
+    }).core;
+    rejected.handleText(utteranceStartText());
+    await rejected.handleTranscriptionEvent(finalEvent('english'));
+    expect(rejectedSecurity.authorizeGeneration).not.toHaveBeenCalled();
+    expect(providerComplete).toHaveBeenCalledTimes(1);
   });
+
+  it('serializes completion behind a heartbeat and completes with the renewed current claim', async () => {
+    const base = createTestSecurityRuntime();
+    const authorized = await base.authorizeGeneration({} as never);
+    const started = { ...authorized.claim, phase: 'started' as const, claimVersion: 2 };
+    const renewed = { ...started, claimVersion: 3 };
+    const completed = { ...renewed, phase: 'completed' as const, claimVersion: 4 };
+    const heartbeatStarted = deferredValue<void>();
+    const heartbeatResult = deferredValue<typeof renewed>();
+    const providerResult = deferredValue<GenerationProviderCompletion>();
+    const completeGeneration = vi.fn(async ({ claim }: CompleteGenerationInput) => {
+      expect(claim).toEqual(renewed);
+      return completed;
+    });
+    const securityRuntime = createTestSecurityRuntime({
+      authorizeGeneration: async () => authorized,
+      providerStart: async () => ({ status: 'start-permitted', claim: started }),
+      heartbeatGeneration: async () => {
+        heartbeatStarted.resolve(undefined);
+        return heartbeatResult.promise;
+      },
+      completeGeneration
+    });
+    const { core } = openNew(recordingAdapter(), 'es', {
+      securityRuntime,
+      generationService: new GenerationService({
+        id: 'heartbeat-race-provider',
+        version: '1.0.0',
+        complete: async () => providerResult.promise
+      })
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent('target'));
+    const heartbeat = core.heartbeatGeneration();
+    await heartbeatStarted.promise;
+    providerResult.resolve({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    });
+    await flushAsyncEvents();
+    expect(completeGeneration).not.toHaveBeenCalled();
+
+    heartbeatResult.resolve(renewed);
+    await heartbeat;
+    await flushAsyncEvents();
+    expect(completeGeneration).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['provider-failure', 'identity-mismatch'] as const)(
+    'keeps the last identity-matching claim after heartbeat %s',
+    async (mode) => {
+      const base = createTestSecurityRuntime();
+      const authorized = await base.authorizeGeneration({} as never);
+      const started = { ...authorized.claim, phase: 'started' as const, claimVersion: 2 };
+      const completed = { ...started, phase: 'completed' as const, claimVersion: 3 };
+      const providerResult = deferredValue<GenerationProviderCompletion>();
+      const completeGeneration = vi.fn(async ({ claim }: CompleteGenerationInput) => {
+        expect(claim).toEqual(started);
+        return completed;
+      });
+      const securityRuntime = createTestSecurityRuntime({
+        authorizeGeneration: async () => authorized,
+        providerStart: async () => ({ status: 'start-permitted', claim: started }),
+        heartbeatGeneration: async () => {
+          if (mode === 'provider-failure') throw new SecurityStateError('state-unavailable');
+          return {
+            ...started,
+            claimId: assertCanonicalUuid('99999999-9999-4999-8999-999999999999'),
+            claimVersion: 3
+          };
+        },
+        completeGeneration
+      });
+      const { core } = openNew(recordingAdapter(), 'es', {
+        securityRuntime,
+        generationService: new GenerationService({
+          id: `heartbeat-${mode}`,
+          version: '1.0.0',
+          complete: async () => providerResult.promise
+        })
+      });
+      core.handleText(utteranceStartText());
+      await core.handleTranscriptionEvent(finalEvent('target'));
+      await expect(core.heartbeatGeneration()).rejects.toBeDefined();
+      providerResult.resolve({
+        englishTranslation: 'hello',
+        suggestions: [
+          { englishText: 'hello', selectedTargetText: 'hola' },
+          { englishText: 'hi', selectedTargetText: 'buenas' }
+        ]
+      });
+      await flushAsyncEvents();
+      expect(completeGeneration).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it('rejects the removed legacy session input before creating a session', () => {
     const adapter = recordingAdapter();
@@ -497,7 +608,7 @@ describe('relay session core', () => {
         type: 'session.ready',
         result: 'new',
         targetLanguage: language,
-        languageRegistryVersion: '1.0.0',
+        languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
         gatePolicyVersion: TEST_GATE_POLICY_VERSION,
         effectiveLimits: lowerLimits
       });
@@ -507,7 +618,10 @@ describe('relay session core', () => {
   it('rejects registry and policy mismatches without creating transcription sessions', () => {
     const adapter = recordingAdapter();
     const core = new RelaySessionCore(createTestOptions({ transcriptionAdapter: adapter }));
-    const registryMismatch = core.openWithFirstText(startText().replace('"1.0.0"', '"2.0.0"'));
+    const registryMismatch = core.openWithFirstText(startText().replace(
+      `"languageRegistryVersion":"${LANGUAGE_REGISTRY_VERSION}"`,
+      '"languageRegistryVersion":"99.0.0"'
+    ));
     expect(registryMismatch.outgoing).toMatchObject([{ type: 'session.rejected', code: 'state_unavailable' }]);
     expect(adapter.sessions).toHaveLength(0);
 
@@ -806,6 +920,33 @@ describe('relay session core', () => {
     expect(adapter.sessions[0]?.closeCalls).toBe(1);
   });
 
+  it.each([
+    'already-requested',
+    'already-finalized'
+  ] as const)('accepts the %s finalize status idempotently and awaits callback final', async (status) => {
+    const { core, adapter } = openNew(recordingAdapter(
+      DETERMINISTIC_MOCK_CAPABILITIES,
+      undefined,
+      undefined,
+      { status }
+    ));
+    core.handleText(utteranceStartText());
+    core.handleBinary(frame());
+
+    const committed = core.handleText(utteranceCommitText(TEST_UTTERANCE_ID, 1));
+    expect(committed.outgoing).toMatchObject([
+      { type: 'audio.ack', highestContiguousExclusiveOffset: 1 }
+    ]);
+    expect(await core.drainAsyncEvents()).toEqual({ outgoing: [] });
+
+    adapter.sessions[0]?.emit(finalEvent());
+    const final = await core.drainAsyncEvents();
+    expect(final.outgoing.slice(0, 2).map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+  });
+
   it('maps a thrown finalize to provider loss without committing or ACKing', () => {
     const finalizeError = new Error('finalize provider secret');
     const { core, adapter } = openNew(
@@ -918,7 +1059,7 @@ describe('relay session core', () => {
     expect(providerSignal?.aborted).toBe(true);
   });
 
-  it('forwards partials only and orders target final generation output', async () => {
+  it('suppresses partial text and orders target final generation output', async () => {
     const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
       englishTranslation: 'hello',
       suggestions: [
@@ -935,7 +1076,7 @@ describe('relay session core', () => {
     });
     core.handleText(utteranceStartText());
     const partial = await core.handleTranscriptionEvent(partialEvent());
-    expect(partial.outgoing.map((message) => message.type)).toEqual(['transcript.partial']);
+    expect(partial.outgoing).toEqual([]);
     const final = await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 2));
     expect(final.outgoing.map((message) => message.type)).toEqual([
       'transcript.final',
@@ -1066,20 +1207,222 @@ describe('relay session core', () => {
       core.handleText(utteranceStartText());
       const result = await core.handleTranscriptionEvent(finalEvent(category));
       expect(result.outgoing.map((message) => message.type)).toEqual([
-        'transcript.final',
         'language.decision'
       ]);
-      expect(result.outgoing[1]).toMatchObject({ decision: category === 'uncertain' ? 'uncertain' : category === 'supported-unselected' ? 'supported_unselected' : category });
+      expect(result.outgoing[0]).toMatchObject({ decision: category === 'uncertain' ? 'uncertain' : category === 'supported-unselected' ? 'supported_unselected' : category });
       expect(complete).not.toHaveBeenCalled();
     }
   });
+
+  it('applies selected-target and supported-unselected decisions symmetrically for es and tr', async () => {
+    for (const selectedLanguage of ['es', 'tr'] as const) {
+      const oppositeLanguage = selectedLanguage === 'es' ? 'tr' : 'es';
+      const selected = openNew(recordingAdapter(), selectedLanguage);
+      selected.core.handleText(utteranceStartText());
+      const accepted = await selected.core.handleTranscriptionEvent(
+        finalEvent('target', TEST_UTTERANCE_ID, 1, selectedLanguage)
+      );
+      expect(accepted.outgoing.map((message) => message.type)).toEqual([
+        'transcript.final',
+        'language.decision'
+      ]);
+      expect(accepted.outgoing[1]).toMatchObject({
+        decision: 'target',
+        detectedLanguage: selectedLanguage
+      });
+
+      const unselected = openNew(recordingAdapter(), selectedLanguage);
+      unselected.core.handleText(utteranceStartText());
+      const rejected = await unselected.core.handleTranscriptionEvent(
+        finalEvent('target', TEST_UTTERANCE_ID, 1, oppositeLanguage)
+      );
+      expect(rejected.outgoing).toMatchObject([
+        {
+          type: 'language.decision',
+          decision: 'supported_unselected',
+          detectedLanguage: oppositeLanguage
+        }
+      ]);
+      expect(rejected.outgoing.some((message) => message.type === 'transcript.final')).toBe(false);
+    }
+  });
+
+  it('ignores provider language metadata, confidence, logprobs, and raw scores', async () => {
+    const { core } = openNew();
+    core.handleText(utteranceStartText());
+    const spoofed = {
+      ...finalEvent(),
+      languageEvidence: {
+        detectorVersion: 'hostile-provider-detector',
+        source: 'transcription-metadata' as const,
+        detectedLanguage: 'en',
+        confidence: 0
+      },
+      logprobs: [{ token: 'spoof', logprob: 0 }],
+      rawScores: [{ language: 'en', score: 999 }]
+    } as NormalizedTranscriptionFinal;
+
+    const result = await core.handleTranscriptionEvent(spoofed);
+    expect(result.outgoing).toMatchObject([
+      { type: 'transcript.final', text: 'es-selected-target-final' },
+      { type: 'language.decision', decision: 'target', detectedLanguage: 'es' }
+    ]);
+  });
+
+  it.each(['resolved', 'microtask'] as const)(
+    'serializes %s classifier completion before accepting a target final',
+    async (mode) => {
+      const classify = vi.fn((text: string): Promise<ClassifiedLanguageEvidence> => {
+        expect(text).toBe('es-selected-target-final');
+        if (mode === 'resolved') {
+          return Promise.resolve(calibratedEvidence('es'));
+        }
+        return new Promise((resolve) => {
+          queueMicrotask(() => resolve(calibratedEvidence('es')));
+        });
+      });
+      const languageClassifier: TextLanguageClassifier = {
+        ready: Promise.resolve(),
+        classify
+      };
+      const { core } = openNew(recordingAdapter(), 'es', { languageClassifier });
+      core.handleText(utteranceStartText());
+
+      const result = await core.handleTranscriptionEvent(finalEvent());
+      expect(result.outgoing.map((message) => message.type)).toEqual([
+        'transcript.final',
+        'language.decision'
+      ]);
+      expect(classify).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('fails classifier errors and unavailable text closed without transcript or generation', async () => {
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    for (const languageClassifier of [
+      {
+        ready: Promise.resolve(),
+        classify: async (): Promise<ClassifiedLanguageEvidence> => {
+          throw new Error('classifier secret');
+        }
+      },
+      {
+        ready: Promise.resolve(),
+        classify: async (): Promise<ClassifiedLanguageEvidence> => ({
+          status: 'unavailable',
+          detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION
+        })
+      }
+    ] satisfies readonly TextLanguageClassifier[]) {
+      const { core } = openNew(recordingAdapter(), 'es', {
+        languageClassifier,
+        generationService: new GenerationService({
+          id: 'must-not-run',
+          version: '1.0.0',
+          complete
+        })
+      });
+      core.handleText(utteranceStartText());
+      const event = { ...finalEvent(), text: 'normal user text' };
+      const result = await core.handleTranscriptionEvent(event);
+      expect(result.outgoing).toMatchObject([
+        { type: 'language.decision', decision: 'uncertain' }
+      ]);
+      expect(result.outgoing.some((message) => message.type.startsWith('transcript.'))).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('normal user text');
+      expect(JSON.stringify(result)).not.toContain('classifier secret');
+      expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toEqual({ outgoing: [] });
+    }
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a classifier result that becomes stale during cancellation', async () => {
+    let resolveClassification: ((evidence: ClassifiedLanguageEvidence) => void) | undefined;
+    const languageClassifier: TextLanguageClassifier = {
+      ready: Promise.resolve(),
+      classify: () => new Promise((resolve) => {
+        resolveClassification = resolve;
+      })
+    };
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      languageClassifier,
+      generationService: new GenerationService({
+        id: 'stale-classification-provider',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+    const final = core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    expect(core.handleText(utteranceCancelText())).toMatchObject({
+      outgoing: [{ type: 'utterance.aborted', category: 'cancellation' }]
+    });
+    resolveClassification?.(calibratedEvidence('es'));
+
+    await expect(final).resolves.toEqual({ outgoing: [] });
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it.each(['throw', 'unavailable'] as const)(
+    'suppresses a partial classifier %s and keeps the utterance active for its final',
+    async (mode) => {
+      let classifyCalls = 0;
+      const languageClassifier: TextLanguageClassifier = {
+        ready: Promise.resolve(),
+        classify: async (text) => {
+          classifyCalls += 1;
+          if (text.includes('-partial-')) {
+            if (mode === 'throw') {
+              throw new Error('partial classifier secret');
+            }
+            return {
+              status: 'unavailable',
+              detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION
+            };
+          }
+          return calibratedEvidence('es');
+        }
+      };
+      const { core } = openNew(recordingAdapter(), 'es', { languageClassifier });
+      core.handleText(utteranceStartText());
+
+      const partial = await core.handleTranscriptionEvent(partialEvent(1));
+      expect(partial).toEqual({ outgoing: [] });
+      expect(JSON.stringify(partial)).not.toContain('partial classifier secret');
+      expect(await core.handleTranscriptionEvent(partialEvent(1))).toEqual({ outgoing: [] });
+      expect(classifyCalls).toBe(1);
+
+      const final = await core.handleTranscriptionEvent(
+        finalEvent('target', TEST_UTTERANCE_ID, 2)
+      );
+      expect(final.outgoing.map((message) => message.type)).toEqual([
+        'transcript.final',
+        'language.decision'
+      ]);
+      expect(classifyCalls).toBe(2);
+    }
+  );
 
   it('ignores stale, duplicate, and post-final events', async () => {
     const { core } = openNew();
     core.handleText(utteranceStartText());
     const stale = await core.handleTranscriptionEvent({ ...partialEvent(), sessionId: '99999999-9999-4999-8999-999999999999' });
     expect(stale).toEqual({ outgoing: [] });
-    expect((await core.handleTranscriptionEvent(partialEvent(2))).outgoing).toHaveLength(1);
+    expect((await core.handleTranscriptionEvent(partialEvent(2))).outgoing).toHaveLength(0);
     expect((await core.handleTranscriptionEvent(partialEvent(1))).outgoing).toHaveLength(0);
     expect((await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 3))).outgoing).toHaveLength(2);
     expect((await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 4))).outgoing).toHaveLength(0);
@@ -1159,7 +1502,67 @@ describe('relay session core', () => {
     const session = adapter.sessions[0];
     session?.emit(partialEvent());
     const result = await core.drainAsyncEvents();
-    expect(result.outgoing.map((message) => message.type)).toEqual(['transcript.partial']);
+    expect(result.outgoing).toEqual([]);
+  });
+
+  it('coalesces content-free transcription failures into one provider-loss terminal result', async () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    const session = adapter.sessions[0];
+    session?.emit(partialEvent());
+    session?.fail();
+    session?.fail();
+
+    const result = await core.drainAsyncEvents();
+    expect(result.outgoing).toMatchObject([
+      { type: 'utterance.aborted', category: 'provider_loss' },
+      { type: 'error', code: 'provider_unavailable' }
+    ]);
+    expect(result.close).toEqual({ code: 4503, reason: 'provider_unavailable' });
+    expect(JSON.stringify(result)).not.toContain('audioStateEpoch');
+    expect(session?.cancelCalls).toEqual([TEST_UTTERANCE_ID]);
+    expect(session?.closeCalls).toBe(1);
+    expect(await core.drainAsyncEvents()).toEqual({
+      outgoing: [],
+      close: { code: 1000, reason: 'closed' }
+    });
+  });
+
+  it('prioritizes transcription failure over a full non-partial callback backlog', async () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    const session = adapter.sessions[0];
+    for (let revision = 1; revision <= 65; revision += 1) {
+      session?.emit({
+        ...finalEvent('english', TEST_UTTERANCE_ID, revision),
+        segmentId: `failure-backlog-${revision}`
+      });
+    }
+    session?.fail();
+
+    const result = await core.drainAsyncEvents();
+    expect(result.outgoing).toMatchObject([
+      { type: 'utterance.aborted', category: 'provider_loss' },
+      { type: 'error', code: 'provider_unavailable' }
+    ]);
+    expect(result.close).toEqual({ code: 4503, reason: 'provider_unavailable' });
+  });
+
+  it('lets cancellation win before a queued provider failure drains and suppresses stale callbacks', async () => {
+    const { core, adapter } = openNew();
+    core.handleText(utteranceStartText());
+    const session = adapter.sessions[0];
+    session?.fail();
+
+    const cancelled = core.handleText(utteranceCancelText());
+    expect(cancelled.outgoing).toMatchObject([
+      { type: 'utterance.aborted', category: 'cancellation' }
+    ]);
+    session?.fail();
+    session?.emit(partialEvent());
+    expect(await core.drainAsyncEvents()).toEqual({ outgoing: [] });
+    expect(session?.cancelCalls).toEqual([TEST_UTTERANCE_ID]);
+    expect(session?.closeCalls).toBe(1);
   });
 
   it('partially evicts distinct-segment partials to admit a final at queue capacity', async () => {

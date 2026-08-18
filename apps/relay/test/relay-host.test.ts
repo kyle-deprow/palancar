@@ -10,7 +10,11 @@ import {
   createWebSocketSubprotocols,
   encodeAudioFrame
 } from '@palancar/contracts';
-import { LANGUAGE_REGISTRY_VERSION } from '@palancar/language-registry';
+import {
+  LANGUAGE_REGISTRY_VERSION,
+  type ClassifiedLanguageEvidence,
+  type TextLanguageClassifier
+} from '@palancar/language-registry';
 import {
   DeterministicMockProvider,
   GenerationService,
@@ -19,18 +23,27 @@ import {
 } from '@palancar/generation';
 import {
   DETERMINISTIC_MOCK_CAPABILITIES,
+  DeterministicMockTranscriptionAdapter,
   type NormalizedTranscriptionEvent,
   type TranscriptionAdapter,
   type TranscriptionSession
 } from '@palancar/transcription';
+import type {
+  SecurityRuntimeStore,
+  SecurityStateMaintenanceStore
+} from '@palancar/security-state';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, type RawData } from 'ws';
 
 import {
   DevelopmentTicketStore,
-  createRelayHost,
+  TEST_CREDENTIAL,
+  createTestHostSecurityComposition,
+  createTestOptions,
+  createRelayHost as createRelayHostProduction,
   parseRelayHostConfig,
   type RelayHost,
+  type RelayHostConfig,
   type RelayUpgradeAudience
 } from '../src/index.js';
 
@@ -42,6 +55,26 @@ const CANARY = 'relay-host-canary-ticket-body-provider-error';
 const CONFIG_CANARY = 'relay-host-config-canary-invalid-origin';
 const RELAY_MAIN_PATH = fileURLToPath(new URL('../dist/main.js', import.meta.url));
 
+function createRelayHost(config: RelayHostConfig): RelayHost {
+  return createRelayHostProduction({
+    ...config,
+    security: createTestHostSecurityComposition()
+  });
+}
+
+function testSecurityWith(input: {
+  readonly runtime?: Partial<SecurityRuntimeStore>;
+  readonly maintenance?: Partial<SecurityStateMaintenanceStore>;
+} = {}) {
+  const base = createTestHostSecurityComposition();
+  const runtime = Object.assign(Object.create(base.runtime) as SecurityRuntimeStore, input.runtime);
+  const maintenance = Object.assign(
+    Object.create(base.maintenance) as SecurityStateMaintenanceStore,
+    input.maintenance
+  );
+  return { mode: 'azure-table' as const, runtime, maintenance };
+}
+
 interface JsonObject {
   readonly [key: string]: unknown;
 }
@@ -50,6 +83,19 @@ function asObject(value: unknown): JsonObject {
   expect(typeof value).toBe('object');
   expect(value).not.toBeNull();
   return value as JsonObject;
+}
+
+function observingControlledClassifier(
+  observe: (text: string) => void | Promise<void>
+): TextLanguageClassifier {
+  const delegate = createTestOptions().languageClassifier;
+  return {
+    ready: delegate.ready,
+    classify: async (text: string): Promise<ClassifiedLanguageEvidence> => {
+      await observe(text);
+      return delegate.classify(text);
+    }
+  };
 }
 
 async function responseJson(response: Response): Promise<JsonObject> {
@@ -132,68 +178,12 @@ function waitForUnexpectedResponse(socket: WebSocket): Promise<number> {
   });
 }
 
-function waitForCloseOrUnexpectedResponse(
-  socket: WebSocket
-): Promise<'close' | 'unexpected-response'> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      finishReject(new Error('timed out waiting for upgrade rejection'));
-    }, 5_000);
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      socket.removeListener('close', onClose);
-      socket.removeListener('unexpected-response', onUnexpectedResponse);
-      socket.removeListener('open', onOpen);
-    };
-    const finishResolve = (result: 'close' | 'unexpected-response'): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      resolve(result);
-    };
-    const finishReject = (error: Error): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const onClose = (): void => finishResolve('close');
-    const onUnexpectedResponse = (_request: unknown, response: { resume(): void }): void => {
-      response.resume();
-      finishResolve('unexpected-response');
-    };
-    const onOpen = (): void => {
-      socket.close();
-      finishReject(new Error('unexpected WebSocket acceptance'));
-    };
-    socket.once('close', onClose);
-    socket.once('unexpected-response', onUnexpectedResponse);
-    socket.once('open', onOpen);
-  });
-}
-
 function createDeferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
   let resolvePromise: () => void = () => undefined;
   const promise = new Promise<void>((resolve) => {
     resolvePromise = resolve;
   });
   return { promise, resolve: () => resolvePromise() };
-}
-
-class DelayedTicketStore extends DevelopmentTicketStore {
-  readonly consumeStarted = createDeferred();
-  readonly consumeRelease = createDeferred();
-
-  override async consume(ticket: string, audience: RelayUpgradeAudience) {
-    this.consumeStarted.resolve();
-    await this.consumeRelease.promise;
-    return super.consume(ticket, audience);
-  }
 }
 
 function runRelayMain(env: NodeJS.ProcessEnv): Promise<{
@@ -287,7 +277,10 @@ async function issueTicket(host: RelayHost, body: unknown = { protocolVersion: 1
   const port = (address as { readonly port: number }).port;
   const response = await fetch(`http://127.0.0.1:${port}/v1/session-tickets`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${TEST_CREDENTIAL}`
+    },
     body: JSON.stringify(body)
   });
   expect(response.status).toBe(200);
@@ -306,7 +299,6 @@ async function openSocket(host: RelayHost, ticket: string, protocols?: readonly 
 
 function audience(origin = ORIGIN): RelayUpgradeAudience {
   return {
-    environment: ENVIRONMENT,
     origin,
     path: '/v1/stream',
     protocol: WEBSOCKET_SUBPROTOCOL
@@ -316,6 +308,7 @@ function audience(origin = ORIGIN): RelayUpgradeAudience {
 function createAsyncCallbackAdapter(): TranscriptionAdapter {
   return {
     capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    checkReadiness: async () => ({ ready: true, provider: 'test', model: 'test' }),
     createSession(input): TranscriptionSession {
       let closed = false;
       const session: TranscriptionSession = {
@@ -337,7 +330,7 @@ function createAsyncCallbackAdapter(): TranscriptionAdapter {
                 utteranceId,
                 segmentId: `${utteranceId}:0`,
                 revision: 1,
-                text: 'asynchronous partial',
+                text: 'es-selected-target-partial-1',
                 providerEventTime: '2026-08-10T12:00:00.000Z',
                 languageEvidence: {
                   detectorVersion: 'async-test-1.0.0',
@@ -372,7 +365,9 @@ function createAsyncCallbackAdapter(): TranscriptionAdapter {
 function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
   return {
     capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    checkReadiness: async () => ({ ready: true, provider: 'test', model: 'test' }),
     createSession(input): TranscriptionSession {
+      let activeUtteranceId: string | undefined;
       return {
         capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
         configuration: input.configuration,
@@ -383,6 +378,19 @@ function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
         },
         deliveryFailures: { failureCount: 0 },
         start: ({ utteranceId }) => {
+          activeUtteranceId = utteranceId;
+          return { status: 'started' };
+        },
+        pushAudio: ({ pcm, originalSampleOffset }) => ({
+          status: 'accepted',
+          acceptedSamples: pcm.byteLength / 2,
+          acceptedThroughOriginalSampleOffset: originalSampleOffset + pcm.byteLength / 2
+        }),
+        finalize: () => {
+          const utteranceId = activeUtteranceId;
+          if (utteranceId === undefined) {
+            return { status: 'already-cancelled' };
+          }
           input.onEvent({
             type: 'transcript.final',
             sessionId: input.sessionId,
@@ -390,7 +398,7 @@ function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
             utteranceId,
             segmentId: `${utteranceId}:0`,
             revision: 1,
-            text: 'synchronous final',
+            text: 'es-selected-target-final',
             providerEventTime: '2026-08-10T12:00:00.000Z',
             languageEvidence: {
               detectorVersion: 'synchronous-final-test-1.0.0',
@@ -401,14 +409,38 @@ function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
             acceptedThroughOriginalSampleOffset: 0,
             finalizationReason: 'explicit'
           });
-          return { status: 'started' };
+          return { status: 'finalization-requested' };
         },
+        cancel: () => ({ status: 'cancelled' }),
+        close: () => ({ status: 'closed' })
+      };
+    }
+  };
+}
+
+function createSynchronousFailureAdapter(): TranscriptionAdapter {
+  return {
+    capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    checkReadiness: async () => ({ ready: true, provider: 'test', model: 'test' }),
+    createSession(input): TranscriptionSession {
+      input.onFailure({ reason: 'provider', audioStateEpoch: 0 });
+      input.onFailure({ reason: 'socket', audioStateEpoch: 0 });
+      return {
+        capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+        configuration: input.configuration,
+        state: {
+          closed: false,
+          acceptedThroughOriginalSampleOffset: 0,
+          audioStateEpoch: 0
+        },
+        deliveryFailures: { failureCount: 0 },
+        start: () => ({ status: 'started' }),
         pushAudio: ({ pcm, originalSampleOffset }) => ({
           status: 'accepted',
           acceptedSamples: pcm.byteLength / 2,
           acceptedThroughOriginalSampleOffset: originalSampleOffset + pcm.byteLength / 2
         }),
-        finalize: () => ({ status: 'already-cancelled' }),
+        finalize: () => ({ status: 'finalization-requested' }),
         cancel: () => ({ status: 'cancelled' }),
         close: () => ({ status: 'closed' })
       };
@@ -419,6 +451,7 @@ function createSynchronousFinalEventAdapter(): TranscriptionAdapter {
 function createTwoAsyncEventAdapter(mode: 'microtask' | 'immediate'): TranscriptionAdapter {
   return {
     capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    checkReadiness: async () => ({ ready: true, provider: 'test', model: 'test' }),
     createSession(input): TranscriptionSession {
       let closed = false;
       const event = (utteranceId: string, revision: number): NormalizedTranscriptionEvent => ({
@@ -428,7 +461,7 @@ function createTwoAsyncEventAdapter(mode: 'microtask' | 'immediate'): Transcript
         utteranceId,
         segmentId: `${utteranceId}:0`,
         revision,
-        text: `asynchronous partial ${revision}`,
+        text: `es-selected-target-partial-${revision}`,
         providerEventTime: '2026-08-10T12:00:00.000Z',
         languageEvidence: {
           detectorVersion: 'async-wakeup-test-1.0.0',
@@ -490,6 +523,7 @@ function createBlockedDeliveryAdapter(): {
   let closed = false;
   const adapter: TranscriptionAdapter = {
     capabilities: DETERMINISTIC_MOCK_CAPABILITIES,
+    checkReadiness: async () => ({ ready: true, provider: 'test', model: 'test' }),
     createSession(input): TranscriptionSession {
       const event = (utteranceId: string, revision: number): NormalizedTranscriptionEvent => ({
         type: 'transcript.partial',
@@ -498,7 +532,7 @@ function createBlockedDeliveryAdapter(): {
         utteranceId,
         segmentId: `${utteranceId}:0`,
         revision,
-        text: `blocked delivery partial ${revision}`,
+        text: `es-selected-target-partial-${revision}`,
         providerEventTime: '2026-08-10T12:00:00.000Z',
         languageEvidence: {
           detectorVersion: 'blocked-delivery-test-1.0.0',
@@ -555,41 +589,28 @@ function createBlockedDeliveryAdapter(): {
 
 const LITELLM_API_KEY = 'relay-host-test-litellm-key';
 const LITELLM_MODEL = 'palancar-generation';
-const LITELLM_BACKEND = 'openrouter';
-const LITELLM_UPSTREAM_MODEL = 'openrouter/openai/gpt-5.6-luna';
 const READINESS_CANARY = 'relay-host-readiness-provider-canary';
 
 interface ReadinessFixtureOptions {
   readonly catalogStatus?: number;
   readonly catalogBody?: unknown;
-  readonly metadataStatus?: number;
-  readonly metadataBody?: unknown;
   readonly hangCatalog?: boolean;
-  readonly hangMetadata?: boolean;
   readonly redirectCatalog?: boolean;
-  readonly redirectMetadata?: boolean;
 }
 
 interface ReadinessFixture {
   readonly server: HttpServer;
   readonly baseUrl: string;
-  readonly metadataUrl: string;
   readonly getCatalogAuthorization: () => string | undefined;
-  readonly getMetadataAuthorization: () => string | undefined;
   readonly getCatalogRedirectAuthorization: () => string | undefined;
-  readonly getMetadataRedirectAuthorization: () => string | undefined;
   readonly getCatalogRedirectRequests: () => number;
-  readonly getMetadataRedirectRequests: () => number;
   close(): Promise<void>;
 }
 
 async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Promise<ReadinessFixture> {
   let catalogAuthorization: string | undefined;
-  let metadataAuthorization: string | undefined;
   let catalogRedirectAuthorization: string | undefined;
-  let metadataRedirectAuthorization: string | undefined;
   let catalogRedirectRequests = 0;
-  let metadataRedirectRequests = 0;
   const server = createHttpServer((request, response) => {
     if (request.url === '/v1/models') {
       catalogAuthorization = request.headers.authorization;
@@ -617,40 +638,6 @@ async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Pro
       response.end(JSON.stringify({ data: [{ id: LITELLM_MODEL }] }));
       return;
     }
-    if (request.url === '/palancar/provider') {
-      metadataAuthorization = request.headers.authorization;
-      if (options.hangMetadata === true) {
-        return;
-      }
-      if (options.redirectMetadata === true) {
-        response.statusCode = 302;
-        response.setHeader('location', '/palancar/provider-redirect-target');
-        response.end(READINESS_CANARY);
-        return;
-      }
-      const body = options.metadataBody ?? {
-        alias: LITELLM_MODEL,
-        backend: LITELLM_BACKEND,
-        upstreamModel: LITELLM_UPSTREAM_MODEL
-      };
-      const text = typeof body === 'string' ? body : JSON.stringify(body);
-      response.statusCode = options.metadataStatus ?? 200;
-      response.setHeader('content-type', 'application/json');
-      response.end(text);
-      return;
-    }
-    if (request.url === '/palancar/provider-redirect-target') {
-      metadataRedirectRequests += 1;
-      metadataRedirectAuthorization = request.headers.authorization;
-      response.statusCode = 200;
-      response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({
-        alias: LITELLM_MODEL,
-        backend: LITELLM_BACKEND,
-        upstreamModel: LITELLM_UPSTREAM_MODEL
-      }));
-      return;
-    }
     response.statusCode = 404;
     response.end();
   });
@@ -668,13 +655,9 @@ async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Pro
   return {
     server,
     baseUrl: `http://127.0.0.1:${port}`,
-    metadataUrl: `http://127.0.0.1:${port}`,
     getCatalogAuthorization: () => catalogAuthorization,
-    getMetadataAuthorization: () => metadataAuthorization,
     getCatalogRedirectAuthorization: () => catalogRedirectAuthorization,
-    getMetadataRedirectAuthorization: () => metadataRedirectAuthorization,
     getCatalogRedirectRequests: () => catalogRedirectRequests,
-    getMetadataRedirectRequests: () => metadataRedirectRequests,
     close: () => new Promise<void>((resolve, reject) => {
       if (!server.listening) {
         resolve();
@@ -687,20 +670,25 @@ async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Pro
 
 function mockEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
+    PALANCAR_SECURITY_MODE: 'local-mock',
     PALANCAR_GENERATION_PROVIDER: 'mock',
+    PALANCAR_TRANSCRIPTION_PROVIDER: 'mock',
     ...overrides
   };
 }
 
 function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
+    PALANCAR_SECURITY_MODE: 'azure-table',
+    PALANCAR_RELAY_ENVIRONMENT: ENVIRONMENT,
+    PALANCAR_WORKLOAD_TABLE_ENDPOINT: 'https://palancartest.table.core.windows.net',
+    PALANCAR_SECURITY_STATE_TABLE: 'SecurityState',
+    PALANCAR_RATE_STATE_TABLE: 'RateState',
+    AZURE_CLIENT_ID: '11111111-1111-4111-8111-111111111111',
     PALANCAR_GENERATION_PROVIDER: 'litellm',
     PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000',
     PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY,
     PALANCAR_LITELLM_MODEL: LITELLM_MODEL,
-    PALANCAR_LITELLM_EXPECTED_BACKEND: LITELLM_BACKEND,
-    PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL: LITELLM_UPSTREAM_MODEL,
-    PALANCAR_LITELLM_METADATA_URL: 'http://127.0.0.1:4001',
     ...overrides
   };
 }
@@ -710,16 +698,17 @@ function hostPort(host: RelayHost): number {
 }
 
 function expectedLiteLLMReadiness(upstreamReady: boolean): JsonObject {
+  return { ready: upstreamReady };
+}
+
+function createReadinessAdapter(
+  checkReadiness: TranscriptionAdapter['checkReadiness']
+): TranscriptionAdapter {
+  const delegate = createAsyncCallbackAdapter();
   return {
-    ready: upstreamReady,
-    generation: {
-      provider: 'litellm',
-      providerId: 'litellm-chat',
-      model: LITELLM_MODEL,
-      backend: LITELLM_BACKEND,
-      upstreamModel: LITELLM_UPSTREAM_MODEL,
-      upstreamReady
-    }
+    capabilities: delegate.capabilities,
+    createSession: (input) => delegate.createSession(input),
+    checkReadiness
   };
 }
 
@@ -747,9 +736,59 @@ describe('relay host configuration and readiness', () => {
     });
   });
 
+  it('accepts only the privately branded built-in generation service in local-mock mode', async () => {
+    const builtInConfig = parseRelayHostConfig(mockEnvironment({ PORT: '0' }));
+    const localHost = createRelayHostProduction(builtInConfig);
+    await localHost.stop();
+
+    const customService = new GenerationService(new DeterministicMockProvider({
+      id: 'custom-deterministic-provider',
+      complete: {
+        result: {
+          englishTranslation: 'custom',
+          suggestions: [
+            { englishText: 'one', selectedTargetText: 'uno' },
+            { englishText: 'two', selectedTargetText: 'dos' }
+          ]
+        }
+      }
+    }));
+    expect(() => createRelayHostProduction({
+      ...builtInConfig,
+      generationService: customService,
+      generationReadiness: {
+        provider: 'mock',
+        providerId: customService.provider.id,
+        model: 'mock'
+      }
+    })).toThrow('Invalid relay host configuration.');
+  });
+
   it('rejects executable configuration without an explicit generation provider generically', () => {
     expect(() => parseRelayHostConfig({})).toThrow('Invalid relay host configuration.');
     expect(() => parseRelayHostConfig({})).not.toThrow(LITELLM_API_KEY);
+  });
+
+  it.each([
+    ['non-loopback bind', { PALANCAR_RELAY_BIND_HOST: '0.0.0.0' }],
+    ['non-loopback origin', { PALANCAR_RELAY_ORIGIN: 'wss://relay.example' }],
+    ['LiteLLM setting', { PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY }],
+    ['Azure setting', { AZURE_CLIENT_ID: '11111111-1111-4111-8111-111111111111' }]
+  ])('rejects local-mock composition with %s', (_name, override) => {
+    expect(() => parseRelayHostConfig(mockEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it.each([
+    ['endpoint', { PALANCAR_WORKLOAD_TABLE_ENDPOINT: undefined }],
+    ['SecurityState name', { PALANCAR_SECURITY_STATE_TABLE: 'Wrong' }],
+    ['RateState name', { PALANCAR_RATE_STATE_TABLE: 'Wrong' }],
+    ['runtime UAMI', { AZURE_CLIENT_ID: undefined }]
+  ])('rejects azure-table composition with invalid %s', (_name, override) => {
+    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
   });
 
   it('creates LiteLLM provider identity without exposing its API key', () => {
@@ -763,11 +802,7 @@ describe('relay host configuration and readiness', () => {
     ['missing base URL', { PALANCAR_LITELLM_BASE_URL: undefined }],
     ['missing API key', { PALANCAR_LITELLM_API_KEY: undefined }],
     ['missing model', { PALANCAR_LITELLM_MODEL: undefined }],
-    ['missing expected backend', { PALANCAR_LITELLM_EXPECTED_BACKEND: undefined }],
-    ['missing expected upstream model', { PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL: undefined }],
-    ['missing metadata URL', { PALANCAR_LITELLM_METADATA_URL: undefined }],
     ['malformed base URL', { PALANCAR_LITELLM_BASE_URL: 'not-a-url' }],
-    ['malformed metadata URL', { PALANCAR_LITELLM_METADATA_URL: 'http://metadata/?secret=1' }],
     ['malformed timeout', { PALANCAR_LITELLM_TIMEOUT_MS: 'not-a-number' }]
   ])('rejects %s with a generic config error', (_name, override) => {
     expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
@@ -784,8 +819,7 @@ describe('relay host configuration and readiness', () => {
     try {
       host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
         PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
-        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
       })));
       await host.start();
       const health = await fetch(`http://127.0.0.1:${hostPort(host)}/healthz`);
@@ -804,14 +838,13 @@ describe('relay host configuration and readiness', () => {
     }
   });
 
-  it('returns content-free ready status for a valid LiteLLM catalog and metadata response', async () => {
+  it('returns content-free ready status for one authenticated LiteLLM alias', async () => {
     const fixture = await startReadinessFixture();
     let host: RelayHost | undefined;
     try {
       host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
         PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
-        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
       })));
       await host.start();
       const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
@@ -819,7 +852,6 @@ describe('relay host configuration and readiness', () => {
       expect(ready.status).toBe(200);
       expect(await responseJson(ready)).toEqual(expectedLiteLLMReadiness(true));
       expect(fixture.getCatalogAuthorization()).toBe(`Bearer ${LITELLM_API_KEY}`);
-      expect(fixture.getMetadataAuthorization()).toBeUndefined();
     } finally {
       await host?.stop();
       await fixture.close();
@@ -847,50 +879,14 @@ describe('relay host configuration and readiness', () => {
     }],
     ['missing alias', {
       catalogBody: { data: [{ id: 'other-model' }], error: READINESS_CANARY }
-    }],
-    ['metadata non-2xx', {
-      metadataStatus: 503,
-      metadataBody: {
-        alias: LITELLM_MODEL,
-        backend: LITELLM_BACKEND,
-        upstreamModel: LITELLM_UPSTREAM_MODEL
-      }
-    }],
-    ['metadata timeout', { hangMetadata: true }],
-    ['metadata malformed JSON', { metadataBody: `{not-json:${READINESS_CANARY}` }],
-    ['metadata body over 16 KiB', {
-      metadataBody: `${JSON.stringify({
-        alias: LITELLM_MODEL,
-        backend: LITELLM_BACKEND,
-        upstreamModel: LITELLM_UPSTREAM_MODEL
-      })}${' '.repeat(16_384)}`
-    }],
-    ['backend mismatch', { metadataBody: {
-      alias: LITELLM_MODEL,
-      backend: 'azure',
-      upstreamModel: LITELLM_UPSTREAM_MODEL,
-      error: READINESS_CANARY
-    } }],
-    ['alias mismatch', { metadataBody: {
-      alias: 'other-model',
-      backend: LITELLM_BACKEND,
-      upstreamModel: LITELLM_UPSTREAM_MODEL,
-      error: READINESS_CANARY
-    } }],
-    ['upstream mismatch', { metadataBody: {
-      alias: LITELLM_MODEL,
-      backend: LITELLM_BACKEND,
-      upstreamModel: 'openrouter/other-model',
-      error: READINESS_CANARY
-    } }]
+    }]
   ])('returns exact content-free 503 for LiteLLM readiness failure: %s', async (_name, options) => {
     const fixture = await startReadinessFixture(options);
     let host: RelayHost | undefined;
     try {
       host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
         PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
-        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
       })));
       await host.start();
       await expectFailedLiteLLMReadiness(host);
@@ -906,32 +902,12 @@ describe('relay host configuration and readiness', () => {
     try {
       host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
         PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
-        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
+        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
       })));
       await host.start();
       await expectFailedLiteLLMReadiness(host);
       expect(fixture.getCatalogRedirectRequests()).toBe(0);
       expect(fixture.getCatalogRedirectAuthorization()).toBeUndefined();
-    } finally {
-      await host?.stop();
-      await fixture.close();
-    }
-  });
-
-  it('rejects a redirect from the LiteLLM metadata endpoint', async () => {
-    const fixture = await startReadinessFixture({ redirectMetadata: true });
-    let host: RelayHost | undefined;
-    try {
-      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
-        PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl,
-        PALANCAR_LITELLM_METADATA_URL: fixture.metadataUrl
-      })));
-      await host.start();
-      await expectFailedLiteLLMReadiness(host);
-      expect(fixture.getMetadataRedirectRequests()).toBe(0);
-      expect(fixture.getMetadataRedirectAuthorization()).toBeUndefined();
     } finally {
       await host?.stop();
       await fixture.close();
@@ -952,18 +928,159 @@ describe('relay host configuration and readiness', () => {
     try {
       const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
       expect(ready.status).toBe(200);
-      expect(await responseJson(ready)).toEqual({
-        ready: true,
-        generation: {
-          provider: 'mock',
-          providerId: 'deterministic-mock-generation',
-          model: 'mock',
-          upstreamReady: true
-        }
-      });
+      expect(await responseJson(ready)).toEqual({ ready: true });
     } finally {
       await host.stop();
     }
+  });
+
+  it('fails readiness closed when durable security maintenance is unavailable', async () => {
+    const security = testSecurityWith({
+      maintenance: { checkReadiness: async () => { throw new Error(READINESS_CANARY); } }
+    });
+    const securedHost = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security
+    });
+    try {
+      await securedHost.start();
+      const response = await fetch(`http://127.0.0.1:${hostPort(securedHost)}/readyz`);
+      expect(response.status).toBe(503);
+      const body = await responseJson(response);
+      expect(body).toEqual({ ready: false });
+      expect(JSON.stringify(body)).not.toContain(READINESS_CANARY);
+    } finally {
+      await securedHost.stop();
+    }
+  });
+
+  it.each([
+    ['not ready', async () => ({
+      ready: false,
+      provider: 'secret-transcription-provider',
+      model: 'secret-transcription-model'
+    })],
+    ['exception', async () => {
+      throw new Error('secret transcription readiness detail');
+    }]
+  ] as const)('fails readiness content-free when transcription reports %s', async (_label, check) => {
+    const host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createReadinessAdapter(check),
+      languageClassifier: observingControlledClassifier(() => undefined)
+    });
+    await host.start();
+    try {
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      expect(ready.status).toBe(503);
+      const body = await responseJson(ready);
+      expect(body).toEqual({ ready: false });
+      expect(JSON.stringify(body)).not.toContain('secret');
+    } finally {
+      await host.stop();
+    }
+  });
+
+  it('bounds a hanging transcription readiness check and leaves health unchanged', async () => {
+    const host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createReadinessAdapter(
+        () => new Promise(() => undefined)
+      ),
+      languageClassifier: observingControlledClassifier(() => undefined)
+    });
+    await host.start();
+    try {
+      const startedAt = Date.now();
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(ready.status).toBe(503);
+      expect(await responseJson(ready)).toEqual({ ready: false });
+      const health = await fetch(`http://127.0.0.1:${hostPort(host)}/healthz`);
+      expect(health.status).toBe(200);
+      expect(await responseJson(health)).toEqual({ ok: true });
+    } finally {
+      await host.stop();
+    }
+  }, 5_000);
+
+  it.each(['rejected', 'timeout'] as const)(
+    'fails readiness content-free when classifier readiness is %s',
+    async (mode) => {
+      const classifierReady = mode === 'rejected'
+        ? Promise.reject(new Error('secret classifier readiness detail'))
+        : new Promise<void>(() => undefined);
+      if (mode === 'rejected') void classifierReady.catch(() => undefined);
+      const languageClassifier: TextLanguageClassifier = {
+        ready: classifierReady,
+        classify: async () => ({
+          status: 'unavailable',
+          detectorVersion: 'unused-test-classifier'
+        })
+      };
+      const host = createRelayHost({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        languageClassifier
+      });
+      await host.start();
+      try {
+        const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+        expect(ready.status).toBe(503);
+        const body = await responseJson(ready);
+        expect(body).toEqual({ ready: false });
+        expect(JSON.stringify(body)).not.toContain('secret');
+      } finally {
+        await host.stop();
+      }
+    },
+    5_000
+  );
+
+  it('requires an explicit classifier for non-default transcription adapters', () => {
+    expect(() => createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createAsyncCallbackAdapter()
+    })).toThrow('Invalid relay host configuration.');
+  });
+
+  it('rejects a branded controlled classifier paired with a non-mock adapter', () => {
+    expect(() => createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createAsyncCallbackAdapter(),
+      languageClassifier: createTestOptions().languageClassifier
+    })).toThrow('Invalid relay host configuration.');
+  });
+
+  it('allows the branded controlled classifier with an actual deterministic mock adapter', async () => {
+    const host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: new DeterministicMockTranscriptionAdapter({
+        evidenceCategory: 'selected-target'
+      }),
+      languageClassifier: createTestOptions().languageClassifier
+    });
+    await host.stop();
   });
 });
 
@@ -992,15 +1109,7 @@ describe('relay HTTP/WebSocket host', () => {
     expect(health.status).toBe(200);
     expect(await responseJson(health)).toEqual({ ok: true });
     expect(ready.status).toBe(200);
-    expect(await responseJson(ready)).toEqual({
-      ready: true,
-      generation: {
-        provider: 'mock',
-        providerId: 'deterministic-mock-generation',
-        model: 'mock',
-        upstreamReady: true
-      }
-    });
+    expect(await responseJson(ready)).toEqual({ ready: true });
   });
 
   it('issues a contract-valid development ticket and rejects malformed requests generically', async () => {
@@ -1043,31 +1152,57 @@ describe('relay HTTP/WebSocket host', () => {
     expect(wrongMethod.status).toBe(405);
   });
 
-  it('does not open an upgrade that is still consuming a ticket when stopping', async () => {
-    await host.stop();
-    const ticketStore = new DelayedTicketStore();
-    host = createRelayHost({
-      environment: ENVIRONMENT,
-      origin: ORIGIN,
-      port: 0,
-      gatePolicyVersion: GATE_POLICY_VERSION,
-      ticketStore
+  it('requires bearer credentials for tickets and marks credential responses no-store', async () => {
+    const port = hostPort(host);
+    const denied = await fetch(`http://127.0.0.1:${port}/v1/session-tickets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ protocolVersion: 1, intent: 'new' })
     });
-    await host.start();
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get('cache-control')).toBe('no-store');
+    expect(await responseJson(denied)).toEqual({ error: 'request_rejected' });
 
+    const accepted = await fetch(`http://127.0.0.1:${port}/v1/session-tickets`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${TEST_CREDENTIAL}`
+      },
+      body: JSON.stringify({ protocolVersion: 1, intent: 'new' })
+    });
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('redeems pairing through the runtime and ignores forwarded identity headers', async () => {
+    const response = await fetch(`http://127.0.0.1:${hostPort(host)}/v1/pairing-redemptions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-forwarded-for': '203.0.113.99',
+        forwarded: 'for=203.0.113.100'
+      },
+      body: JSON.stringify({ pairingCode: '00000000000000000000000001' })
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await responseJson(response);
+    expect(body.credential).toBe(TEST_CREDENTIAL);
+    expect(JSON.stringify(body)).not.toContain('203.0.113');
+  });
+
+  it('closes an upgraded connection when stopping', async () => {
     const issued = await issueTicket(host);
     const address = host.server.address() as { readonly port: number };
     const socket = new WebSocket(
       `ws://127.0.0.1:${address.port}/v1/stream`,
       [...createWebSocketSubprotocols(String(issued.ticket))]
     );
-    const rejected = waitForCloseOrUnexpectedResponse(socket);
-    await ticketStore.consumeStarted.promise;
-
-    const stopping = host.stop();
-    ticketStore.consumeRelease.resolve();
-    await expect(stopping).resolves.toBeUndefined();
-    await expect(rejected).resolves.toMatch(/close|unexpected-response/);
+    await waitForOpen(socket);
+    const closed = waitForClose(socket);
+    await expect(host.stop()).resolves.toBeUndefined();
+    await expect(closed).resolves.toBeGreaterThan(0);
     expect(socket.readyState).not.toBe(WebSocket.OPEN);
   });
 
@@ -1121,8 +1256,6 @@ describe('relay HTTP/WebSocket host', () => {
     const malformed = new WebSocket(url, [`${WEBSOCKET_TICKET_PREFIX}bad`]);
     await expect(waitForUnexpectedResponse(malformed)).resolves.toBe(400);
     await expect(rawUpgradeStatus(address.port, `${WEBSOCKET_SUBPROTOCOL}, ${WEBSOCKET_SUBPROTOCOL}`)).resolves.toBe(400);
-    expect(host.ticketStore.size).toBe(1);
-
     const socket = await openSocket(host, ticket);
     expect(socket.protocol).toBe(WEBSOCKET_SUBPROTOCOL);
     const closed = waitForClose(socket);
@@ -1339,42 +1472,65 @@ describe('relay HTTP/WebSocket host', () => {
     await closed;
   });
 
-  it('drains asynchronous adapter events without another inbound message', async () => {
+  it('classifies and suppresses an asynchronous partial without another inbound message', async () => {
     await host.stop();
+    const classified = createDeferred();
+    const receivedTypes: string[] = [];
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createAsyncCallbackAdapter()
+      transcriptionAdapter: createAsyncCallbackAdapter(),
+      languageClassifier: observingControlledClassifier((text) => {
+        expect(text).toBe('es-selected-target-partial-1');
+        classified.resolve();
+      })
     });
     await host.start();
     const issued = await issueTicket(host);
     const socket = await openSocket(host, String(issued.ticket));
     const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.on('message', (data) => {
+      try {
+        const message = asObject(JSON.parse(rawDataText(data)) as unknown);
+        if (typeof message.type === 'string') receivedTypes.push(message.type);
+      } catch {
+        // Observation only.
+      }
+    });
     socket.send(sessionStartText());
     const ready = await readyPromise;
-    const partial = nextMessage(socket, (message) => message.type === 'transcript.partial');
     socket.send(JSON.stringify({
       type: 'utterance.start',
       sessionId: String(ready.sessionId),
       sessionEpoch: Number(ready.sessionEpoch),
       utteranceId: UTTERANCE_ID
     }));
-    await expect(partial).resolves.toMatchObject({ text: 'asynchronous partial' });
+    await classified.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(receivedTypes).not.toContain('transcript.partial');
     const closed = waitForClose(socket);
     socket.close(1000, 'test_done');
     await closed;
   });
 
-  it('does not lose an event arriving while an async drain is already scheduled', async () => {
+  it.each(['microtask', 'immediate'] as const)(
+    'classifies a %s partial arriving while an async drain is already scheduled',
+    async (mode) => {
     await host.stop();
+    const classifiedTexts: string[] = [];
+    const secondClassified = createDeferred();
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createTwoAsyncEventAdapter('microtask')
+      transcriptionAdapter: createTwoAsyncEventAdapter(mode),
+      languageClassifier: observingControlledClassifier((text) => {
+        classifiedTexts.push(text);
+        if (text === 'es-selected-target-partial-2') secondClassified.resolve();
+      })
     });
     await host.start();
     const issued = await issueTicket(host);
@@ -1382,10 +1538,6 @@ describe('relay HTTP/WebSocket host', () => {
     const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
     socket.send(sessionStartText());
     const ready = await readyPromise;
-    const partial = nextMessage(
-      socket,
-      (message) => message.type === 'transcript.partial' && message.revision === 2
-    );
     socket.send(JSON.stringify({
       type: 'utterance.start',
       sessionId: String(ready.sessionId),
@@ -1393,9 +1545,49 @@ describe('relay HTTP/WebSocket host', () => {
       utteranceId: UTTERANCE_ID
     }));
 
-    await expect(partial).resolves.toMatchObject({ text: 'asynchronous partial 2' });
+    await secondClassified.promise;
+    expect(classifiedTexts).toContain('es-selected-target-partial-2');
     socket.close(1000, 'test_done');
     await waitForClose(socket);
+    }
+  );
+
+  it('serializes and coalesces a synchronous create-session failure content-free', async () => {
+    await host.stop();
+    host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      transcriptionAdapter: createSynchronousFailureAdapter(),
+      languageClassifier: observingControlledClassifier(() => undefined)
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const received: JsonObject[] = [];
+    socket.on('message', (data) => {
+      try {
+        received.push(asObject(JSON.parse(rawDataText(data)) as unknown));
+      } catch {
+        // Test observation ignores malformed unrelated frames.
+      }
+    });
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const closed = waitForClose(socket);
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+
+    await expect(closed).resolves.toBe(4503);
+    expect(received.filter((message) => message.type === 'utterance.aborted')).toHaveLength(1);
+    expect(received.filter((message) => message.type === 'error')).toHaveLength(1);
+    expect(JSON.stringify(received)).not.toContain('audioStateEpoch');
   });
 
   it('keeps consecutive production sends synchronous when delivery hook is omitted', async () => {
@@ -1405,7 +1597,8 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createSynchronousFinalEventAdapter()
+      transcriptionAdapter: createSynchronousFinalEventAdapter(),
+      languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
     const issued = await issueTicket(host);
@@ -1419,7 +1612,17 @@ describe('relay HTTP/WebSocket host', () => {
       this: WebSocket,
       ...args: Parameters<typeof originalSend>
     ) {
-      if (this !== socket && observingServerSends) {
+      let relevantServerMessage = false;
+      if (this !== socket && observingServerSends && typeof args[0] === 'string') {
+        try {
+          const message = asObject(JSON.parse(args[0]) as unknown);
+          relevantServerMessage = message.type === 'transcript.final' ||
+            message.type === 'language.decision';
+        } catch {
+          relevantServerMessage = false;
+        }
+      }
+      if (relevantServerMessage) {
         if (serverSendCount === 0) {
           queueMicrotask(() => {
             microtaskRan = true;
@@ -1446,6 +1649,13 @@ describe('relay HTTP/WebSocket host', () => {
         sessionEpoch: Number(ready.sessionEpoch),
         utteranceId: UTTERANCE_ID
       }));
+      socket.send(JSON.stringify({
+        type: 'utterance.commit',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID,
+        finalOriginalSampleOffset: 0
+      }));
 
       await Promise.all([transcript, language]);
       expect(serverSendCount).toBe(2);
@@ -1458,25 +1668,28 @@ describe('relay HTTP/WebSocket host', () => {
     }
   });
 
-  it('reschedules an event enqueued while the first async delivery is blocked', async () => {
+  it('reschedules a partial enqueued while the first async classification is blocked', async () => {
     await host.stop();
     const fixture = createBlockedDeliveryAdapter();
-    const deliveryReleased = createDeferred();
-    const firstDeliveryStarted = createDeferred();
-    let blocked = false;
+    const classificationReleased = createDeferred();
+    const firstClassificationStarted = createDeferred();
+    const secondClassificationFinished = createDeferred();
+    const classifiedTexts: string[] = [];
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
       transcriptionAdapter: fixture.adapter,
-      beforeServerMessageDelivery: async (message) => {
-        if (!blocked && message.type === 'transcript.partial' && message.revision === 1) {
-          blocked = true;
-          firstDeliveryStarted.resolve();
-          await deliveryReleased.promise;
+      languageClassifier: observingControlledClassifier(async (text) => {
+        classifiedTexts.push(text);
+        if (text === 'es-selected-target-partial-1') {
+          firstClassificationStarted.resolve();
+          await classificationReleased.promise;
+        } else if (text === 'es-selected-target-partial-2') {
+          secondClassificationFinished.resolve();
         }
-      }
+      })
     });
     await host.start();
     const issued = await issueTicket(host);
@@ -1484,14 +1697,6 @@ describe('relay HTTP/WebSocket host', () => {
     const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
     socket.send(sessionStartText());
     const ready = await readyPromise;
-    const firstPartial = nextMessage(
-      socket,
-      (message) => message.type === 'transcript.partial' && message.revision === 1
-    );
-    const secondPartial = nextMessage(
-      socket,
-      (message) => message.type === 'transcript.partial' && message.revision === 2
-    );
     socket.send(JSON.stringify({
       type: 'utterance.start',
       sessionId: String(ready.sessionId),
@@ -1502,11 +1707,14 @@ describe('relay HTTP/WebSocket host', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     fixture.emitFirstEvent();
 
-    await firstDeliveryStarted.promise;
+    await firstClassificationStarted.promise;
     fixture.emitSecondEvent();
-    deliveryReleased.resolve();
-    await expect(firstPartial).resolves.toMatchObject({ text: 'blocked delivery partial 1' });
-    await expect(secondPartial).resolves.toMatchObject({ text: 'blocked delivery partial 2' });
+    classificationReleased.resolve();
+    await secondClassificationFinished.promise;
+    expect(classifiedTexts).toEqual([
+      'es-selected-target-partial-1',
+      'es-selected-target-partial-2'
+    ]);
     socket.close(1000, 'test_done');
     await waitForClose(socket);
   });
@@ -1518,5 +1726,103 @@ describe('relay HTTP/WebSocket host', () => {
     await host.stop();
     await expect(closed).resolves.toBe(1001);
     expect(host.server.listening).toBe(false);
+  });
+
+  it.each([
+    ['es', 'es-selected-target-final', 'A Spanish phrase translated to English.',
+      ['Sí, por favor.', 'No, gracias.']],
+    ['tr', 'tr-selected-target-final', 'A Turkish phrase translated to English.',
+      ['Evet, lütfen.', 'Hayır, teşekkürler.']]
+  ] as const)(
+    'keeps built-in %s transcription and suggestions language-consistent',
+    async (targetLanguage, expectedTranscript, expectedEnglish, expectedTargets) => {
+      const issued = await issueTicket(host);
+      const socket = await openSocket(host, String(issued.ticket));
+      const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+      socket.send(sessionStartText().replace('"targetLanguage":"es"',
+        `"targetLanguage":"${targetLanguage}"`));
+      const ready = await readyPromise;
+      const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
+      const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
+      const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
+      socket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID
+      }));
+      socket.send(JSON.stringify({
+        type: 'utterance.commit',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID,
+        finalOriginalSampleOffset: 0
+      }));
+
+      await expect(transcript).resolves.toMatchObject({ text: expectedTranscript });
+      await expect(translation).resolves.toMatchObject({ englishTranslation: expectedEnglish });
+      const suggestionMessage = await suggestions;
+      expect(suggestionMessage.suggestions).toEqual([
+        { englishText: 'Yes, please.', selectedTargetText: expectedTargets[0] },
+        { englishText: 'No, thank you.', selectedTargetText: expectedTargets[1] }
+      ]);
+      socket.close(1000, 'test_done');
+      await waitForClose(socket);
+    }
+  );
+
+  it('reserves audio in exact 8,000-sample ranges rather than writing per frame', async () => {
+    await host.stop();
+    const security = testSecurityWith();
+    const reserve = vi.spyOn(security.runtime, 'reserveAudio');
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const readyMessage = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyMessage;
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+    const grantBoundaryAck = nextMessage(socket, (message) =>
+      message.type === 'audio.ack' && message.highestContiguousExclusiveOffset === 8_000
+    );
+    for (let sequence = 0; sequence < 5; sequence += 1) {
+      socket.send(frame(sequence, sequence * 1_600));
+    }
+    socket.send(frame(5, 8_000, new Uint8Array(2)));
+    await grantBoundaryAck;
+    const finalAck = nextMessage(socket, (message) =>
+      message.type === 'audio.ack' && message.highestContiguousExclusiveOffset === 8_001
+    );
+    socket.send(JSON.stringify({
+      type: 'utterance.commit',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 8_001
+    }));
+    await finalAck;
+
+    expect(reserve).toHaveBeenCalledTimes(2);
+    expect(reserve.mock.calls.map(([input]) => ({
+      from: input.fromOriginalSampleOffset,
+      samples: input.originalSamples
+    }))).toEqual([
+      { from: 0, samples: 8_000 },
+      { from: 8_000, samples: 8_000 }
+    ]);
+    socket.close(1000, 'test_done');
+    await waitForClose(socket);
   });
 });

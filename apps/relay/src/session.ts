@@ -26,6 +26,9 @@ import {
 import {
   LANGUAGE_REGISTRY_VERSION,
   evaluateLanguageGate,
+  type ClassifiedLanguageEvidence,
+  type LanguageGateResult,
+  type TextLanguageClassifier,
   type TargetLanguage
 } from '@palancar/language-registry';
 import type {
@@ -33,10 +36,15 @@ import type {
   TranscriptionSession,
   TranscriptionAdapter
 } from '@palancar/transcription';
+import {
+  hashCorrelationKey,
+  type GenerationClaim,
+  type SecurityRuntimeStore,
+  type SessionLease
+} from '@palancar/security-state';
 
-import { hasExactNewSessionIntent, negotiateLimits } from './protocol.js';
+import { negotiateLimits } from './protocol.js';
 import type {
-  ConsumedRelayTicket,
   RelayClock,
   RelayIdGenerator,
   RelaySessionCoreOptions,
@@ -49,7 +57,7 @@ import type {
 const SESSION_EPOCH = 1;
 const MANUAL_COMMIT_CADENCE_MS = 600;
 const CONFIGURED_SERVER_VAD = 'disabled' as const;
-const CONFIGURED_LANGUAGE_MODE = 'selected-target-hint' as const;
+const CONFIGURED_LANGUAGE_MODE = 'automatic' as const;
 
 const SAFE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   malformed_message: 'Malformed control message.',
@@ -71,6 +79,7 @@ interface ActiveUtterance {
   committed: boolean;
   committedFinalOriginalSampleOffset: number | undefined;
   finalAccepted: boolean;
+  providerFailureQueued: boolean;
   lastRevision: number;
 }
 
@@ -78,6 +87,11 @@ interface UtteranceIdentity {
   readonly sessionId: string;
   readonly sessionEpoch: number;
   readonly utteranceId: string;
+}
+
+interface GenerationSecurityOperation {
+  claim: GenerationClaim;
+  queue: Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -138,15 +152,21 @@ function sameFinalToken(left: FinalProcessingToken, right: FinalProcessingToken)
     left.acceptedFinalRevision === right.acceptedFinalRevision &&
     left.selectedTargetLanguage === right.selectedTargetLanguage &&
     left.gatePolicyVersion === right.gatePolicyVersion &&
-    left.targetTranscript === right.targetTranscript
+    left.targetTranscript === right.targetTranscript &&
+    left.generationClaim.authorizationId === right.generationClaim.authorizationId &&
+    left.generationClaim.claimId === right.generationClaim.claimId &&
+    left.generationClaim.claimVersion === right.generationClaim.claimVersion
   );
 }
 
 export class RelaySessionCore {
-  readonly #ticketClaim: ConsumedRelayTicket;
+  #sessionLease: SessionLease;
+  readonly #securityRuntime: SecurityRuntimeStore;
   readonly #clock: RelayClock;
   readonly #ids: RelayIdGenerator;
   readonly #transcriptionAdapter: TranscriptionAdapter;
+  readonly #transcriptionAdapterForTarget: (target: TargetLanguage) => TranscriptionAdapter;
+  readonly #languageClassifier: TextLanguageClassifier;
   readonly #generationService: GenerationService;
   readonly #gatePolicyVersion: string;
   readonly #serverLimits: NegotiatedLimits;
@@ -164,13 +184,19 @@ export class RelaySessionCore {
   #terminalOverflow = false;
   #finalToken: FinalProcessingToken | undefined;
   #finalController: AbortController | undefined;
+  #generationOperation: GenerationSecurityOperation | undefined;
+  #generationStarted = false;
   #lastCancelled: UtteranceIdentity | undefined;
 
   constructor(options: RelaySessionCoreOptions) {
-    this.#ticketClaim = options.ticketClaim;
+    this.#sessionLease = options.sessionLease;
+    this.#securityRuntime = options.securityRuntime;
     this.#clock = options.clock;
     this.#ids = options.ids;
     this.#transcriptionAdapter = options.transcriptionAdapter;
+    this.#transcriptionAdapterForTarget = options.transcriptionAdapterForTarget ??
+      (() => options.transcriptionAdapter);
+    this.#languageClassifier = options.languageClassifier;
     this.#generationService = options.generationService;
     this.#gatePolicyVersion = options.gatePolicyVersion;
     this.#onAsyncEventsAvailable = options.onAsyncEventsAvailable ?? (() => undefined);
@@ -380,24 +406,57 @@ export class RelaySessionCore {
       return this.#result([]);
     }
 
+    active.lastRevision = event.revision;
+    if (event.type === 'transcript.final') {
+      active.finalAccepted = true;
+    }
+
+    let evidence: ClassifiedLanguageEvidence;
+    try {
+      evidence = await this.#languageClassifier.classify(event.text);
+    } catch {
+      return this.#classifierFailure(active, event);
+    }
+    if (!this.#isCurrentTranscriptionEvent(active, event)) {
+      return this.#result([]);
+    }
+
+    let gateResult: LanguageGateResult;
+    try {
+      gateResult = evaluateLanguageGate({
+        selectedLanguage: this.#selectedTargetLanguage ?? 'es',
+        evidence,
+        isFinal: event.type === 'transcript.final'
+      });
+    } catch {
+      return this.#classifierFailure(active, event);
+    }
+    if (!this.#isCurrentTranscriptionEvent(active, event)) {
+      return this.#result([]);
+    }
+
     if (event.type === 'transcript.partial') {
-      let partial: ServerControlMessage;
-      try {
-        partial = assertServerControlMessage({
-          type: 'transcript.partial',
-          sessionId: event.sessionId,
-          sessionEpoch: event.sessionEpoch,
-          utteranceId: event.utteranceId,
-          segmentId: event.segmentId,
-          revision: event.revision,
-          text: event.text,
-          providerEventTime: event.providerEventTime
-        });
-      } catch {
-        return this.#result([]);
-      }
-      active.lastRevision = event.revision;
-      return this.#result([partial]);
+      // The current registry has no approved partial-display profile and the
+      // wire contract has no provisional language-decision value.
+      return this.#result([]);
+    }
+
+    const finalDecision: Exclude<LanguageDecisionValue, 'provisional'> =
+      gateResult.decision === 'provisional' ? 'uncertain' : gateResult.decision;
+    let languageDecision: ServerControlMessage;
+    try {
+      languageDecision = this.#languageDecision(event, finalDecision, gateResult);
+    } catch {
+      this.#finishActive(false);
+      return this.#result([]);
+    }
+    if (
+      finalDecision !== 'target' ||
+      !gateResult.displayAllowed ||
+      !gateResult.generationAllowed
+    ) {
+      this.#finishActive(false);
+      return this.#result([languageDecision]);
     }
 
     let transcriptFinal: ServerControlMessage;
@@ -413,43 +472,57 @@ export class RelaySessionCore {
         providerEventTime: event.providerEventTime
       });
     } catch {
+      this.#finishActive(false);
       return this.#result([]);
     }
-
-    active.lastRevision = event.revision;
-    active.finalAccepted = true;
-    let gateResult: ReturnType<typeof evaluateLanguageGate>;
-    try {
-      gateResult = evaluateLanguageGate({
-        selectedLanguage: this.#selectedTargetLanguage ?? 'es',
-        evidence: {
-          text: event.text,
-          detectorVersion: event.languageEvidence.detectorVersion,
-          source: event.languageEvidence.source,
-          ...(event.languageEvidence.detectedLanguage === undefined
-            ? {}
-            : { detectedLanguage: event.languageEvidence.detectedLanguage }),
-          ...(event.languageEvidence.confidence === undefined
-            ? {}
-            : { confidence: event.languageEvidence.confidence })
-        },
-        isFinal: true
-      });
-    } catch {
-      this.#finishActive(false);
-      return this.#result([
-        transcriptFinal,
-        this.#error('provider_unavailable', 'server', true)
-      ]);
-    }
-
-    const finalDecision: Exclude<LanguageDecisionValue, 'provisional'> =
-      gateResult.decision === 'provisional' ? 'uncertain' : gateResult.decision;
-    const languageDecision = this.#languageDecision(event, finalDecision);
     const outgoing: ServerControlMessage[] = [transcriptFinal, languageDecision];
-    if (finalDecision !== 'target') {
+
+    let generationClaim: GenerationClaim;
+    try {
+      const authorization = await this.#securityRuntime.authorizeGeneration({
+        lease: this.#sessionLease,
+        decision: 'target',
+        utteranceId: event.utteranceId,
+        acceptedFinalRevision: event.revision,
+        selectedTargetLanguage: this.#selectedTargetLanguage ?? 'es',
+        gatePolicyVersion: this.#gatePolicyVersion,
+        transcriptHash: hashCorrelationKey(event.text)
+      });
+      if (!this.#isCurrentTranscriptionEvent(active, event)) {
+        if (authorization.status === 'acquired') {
+          await this.#releaseClaim(authorization.claim);
+        }
+        return this.#result([]);
+      }
+      if (authorization.status !== 'acquired') {
+        this.#finishActive(false);
+        return this.#result(outgoing);
+      }
+      const operation: GenerationSecurityOperation = {
+        claim: authorization.claim,
+        queue: Promise.resolve()
+      };
+      this.#generationOperation = operation;
+      const started = await this.#runGenerationSecurityOperation(
+        operation,
+        (claim) => this.#securityRuntime.providerStart({ claim })
+      );
+      if (started.status !== 'start-permitted') {
+        this.#assertMatchingGenerationClaim(operation.claim, started.claim);
+        operation.claim = started.claim;
+        this.#finishActive(false);
+        return this.#result(outgoing);
+      }
+      generationClaim = started.claim;
+      this.#assertMatchingGenerationClaim(operation.claim, generationClaim);
+      operation.claim = generationClaim;
+      this.#generationStarted = true;
+    } catch {
+      if (!this.#isCurrentTranscriptionEvent(active, event)) {
+        return this.#result([]);
+      }
       this.#finishActive(false);
-      return this.#result(outgoing);
+      return this.#result([this.#error('state_unavailable', 'server', false)]);
     }
 
     const token: FinalProcessingToken = {
@@ -460,8 +533,14 @@ export class RelaySessionCore {
       acceptedFinalRevision: event.revision,
       selectedTargetLanguage: this.#selectedTargetLanguage ?? 'es',
       gatePolicyVersion: this.#gatePolicyVersion,
-      targetTranscript: event.text
+      targetTranscript: event.text,
+      generationClaim
     };
+    const generationOperation = this.#generationOperation;
+    if (generationOperation === undefined) {
+      this.#finishActive(false);
+      return this.#result([this.#error('state_unavailable', 'server', false)]);
+    }
 
     let turn: ReturnType<typeof createAcceptedTargetTurn>;
     try {
@@ -477,9 +556,11 @@ export class RelaySessionCore {
         gatePolicyVersion: this.#gatePolicyVersion
       });
     } catch {
-      if (!this.#isCurrent(active, token)) {
-        return this.#result(outgoing);
-      }
+      void this.#completeGenerationSecurityOperation(
+        generationOperation,
+        token.generationClaim,
+        'failed'
+      ).catch(() => undefined);
       outgoing.push(this.#error('provider_unavailable', 'server', true));
       this.#finishActive(false);
       return this.#result(outgoing);
@@ -505,12 +586,32 @@ export class RelaySessionCore {
     }
 
     void completion.then(
-      (result) => {
-        if (this.#isCurrent(active, token) && !controller.signal.aborted) {
-          this.#appendAsyncEvent({ kind: 'generation.completed', token, result });
+      async (result) => {
+        try {
+          await this.#completeGenerationSecurityOperation(
+            generationOperation,
+            token.generationClaim,
+            'completed'
+          );
+          if (this.#isCurrent(active, token) && !controller.signal.aborted) {
+            this.#appendAsyncEvent({ kind: 'generation.completed', token, result });
+          }
+        } catch {
+          if (this.#isCurrent(active, token) && !controller.signal.aborted) {
+            this.#appendAsyncEvent({ kind: 'generation.failed', token });
+          }
         }
       },
-      () => {
+      async () => {
+        try {
+          await this.#completeGenerationSecurityOperation(
+            generationOperation,
+            token.generationClaim,
+            'failed'
+          );
+        } catch {
+          // The public result is the same for provider and durable-state loss.
+        }
         if (this.#isCurrent(active, token) && !controller.signal.aborted) {
           this.#appendAsyncEvent({ kind: 'generation.failed', token });
         }
@@ -558,6 +659,52 @@ export class RelaySessionCore {
       return this.#terminalResult();
     }
     return this.#terminate([], 1000, 'closed');
+  }
+
+  updateSessionLease(lease: SessionLease): void {
+    if (
+      lease.sessionId !== this.#sessionLease.sessionId ||
+      lease.sessionEpoch !== this.#sessionLease.sessionEpoch ||
+      lease.installationId !== this.#sessionLease.installationId
+    ) {
+      throw new Error('stale_session_lease');
+    }
+    this.#sessionLease = lease;
+  }
+
+  async heartbeatGeneration(): Promise<void> {
+    const operation = this.#generationOperation;
+    if (operation === undefined || !this.#generationStarted) {
+      return;
+    }
+    await this.#runGenerationSecurityOperation(operation, async (claim) => {
+      if (claim.phase !== 'started') return claim;
+      const renewed = await this.#securityRuntime.heartbeatGeneration({ claim });
+      this.#assertMatchingGenerationClaim(claim, renewed);
+      operation.claim = renewed;
+      return renewed;
+    });
+  }
+
+  handleSecurityFailure(kind: 'quota' | 'state'): RelayStepResult {
+    if (this.#terminal) {
+      return this.#terminalResult();
+    }
+    const active = this.#active;
+    if (kind === 'quota') {
+      const outgoing = active === undefined
+        ? [this.#error('flow_control', 'audio', false)]
+        : [this.#aborted(this.#identity(active), 'duration')];
+      return this.#terminate(outgoing, 4408, 'flow_control');
+    }
+    if (active !== undefined) {
+      return this.#providerLoss(active);
+    }
+    return this.#terminate(
+      [this.#error('state_unavailable', 'server', false)],
+      4503,
+      'state_unavailable'
+    );
   }
 
   #parsePreReady(text: string):
@@ -662,13 +809,6 @@ export class RelaySessionCore {
   }
 
   #openNewSession(message: SessionStart): RelayStepResult {
-    if (!hasExactNewSessionIntent(this.#ticketClaim)) {
-      return this.#terminate(
-        [this.#sessionRejected('authentication_failed')],
-        4401,
-        'authentication_failed'
-      );
-    }
     const commonFailure = this.#validateNegotiation(message);
     if (commonFailure !== undefined) {
       return this.#terminate(
@@ -678,8 +818,8 @@ export class RelaySessionCore {
       );
     }
 
-    this.#sessionId = this.#ids.sessionId();
-    this.#sessionEpoch = SESSION_EPOCH;
+    this.#sessionId = this.#sessionLease.sessionId;
+    this.#sessionEpoch = this.#sessionLease.sessionEpoch;
     this.#selectedTargetLanguage = message.targetLanguage;
     this.#effectiveLimits = negotiateLimits(message.requestedLimits, this.#serverLimits);
     this.#ready = true;
@@ -688,7 +828,7 @@ export class RelaySessionCore {
         type: 'session.ready',
         result: 'new',
         sessionId: this.#sessionId,
-        sessionEpoch: SESSION_EPOCH,
+        sessionEpoch: this.#sessionLease.sessionEpoch,
         targetLanguage: message.targetLanguage,
         languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
         gatePolicyVersion: this.#gatePolicyVersion,
@@ -741,12 +881,11 @@ export class RelaySessionCore {
 
     const sessionId = this.#sessionId;
     const sessionEpoch = this.#sessionEpoch;
-    const targetLanguage = this.#selectedTargetLanguage;
     const limits = this.#effectiveLimits;
     if (
       sessionId === undefined ||
       sessionEpoch === undefined ||
-      targetLanguage === undefined ||
+      this.#selectedTargetLanguage === undefined ||
       limits === undefined
     ) {
       return this.#terminate(
@@ -757,19 +896,61 @@ export class RelaySessionCore {
     }
 
     let ownedSession: TranscriptionSession | undefined;
-    const onEvent = (event: NormalizedTranscriptionEvent): void => {
+    let callbacksActivated = false;
+    const stagedCallbacks: Array<
+      | { readonly kind: 'event'; readonly event: NormalizedTranscriptionEvent }
+      | { readonly kind: 'failure' }
+    > = [];
+    const appendEvent = (event: NormalizedTranscriptionEvent): void => {
+      const active = this.#active;
       if (
         !this.#terminal &&
         ownedSession !== undefined &&
-        this.#active?.transcription === ownedSession &&
-        this.#active.utteranceId === message.utteranceId
+        active?.transcription === ownedSession &&
+        active.utteranceId === message.utteranceId &&
+        !active.providerFailureQueued
       ) {
         this.#appendAsyncEvent({ kind: 'transcription', event });
       }
     };
+    const appendFailure = (): void => {
+      const active = this.#active;
+      if (
+        !this.#terminal &&
+        ownedSession !== undefined &&
+        active?.transcription === ownedSession &&
+        active.utteranceId === message.utteranceId &&
+        !active.finalAccepted &&
+        !active.providerFailureQueued
+      ) {
+        active.providerFailureQueued = true;
+        this.#appendAsyncEvent({
+          kind: 'transcription.failed',
+          sessionId,
+          sessionEpoch,
+          utteranceId: message.utteranceId
+        });
+      }
+    };
+    const onEvent = (event: NormalizedTranscriptionEvent): void => {
+      if (!callbacksActivated) {
+        stagedCallbacks.push({ kind: 'event', event });
+        return;
+      }
+      appendEvent(event);
+    };
+    const onFailure = (): void => {
+      if (!callbacksActivated) {
+        stagedCallbacks.push({ kind: 'failure' });
+        return;
+      }
+      appendFailure();
+    };
     let transcription: TranscriptionSession;
     try {
-      transcription = this.#transcriptionAdapter.createSession({
+      transcription = this.#transcriptionAdapterForTarget(
+        this.#selectedTargetLanguage
+      ).createSession({
         sessionId,
         sessionEpoch,
         configuration: {
@@ -778,6 +959,7 @@ export class RelaySessionCore {
           manualCommitCadenceMs: MANUAL_COMMIT_CADENCE_MS
         },
         onEvent,
+        onFailure,
         maxUtteranceSamples: limits.maxUtteranceSamples
       });
       ownedSession = transcription;
@@ -793,12 +975,19 @@ export class RelaySessionCore {
         committed: false,
         committedFinalOriginalSampleOffset: undefined,
         finalAccepted: false,
+        providerFailureQueued: false,
         lastRevision: 0
       };
-      const started = transcription.start({
-        utteranceId: message.utteranceId,
-        selectedTargetLanguage: targetLanguage
-      });
+      callbacksActivated = true;
+      for (const callback of stagedCallbacks) {
+        if (callback.kind === 'event') {
+          appendEvent(callback.event);
+        } else {
+          appendFailure();
+        }
+      }
+      stagedCallbacks.length = 0;
+      const started = transcription.start({ utteranceId: message.utteranceId });
       if (started.status !== 'started') {
         this.#finishActive(false);
         return this.#terminate(
@@ -855,8 +1044,13 @@ export class RelaySessionCore {
     } catch {
       return this.#providerLoss(active);
     }
-    if (finalized.status !== 'finalized' && finalized.status !== 'already-finalized') {
-      return this.#providerLoss(active);
+    switch (finalized.status) {
+      case 'finalization-requested':
+      case 'already-requested':
+      case 'already-finalized':
+        break;
+      case 'already-cancelled':
+        return this.#providerLoss(active);
     }
     active.committed = true;
     active.committedFinalOriginalSampleOffset = message.finalOriginalSampleOffset;
@@ -932,7 +1126,9 @@ export class RelaySessionCore {
 
   #supportsConfiguredTranscription(): boolean {
     try {
-      const capabilities = this.#transcriptionAdapter.capabilities;
+      const capabilities = this.#selectedTargetLanguage === undefined
+        ? this.#transcriptionAdapter.capabilities
+        : this.#transcriptionAdapterForTarget(this.#selectedTargetLanguage).capabilities;
       return (
         capabilities.serverVad.supported &&
         capabilities.serverVad.modes.includes(CONFIGURED_SERVER_VAD) &&
@@ -1024,10 +1220,11 @@ export class RelaySessionCore {
 
   #languageDecision(
     event: Extract<NormalizedTranscriptionEvent, { readonly type: 'transcript.final' }>,
-    decision: LanguageDecisionValue
+    decision: LanguageDecisionValue,
+    gateResult?: LanguageGateResult
   ): ServerControlMessage {
-    const detectedLanguage = event.languageEvidence.detectedLanguage;
-    const confidence = event.languageEvidence.confidence;
+    const detectedLanguage = gateResult?.detectedLanguage;
+    const confidence = gateResult?.confidence;
     return assertServerControlMessage({
       type: 'language.decision',
       sessionId: event.sessionId,
@@ -1041,6 +1238,27 @@ export class RelaySessionCore {
       ...(confidence === undefined ? {} : { confidence }),
       gatePolicyVersion: this.#gatePolicyVersion
     });
+  }
+
+  #classifierFailure(
+    active: ActiveUtterance,
+    event: NormalizedTranscriptionEvent
+  ): RelayStepResult {
+    if (!this.#isCurrentTranscriptionEvent(active, event)) {
+      return this.#result([]);
+    }
+    if (event.type === 'transcript.partial') {
+      return this.#result([]);
+    }
+    let decision: ServerControlMessage;
+    try {
+      decision = this.#languageDecision(event, 'uncertain');
+    } catch {
+      this.#finishActive(false);
+      return this.#result([]);
+    }
+    this.#finishActive(false);
+    return this.#result([decision]);
   }
 
   #translationReady(translation: GenerationCompletion): ServerControlMessage {
@@ -1068,6 +1286,20 @@ export class RelaySessionCore {
   }
 
   async #handleAsyncEvent(event: RelayAsyncEvent): Promise<RelayStepResult> {
+    if (event.kind === 'transcription.failed') {
+      const active = this.#active;
+      if (
+        active === undefined ||
+        active.utteranceId !== event.utteranceId ||
+        this.#sessionId !== event.sessionId ||
+        this.#sessionEpoch !== event.sessionEpoch ||
+        !active.providerFailureQueued ||
+        active.finalAccepted
+      ) {
+        return this.#result([]);
+      }
+      return this.#providerLoss(active);
+    }
     if (event.kind === 'transcription') {
       return this.handleTranscriptionEvent(event.event);
     }
@@ -1100,10 +1332,38 @@ export class RelaySessionCore {
   }
 
   #appendAsyncEvent(event: RelayAsyncEvent): void {
-    if (this.#terminal || this.#terminalOverflow) {
+    if (this.#terminal || (this.#terminalOverflow && event.kind !== 'transcription.failed')) {
       return;
     }
+    if (event.kind === 'transcription.failed') {
+      this.#terminalOverflow = false;
+    }
     this.#compactEventQueue();
+    if (event.kind === 'transcription.failed') {
+      for (let index = this.#eventQueue.length - 1; index >= this.#queueHead; index -= 1) {
+        const queued = this.#eventQueue[index];
+        if (
+          queued?.kind === 'transcription.failed' &&
+          queued.sessionId === event.sessionId &&
+          queued.sessionEpoch === event.sessionEpoch &&
+          queued.utteranceId === event.utteranceId
+        ) {
+          return;
+        }
+        const queuedIdentity = queued?.kind === 'transcription'
+          ? queued.event
+          : queued?.kind === 'generation.completed' || queued?.kind === 'generation.failed'
+            ? queued.token
+            : undefined;
+        if (
+          queuedIdentity?.sessionId === event.sessionId &&
+          queuedIdentity.sessionEpoch === event.sessionEpoch &&
+          queuedIdentity.utteranceId === event.utteranceId
+        ) {
+          this.#eventQueue.splice(index, 1);
+        }
+      }
+    }
     if (event.kind === 'transcription' && event.event.type === 'transcript.partial') {
       for (let index = this.#queueHead; index < this.#eventQueue.length; index += 1) {
         const queued = this.#eventQueue[index];
@@ -1169,6 +1429,19 @@ export class RelaySessionCore {
     }
   }
 
+  #isCurrentTranscriptionEvent(
+    active: ActiveUtterance,
+    event: NormalizedTranscriptionEvent
+  ): boolean {
+    return (
+      !this.#terminal &&
+      this.#active === active &&
+      this.#sessionId === event.sessionId &&
+      this.#sessionEpoch === event.sessionEpoch &&
+      active.utteranceId === event.utteranceId
+    );
+  }
+
   #isCurrent(active: ActiveUtterance | undefined, token: FinalProcessingToken): boolean {
     return (
       !this.#terminal &&
@@ -1182,9 +1455,14 @@ export class RelaySessionCore {
   #finishActive(cancel: boolean): void {
     const active = this.#active;
     this.#abortPendingGeneration();
+    const operation = this.#generationOperation;
+    const claim = operation?.claim;
+    const generationStarted = this.#generationStarted;
     this.#active = undefined;
     this.#finalToken = undefined;
     this.#finalController = undefined;
+    this.#generationOperation = undefined;
+    this.#generationStarted = false;
     this.#eventQueue = [];
     this.#queueHead = 0;
     if (active === undefined) {
@@ -1201,6 +1479,66 @@ export class RelaySessionCore {
       active.transcription.close();
     } catch {
       // Provider cleanup is best effort and public errors are intentionally generic.
+    }
+    if (claim !== undefined && !generationStarted && claim.phase === 'claimed') {
+      if (operation !== undefined) {
+        void this.#runGenerationSecurityOperation(
+          operation,
+          (current) => this.#releaseClaim(current)
+        );
+      }
+    }
+  }
+
+  #sameGenerationClaimIdentity(left: GenerationClaim, right: GenerationClaim): boolean {
+    return (
+      left.authorizationId === right.authorizationId &&
+      left.claimId === right.claimId &&
+      left.installationId === right.installationId &&
+      left.sessionId === right.sessionId &&
+      left.sessionEpoch === right.sessionEpoch
+    );
+  }
+
+  #assertMatchingGenerationClaim(expected: GenerationClaim, actual: GenerationClaim): void {
+    if (!this.#sameGenerationClaimIdentity(expected, actual)) {
+      throw new Error('generation_claim_identity_mismatch');
+    }
+  }
+
+  #runGenerationSecurityOperation<T>(
+    operation: GenerationSecurityOperation,
+    action: (claim: GenerationClaim) => Promise<T>
+  ): Promise<T> {
+    const result = operation.queue.then(
+      () => action(operation.claim),
+      () => action(operation.claim)
+    );
+    operation.queue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async #completeGenerationSecurityOperation(
+    operation: GenerationSecurityOperation,
+    expectedIdentity: GenerationClaim,
+    outcome: 'completed' | 'failed'
+  ): Promise<GenerationClaim> {
+    return this.#runGenerationSecurityOperation(operation, async (claim) => {
+      this.#assertMatchingGenerationClaim(expectedIdentity, claim);
+      if (claim.phase === 'completed') return claim;
+      if (claim.phase !== 'started') throw new Error('generation_claim_not_started');
+      const completed = await this.#securityRuntime.completeGeneration({ claim, outcome });
+      this.#assertMatchingGenerationClaim(claim, completed);
+      operation.claim = completed;
+      return completed;
+    });
+  }
+
+  async #releaseClaim(claim: GenerationClaim): Promise<void> {
+    try {
+      await this.#securityRuntime.releaseGeneration({ claim });
+    } catch {
+      // Release is best effort; an unstarted durable claim is reclaimable by design.
     }
   }
 
@@ -1230,4 +1568,4 @@ export class RelaySessionCore {
   }
 }
 
-export type { ConsumedRelayTicket, RelaySessionCoreOptions };
+export type { RelaySessionCoreOptions };

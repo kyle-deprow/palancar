@@ -8,48 +8,14 @@ import {
 import type { NegotiatedLimits } from '@palancar/contracts';
 
 import type {
-  ConsumedRelayTicket,
   PreparedStreamUpgrade,
   RelayUpgradeAudience,
-  StreamSubprotocolSelection,
-  TicketConsumer
+  StreamSubprotocolSelection
 } from './types.js';
-
-export function hasExactNewSessionIntent(claim: unknown): boolean {
-  if (typeof claim !== 'object' || claim === null) {
-    return false;
-  }
-
-  try {
-    const claimIntent = Object.getOwnPropertyDescriptor(claim, 'intent');
-    if (claimIntent === undefined || !Object.hasOwn(claimIntent, 'value')) {
-      return false;
-    }
-
-    const intent = claimIntent.value as unknown;
-    if (
-      typeof intent !== 'object' ||
-      intent === null ||
-      Object.getPrototypeOf(intent) !== Object.prototype
-    ) {
-      return false;
-    }
-
-    const keys = Reflect.ownKeys(intent);
-    if (keys.length !== 1 || keys[0] !== 'intent') {
-      return false;
-    }
-
-    const intentValue = Object.getOwnPropertyDescriptor(intent, 'intent');
-    return (
-      intentValue !== undefined &&
-      Object.hasOwn(intentValue, 'value') &&
-      intentValue.value === 'new'
-    );
-  } catch {
-    return false;
-  }
-}
+import {
+  SecurityStateError,
+  type SecurityRuntimeStore
+} from '@palancar/security-state';
 
 export function selectStreamSubprotocols(
   offered: readonly string[]
@@ -82,28 +48,19 @@ export function selectStreamSubprotocols(
   };
 }
 
-function consumeFailureStatus(reason: string): 401 | 403 | 409 | 429 | 503 {
-  switch (reason) {
-    case 'authentication_failed':
-    case 'ticket_expired':
-      return 401;
-    case 'origin_rejected':
-      return 403;
-    case 'session_conflict':
-      return 409;
-    case 'rate_limited':
-      return 429;
-    case 'state_unavailable':
-      return 503;
-    default:
-      return 503;
-  }
+function consumeFailureStatus(error: unknown): 401 | 409 | 429 | 503 {
+  if (!(error instanceof SecurityStateError)) return 503;
+  if (error.category === 'rate-limited' || error.category === 'quota-exceeded') return 429;
+  if (error.category === 'session-rejected') return 409;
+  if (error.category === 'state-unavailable') return 503;
+  return 401;
 }
 
 export async function prepareStreamUpgrade(input: {
   readonly offeredSubprotocols: readonly string[];
   readonly audience: RelayUpgradeAudience;
-  readonly ticketConsumer: TicketConsumer;
+  readonly environment: string;
+  readonly securityRuntime: SecurityRuntimeStore;
 }): Promise<PreparedStreamUpgrade> {
   const selection = selectStreamSubprotocols(input.offeredSubprotocols);
   if (selection.status === 'rejected') {
@@ -111,20 +68,19 @@ export async function prepareStreamUpgrade(input: {
   }
 
   try {
-    const result = await input.ticketConsumer.consume(selection.ticket, input.audience);
-    if (result.status === 'accepted') {
-      if (!hasExactNewSessionIntent(result.claim)) {
-        return { status: 'rejected', httpStatus: 401 };
-      }
-      return {
-        status: 'accepted',
-        selectedProtocol: WEBSOCKET_SUBPROTOCOL,
-        ticketClaim: result.claim
-      };
-    }
-    return { status: 'rejected', httpStatus: consumeFailureStatus(result.reason) };
-  } catch {
-    return { status: 'rejected', httpStatus: 503 };
+    const sessionLease = await input.securityRuntime.consumeSessionTicket({
+      ticket: selection.ticket,
+      environment: input.environment,
+      audience: input.audience,
+      intent: 'new'
+    });
+    return {
+      status: 'accepted',
+      selectedProtocol: WEBSOCKET_SUBPROTOCOL,
+      sessionLease
+    };
+  } catch (error) {
+    return { status: 'rejected', httpStatus: consumeFailureStatus(error) };
   }
 }
 
@@ -158,5 +114,3 @@ export function negotiateLimits(
   }
   return Object.freeze(assertNegotiatedLimits(negotiated));
 }
-
-export type { ConsumedRelayTicket };

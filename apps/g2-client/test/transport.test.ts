@@ -4,6 +4,7 @@ import {
   decodeAudioFrame,
   type NegotiatedLimits,
 } from "@palancar/contracts";
+import { LANGUAGE_REGISTRY_VERSION } from "@palancar/language-registry";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -21,6 +22,14 @@ const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_UTTERANCE_ID = "33333333-3333-4333-8333-333333333333";
 const ERROR_ID = "44444444-4444-4444-8444-444444444444";
 const SESSION_READY_TIME = "2026-08-10T12:00:00.000Z";
+
+function noncurrentRegistryVersion(current: string): string {
+  return current === "1.0.0" ? "2.0.0" : "1.0.0";
+}
+
+const NONCURRENT_LANGUAGE_REGISTRY_VERSION = noncurrentRegistryVersion(
+  LANGUAGE_REGISTRY_VERSION,
+);
 const RETRYABLE_CLOSE_CODES = [
   0,
   1001,
@@ -140,7 +149,7 @@ function readyMessage(
     sessionId: SESSION_ID,
     sessionEpoch: 1,
     targetLanguage: "es",
-    languageRegistryVersion: "1.0.0",
+    languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
     gatePolicyVersion: "1.0.0",
     effectiveLimits: limits,
     serverTime: SESSION_READY_TIME,
@@ -316,7 +325,7 @@ describe("G2 relay transport", () => {
       protocolVersion: 1,
       wearerLanguage: "en",
       targetLanguage: "es",
-      languageRegistryVersion: "1.0.0",
+      languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
       gatePolicyVersion: "1.0.0",
       clientBuild: "g2-client-dev",
       requestedLimits: DEFAULT_NEGOTIATED_LIMITS,
@@ -1449,7 +1458,7 @@ describe("G2 relay transport", () => {
   it("rejects session.ready messages that violate this generation's negotiation", async () => {
     const mismatches = [
       { targetLanguage: "tr" },
-      { languageRegistryVersion: "2.0.0" },
+      { languageRegistryVersion: NONCURRENT_LANGUAGE_REGISTRY_VERSION },
       { gatePolicyVersion: "2.0.0" },
       { result: "resumed", requestedReplayOffset: 0 },
     ];

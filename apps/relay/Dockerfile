@@ -8,6 +8,7 @@ COPY packages/audio/package.json packages/audio/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/generation/package.json packages/generation/package.json
 COPY packages/language-registry/package.json packages/language-registry/package.json
+COPY packages/security-state/package.json packages/security-state/package.json
 COPY packages/transcription/package.json packages/transcription/package.json
 
 RUN npm ci --ignore-scripts
@@ -25,6 +26,8 @@ COPY packages/generation/src packages/generation/src
 COPY packages/generation/tsconfig*.json packages/generation/
 COPY packages/language-registry/src packages/language-registry/src
 COPY packages/language-registry/tsconfig*.json packages/language-registry/
+COPY packages/security-state/src packages/security-state/src
+COPY packages/security-state/tsconfig*.json packages/security-state/
 COPY packages/transcription/src packages/transcription/src
 COPY packages/transcription/tsconfig*.json packages/transcription/
 
@@ -33,6 +36,7 @@ RUN npm run build -w @palancar/contracts \
   && npm run build -w @palancar/language-registry \
   && npm run build -w @palancar/transcription \
   && npm run build -w @palancar/generation \
+  && npm run build -w @palancar/security-state \
   && npm run build -w @palancar/relay
 
 RUN npm prune --omit=dev --ignore-scripts
@@ -58,6 +62,8 @@ COPY --from=builder --chown=node:node /app/packages/generation/package.json pack
 COPY --from=builder --chown=node:node /app/packages/generation/dist packages/generation/dist
 COPY --from=builder --chown=node:node /app/packages/language-registry/package.json packages/language-registry/package.json
 COPY --from=builder --chown=node:node /app/packages/language-registry/dist packages/language-registry/dist
+COPY --from=builder --chown=node:node /app/packages/security-state/package.json packages/security-state/package.json
+COPY --from=builder --chown=node:node /app/packages/security-state/dist packages/security-state/dist
 COPY --from=builder --chown=node:node /app/packages/transcription/package.json packages/transcription/package.json
 COPY --from=builder --chown=node:node /app/packages/transcription/dist packages/transcription/dist
 

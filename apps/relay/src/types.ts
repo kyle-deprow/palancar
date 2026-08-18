@@ -1,38 +1,19 @@
 import type { WEBSOCKET_SUBPROTOCOL } from '@palancar/contracts';
 import type { NegotiatedLimits, ServerControlMessage } from '@palancar/contracts';
 import type { GenerationCompletion, GenerationService } from '@palancar/generation';
+import type { TargetLanguage, TextLanguageClassifier } from '@palancar/language-registry';
+import type {
+  GenerationClaim,
+  SecurityRuntimeStore,
+  SecurityStateMaintenanceStore,
+  SessionLease
+} from '@palancar/security-state';
 import type { NormalizedTranscriptionEvent, TranscriptionAdapter } from '@palancar/transcription';
 
 export interface RelayUpgradeAudience {
-  readonly environment: string;
   readonly origin: string;
   readonly path: '/v1/stream';
   readonly protocol: typeof WEBSOCKET_SUBPROTOCOL;
-}
-
-export type RelayTicketIntent = { readonly intent: 'new' };
-
-export interface ConsumedRelayTicket {
-  readonly installationId: string;
-  readonly credentialVersion: number;
-  readonly intent: RelayTicketIntent;
-  readonly expiresAt: string;
-}
-
-export type TicketConsumeFailureReason =
-  | 'authentication_failed'
-  | 'ticket_expired'
-  | 'session_conflict'
-  | 'rate_limited'
-  | 'origin_rejected'
-  | 'state_unavailable';
-
-export type TicketConsumeResult =
-  | { readonly status: 'accepted'; readonly claim: ConsumedRelayTicket }
-  | { readonly status: 'rejected'; readonly reason: TicketConsumeFailureReason };
-
-export interface TicketConsumer {
-  consume(ticket: string, audience: RelayUpgradeAudience): Promise<TicketConsumeResult>;
 }
 
 export type StreamSubprotocolSelection =
@@ -47,7 +28,7 @@ export type PreparedStreamUpgrade =
   | {
       readonly status: 'accepted';
       readonly selectedProtocol: typeof WEBSOCKET_SUBPROTOCOL;
-      readonly ticketClaim: ConsumedRelayTicket;
+      readonly sessionLease: SessionLease;
     }
   | { readonly status: 'rejected'; readonly httpStatus: 400 | 401 | 403 | 409 | 429 | 503 };
 
@@ -61,10 +42,13 @@ export interface RelayIdGenerator {
 }
 
 export interface RelaySessionCoreOptions {
-  readonly ticketClaim: ConsumedRelayTicket;
+  readonly sessionLease: SessionLease;
+  readonly securityRuntime: SecurityRuntimeStore;
   readonly clock: RelayClock;
   readonly ids: RelayIdGenerator;
   readonly transcriptionAdapter: TranscriptionAdapter;
+  readonly transcriptionAdapterForTarget?: (target: TargetLanguage) => TranscriptionAdapter;
+  readonly languageClassifier: TextLanguageClassifier;
   readonly generationService: GenerationService;
   readonly gatePolicyVersion: string;
   readonly serverLimits?: NegotiatedLimits;
@@ -80,10 +64,17 @@ export interface FinalProcessingToken {
   readonly selectedTargetLanguage: string;
   readonly gatePolicyVersion: string;
   readonly targetTranscript: string;
+  readonly generationClaim: GenerationClaim;
 }
 
 export type RelayAsyncEvent =
   | { readonly kind: 'transcription'; readonly event: NormalizedTranscriptionEvent }
+  | {
+      readonly kind: 'transcription.failed';
+      readonly sessionId: string;
+      readonly sessionEpoch: number;
+      readonly utteranceId: string;
+    }
   | { readonly kind: 'generation.completed'; readonly token: FinalProcessingToken; readonly result: GenerationCompletion }
   | { readonly kind: 'generation.failed'; readonly token: FinalProcessingToken };
 
@@ -106,3 +97,4 @@ export interface RelayStepResult {
 }
 
 export type { NegotiatedLimits, NormalizedTranscriptionEvent, ServerControlMessage };
+export type { SecurityRuntimeStore, SecurityStateMaintenanceStore, SessionLease };
