@@ -1,0 +1,33 @@
+{
+  "name": "@palancar/security-state",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "dependencies": {
+    "@azure/data-tables": "13.3.2",
+    "@azure/identity": "4.13.1"
+  },
+  "devDependencies": {
+    "azurite": "3.36.0"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run --exclude test/azure-store.azurite.test.ts",
+    "test:azurite": "node scripts/run-azurite-tests.mjs",
+    "build": "tsc -p tsconfig.build.json"
+  }
+}
