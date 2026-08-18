@@ -2,7 +2,6 @@ import {
   DEFAULT_NEGOTIATED_LIMITS,
   MAX_CONTROL_MESSAGE_BYTES,
   assertServerControlMessage,
-  assertSessionResume,
   assertSessionStart,
   assertSessionEnd,
   assertUtteranceCancel,
@@ -16,7 +15,6 @@ import {
   type ServerControlMessage,
   type SessionRejectionCode,
   type SessionRejected,
-  type SessionResume,
   type SessionStart,
 } from '@palancar/contracts';
 import { RelayOrderedFrameAcceptor } from '@palancar/audio';
@@ -36,7 +34,7 @@ import type {
   TranscriptionAdapter
 } from '@palancar/transcription';
 
-import { negotiateLimits } from './protocol.js';
+import { hasExactNewSessionIntent, negotiateLimits } from './protocol.js';
 import type {
   ConsumedRelayTicket,
   RelayClock,
@@ -57,7 +55,6 @@ const SAFE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   malformed_message: 'Malformed control message.',
   unsupported_protocol_version: 'Unsupported protocol version.',
   unsupported_target_language: 'Unsupported target language.',
-  invalid_session: 'Session is not resumable.',
   authentication_failed: 'Authentication failed.',
   state_unavailable: 'Session state unavailable.',
   provider_unavailable: 'Provider unavailable.',
@@ -204,10 +201,7 @@ export class RelaySessionCore {
       );
     }
 
-    if (parsed.message.type === 'session.start') {
-      return this.#openNewSession(parsed.message);
-    }
-    return this.#openResumeSession(parsed.message);
+    return this.#openNewSession(parsed.message);
   }
 
   handleText(text: string): RelayStepResult {
@@ -567,7 +561,7 @@ export class RelaySessionCore {
   }
 
   #parsePreReady(text: string):
-    | { readonly message: SessionStart | SessionResume }
+    | { readonly message: SessionStart }
     | {
         readonly failure: {
           readonly code: SessionRejectionCode;
@@ -599,16 +593,13 @@ export class RelaySessionCore {
     }
 
     const type = controlType(parsed);
-    const expectedType =
-      this.#ticketClaim.intent.intent === 'new' ? 'session.start' : 'session.resume';
     const knownClientControl =
       type === 'session.start' ||
-      type === 'session.resume' ||
       type === 'utterance.start' ||
       type === 'utterance.commit' ||
       type === 'utterance.cancel' ||
       type === 'session.end';
-    if (knownClientControl && type !== expectedType) {
+    if (knownClientControl && type !== 'session.start') {
       return {
         failure: {
           code: 'authentication_failed',
@@ -617,7 +608,7 @@ export class RelaySessionCore {
         }
       };
     }
-    if (type !== expectedType) {
+    if (type !== 'session.start') {
       return {
         failure: {
           code: 'malformed_message',
@@ -658,10 +649,7 @@ export class RelaySessionCore {
     }
 
     try {
-      if (expectedType === 'session.start') {
-        return { message: assertSessionStart(parsed) };
-      }
-      return { message: assertSessionResume(parsed) };
+      return { message: assertSessionStart(parsed) };
     } catch {
       return {
         failure: {
@@ -674,7 +662,7 @@ export class RelaySessionCore {
   }
 
   #openNewSession(message: SessionStart): RelayStepResult {
-    if (this.#ticketClaim.intent.intent !== 'new') {
+    if (!hasExactNewSessionIntent(this.#ticketClaim)) {
       return this.#terminate(
         [this.#sessionRejected('authentication_failed')],
         4401,
@@ -710,39 +698,7 @@ export class RelaySessionCore {
     ]);
   }
 
-  #openResumeSession(message: SessionResume): RelayStepResult {
-    if (
-      this.#ticketClaim.intent.intent !== 'resume' ||
-      message.sessionId !== this.#ticketClaim.intent.sessionId
-    ) {
-      return this.#terminate(
-        [this.#sessionRejected('authentication_failed')],
-        4401,
-        'authentication_failed'
-      );
-    }
-    const commonFailure = this.#validateNegotiation(message);
-    if (commonFailure !== undefined) {
-      return this.#terminate(
-        [this.#sessionRejected(commonFailure.code)],
-        commonFailure.closeCode,
-        commonFailure.reason
-      );
-    }
-
-    const identity = {
-      sessionId: message.sessionId,
-      sessionEpoch: message.sessionEpoch,
-      utteranceId: message.utteranceId
-    };
-    return this.#terminate(
-      [this.#aborted(identity, 'non_resumable'), this.#sessionRejected('invalid_session')],
-      4409,
-      'session_conflict'
-    );
-  }
-
-  #validateNegotiation(message: SessionStart | SessionResume):
+  #validateNegotiation(message: SessionStart):
     | {
         readonly code: 'state_unavailable';
         readonly closeCode: 4503;
@@ -1035,7 +991,7 @@ export class RelaySessionCore {
 
   #aborted(
     identity: UtteranceIdentity,
-    category: 'non_resumable' | 'duration' | 'cancellation' | 'stale_conflict' | 'provider_loss'
+    category: 'duration' | 'cancellation' | 'stale_conflict' | 'provider_loss'
   ): ServerControlMessage {
     return assertServerControlMessage({
       type: 'utterance.aborted',

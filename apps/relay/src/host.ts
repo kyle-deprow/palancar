@@ -28,7 +28,6 @@ import type {
   RelayClock,
   RelayIdGenerator,
   RelayStepResult,
-  RelayTicketIntent,
   RelayUpgradeAudience
 } from './types.js';
 
@@ -710,11 +709,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
           return;
         }
         try {
-          const requestBody = assertSessionTicketRequest(body.value);
-          const intent: RelayTicketIntent = requestBody.intent === 'new'
-            ? { intent: 'new' }
-            : { intent: 'resume', sessionId: requestBody.sessionId };
-          const issued = ticketStore.issue({ intent, audience });
+          assertSessionTicketRequest(body.value);
+          const issued = ticketStore.issue({ intent: { intent: 'new' }, audience });
           const result = {
             ticket: issued.ticket,
             wssOrigin: origin,

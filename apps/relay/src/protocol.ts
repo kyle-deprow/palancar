@@ -15,6 +15,42 @@ import type {
   TicketConsumer
 } from './types.js';
 
+export function hasExactNewSessionIntent(claim: unknown): boolean {
+  if (typeof claim !== 'object' || claim === null) {
+    return false;
+  }
+
+  try {
+    const claimIntent = Object.getOwnPropertyDescriptor(claim, 'intent');
+    if (claimIntent === undefined || !Object.hasOwn(claimIntent, 'value')) {
+      return false;
+    }
+
+    const intent = claimIntent.value as unknown;
+    if (
+      typeof intent !== 'object' ||
+      intent === null ||
+      Object.getPrototypeOf(intent) !== Object.prototype
+    ) {
+      return false;
+    }
+
+    const keys = Reflect.ownKeys(intent);
+    if (keys.length !== 1 || keys[0] !== 'intent') {
+      return false;
+    }
+
+    const intentValue = Object.getOwnPropertyDescriptor(intent, 'intent');
+    return (
+      intentValue !== undefined &&
+      Object.hasOwn(intentValue, 'value') &&
+      intentValue.value === 'new'
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function selectStreamSubprotocols(
   offered: readonly string[]
 ): StreamSubprotocolSelection {
@@ -77,6 +113,9 @@ export async function prepareStreamUpgrade(input: {
   try {
     const result = await input.ticketConsumer.consume(selection.ticket, input.audience);
     if (result.status === 'accepted') {
+      if (!hasExactNewSessionIntent(result.claim)) {
+        return { status: 'rejected', httpStatus: 401 };
+      }
       return {
         status: 'accepted',
         selectedProtocol: WEBSOCKET_SUBPROTOCOL,

@@ -21,6 +21,7 @@ import type {
 import { DETERMINISTIC_MOCK_CAPABILITIES } from '@palancar/transcription';
 import {
   RelaySessionCore,
+  type ConsumedRelayTicket,
   createTestOptions,
   createTestSubprotocols,
   createTestTicketClaim,
@@ -53,25 +54,6 @@ function startText(
     gatePolicyVersion: TEST_GATE_POLICY_VERSION,
     clientBuild: 'relay-test-1.0.0',
     requestedLimits
-  });
-}
-
-function resumeText(sessionId: string = TEST_SESSION_ID): string {
-  return JSON.stringify({
-    type: 'session.resume',
-    protocolVersion: 1,
-    wearerLanguage: 'en',
-    targetLanguage: 'es',
-    languageRegistryVersion: '1.0.0',
-    gatePolicyVersion: TEST_GATE_POLICY_VERSION,
-    clientBuild: 'relay-test-1.0.0',
-    requestedLimits: START_LIMITS,
-    sessionId,
-    sessionEpoch: 1,
-    utteranceId: TEST_UTTERANCE_ID,
-    clientLastAcknowledgedOffset: 0,
-    oldestRetainedOffset: 0,
-    nextCapturedOffset: 0
   });
 }
 
@@ -381,26 +363,123 @@ describe('relay protocol helpers', () => {
       expect(result).toEqual({ status: 'rejected', httpStatus });
     }
   });
+
+  it('rejects a legacy consumed ticket claim generically', async () => {
+    const legacyClaim = {
+      ...createTestTicketClaim(),
+      intent: { intent: 'resume', sessionId: TEST_SESSION_ID }
+    } as unknown as ConsumedRelayTicket;
+    const result = await prepareStreamUpgrade({
+      offeredSubprotocols: createTestSubprotocols(),
+      audience: {
+        environment: 'test',
+        origin: 'wss://relay.test',
+        path: '/v1/stream',
+        protocol: 'palancar.v1'
+      },
+      ticketConsumer: {
+        consume: async () => ({ status: 'accepted', claim: legacyClaim })
+      }
+    });
+
+    expect(result).toEqual({ status: 'rejected', httpStatus: 401 });
+  });
+
+  it('fails closed on malformed consumed ticket intent shapes without invoking accessors', async () => {
+    const baseClaim = createTestTicketClaim();
+    let getterCalls = 0;
+    const outerAccessorClaim = { ...baseClaim };
+    Object.defineProperty(outerAccessorClaim, 'intent', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return { intent: 'new' };
+      }
+    });
+    const innerAccessorIntent = {};
+    Object.defineProperty(innerAccessorIntent, 'intent', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return 'new';
+      }
+    });
+    const inheritedClaim = Object.create({ intent: { intent: 'new' } }) as Record<string, unknown>;
+    Object.assign(inheritedClaim, {
+      installationId: baseClaim.installationId,
+      credentialVersion: baseClaim.credentialVersion,
+      expiresAt: baseClaim.expiresAt
+    });
+    const nullPrototypeIntent = Object.assign(Object.create(null) as object, { intent: 'new' });
+    const customPrototypeIntent = Object.assign(Object.create({ legacy: true }) as object, {
+      intent: 'new'
+    });
+    const malformedClaims: readonly unknown[] = [
+      null,
+      { ...baseClaim, intent: null },
+      { ...baseClaim, intent: 'new' },
+      { ...baseClaim, intent: { intent: 'new', sessionId: TEST_SESSION_ID } },
+      { ...baseClaim, intent: nullPrototypeIntent },
+      { ...baseClaim, intent: customPrototypeIntent },
+      { ...baseClaim, intent: innerAccessorIntent },
+      inheritedClaim,
+      outerAccessorClaim
+    ];
+    const audience = {
+      environment: 'test',
+      origin: 'wss://relay.test',
+      path: '/v1/stream' as const,
+      protocol: 'palancar.v1' as const
+    };
+
+    for (const claim of malformedClaims) {
+      const result = await prepareStreamUpgrade({
+        offeredSubprotocols: createTestSubprotocols(),
+        audience,
+        ticketConsumer: {
+          consume: async () => ({
+            status: 'accepted' as const,
+            claim: claim as ConsumedRelayTicket
+          })
+        }
+      });
+      expect(result).toEqual({ status: 'rejected', httpStatus: 401 });
+    }
+    expect(getterCalls).toBe(0);
+  });
 });
 
 describe('relay session core', () => {
-  it('rejects ticket intent mismatches before creating a session', () => {
-    const newCore = new RelaySessionCore(createTestOptions({
-      transcriptionAdapter: recordingAdapter()
+  it('rejects a legacy ticket claim before creating a new session', () => {
+    const adapter = recordingAdapter();
+    const legacyClaim = {
+      ...createTestTicketClaim(),
+      intent: { intent: 'resume', sessionId: TEST_SESSION_ID }
+    } as unknown as ConsumedRelayTicket;
+    const core = new RelaySessionCore(createTestOptions({
+      ticketClaim: legacyClaim,
+      transcriptionAdapter: adapter
     }));
-    const newResult = newCore.openWithFirstText('{"type":"session.resume"}');
-    expect(newResult.outgoing).toMatchObject([{ type: 'session.rejected', code: 'authentication_failed' }]);
-    expect(newResult.close).toEqual({ code: 4401, reason: 'authentication_failed' });
 
-    const resumeAdapter = recordingAdapter();
-    const resumeCore = new RelaySessionCore(createTestOptions({
-      ticketClaim: createTestTicketClaim({ intent: 'resume', sessionId: TEST_SESSION_ID }),
-      transcriptionAdapter: resumeAdapter
-    }));
-    const resumeResult = resumeCore.openWithFirstText('{"type":"session.start"}');
-    expect(resumeResult.outgoing).toMatchObject([{ type: 'session.rejected', code: 'authentication_failed' }]);
-    expect(resumeResult.close).toEqual({ code: 4401, reason: 'authentication_failed' });
-    expect(resumeAdapter.sessions).toHaveLength(0);
+    const result = core.openWithFirstText(startText());
+
+    expect(result.outgoing).toMatchObject([
+      { type: 'session.rejected', code: 'authentication_failed' }
+    ]);
+    expect(result.outgoing.some((message) => message.type === 'session.ready')).toBe(false);
+    expect(result.close).toEqual({ code: 4401, reason: 'authentication_failed' });
+    expect(adapter.sessions).toHaveLength(0);
+  });
+
+  it('rejects the removed legacy session input before creating a session', () => {
+    const adapter = recordingAdapter();
+    const core = new RelaySessionCore(createTestOptions({ transcriptionAdapter: adapter }));
+    const result = core.openWithFirstText('{"type":"session.resume"}');
+    expect(result.outgoing).toMatchObject([{ type: 'session.rejected', code: 'malformed_message' }]);
+    expect(result.close).toEqual({ code: 1002, reason: 'protocol_error' });
+    expect(adapter.sessions).toHaveLength(0);
   });
 
   it('opens Spanish and Turkish sessions with field-wise minimum limits', () => {
@@ -473,22 +552,6 @@ describe('relay session core', () => {
     const secondOpen = opened.openWithFirstText(startText());
     expect(secondOpen.outgoing).toMatchObject([{ type: 'error', code: 'session_conflict' }]);
     expect(secondOpen.close).toEqual({ code: 4409, reason: 'session_conflict' });
-  });
-
-  it('fails valid resume closed as non-resumable without replacement creation', () => {
-    const adapter = recordingAdapter();
-    const core = new RelaySessionCore(createTestOptions({
-      ticketClaim: createTestTicketClaim({ intent: 'resume', sessionId: TEST_SESSION_ID }),
-      transcriptionAdapter: adapter
-    }));
-    const result = core.openWithFirstText(resumeText());
-    expect(result.outgoing.map((message) => message.type)).toEqual([
-      'utterance.aborted',
-      'session.rejected'
-    ]);
-    expect(result.outgoing[1]).toMatchObject({ code: 'invalid_session' });
-    expect(result.close).toEqual({ code: 4409, reason: 'session_conflict' });
-    expect(adapter.sessions).toHaveLength(0);
   });
 
   it('starts one utterance idempotently and conflicts on a different active utterance', () => {
@@ -1065,15 +1128,6 @@ describe('relay session core', () => {
     expect(tooLarge.outgoing).toMatchObject([{ type: 'error', code: 'malformed_message' }]);
     expect(tooLarge.close?.code).toBe(1002);
     expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
-  });
-
-  it('rejects a resume session ID that differs from the ticket binding', () => {
-    const core = new RelaySessionCore(createTestOptions({
-      ticketClaim: createTestTicketClaim({ intent: 'resume', sessionId: TEST_SESSION_ID })
-    }));
-    const result = core.openWithFirstText(resumeText('55555555-5555-4555-8555-555555555555'));
-    expect(result.outgoing).toMatchObject([{ type: 'session.rejected', code: 'authentication_failed' }]);
-    expect(result.close?.code).toBe(4401);
   });
 
   it('returns a generic provider error when generation completion fails', async () => {

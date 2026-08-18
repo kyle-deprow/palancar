@@ -10,9 +10,7 @@ export interface RelayUpgradeAudience {
   readonly protocol: typeof WEBSOCKET_SUBPROTOCOL;
 }
 
-export type RelayTicketIntent =
-  | { readonly intent: 'new' }
-  | { readonly intent: 'resume'; readonly sessionId: string };
+export type RelayTicketIntent = { readonly intent: 'new' };
 
 export interface ConsumedRelayTicket {
   readonly installationId: string;

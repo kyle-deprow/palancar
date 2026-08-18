@@ -1021,6 +1021,17 @@ describe('relay HTTP/WebSocket host', () => {
     expect(malformed.status).toBe(400);
     expect(JSON.stringify(await responseJson(malformed))).not.toContain(CANARY);
 
+    const legacyResume = await fetch(`http://127.0.0.1:${port}/v1/session-tickets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        protocolVersion: 1,
+        intent: 'resume',
+        sessionId: '11111111-1111-4111-8111-111111111111'
+      })
+    });
+    expect(legacyResume.status).toBe(400);
+
     const oversized = await fetch(`http://127.0.0.1:${port}/v1/session-tickets`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
