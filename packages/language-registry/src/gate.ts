@@ -1,10 +1,11 @@
+import { validateClassifiedLanguageEvidence } from './classifier.js';
 import {
   languageRegistry,
   type LanguageRegistry
 } from './registry.js';
 import type {
   GateDecision,
-  LanguageEvidence,
+  LanguageDefinition,
   LanguageGateInput,
   LanguageGateResult
 } from './types.js';
@@ -17,32 +18,62 @@ function normalizeLanguageCode(code: string): string {
 }
 
 function hasSufficientConfidence(
-  evidence: LanguageEvidence,
+  confidence: number | undefined,
   threshold: number
 ): boolean {
+  return confidence !== undefined && confidence >= threshold;
+}
+
+function partialDisplayAccepted(
+  input: LanguageGateInput,
+  selectedLanguage: string,
+  selectedDefinition: LanguageDefinition<string>
+): boolean {
+  const profile = selectedDefinition.partialDisplayCalibration;
+  const evidence = input.evidence;
   return (
-    typeof evidence.confidence === 'number' &&
-    Number.isFinite(evidence.confidence) &&
-    evidence.confidence >= 0 &&
-    evidence.confidence <= 1 &&
-    evidence.confidence >= threshold
+    profile !== undefined &&
+    evidence.status === 'calibrated' &&
+    evidence.detectedLanguage === selectedLanguage &&
+    evidence.detectorVersion === profile.detectorVersion &&
+    evidence.calibrationVersion === profile.calibrationVersion &&
+    hasSufficientConfidence(evidence.confidence, profile.confidenceThreshold)
+  );
+}
+
+function finalCalibrationAccepted(
+  input: LanguageGateInput,
+  selectedDefinition: LanguageDefinition<string>
+): boolean {
+  const evidence = input.evidence;
+  const profile = selectedDefinition.finalCalibration;
+  return (
+    evidence.status === 'calibrated' &&
+    evidence.detectorVersion === profile.detectorVersion &&
+    evidence.calibrationVersion === profile.calibrationVersion &&
+    hasSufficientConfidence(evidence.confidence, profile.confidenceThreshold)
   );
 }
 
 function resultFor(
   decision: GateDecision,
   input: LanguageGateInput,
-  detectedLanguage: string | undefined
+  selectedLanguage: string,
+  displayAllowed: boolean,
+  generationAllowed: boolean
 ): LanguageGateResult {
   return {
     decision,
-    generationAllowed: decision === 'target' && input.isFinal,
-    selectedLanguage: normalizeLanguageCode(input.selectedLanguage),
+    displayAllowed,
+    generationAllowed,
+    selectedLanguage,
     isFinal: input.isFinal,
-    ...(detectedLanguage === undefined ? {} : { detectedLanguage }),
-    ...(input.evidence.confidence === undefined
+    ...(input.evidence.detectedLanguage === undefined
       ? {}
-      : { confidence: input.evidence.confidence })
+      : { detectedLanguage: input.evidence.detectedLanguage }),
+    ...(input.evidence.status === 'calibrated'
+      ? { confidence: input.evidence.confidence }
+      : {})
   };
 }
 
@@ -57,36 +88,50 @@ export function evaluateLanguageGate(
     throw new RangeError(`Unsupported selected target language: ${selectedLanguage}`);
   }
 
-  const detectedLanguage = input.evidence.detectedLanguage === undefined
-    ? undefined
-    : normalizeLanguageCode(input.evidence.detectedLanguage);
+  validateClassifiedLanguageEvidence(input.evidence);
 
   if (!input.isFinal) {
-    return resultFor('provisional', input, detectedLanguage);
-  }
-
-  if (detectedLanguage === MIXED_LANGUAGE && selectedDefinition.mixedPolicy === 'reject') {
-    return resultFor('mixed', input, detectedLanguage);
+    return resultFor(
+      'provisional',
+      input,
+      selectedLanguage,
+      partialDisplayAccepted(input, selectedLanguage, selectedDefinition),
+      false
+    );
   }
 
   if (
-    detectedLanguage === undefined ||
-    !hasSufficientConfidence(input.evidence, selectedDefinition.confidenceThreshold)
+    input.evidence.status !== 'calibrated' ||
+    !finalCalibrationAccepted(input, selectedDefinition)
   ) {
-    return resultFor('uncertain', input, detectedLanguage);
+    return resultFor('uncertain', input, selectedLanguage, false, false);
+  }
+
+  const detectedLanguage = input.evidence.detectedLanguage;
+  if (
+    detectedLanguage === MIXED_LANGUAGE &&
+    selectedDefinition.mixedPolicy === 'reject'
+  ) {
+    return resultFor('mixed', input, selectedLanguage, false, false);
   }
 
   if (detectedLanguage === selectedLanguage) {
-    return resultFor('target', input, detectedLanguage);
+    return resultFor('target', input, selectedLanguage, true, true);
   }
 
   if (detectedLanguage === ENGLISH_LANGUAGE) {
-    return resultFor('english', input, detectedLanguage);
+    return resultFor('english', input, selectedLanguage, false, false);
   }
 
   if (registry.get(detectedLanguage) !== undefined) {
-    return resultFor('supported_unselected', input, detectedLanguage);
+    return resultFor(
+      'supported_unselected',
+      input,
+      selectedLanguage,
+      false,
+      false
+    );
   }
 
-  return resultFor('unsupported', input, detectedLanguage);
+  return resultFor('unsupported', input, selectedLanguage, false, false);
 }

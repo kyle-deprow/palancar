@@ -1,7 +1,10 @@
 import {
+  CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+  CONTROLLED_FIXTURE_DETECTOR_VERSION,
   listLanguageDefinitions,
+  type ClassifiedLanguageEvidence,
   type GateDecision,
-  type LanguageEvidence,
+  type LanguageClassificationStatus,
   type TargetLanguage
 } from '@palancar/language-registry';
 
@@ -23,8 +26,10 @@ export interface LanguageEvidenceFixture {
   readonly kind: LanguageEvidenceFixtureKind;
   readonly selectedLanguage: TargetLanguage;
   readonly isFinal: boolean;
-  readonly evidence: LanguageEvidence;
+  readonly text: string;
+  readonly evidence: ClassifiedLanguageEvidence;
   readonly expectedDecision: GateDecision;
+  readonly expectedDisplayAllowed: boolean;
   readonly expectedGenerationAllowed: boolean;
 }
 
@@ -42,8 +47,10 @@ interface FixtureInput {
   readonly isFinal: boolean;
   readonly detectedLanguage?: string;
   readonly confidence?: number;
+  readonly status?: Exclude<LanguageClassificationStatus, 'calibrated'>;
   readonly text: string;
   readonly expectedDecision: GateDecision;
+  readonly expectedDisplayAllowed: boolean;
   readonly expectedGenerationAllowed: boolean;
 }
 
@@ -62,15 +69,27 @@ const TARGET_TEXT_EVIDENCE: Readonly<Record<TargetLanguage, TargetTextEvidence>>
   });
 
 function createFixture(input: FixtureInput): LanguageEvidenceFixture {
-  const evidence: LanguageEvidence = Object.freeze({
-    ...(input.detectedLanguage === undefined
-      ? {}
-      : { detectedLanguage: input.detectedLanguage }),
-    ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
-    text: input.text,
-    detectorVersion: 'controlled-fixture-1',
-    source: 'controlled-fixture'
-  });
+  let evidence: ClassifiedLanguageEvidence;
+  if (input.status !== undefined) {
+    evidence = Object.freeze({
+      status: input.status,
+      detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+      ...(input.detectedLanguage === undefined
+        ? {}
+        : { detectedLanguage: input.detectedLanguage })
+    });
+  } else {
+    if (input.detectedLanguage === undefined || input.confidence === undefined) {
+      throw new TypeError('Calibrated fixture requires language and confidence');
+    }
+    evidence = Object.freeze({
+      status: 'calibrated',
+      detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+      calibrationVersion: CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+      detectedLanguage: input.detectedLanguage,
+      confidence: input.confidence
+    });
+  }
 
   return Object.freeze({
     id: input.id,
@@ -78,8 +97,10 @@ function createFixture(input: FixtureInput): LanguageEvidenceFixture {
     kind: input.kind,
     selectedLanguage: input.selectedLanguage,
     isFinal: input.isFinal,
+    text: input.text,
     evidence,
     expectedDecision: input.expectedDecision,
+    expectedDisplayAllowed: input.expectedDisplayAllowed,
     expectedGenerationAllowed: input.expectedGenerationAllowed
   });
 }
@@ -97,9 +118,10 @@ const fixtures = definitions.flatMap((definition) => {
       selectedLanguage,
       isFinal: true,
       detectedLanguage: selectedLanguage,
-      confidence: definition.confidenceThreshold,
+      confidence: definition.finalCalibration.confidenceThreshold,
       text: targetText.final,
       expectedDecision: 'target',
+      expectedDisplayAllowed: true,
       expectedGenerationAllowed: true
     }),
     createFixture({
@@ -112,6 +134,7 @@ const fixtures = definitions.flatMap((definition) => {
       confidence: 1,
       text: targetText.provisional,
       expectedDecision: 'provisional',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     }),
     createFixture({
@@ -121,9 +144,10 @@ const fixtures = definitions.flatMap((definition) => {
       selectedLanguage,
       isFinal: true,
       detectedLanguage: selectedLanguage,
-      confidence: definition.confidenceThreshold - 0.01,
+      confidence: definition.finalCalibration.confidenceThreshold - 0.01,
       text: targetText.lowConfidence,
       expectedDecision: 'uncertain',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     }),
     createFixture({
@@ -136,6 +160,7 @@ const fixtures = definitions.flatMap((definition) => {
       confidence: 1,
       text: 'Where is the station?',
       expectedDecision: 'english',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     }),
     createFixture({
@@ -148,6 +173,7 @@ const fixtures = definitions.flatMap((definition) => {
       confidence: 1,
       text: 'Can you help me, por favor?',
       expectedDecision: 'mixed',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     }),
     createFixture({
@@ -160,6 +186,7 @@ const fixtures = definitions.flatMap((definition) => {
       confidence: 1,
       text: 'Où est la station?',
       expectedDecision: 'unsupported',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     }),
     createFixture({
@@ -168,8 +195,10 @@ const fixtures = definitions.flatMap((definition) => {
       kind: 'missing-evidence',
       selectedLanguage,
       isFinal: true,
+      status: 'insufficient-text',
       text: 'Evidence without a language label',
       expectedDecision: 'uncertain',
+      expectedDisplayAllowed: false,
       expectedGenerationAllowed: false
     })
   ];
@@ -187,6 +216,7 @@ const fixtures = definitions.flatMap((definition) => {
         confidence: 1,
         text: TARGET_TEXT_EVIDENCE[candidate.code].final,
         expectedDecision: 'supported_unselected',
+        expectedDisplayAllowed: false,
         expectedGenerationAllowed: false
       })
     );

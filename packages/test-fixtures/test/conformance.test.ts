@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+  CONTROLLED_FIXTURE_DETECTOR_VERSION,
   evaluateLanguageGate,
   listLanguageDefinitions,
-  type LanguageEvidence
+  type ClassifiedLanguageEvidence
 } from '@palancar/language-registry';
 import {
   getLanguageEvidenceFixture,
@@ -70,6 +72,17 @@ describe('controlled language evidence matrix', () => {
 
   it('evaluates each fixture using its stored selection metadata and exact outcome', () => {
     for (const fixture of LANGUAGE_EVIDENCE_FIXTURES) {
+      expect('text' in fixture.evidence, fixture.id).toBe(false);
+      expect('source' in fixture.evidence, fixture.id).toBe(false);
+      expect('logprobs' in fixture.evidence, fixture.id).toBe(false);
+      if (fixture.evidence.status === 'calibrated') {
+        expect(fixture.evidence.detectorVersion, fixture.id).toBe(
+          CONTROLLED_FIXTURE_DETECTOR_VERSION
+        );
+        expect(fixture.evidence.calibrationVersion, fixture.id).toBe(
+          CONTROLLED_FIXTURE_CALIBRATION_VERSION
+        );
+      }
       const result = evaluateLanguageGate({
         selectedLanguage: fixture.selectedLanguage,
         evidence: fixture.evidence,
@@ -77,6 +90,9 @@ describe('controlled language evidence matrix', () => {
       });
 
       expect(result.decision, fixture.id).toBe(fixture.expectedDecision);
+      expect(result.displayAllowed, fixture.id).toBe(
+        fixture.expectedDisplayAllowed
+      );
       expect(result.generationAllowed, fixture.id).toBe(
         fixture.expectedGenerationAllowed
       );
@@ -104,14 +120,21 @@ describe('controlled language evidence matrix', () => {
       ]) {
         expect(fixture.selectedLanguage).toBe(definition.code);
         expect(fixture.evidence.detectedLanguage).toBe(definition.code);
-        expect(fixture.evidence.text.trim().length).toBeGreaterThan(0);
+        expect(fixture.text.trim().length).toBeGreaterThan(0);
+        expect(fixture.evidence.status).toBe('calibrated');
+        expect(fixture.evidence.detectorVersion).toBe(
+          CONTROLLED_FIXTURE_DETECTOR_VERSION
+        );
+        expect(fixture.evidence.status === 'calibrated' && fixture.evidence.calibrationVersion).toBe(
+          CONTROLLED_FIXTURE_CALIBRATION_VERSION
+        );
       }
 
       expect(targetFixture.evidence.confidence).toBeGreaterThanOrEqual(
-        definition.confidenceThreshold
+        definition.finalCalibration.confidenceThreshold
       );
       expect(lowConfidenceFixture.evidence.confidence).toBeLessThan(
-        definition.confidenceThreshold
+        definition.finalCalibration.confidenceThreshold
       );
     }
   });
@@ -120,23 +143,23 @@ describe('controlled language evidence matrix', () => {
     const failOnEvidenceAccess = (): never => {
       throw new Error('Evidence was inspected before target selection was rejected');
     };
-    const unreadableEvidence: LanguageEvidence = {
+    const unreadableEvidence = {
+      get status(): 'calibrated' {
+        return failOnEvidenceAccess();
+      },
       get detectedLanguage(): string {
         return failOnEvidenceAccess();
       },
       get confidence(): number {
         return failOnEvidenceAccess();
       },
-      get text(): string {
-        return failOnEvidenceAccess();
-      },
       get detectorVersion(): string {
         return failOnEvidenceAccess();
       },
-      get source(): LanguageEvidence['source'] {
+      get calibrationVersion(): string {
         return failOnEvidenceAccess();
       }
-    };
+    } as ClassifiedLanguageEvidence;
     const evaluateUnsupportedTarget = () =>
       evaluateLanguageGate({
         selectedLanguage: 'ja',
@@ -161,6 +184,7 @@ describe('controlled language evidence matrix', () => {
 
     expect(Object.isFrozen(definitions)).toBe(true);
     expect(Object.isFrozen(firstDefinition)).toBe(true);
+    expect(Object.isFrozen(firstDefinition.finalCalibration)).toBe(true);
     expect(Object.isFrozen(firstDefinition.fixtureSuiteIds)).toBe(true);
     expect(Object.isFrozen(LANGUAGE_EVIDENCE_FIXTURES)).toBe(true);
     expect(Object.isFrozen(firstFixture)).toBe(true);
