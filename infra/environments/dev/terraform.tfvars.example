@@ -47,6 +47,6 @@ azure_api_version              = ""
 # enable_litellm_sidecar = true
 # litellm_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-litellm-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # litellm_backend = "openrouter"
-# litellm_upstream_model = "openrouter/openai/gpt-4o-mini"
+# litellm_upstream_model = "openrouter/openai/gpt-5.6-luna"
 # openrouter_api_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/openrouter-api-key"
 # litellm_master_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/litellm-master-key"
