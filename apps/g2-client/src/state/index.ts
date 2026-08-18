@@ -9,8 +9,7 @@ export const MAX_DISPLAY_MESSAGE_LENGTH = 256;
 export const MAX_RESULT_TEXT_LENGTH = 1_024;
 export const MAX_TRANSCRIPT_LENGTH = 4_096;
 export const MAX_TRANSCRIPT_SEGMENTS = 64;
-export const MAX_AUDIO_OFFSET = 480_000;
-export const MAX_RETAINED_REPLAY_SAMPLES = 8_000;
+export const MAX_UINT32 = 4_294_967_295;
 
 type StateName =
   | "Starting"
@@ -20,7 +19,6 @@ type StateName =
   | "Finalizing"
   | "Translating"
   | "Results"
-  | "Recovering"
   | "Error";
 
 export interface StartingState {
@@ -40,22 +38,30 @@ interface ReadyStateBase {
   readonly type: "Ready";
   readonly targetLanguage: TargetLanguage;
   readonly turn: number;
-  readonly transcript: "";
-  readonly suggestions: readonly [];
-  readonly suggestionIndex: 0;
   readonly message?: string;
 }
 
-export interface PendingReadyState extends ReadyStateBase {
+export interface InitialReadyState extends ReadyStateBase {
   readonly sessionReady: false;
+  readonly pending: "initial";
+}
+
+export interface RecoveryReadyState extends ReadyStateBase {
+  readonly sessionReady: false;
+  readonly pending: "recovery";
+  readonly previousSessionId: string;
+  readonly previousSessionEpoch: number;
+  readonly message: string;
 }
 
 export interface EstablishedReadyState extends ReadyStateBase {
   readonly sessionReady: true;
+  readonly pending: false;
   readonly sessionId: string;
   readonly sessionEpoch: number;
 }
 
+export type PendingReadyState = InitialReadyState | RecoveryReadyState;
 export type ReadyState = PendingReadyState | EstablishedReadyState;
 
 interface ActiveTurnState {
@@ -104,31 +110,11 @@ export interface ResultsState extends ActiveTurnState {
   readonly suggestionIndex: number;
 }
 
-export type ActiveResumableState =
+export type ActiveTurnClientState =
   | ListeningState
   | FinalizingState
   | TranslatingState
   | ResultsState;
-
-export type ResumableState = ReadyState | ActiveResumableState;
-
-export interface ReplaySnapshot {
-  readonly utteranceId: string;
-  readonly clientLastAcknowledgedOffset: number;
-  readonly oldestRetainedOffset: number;
-  readonly nextCapturedOffset: number;
-}
-
-export interface RecoveringState {
-  readonly state: "Recovering";
-  readonly type: "Recovering";
-  readonly targetLanguage: TargetLanguage;
-  readonly sessionId: string;
-  readonly sessionEpoch: number;
-  readonly priorState: ActiveResumableState;
-  readonly replay: ReplaySnapshot;
-  readonly message: string;
-}
 
 export interface ErrorState {
   readonly state: "Error";
@@ -148,7 +134,6 @@ export type ClientState =
   | FinalizingState
   | TranslatingState
   | ResultsState
-  | RecoveringState
   | ErrorState;
 
 export interface StartupReadyEvent {
@@ -177,7 +162,7 @@ export interface SessionReadyEvent {
   readonly sessionId: string;
   readonly sessionEpoch: number;
   readonly targetLanguage: TargetLanguage;
-  readonly result: "new" | "resumed";
+  readonly result: "new";
 }
 
 export interface TranscriptEventBase {
@@ -236,36 +221,19 @@ export interface SuggestionsReadyEvent {
   readonly suggestions: unknown;
 }
 
-export interface IdleTransportLostEvent {
+export interface TransportLostEvent {
   readonly type: "transport.lost";
   readonly sessionId: string;
   readonly sessionEpoch: number;
 }
 
-export interface ActiveTransportLostEvent extends IdleTransportLostEvent {
-  readonly utteranceId: string;
-  readonly clientLastAcknowledgedOffset: number;
-  readonly oldestRetainedOffset: number;
-  readonly nextCapturedOffset: number;
-}
-
-export type TransportLostEvent = IdleTransportLostEvent | ActiveTransportLostEvent;
-
-export interface TransportResumedEvent {
-  readonly type: "transport.resumed";
-  readonly sessionId: string;
-  readonly sessionEpoch: number;
-  readonly resumable?: boolean;
-}
-
-export interface TransportNonResumableEvent {
-  readonly type: "transport.non-resumable";
+export interface RecoveryFailedEvent {
+  readonly type: "recovery.failed";
   readonly sessionId: string;
   readonly sessionEpoch: number;
 }
 
 export type UtteranceAbortCategory =
-  | "non_resumable"
   | "flow"
   | "duration"
   | "rate"
@@ -296,8 +264,7 @@ export type LocalClientEvent =
   | SwipePreviousEvent
   | PressEvent
   | TransportLostEvent
-  | TransportResumedEvent
-  | TransportNonResumableEvent
+  | RecoveryFailedEvent
   | FatalEvent
   | ShutdownEvent;
 
@@ -322,6 +289,13 @@ export interface StartSessionEffect {
   readonly targetLanguage: TargetLanguage;
 }
 
+export interface StartFreshSessionEffect {
+  readonly type: "start-fresh-session";
+  readonly targetLanguage: TargetLanguage;
+  readonly previousSessionId: string;
+  readonly previousSessionEpoch: number;
+}
+
 export interface SessionEffect {
   readonly sessionId: string;
   readonly sessionEpoch: number;
@@ -335,10 +309,6 @@ export interface AudioEffect extends SessionEffect {
 export interface UtteranceEffect extends SessionEffect {
   readonly type: "start-utterance" | "commit-utterance";
   readonly utteranceId: string;
-}
-
-export interface ResumeSessionEffect extends SessionEffect, ReplaySnapshot {
-  readonly type: "resume-session";
 }
 
 export interface EndSessionEffect extends SessionEffect {
@@ -362,9 +332,9 @@ export interface RequestSuggestionsEffect extends SessionEffect {
 export type ClientEffect =
   | PersistTargetEffect
   | StartSessionEffect
+  | StartFreshSessionEffect
   | AudioEffect
   | UtteranceEffect
-  | ResumeSessionEffect
   | EndSessionEffect
   | RequestTranslationEffect
   | RequestSuggestionsEffect;
@@ -399,14 +369,32 @@ const SAFE_MESSAGES = Object.freeze({
   startup: "Startup failed.",
   fatal: "The client encountered an unrecoverable error.",
   shutdown: "Shutting down.",
-  transportLost: "Connection lost; recovering.",
-  nonResumable: "Connection could not be resumed; start a new turn.",
-  replayInvalid: "The captured audio could not be safely resumed; start a new turn.",
+  transportLost: "Connection lost; starting a fresh session.",
+  recoveryFailed: "Fresh-session recovery failed.",
+  recoveryInvalid: "Fresh-session recovery returned an invalid session.",
   utteranceAborted: "The utterance was aborted; ready for a new turn.",
   malformedResults: "Response results were invalid; ready for a new turn.",
   transcriptOverflow: "The transcript exceeded the safe display limit; ready for a new turn.",
   sessionMismatch: "The session target did not match the confirmed target.",
 } as const);
+const KNOWN_CLIENT_EVENT_TYPES = Object.freeze({
+  "startup.ready": true,
+  "startup.failed": true,
+  "swipe.next": true,
+  "swipe.previous": true,
+  press: true,
+  "transport.lost": true,
+  "recovery.failed": true,
+  fatal: true,
+  shutdown: true,
+  "session.ready": true,
+  "transcript.partial": true,
+  "transcript.final": true,
+  "language.decision": true,
+  "translation.ready": true,
+  "suggestions.ready": true,
+  "utterance.aborted": true,
+} satisfies Record<ClientEvent["type"], true>);
 
 function cloneValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
   if (value === null || typeof value !== "object") return value;
@@ -463,20 +451,25 @@ function noChange(state: ClientState): ClientStateReduction {
   return reduction(state);
 }
 
+function isKnownClientEvent(value: unknown): value is ClientEvent {
+  if (value === null || typeof value !== "object") return false;
+  const type = (value as { readonly type?: unknown }).type;
+  return typeof type === "string" &&
+    Object.prototype.hasOwnProperty.call(KNOWN_CLIENT_EVENT_TYPES, type);
+}
+
+function assertNeverClientEvent(event: never): never {
+  void event;
+  throw new Error("Unhandled client event");
+}
+
 function validUuidV4(value: unknown): value is string {
   return typeof value === "string" && UUID_V4_PATTERN.test(value);
 }
 
-function validEpoch(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
-
-function validRevision(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
-
-function validOffset(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_AUDIO_OFFSET;
+function validPositiveUint32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 &&
+    value <= MAX_UINT32;
 }
 
 function validText(value: unknown, maxLength: number): value is string {
@@ -516,7 +509,6 @@ function stateTarget(state: ClientState): TargetLanguage | undefined {
     case "Finalizing":
     case "Translating":
     case "Results":
-    case "Recovering":
       return state.targetLanguage;
     case "Error":
       return state.targetLanguage;
@@ -526,22 +518,23 @@ function stateTarget(state: ClientState): TargetLanguage | undefined {
 function stateSession(state: ClientState): SessionIdentity | undefined {
   switch (state.state) {
     case "Ready":
-      return state.sessionReady && validUuidV4(state.sessionId) && validEpoch(state.sessionEpoch)
-        ? { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch }
+      if (state.sessionReady && validUuidV4(state.sessionId) &&
+        validPositiveUint32(state.sessionEpoch)) {
+        return { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch };
+      }
+      return state.pending === "recovery" && validUuidV4(state.previousSessionId) &&
+        validPositiveUint32(state.previousSessionEpoch)
+        ? { sessionId: state.previousSessionId, sessionEpoch: state.previousSessionEpoch }
         : undefined;
     case "Listening":
     case "Finalizing":
     case "Translating":
     case "Results":
-      return validUuidV4(state.sessionId) && validEpoch(state.sessionEpoch)
-        ? { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch }
-        : undefined;
-    case "Recovering":
-      return validUuidV4(state.sessionId) && validEpoch(state.sessionEpoch)
+      return validUuidV4(state.sessionId) && validPositiveUint32(state.sessionEpoch)
         ? { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch }
         : undefined;
     case "Error":
-      return validUuidV4(state.sessionId) && validEpoch(state.sessionEpoch)
+      return validUuidV4(state.sessionId) && validPositiveUint32(state.sessionEpoch)
         ? { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch }
         : undefined;
     case "Starting":
@@ -552,7 +545,7 @@ function stateSession(state: ClientState): SessionIdentity | undefined {
 
 function eventSession(event: object): SessionIdentity | undefined {
   const value = event as { readonly sessionId?: unknown; readonly sessionEpoch?: unknown };
-  return validUuidV4(value.sessionId) && validEpoch(value.sessionEpoch)
+  return validUuidV4(value.sessionId) && validPositiveUint32(value.sessionEpoch)
     ? { sessionId: value.sessionId, sessionEpoch: value.sessionEpoch }
     : undefined;
 }
@@ -593,20 +586,45 @@ function readyState(
   turn: number,
   message?: string,
 ): ReadyState {
+  if (session === undefined) {
+    return makeState({
+      state: "Ready" as const,
+      targetLanguage,
+      sessionReady: false as const,
+      pending: "initial" as const,
+      turn,
+      ...(message === undefined ? {} : { message }),
+    }) as InitialReadyState;
+  }
   return makeState({
     state: "Ready" as const,
     targetLanguage,
-    sessionReady: session !== undefined,
-    ...(session ?? {}),
+    sessionReady: true as const,
+    pending: false as const,
+    ...session,
     turn,
-    transcript: "" as const,
-    suggestions: [] as readonly [],
-    suggestionIndex: 0 as const,
     ...(message === undefined ? {} : { message }),
   }) as ReadyState;
 }
 
-function activeData(state: ActiveResumableState): ActiveTurnData {
+function recoveryReadyState(
+  targetLanguage: TargetLanguage,
+  previousSession: SessionIdentity,
+  turn: number,
+): RecoveryReadyState {
+  return makeState({
+    state: "Ready" as const,
+    targetLanguage,
+    sessionReady: false as const,
+    pending: "recovery" as const,
+    previousSessionId: previousSession.sessionId,
+    previousSessionEpoch: previousSession.sessionEpoch,
+    turn,
+    message: SAFE_MESSAGES.transportLost,
+  }) as RecoveryReadyState;
+}
+
+function activeData(state: ActiveTurnClientState): ActiveTurnData {
   return {
     targetLanguage: state.targetLanguage,
     sessionId: state.sessionId,
@@ -681,7 +699,7 @@ function nextTarget(target: TargetLanguage, direction: 1 | -1): TargetLanguage {
   return next.code;
 }
 
-function isActiveTurnState(state: ClientState): state is ActiveResumableState {
+function isActiveTurnState(state: ClientState): state is ActiveTurnClientState {
   return state.state === "Listening" || state.state === "Finalizing" ||
     state.state === "Translating" || state.state === "Results";
 }
@@ -693,6 +711,18 @@ function startSessionEffects(targetLanguage: TargetLanguage): readonly ClientEff
   ];
 }
 
+function startFreshSessionEffect(
+  targetLanguage: TargetLanguage,
+  previousSession: SessionIdentity,
+): StartFreshSessionEffect {
+  return {
+    type: "start-fresh-session",
+    targetLanguage,
+    previousSessionId: previousSession.sessionId,
+    previousSessionEpoch: previousSession.sessionEpoch,
+  };
+}
+
 function endSessionEffect(session: SessionIdentity): EndSessionEffect {
   return { type: "end-session", ...session };
 }
@@ -701,6 +731,13 @@ function stopAudioEffect(state: ClientState): AudioEffect | undefined {
   const session = stateSession(state);
   if (state.state !== "Listening" || session === undefined) return undefined;
   return { type: "stop-audio", ...session, utteranceId: state.utteranceId };
+}
+
+function stopAudioForActiveTurn(state: ActiveTurnClientState): AudioEffect | undefined {
+  const session = stateSession(state);
+  return session === undefined
+    ? undefined
+    : { type: "stop-audio", ...session, utteranceId: state.utteranceId };
 }
 
 function cleanupEffects(state: ClientState): ClientEffect[] {
@@ -720,7 +757,31 @@ function sessionReadyMismatch(state: ReadyState, event: SessionReadyEvent): Clie
   );
 }
 
-function transcriptOverflow(state: ActiveResumableState): ClientStateReduction {
+function invalidRecoveryReady(
+  state: RecoveryReadyState,
+  event: SessionReadyEvent,
+): ClientStateReduction {
+  const session = eventSession(event);
+  const previousSession = {
+    sessionId: state.previousSessionId,
+    sessionEpoch: state.previousSessionEpoch,
+  };
+  const effects = session !== undefined &&
+    (session.sessionId !== previousSession.sessionId || session.sessionEpoch !== previousSession.sessionEpoch)
+    ? [endSessionEffect(session)]
+    : NO_EFFECTS;
+  return reduction(
+    errorState(SAFE_MESSAGES.recoveryInvalid, true, state.targetLanguage),
+    effects,
+  );
+}
+
+function isUtteranceAbortCategory(value: unknown): value is UtteranceAbortCategory {
+  return value === "flow" || value === "duration" || value === "rate" ||
+    value === "cancellation" || value === "stale_conflict" || value === "provider_loss";
+}
+
+function transcriptOverflow(state: ActiveTurnClientState): ClientStateReduction {
   return reduction(
     errorState(SAFE_MESSAGES.transcriptOverflow, true, state.targetLanguage),
     cleanupEffects(state),
@@ -733,7 +794,7 @@ function segmentUpdate(
 ): ClientStateReduction {
   if (!sameSession(state, event) || !validUuidV4(event.utteranceId) ||
     event.utteranceId !== state.utteranceId || !validSegmentId(event.segmentId) ||
-    !validRevision(event.revision)) {
+    !validPositiveUint32(event.revision)) {
     return noChange(state);
   }
 
@@ -811,7 +872,7 @@ function isLanguageDecisionValue(value: unknown): value is LanguageDecisionValue
 function languageDecision(state: FinalizingState, event: LanguageDecisionEvent): ClientStateReduction {
   if (!sameSession(state, event) || !validUuidV4(event.utteranceId) ||
     event.utteranceId !== state.utteranceId || !validSegmentId(event.segmentId) ||
-    !validRevision(event.revision) || event.segmentId !== state.finalSegmentId ||
+    !validPositiveUint32(event.revision) || event.segmentId !== state.finalSegmentId ||
     event.revision !== state.finalRevision || state.finalTranscript === undefined ||
     !isTargetLanguage(event.selectedTargetLanguage) ||
     event.selectedTargetLanguage !== state.targetLanguage ||
@@ -844,7 +905,8 @@ function acceptedResultMatches(
 ): boolean {
   return sameSession(state, event) && validUuidV4(event.utteranceId) &&
     event.utteranceId === state.utteranceId && validSegmentId(event.segmentId) &&
-    event.segmentId === state.finalSegmentId && validRevision(event.acceptedFinalRevision) &&
+    event.segmentId === state.finalSegmentId &&
+    validPositiveUint32(event.acceptedFinalRevision) &&
     event.acceptedFinalRevision === state.finalRevision;
 }
 
@@ -910,59 +972,16 @@ function suggestionsReady(
   ));
 }
 
-function replaySnapshotFromEvent(
-  state: ActiveResumableState,
-  event: ActiveTransportLostEvent,
-): ReplaySnapshot | undefined {
-  if (!validUuidV4(event.utteranceId) || event.utteranceId !== state.utteranceId ||
-    !validOffset(event.clientLastAcknowledgedOffset) ||
-    !validOffset(event.oldestRetainedOffset) || !validOffset(event.nextCapturedOffset) ||
-    event.oldestRetainedOffset > event.clientLastAcknowledgedOffset ||
-    event.clientLastAcknowledgedOffset > event.nextCapturedOffset ||
-    event.nextCapturedOffset - event.oldestRetainedOffset > MAX_RETAINED_REPLAY_SAMPLES) {
-    return undefined;
-  }
-  return {
-    utteranceId: event.utteranceId,
-    clientLastAcknowledgedOffset: event.clientLastAcknowledgedOffset,
-    oldestRetainedOffset: event.oldestRetainedOffset,
-    nextCapturedOffset: event.nextCapturedOffset,
-  };
-}
-
-function recoveringState(state: ActiveResumableState, replay: ReplaySnapshot): RecoveringState {
-  const session = stateSession(state);
-  if (session === undefined) throw new Error("Recovering requires a session");
-  return makeState({
-    state: "Recovering" as const,
-    targetLanguage: state.targetLanguage,
-    ...session,
-    priorState: cloneValue(state),
-    replay: { ...replay },
-    message: SAFE_MESSAGES.transportLost,
-  }) as RecoveringState;
-}
-
-function resumeEffect(state: RecoveringState): ResumeSessionEffect {
-  return {
-    type: "resume-session",
-    sessionId: state.sessionId,
-    sessionEpoch: state.sessionEpoch,
-    ...state.replay,
-  };
-}
-
 function clearAfterAbort(
-  state: RecoveringState | ActiveResumableState,
+  state: ActiveTurnClientState,
   effects: readonly ClientEffect[] = NO_EFFECTS,
 ): ClientStateReduction {
-  const prior = state.state === "Recovering" ? state.priorState : state;
-  const session = stateSession(prior);
+  const session = stateSession(state);
   if (session === undefined) return noChange(state);
   return reduction(readyState(
-    prior.targetLanguage,
+    state.targetLanguage,
     session,
-    prior.turn,
+    state.turn,
     SAFE_MESSAGES.utteranceAborted,
   ), effects);
 }
@@ -1052,38 +1071,29 @@ function handleTransportLost(
   if (!sameSession(state, event)) return noChange(state);
 
   if (state.state === "Ready" && state.sessionReady) {
+    const session = stateSession(state);
+    if (session === undefined) return noChange(state);
     return reduction(
-      readyState(state.targetLanguage, undefined, state.turn, SAFE_MESSAGES.transportLost),
-      startSessionEffects(state.targetLanguage),
+      recoveryReadyState(state.targetLanguage, session, state.turn),
+      [startFreshSessionEffect(state.targetLanguage, session)],
     );
   }
 
   if (!isActiveTurnState(state)) return noChange(state);
-
-  const replay = replaySnapshotFromEvent(state, event as ActiveTransportLostEvent);
-  if (replay === undefined) {
-    return reduction(
-      readyState(
-        state.targetLanguage,
-        { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch },
-        state.turn,
-        SAFE_MESSAGES.replayInvalid,
-      ),
-      stopAudioEffect(state) === undefined ? NO_EFFECTS : [stopAudioEffect(state)!],
-    );
-  }
-
-  const recovering = recoveringState(state, replay);
+  const session = stateSession(state);
+  if (session === undefined) return noChange(state);
   const effects: ClientEffect[] = [];
-  const stopAudio = stopAudioEffect(state);
+  const stopAudio = stopAudioForActiveTurn(state);
   if (stopAudio !== undefined) effects.push(stopAudio);
-  effects.push(resumeEffect(recovering));
-  return reduction(recovering, effects);
+  effects.push(startFreshSessionEffect(state.targetLanguage, session));
+  return reduction(recoveryReadyState(state.targetLanguage, session, state.turn), effects);
 }
 
 export function reduceClientState(inputState: ClientState, inputEvent: ClientEvent): ClientStateReduction {
   const state = normalizeInput(inputState);
-  const event = normalizeInput(inputEvent);
+  const eventValue: unknown = normalizeInput(inputEvent as unknown);
+  if (!isKnownClientEvent(eventValue)) return noChange(state);
+  const event = eventValue;
 
   switch (event.type) {
     case "startup.ready":
@@ -1115,8 +1125,18 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
       if (state.state !== "Ready") return noChange(state);
       const target = eventTarget(event);
       const session = eventSession(event);
-      if (target === undefined || session === undefined ||
-        (event.result !== "new" && event.result !== "resumed")) return noChange(state);
+      if (state.pending === "recovery") {
+        const previousSession = stateSession(state);
+        if (target === undefined || session === undefined || previousSession === undefined ||
+          event.result !== "new" ||
+          target !== state.targetLanguage ||
+          session.sessionId === previousSession.sessionId ||
+          session.sessionEpoch <= previousSession.sessionEpoch) {
+          return invalidRecoveryReady(state, event);
+        }
+        return reduction(readyState(target, session, state.turn, state.message));
+      }
+      if (target === undefined || session === undefined || event.result !== "new") return noChange(state);
       const confirmedTarget = stateTarget(state);
       if (confirmedTarget === undefined || target !== confirmedTarget) {
         return sessionReadyMismatch(state, event);
@@ -1151,45 +1171,16 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
     case "transport.lost":
       return handleTransportLost(state, event);
 
-    case "transport.resumed":
-      if (state.state !== "Recovering" || !sameSession(state, event)) return noChange(state);
-      if (event.resumable === false) {
-        return reduction(readyState(
-          state.targetLanguage,
-          { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch },
-          state.priorState.turn,
-          SAFE_MESSAGES.nonResumable,
-        ));
+    case "recovery.failed":
+      if (state.state !== "Ready" || state.pending !== "recovery" || !sameSession(state, event)) {
+        return noChange(state);
       }
-      return reduction(
-        state.priorState,
-        state.priorState.state === "Listening"
-          ? [{
-              type: "start-audio",
-              sessionId: state.sessionId,
-              sessionEpoch: state.sessionEpoch,
-              utteranceId: state.priorState.utteranceId,
-            }]
-          : NO_EFFECTS,
-      );
-
-    case "transport.non-resumable":
-      if (state.state !== "Recovering" || !sameSession(state, event)) return noChange(state);
-      return reduction(readyState(
-        state.targetLanguage,
-        { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch },
-        state.priorState.turn,
-        SAFE_MESSAGES.nonResumable,
-      ));
+      return reduction(errorState(SAFE_MESSAGES.recoveryFailed, true, state.targetLanguage));
 
     case "utterance.aborted":
-      if (state.state === "Recovering") {
-        if (!sameSession(state, event) || !validUuidV4(event.utteranceId) ||
-          event.utteranceId !== state.priorState.utteranceId) return noChange(state);
-        return clearAfterAbort(state);
-      }
       if (!isActiveTurnState(state) || !sameSession(state, event) ||
-        !validUuidV4(event.utteranceId) || event.utteranceId !== state.utteranceId) {
+        !validUuidV4(event.utteranceId) || event.utteranceId !== state.utteranceId ||
+        !isUtteranceAbortCategory(event.category)) {
         return noChange(state);
       }
       return clearAfterAbort(
@@ -1210,4 +1201,6 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
     case "shutdown":
       return shutdownReduction(state);
   }
+
+  return assertNeverClientEvent(event);
 }

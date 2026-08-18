@@ -25,6 +25,7 @@ import {
   createRelayTransport,
   type RelayTransport,
   type RelayTransportCallbackEvent,
+  type RelayTransportError,
   type RelayTransportOptions,
 } from "../transport/index.js";
 import { toStartUpPageContainer } from "./sdk-layout.js";
@@ -40,6 +41,15 @@ const AUDIO_CLOSE_TIMEOUT_MS = 1_000;
 const BRIDGE_CLEANUP_TIMEOUT_MS = 1_000;
 const DISPLAY_UPGRADE_TIMEOUT_MS = 1_000;
 const MAX_QUEUED_EVENTS = 64;
+
+export const RECOVERY_MAX_CONSECUTIVE_ATTEMPTS = 5;
+export const RECOVERY_ATTEMPT_WINDOW_MS = 60_000;
+export const RECOVERY_MAX_ATTEMPTS_PER_WINDOW = 5;
+export const RECOVERY_LONG_ATTEMPT_WINDOW_MS = 600_000;
+export const RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW = 12;
+export const RECOVERY_BACKOFF_BASE_MS = 500;
+export const RECOVERY_BACKOFF_MAX_MS = 8_000;
+export const RECOVERY_READY_DEADLINE_MS = 10_000;
 
 const CLEANUP_PREEMPTED = Symbol("cleanup-preempted");
 
@@ -115,6 +125,13 @@ export interface G2BridgeRuntimeOptions {
   readonly relayOrigin?: string;
   readonly storage?: G2TargetStorage;
   readonly displayDebounceMs?: number;
+  readonly recoveryTiming?: RecoveryTiming;
+}
+
+export interface RecoveryTiming {
+  readonly now: () => number;
+  readonly random: () => number;
+  readonly schedule: (callback: () => void, delayMs: number) => () => void;
 }
 
 export class BridgeStartupError extends Error {
@@ -193,7 +210,6 @@ function targetForState(state: ClientState): TargetLanguage | undefined {
     case "Finalizing":
     case "Translating":
     case "Results":
-    case "Recovering":
     case "Error":
       return state.targetLanguage;
   }
@@ -224,6 +240,15 @@ function displayTexts(state: ClientState): readonly string[] {
         "press to confirm, swipe to change",
       ];
     case "Ready":
+      if (state.pending === "recovery") {
+        return [
+          "Reconnecting",
+          targetLine,
+          "Source: Interrupted turn cleared",
+          "English: waiting",
+          "Please wait",
+        ];
+      }
       return [
         state.message === undefined ? "Ready" : compact(`Ready: ${state.message}`),
         targetLine,
@@ -267,21 +292,13 @@ function displayTexts(state: ClientState): readonly string[] {
           : compact(`${suggestion.englishText} → ${suggestion.selectedTargetText}`),
       ];
     }
-    case "Recovering":
-      return [
-        compact(`Recovering: ${state.message}`),
-        targetLine,
-        "Source: unavailable",
-        "English: unavailable",
-        "Reconnecting",
-      ];
     case "Error":
       return [
         compact(`Error: ${state.message}`),
         targetLine,
         "Source: unavailable",
         "English: unavailable",
-        "Try again",
+        state.terminal ? "Restart app" : "Try again",
       ];
   }
 }
@@ -322,6 +339,49 @@ function defaultStorage(): G2TargetStorage | undefined {
   }
 }
 
+function defaultRecoveryTiming(): RecoveryTiming {
+  return {
+    now: () => Date.now(),
+    random: () => Math.random(),
+    schedule: (callback, delayMs) => {
+      const handle = setTimeout(callback, delayMs);
+      return () => clearTimeout(handle);
+    },
+  };
+}
+
+interface RecoveryContext {
+  readonly cycle: number;
+  readonly targetLanguage: TargetLanguage;
+  readonly previousSessionId: string;
+  readonly previousSessionEpoch: number;
+  consecutiveAttempts: number;
+  readonly attemptTimes: number[];
+  scheduledCancel: (() => void) | undefined;
+  activeAttempt: RecoveryAttempt | undefined;
+}
+
+interface RecoveryAttempt {
+  readonly cycle: number;
+  readonly attempt: number;
+  transport: G2Transport | undefined;
+  transportGeneration: number | undefined;
+  deadlineCancel: (() => void) | undefined;
+}
+
+interface StartAudioEffect {
+  readonly type: "start-audio";
+  readonly sessionId: string;
+  readonly sessionEpoch: number;
+  readonly utteranceId: string;
+}
+
+interface TransportEventGuard {
+  readonly transport: G2Transport;
+  readonly generation: number;
+  readonly recoveryAttempt: number | undefined;
+}
+
 export class G2BridgeRuntime {
   readonly #waitForBridge: () => Promise<G2BridgePort>;
   readonly #readyLogger: (marker: typeof PALANCAR_G2_READY) => unknown | Promise<unknown>;
@@ -330,9 +390,14 @@ export class G2BridgeRuntime {
   readonly #relayOrigin: string;
   readonly #storage: G2TargetStorage | undefined;
   readonly #displayDebounceMs: number;
+  readonly #recoveryTiming: RecoveryTiming;
   readonly #startupContainer = toStartUpPageContainer(PAGE_LAYOUTS.Starting);
   #bridge: G2BridgePort | undefined;
   #transport: G2Transport | undefined;
+  #transportGeneration = 0;
+  #recoveryCycle = 0;
+  #recoveryContext: RecoveryContext | undefined;
+  #pendingRecoveryLoss = false;
   readonly #pendingTransportStarts = new Set<G2Transport>();
   readonly #pendingTransportCloses = new Set<G2Transport>();
   #bootPromise: Promise<void> | undefined;
@@ -395,6 +460,15 @@ export class G2BridgeRuntime {
       throw new RangeError("displayDebounceMs must be non-negative");
     }
     this.#displayDebounceMs = displayDebounceMs;
+    const recoveryTiming = options.recoveryTiming ?? defaultRecoveryTiming();
+    if (
+      typeof recoveryTiming.now !== "function" ||
+      typeof recoveryTiming.random !== "function" ||
+      typeof recoveryTiming.schedule !== "function"
+    ) {
+      throw new TypeError("recoveryTiming must provide now, random, and schedule functions");
+    }
+    this.#recoveryTiming = recoveryTiming;
   }
 
   get snapshot(): BridgeRuntimeSnapshot {
@@ -636,6 +710,10 @@ export class G2BridgeRuntime {
   }
 
   async #teardownAfterBootFailure(): Promise<void> {
+    this.#cancelRecoveryTimers();
+    this.#recoveryCycle += 1;
+    this.#recoveryContext = undefined;
+    this.#pendingRecoveryLoss = false;
     this.#displayAvailable = false;
     if (this.#displayTimer !== undefined) {
       clearTimeout(this.#displayTimer);
@@ -762,6 +840,10 @@ export class G2BridgeRuntime {
     this.#cleanupSignalResolve = undefined;
     for (const waiter of this.#cleanupWaiters) waiter();
     this.#cleanupWaiters.clear();
+    this.#cancelRecoveryTimers();
+    this.#recoveryCycle += 1;
+    this.#recoveryContext = undefined;
+    this.#pendingRecoveryLoss = false;
     this.#displayAvailable = false;
 
     if (this.#displayTimer !== undefined) {
@@ -950,19 +1032,27 @@ export class G2BridgeRuntime {
   #queueTransportEvent(
     transport: G2Transport,
     event: RelayTransportCallbackEvent | ClientEvent,
+    generation = this.#transportGeneration,
+    recoveryAttempt: number | undefined = undefined,
   ): void {
-    if (this.#isRuntimeInactive() || this.#transport !== transport) return;
+    if (this.#isRuntimeInactive() || !this.#isCurrentTransport(transport, generation)) return;
+    const guard: TransportEventGuard = { transport, generation, recoveryAttempt };
     this.#queueSerializedEvent(async () => {
-      if (this.#isRuntimeInactive() || this.#transport !== transport) return;
+      if (this.#isRuntimeInactive() || !this.#isCurrentTransport(guard.transport, guard.generation)) return;
       const clientEvent = event as ClientEvent;
-      await this.#dispatchAndRunEffects(clientEvent);
+      await this.#dispatchAndRunEffects(clientEvent, guard);
       if (
         clientEvent.type === "fatal" &&
         !this.#isRuntimeInactive() &&
-        this.#transport === transport
+        this.#isCurrentTransport(guard.transport, guard.generation)
       ) {
-        this.#endAndCloseTransport("transport_error");
-        this.#requestCleanup();
+        if (guard.recoveryAttempt !== undefined && this.#isRecoveryPending()) {
+          this.#retireCurrentTransport(guard.transport, guard.generation, false);
+          this.#failRecovery();
+        } else {
+          this.#endAndCloseTransport("transport_error");
+          this.#requestCleanup();
+        }
       }
     });
   }
@@ -1004,6 +1094,7 @@ export class G2BridgeRuntime {
       systemEventType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
       systemEventType === OsEventTypeList.ABNORMAL_EXIT_EVENT
     ) {
+      this.#cancelRecoveryTimers();
       queueMicrotask(() => this.#requestCleanup());
       return;
     }
@@ -1051,6 +1142,7 @@ export class G2BridgeRuntime {
         systemEvent.eventType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
         systemEvent.eventType === OsEventTypeList.ABNORMAL_EXIT_EVENT
       ) {
+        this.#cancelRecoveryTimers();
         this.#requestCleanup();
         return;
       }
@@ -1130,9 +1222,25 @@ export class G2BridgeRuntime {
     return undefined;
   }
 
-  #dispatchAndRunEffects(event: ClientEvent): Promise<void> {
+  #dispatchAndRunEffects(
+    event: ClientEvent,
+    guard?: TransportEventGuard,
+  ): Promise<void> {
     if (this.#isRuntimeInactive()) return Promise.resolve();
     const reduction = this.#dispatch(event);
+    if (
+      event.type === "session.ready" &&
+      guard?.recoveryAttempt !== undefined &&
+      reduction.state.state === "Ready" &&
+      reduction.state.sessionReady
+    ) {
+      this.#completeRecoveryAttempt(guard);
+    } else if (
+      reduction.state.state === "Error" &&
+      guard?.recoveryAttempt !== undefined
+    ) {
+      this.#cancelRecoveryTimers();
+    }
     return this.#runEffects(reduction.effects);
   }
 
@@ -1177,11 +1285,14 @@ export class G2BridgeRuntime {
           case "start-session":
             this.#startSession(effect.targetLanguage);
             break;
+          case "start-fresh-session":
+            await this.#beginFreshRecovery(effect.targetLanguage, effect.previousSessionId, effect.previousSessionEpoch);
+            break;
           case "start-utterance":
             this.#transport?.startUtterance(effect.utteranceId);
             break;
           case "start-audio":
-            await this.#startAudio();
+            await this.#startAudio(effect as StartAudioEffect);
             break;
           case "stop-audio":
             await this.#stopAudio();
@@ -1192,14 +1303,16 @@ export class G2BridgeRuntime {
           case "end-session":
             this.#transport?.endSession("user_requested");
             break;
-          case "resume-session":
           case "request-translation":
           case "request-suggestions":
-            // The reviewed transport has no separate request/resume methods in this slice.
             break;
         }
       } catch {
-        this.#handleEffectFailure();
+        if (this.#isRecoveryPending()) {
+          this.#failRecovery();
+        } else {
+          this.#handleEffectFailure();
+        }
         return;
       }
     }
@@ -1207,6 +1320,7 @@ export class G2BridgeRuntime {
 
   #handleEffectFailure(): void {
     if (this.#isRuntimeInactive()) return;
+    this.#cancelRecoveryTimers();
     this.#dispatch({ type: "fatal" });
     this.#endAndCloseTransport("transport_error");
     this.#requestCleanup();
@@ -1216,42 +1330,51 @@ export class G2BridgeRuntime {
     reason: "user_requested" | "app_shutdown" | "transport_error",
   ): void {
     const transport = this.#transport;
-    this.#transport = undefined;
     if (transport === undefined) return;
-    this.#pendingTransportStarts.delete(transport);
-    try {
-      transport.endSession(reason);
-    } catch {
-      // Fatal handling continues to close the transport even if its end call fails.
-    }
-    const closeResult = this.#tryCloseTransport(transport);
+    const generation = this.#transportGeneration;
+    const closeResult = this.#retireCurrentTransport(transport, generation, true, reason);
     if (!closeResult.ok) this.#requestCleanup();
   }
 
-  #startSession(targetLanguage: TargetLanguage): void {
+  #startSession(
+    targetLanguage: TargetLanguage,
+    recoveryAttempt?: number,
+  ): { readonly transport: G2Transport; readonly generation: number } | undefined {
     this.#audioPcmFaultTransport = undefined;
     const priorTransport = this.#transport;
-    this.#transport = undefined;
     if (priorTransport !== undefined) {
-      this.#pendingTransportStarts.delete(priorTransport);
-      const closeResult = this.#tryCloseTransport(priorTransport);
+      const closeResult = this.#retireCurrentTransport(
+        priorTransport,
+        this.#transportGeneration,
+        false,
+      );
       if (!closeResult.ok) {
-        this.#handleEffectFailure();
-        return;
+        throw closeResult.error;
       }
     }
 
+    const generation = ++this.#transportGeneration;
     const transportReference: { current?: G2Transport } = {};
     const transportOptions: RelayTransportOptions = {
       relayOrigin: this.#relayOrigin,
       onEvent: (event) => {
         if (transportReference.current !== undefined) {
-          this.#handleTransportCallback(transportReference.current, event);
+          this.#handleTransportCallback(
+            transportReference.current,
+            generation,
+            recoveryAttempt,
+            event,
+          );
         }
       },
-      onTransportError: () => {
+      onTransportError: (error) => {
         if (transportReference.current !== undefined) {
-          this.#handleTransportError(transportReference.current);
+          this.#handleTransportError(
+            transportReference.current,
+            generation,
+            recoveryAttempt,
+            error,
+          );
         }
       },
     };
@@ -1268,45 +1391,427 @@ export class G2BridgeRuntime {
         },
         () => {
           this.#pendingTransportStarts.delete(transport);
-          if (!this.#isRuntimeInactive() && this.#transport === transport) {
-            this.#failTransport(transport);
+          if (!this.#isCurrentTransport(transport, generation)) return;
+          if (recoveryAttempt !== undefined) {
+            this.#handleRecoveryAttemptFailure(
+              transport,
+              generation,
+              recoveryAttempt,
+              "retry",
+            );
+          } else {
+            this.#failTransport(transport, generation);
           }
         },
       );
     } catch {
       this.#pendingTransportStarts.delete(transport);
-      if (this.#transport === transport) {
-        this.#failTransport(transport);
+      if (this.#isCurrentTransport(transport, generation)) {
+        if (recoveryAttempt !== undefined) {
+          this.#handleRecoveryAttemptFailure(
+            transport,
+            generation,
+            recoveryAttempt,
+            "retry",
+          );
+        } else {
+          this.#failTransport(transport, generation);
+        }
       }
     }
+    return { transport, generation };
   }
 
-  #failTransport(transport: G2Transport): void {
-    if (this.#isRuntimeInactive() || this.#transport !== transport) return;
+  #failTransport(transport: G2Transport, generation = this.#transportGeneration): void {
+    if (this.#isRuntimeInactive() || !this.#isCurrentTransport(transport, generation)) return;
     this.#dispatch({ type: "fatal" });
     this.#endAndCloseTransport("transport_error");
     this.#requestCleanup();
   }
 
-  #handleTransportError(transport: G2Transport): void {
-    if (this.#isRuntimeInactive() || this.#transport !== transport) return;
-    this.#queueTransportEvent(transport, { type: "fatal" });
+  #handleTransportError(
+    transport: G2Transport,
+    generation: number,
+    recoveryAttempt: number | undefined,
+    error: RelayTransportError,
+  ): void {
+    if (this.#isRuntimeInactive() || !this.#isCurrentTransport(transport, generation)) return;
+    if (recoveryAttempt !== undefined && this.#isRecoveryPending()) {
+      this.#handleRecoveryAttemptFailure(
+        transport,
+        generation,
+        recoveryAttempt,
+        error.recoveryDisposition,
+      );
+      return;
+    }
+    this.#queueTransportEvent(transport, { type: "fatal" }, generation);
   }
 
   #handleTransportCallback(
     transport: G2Transport,
+    generation: number,
+    recoveryAttempt: number | undefined,
     event: RelayTransportCallbackEvent,
   ): void {
-    if (this.#isRuntimeInactive() || this.#transport !== transport) return;
+    if (this.#isRuntimeInactive() || !this.#isCurrentTransport(transport, generation)) return;
+    if (event.type === "transport.lost") {
+      if (recoveryAttempt !== undefined && this.#isRecoveryPending()) {
+        this.#handleRecoveryAttemptFailure(
+          transport,
+          generation,
+          recoveryAttempt,
+          "retry",
+        );
+        return;
+      }
+      this.#handleTransportLostSynchronously(transport, generation, event);
+      return;
+    }
     if (event.type === "fatal") {
-      this.#queueTransportEvent(transport, event);
+      this.#queueTransportEvent(transport, event, generation, recoveryAttempt);
       return;
     }
     if (event.type === "session.rejected") {
-      this.#queueTransportEvent(transport, { type: "fatal" });
+      this.#queueTransportEvent(transport, { type: "fatal" }, generation, recoveryAttempt);
       return;
     }
-    this.#queueTransportEvent(transport, event);
+    this.#queueTransportEvent(transport, event, generation, recoveryAttempt);
+  }
+
+  #isCurrentTransport(transport: G2Transport, generation: number): boolean {
+    return this.#transport === transport && this.#transportGeneration === generation;
+  }
+
+  #retireCurrentTransport(
+    transport: G2Transport,
+    generation: number,
+    endSession: boolean,
+    reason: "user_requested" | "app_shutdown" | "transport_error" = "transport_error",
+  ): TransportCloseResult {
+    if (!this.#isCurrentTransport(transport, generation)) return { ok: true };
+    this.#audioPcmEnabled = false;
+    this.#transport = undefined;
+    this.#transportGeneration += 1;
+    this.#pendingTransportStarts.delete(transport);
+    if (endSession) {
+      try {
+        transport.endSession(reason);
+      } catch {
+        // Closing remains best effort after a failed session-end call.
+      }
+    }
+    const closeResult = this.#tryCloseTransport(transport);
+    if (!closeResult.ok) {
+      this.#cancelRecoveryTimers();
+      this.#dispatch({ type: "fatal" });
+      this.#requestCleanup();
+    }
+    return closeResult;
+  }
+
+  #handleTransportLostSynchronously(
+    transport: G2Transport,
+    generation: number,
+    event: Extract<RelayTransportCallbackEvent, { readonly type: "transport.lost" }>,
+  ): void {
+    if (this.#isRuntimeInactive() || !this.#isCurrentTransport(transport, generation)) return;
+    this.#audioPcmEnabled = false;
+    this.#pendingRecoveryLoss = true;
+    this.#cancelRecoveryTimers();
+    this.#retireCurrentTransport(transport, generation, false);
+
+    // The transport is detached before this callback enters the serialized
+    // reducer. A later callback from this dead transport therefore cannot
+    // replace the fresh-session attempt or feed it stale events.
+    this.#queueSerializedEvent(async () => {
+      if (this.#isRuntimeInactive()) return;
+      const reduction = this.#dispatch(event);
+      if (!this.#isRecoveryPending()) {
+        this.#pendingRecoveryLoss = false;
+        return;
+      }
+      // Fresh recovery owns the microphone shutdown. The reducer lists the
+      // stop-audio effect before start-fresh-session, but starting recovery
+      // first is required so a close failure has a recovery context in which
+      // to dispatch recovery.failed instead of being discarded as a generic
+      // effect failure.
+      await this.#runEffects(
+        reduction.effects.filter((effect) => effect.type !== "stop-audio"),
+      );
+    });
+  }
+
+  #isRecoveryPending(): boolean {
+    return this.#state.state === "Ready" && this.#state.pending === "recovery";
+  }
+
+  #recoveryNow(): number {
+    const now = this.#recoveryTiming.now();
+    return Number.isFinite(now) ? now : Date.now();
+  }
+
+  #recoveryRandom(): number {
+    const random = this.#recoveryTiming.random();
+    if (!Number.isFinite(random) || random < 0 || random >= 1) {
+      throw new RangeError("recoveryTiming.random must return a number in [0, 1)");
+    }
+    return random;
+  }
+
+  #pruneRecoveryAttempts(context: RecoveryContext, now: number): void {
+    const oldest = now - RECOVERY_LONG_ATTEMPT_WINDOW_MS;
+    while (context.attemptTimes[0] !== undefined && context.attemptTimes[0] <= oldest) {
+      context.attemptTimes.shift();
+    }
+  }
+
+  #recoveryBudgetAvailable(context: RecoveryContext, now: number): boolean {
+    this.#pruneRecoveryAttempts(context, now);
+    const recentMinute = context.attemptTimes.filter((time) => now - time < RECOVERY_ATTEMPT_WINDOW_MS);
+    const recentTenMinutes = context.attemptTimes.filter(
+      (time) => now - time < RECOVERY_LONG_ATTEMPT_WINDOW_MS,
+    );
+    return context.consecutiveAttempts < RECOVERY_MAX_CONSECUTIVE_ATTEMPTS &&
+      recentMinute.length < RECOVERY_MAX_ATTEMPTS_PER_WINDOW &&
+      recentTenMinutes.length < RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW;
+  }
+
+  #cancelRecoveryTimers(): void {
+    const context = this.#recoveryContext;
+    if (context?.scheduledCancel !== undefined) {
+      try {
+        context.scheduledCancel();
+      } catch {
+        // A custom scheduler's cancellation is best effort.
+      }
+      context.scheduledCancel = undefined;
+    }
+    const active = context?.activeAttempt;
+    if (active?.deadlineCancel !== undefined) {
+      try {
+        active.deadlineCancel();
+      } catch {
+        // A custom scheduler's cancellation is best effort.
+      }
+      active.deadlineCancel = undefined;
+    }
+  }
+
+  async #beginFreshRecovery(
+    targetLanguage: TargetLanguage,
+    previousSessionId: string,
+    previousSessionEpoch: number,
+  ): Promise<void> {
+    if (!this.#isRecoveryPending() || this.#isRuntimeInactive()) return;
+
+    this.#cancelRecoveryTimers();
+    const cycle = ++this.#recoveryCycle;
+    const previousTimes = this.#recoveryContext?.attemptTimes ?? [];
+    const context: RecoveryContext = {
+      cycle,
+      targetLanguage,
+      previousSessionId,
+      previousSessionEpoch,
+      consecutiveAttempts: 0,
+      attemptTimes: previousTimes,
+      scheduledCancel: undefined,
+      activeAttempt: undefined,
+    };
+    this.#recoveryContext = context;
+
+    try {
+      await this.#awaitMicrophoneShutdownForRecovery();
+    } catch {
+      this.#pendingRecoveryLoss = false;
+      this.#failRecovery();
+      return;
+    }
+    this.#pendingRecoveryLoss = false;
+    if (this.#isRuntimeInactive() || this.#recoveryContext !== context || !this.#isRecoveryPending()) return;
+    this.#scheduleRecoveryAttempt(context);
+  }
+
+  #scheduleRecoveryAttempt(context: RecoveryContext): void {
+    if (this.#isRuntimeInactive() || this.#recoveryContext !== context || !this.#isRecoveryPending()) return;
+    const now = this.#recoveryNow();
+    if (!this.#recoveryBudgetAvailable(context, now)) {
+      this.#failRecovery();
+      return;
+    }
+    let delay: number;
+    try {
+      const cap = Math.min(
+        RECOVERY_BACKOFF_MAX_MS,
+        RECOVERY_BACKOFF_BASE_MS * 2 ** context.consecutiveAttempts,
+      );
+      delay = cap / 2 + this.#recoveryRandom() * cap / 2;
+    } catch {
+      this.#failRecovery();
+      return;
+    }
+
+    const cycle = context.cycle;
+    try {
+      context.scheduledCancel = this.#recoveryTiming.schedule(() => {
+        if (this.#recoveryContext !== context || context.cycle !== cycle) return;
+        context.scheduledCancel = undefined;
+        this.#queueSerializedEvent(() => {
+          if (this.#recoveryContext !== context || context.cycle !== cycle) return;
+          this.#startRecoveryAttempt(context);
+        });
+      }, delay);
+    } catch {
+      this.#failRecovery();
+    }
+  }
+
+  #startRecoveryAttempt(context: RecoveryContext): void {
+    if (this.#isRuntimeInactive() || this.#recoveryContext !== context || !this.#isRecoveryPending()) return;
+    const now = this.#recoveryNow();
+    if (!this.#recoveryBudgetAvailable(context, now)) {
+      this.#failRecovery();
+      return;
+    }
+
+    const attempt = context.consecutiveAttempts + 1;
+    context.consecutiveAttempts = attempt;
+    context.attemptTimes.push(now);
+    const active: RecoveryAttempt = {
+      cycle: context.cycle,
+      attempt,
+      transport: undefined,
+      transportGeneration: undefined,
+      deadlineCancel: undefined,
+    };
+    context.activeAttempt = active;
+
+    let binding: { readonly transport: G2Transport; readonly generation: number } | undefined;
+    try {
+      binding = this.#startSession(context.targetLanguage, attempt);
+    } catch {
+      this.#finishRecoveryAttemptFailure(context, active, "retry");
+      return;
+    }
+    if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
+    if (binding === undefined) {
+      this.#finishRecoveryAttemptFailure(context, active, "retry");
+      return;
+    }
+    active.transport = binding.transport;
+    active.transportGeneration = binding.generation;
+    try {
+      active.deadlineCancel = this.#recoveryTiming.schedule(() => {
+        if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
+        active.deadlineCancel = undefined;
+        this.#handleRecoveryAttemptFailure(
+          binding!.transport,
+          binding!.generation,
+          active.attempt,
+          "retry",
+        );
+      }, RECOVERY_READY_DEADLINE_MS);
+    } catch {
+      this.#handleRecoveryAttemptFailure(
+        binding.transport,
+        binding.generation,
+        active.attempt,
+        "stop",
+      );
+    }
+  }
+
+  #handleRecoveryAttemptFailure(
+    transport: G2Transport,
+    generation: number,
+    attempt: number,
+    disposition: "retry" | "stop",
+  ): void {
+    const context = this.#recoveryContext;
+    const active = context?.activeAttempt;
+    if (
+      context === undefined ||
+      active === undefined ||
+      active.attempt !== attempt ||
+      (active.transport !== undefined && active.transport !== transport) ||
+      (active.transportGeneration !== undefined && active.transportGeneration !== generation)
+    ) return;
+    this.#retireCurrentTransport(transport, generation, false);
+    this.#queueSerializedEvent(() => {
+      if (this.#recoveryContext !== context || context.activeAttempt?.attempt !== attempt) return;
+      const active = context.activeAttempt;
+      if (active === undefined) return;
+      this.#finishRecoveryAttemptFailure(context, active, disposition);
+    });
+  }
+
+  #finishRecoveryAttemptFailure(
+    context: RecoveryContext,
+    active: RecoveryAttempt,
+    disposition: "retry" | "stop",
+  ): void {
+    if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
+    if (active.deadlineCancel !== undefined) {
+      try {
+        active.deadlineCancel();
+      } catch {
+        // A custom scheduler's cancellation is best effort.
+      }
+      active.deadlineCancel = undefined;
+    }
+    context.activeAttempt = undefined;
+    if (disposition === "stop" || !this.#recoveryBudgetAvailable(context, this.#recoveryNow())) {
+      this.#failRecovery();
+      return;
+    }
+    this.#scheduleRecoveryAttempt(context);
+  }
+
+  #completeRecoveryAttempt(guard: TransportEventGuard): void {
+    const context = this.#recoveryContext;
+    const active = context?.activeAttempt;
+    if (
+      context === undefined ||
+      active === undefined ||
+      active.attempt !== guard.recoveryAttempt ||
+      active.transport !== guard.transport ||
+      active.transportGeneration !== guard.generation
+    ) return;
+    if (active.deadlineCancel !== undefined) {
+      try {
+        active.deadlineCancel();
+      } catch {
+        // A custom scheduler's cancellation is best effort.
+      }
+      active.deadlineCancel = undefined;
+    }
+    if (context.scheduledCancel !== undefined) {
+      try {
+        context.scheduledCancel();
+      } catch {
+        // A custom scheduler's cancellation is best effort.
+      }
+      context.scheduledCancel = undefined;
+    }
+    context.activeAttempt = undefined;
+    context.consecutiveAttempts = 0;
+  }
+
+  #failRecovery(): void {
+    const context = this.#recoveryContext;
+    this.#cancelRecoveryTimers();
+    this.#recoveryCycle += 1;
+    this.#recoveryContext = undefined;
+    this.#pendingRecoveryLoss = false;
+    if (
+      context === undefined ||
+      !this.#isRecoveryPending()
+    ) return;
+    this.#dispatch({
+      type: "recovery.failed",
+      sessionId: context.previousSessionId,
+      sessionEpoch: context.previousSessionEpoch,
+    });
   }
 
   #startDetachedAudioClose(): void {
@@ -1370,7 +1875,54 @@ export class G2BridgeRuntime {
     });
   }
 
-  async #startAudio(): Promise<void> {
+  async #awaitMicrophoneShutdownForRecovery(): Promise<void> {
+    this.#audioPcmEnabled = false;
+    const pendingAudioOpen = this.#pendingAudioOpen;
+    if (pendingAudioOpen !== undefined) {
+      try {
+        await this.#awaitWithTimeout(
+          pendingAudioOpen,
+          "G2 audio open timed out during recovery",
+          AUDIO_CLOSE_TIMEOUT_MS,
+        );
+      } catch (error: unknown) {
+        // A late open is still owned by the old turn. The close pass below
+        // makes the recovery failure terminal without opening a new turn.
+        if (this.#audioOpen || this.#audioOpenUncertain || this.#audioCloseRequired) {
+          try {
+            const closed = await this.#awaitWithTimeout(
+              this.#closeAudio(),
+              "G2 audio close timed out during recovery",
+              AUDIO_CLOSE_TIMEOUT_MS,
+            );
+            if (!closed) throw new Error("G2 audio close failed during recovery");
+          } catch (closeError: unknown) {
+            throw normalizeError(closeError, "G2 audio close failed during recovery");
+          }
+        }
+        throw normalizeError(error, "G2 audio open failed during recovery");
+      }
+    }
+
+    const pendingAudioClose = this.#pendingAudioClose;
+    if (pendingAudioClose !== undefined) {
+      const closed = await this.#awaitWithTimeout(
+        pendingAudioClose,
+        "G2 audio close timed out during recovery",
+        AUDIO_CLOSE_TIMEOUT_MS,
+      );
+      if (!closed) throw new Error("G2 audio close failed during recovery");
+    }
+    if (!this.#audioOpen && !this.#audioOpenUncertain && !this.#audioCloseRequired) return;
+    const closed = await this.#awaitWithTimeout(
+      this.#closeAudio(),
+      "G2 audio close timed out during recovery",
+      AUDIO_CLOSE_TIMEOUT_MS,
+    );
+    if (!closed) throw new Error("G2 audio close failed during recovery");
+  }
+
+  async #startAudio(effect: StartAudioEffect): Promise<void> {
     if (this.#isRuntimeInactive()) return;
     const pendingAudioClose = this.#pendingAudioClose;
     if (pendingAudioClose !== undefined) {
@@ -1385,6 +1937,18 @@ export class G2BridgeRuntime {
     if (this.#audioOpen || this.#isRuntimeInactive()) return;
     const bridge = this.#bridge;
     if (bridge === undefined) throw new Error("G2 bridge is unavailable");
+    const ownerTransport = this.#transport;
+    const ownerTransportGeneration = this.#transportGeneration;
+    const ownsTurn = (): boolean => {
+      const state = this.#state;
+      return ownerTransport !== undefined &&
+        this.#isCurrentTransport(ownerTransport, ownerTransportGeneration) &&
+        state.state === "Listening" &&
+        state.sessionId === effect.sessionId &&
+        state.sessionEpoch === effect.sessionEpoch &&
+        state.utteranceId === effect.utteranceId;
+    };
+    if (!ownsTurn()) return;
     this.#audioCloseRequired = true;
     const opening = Promise.resolve()
       .then(() => {
@@ -1403,11 +1967,16 @@ export class G2BridgeRuntime {
         this.#audioOpenUncertain = false;
         this.#audioCloseRequired = true;
         this.#audioPcmFaultTransport = undefined;
-        if (this.#isRuntimeInactive()) {
-          this.#scheduleCleanupForLateResource();
-        } else {
+        if (ownsTurn() && !this.#isRuntimeInactive()) {
           this.#audioPcmEnabled = true;
+        } else {
+          this.#audioPcmEnabled = false;
+          const lateClose = this.#closeAudio();
+          return lateClose.then((closed) => {
+            if (!closed) throw new Error("G2 audio close failed");
+          });
         }
+        return undefined;
       }, (error: unknown) => {
         this.#audioOpenUncertain = false;
         this.#audioCloseRequired = true;
@@ -1433,18 +2002,36 @@ export class G2BridgeRuntime {
         AUDIO_CLOSE_TIMEOUT_MS,
       );
       if (result === CLEANUP_PREEMPTED) return;
+    } catch (error: unknown) {
+      if (this.#pendingRecoveryLoss && this.#pendingAudioOpen === opening) return;
+      throw error;
     } finally {
       if (this.#pendingAudioOpen === opening) {
-        this.#pendingAudioOpen = undefined;
+        if (!this.#pendingRecoveryLoss) this.#pendingAudioOpen = undefined;
         this.#audioOpenUncertain = true;
       }
     }
   }
 
   async #stopAudio(): Promise<void> {
-    if (!this.#audioOpen) return;
+    const pendingAudioClose = this.#pendingAudioClose;
+    if (!this.#audioOpen && pendingAudioClose !== undefined) {
+      const closed = await this.#awaitWithCleanup(
+        pendingAudioClose,
+        "G2 audio close timed out",
+        AUDIO_CLOSE_TIMEOUT_MS,
+      );
+      if (closed === CLEANUP_PREEMPTED) return;
+      if (!closed) throw new Error("G2 audio close failed");
+      return;
+    }
+    if (!this.#audioOpen && this.#pendingAudioOpen === undefined && !this.#audioOpenUncertain && !this.#audioCloseRequired) return;
     this.#audioPcmEnabled = false;
     this.#audioCloseRequired = true;
+    if (!this.#audioOpen && this.#pendingAudioOpen !== undefined) {
+      await this.#awaitMicrophoneShutdownForRecovery();
+      return;
+    }
     const closing = this.#closeAudio();
     const closed = await this.#awaitWithCleanup(
       closing,

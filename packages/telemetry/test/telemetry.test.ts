@@ -142,6 +142,13 @@ function withField(field: string, value: unknown): Record<string, unknown> {
 }
 
 describe('telemetry vocabulary and record sanitization', () => {
+  it('does not expose or accept the removed non-resumable vocabulary', () => {
+    expect(Object.values(TELEMETRY_METRIC_NAMES)).not.toContain('transport.non_resumable');
+    expect(Object.values(TELEMETRY_OUTCOMES)).not.toContain('non_resumable');
+    expectValidation({ ...MINIMAL_RECORD, name: 'transport.non_resumable' }, 'invalid-field');
+    expectValidation({ ...MINIMAL_RECORD, outcome: 'non_resumable' }, 'invalid-field');
+  });
+
   it('accepts every canonical metric name', () => {
     const names = Object.values(TELEMETRY_METRIC_NAMES);
     expect(new Set(names).size).toBe(names.length);

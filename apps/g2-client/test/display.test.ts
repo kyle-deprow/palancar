@@ -62,6 +62,20 @@ const textUpdate = (
 });
 
 describe("G2 page layouts", () => {
+  it("does not expose a recovering layout", () => {
+    expect(DISPLAY_STATES).toEqual([
+      "Starting",
+      "TargetSelection",
+      "Ready",
+      "Listening",
+      "Finalizing",
+      "Translating",
+      "Results",
+      "Error",
+    ]);
+    expect("Recovering" in PAGE_LAYOUTS).toBe(false);
+  });
+
   it.each(DISPLAY_STATES)("validates the immutable %s layout", (state) => {
     const layout = PAGE_LAYOUTS[state];
     expect(validatePageLayout(layout)).toEqual({ valid: true, errors: [] });
@@ -83,6 +97,7 @@ describe("G2 page layouts", () => {
     }
     expect(PAGE_LAYOUTS.TargetSelection.textObject[1]?.content).toContain("Espanol");
     expect(PAGE_LAYOUTS.TargetSelection.textObject[1]?.content).toContain("Turkce");
+    expect(PAGE_LAYOUTS.Error.textObject[4]?.content).toBe("Restart app");
   });
 
   it("enforces count, identity, bounds, capture, content, and z-order invariants", () => {

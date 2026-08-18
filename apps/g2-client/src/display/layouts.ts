@@ -21,7 +21,6 @@ export const DISPLAY_STATES = [
   "Finalizing",
   "Translating",
   "Results",
-  "Recovering",
   "Error",
 ] as const;
 
@@ -162,19 +161,12 @@ const CONTENT: Readonly<Record<DisplayState, readonly [string, string, string, s
       "English: sample translation",
       "Suggestion: Hola / Hello | Merhaba / Hello",
     ],
-    Recovering: [
-      "Recovering",
-      "Target: Spanish / Turkish",
-      "Source: unavailable",
-      "English: unavailable",
-      "Status: reconnecting",
-    ],
     Error: [
       "Error",
       "Target: Spanish / Turkish",
       "Source: unavailable",
       "English: unavailable",
-      "Status: try again",
+      "Restart app",
     ],
   });
 

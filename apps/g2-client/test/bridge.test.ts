@@ -18,6 +18,14 @@ import {
   DEFAULT_RELAY_ORIGIN,
   G2BridgeRuntime,
   PALANCAR_G2_READY,
+  RECOVERY_ATTEMPT_WINDOW_MS,
+  RECOVERY_BACKOFF_BASE_MS,
+  RECOVERY_BACKOFF_MAX_MS,
+  RECOVERY_LONG_ATTEMPT_WINDOW_MS,
+  RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW,
+  RECOVERY_MAX_CONSECUTIVE_ATTEMPTS,
+  RECOVERY_READY_DEADLINE_MS,
+  type RecoveryTiming,
   isPairedTurnEffects,
   type G2BridgePort,
   type G2Transport,
@@ -29,6 +37,7 @@ import type {
 } from "../src/transport/index.js";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const RECOVERY_SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
 
 class FakeBridge implements G2BridgePort {
@@ -189,6 +198,10 @@ class FakeTransport implements G2Transport {
   emit(event: RelayTransportCallbackEvent): void {
     this.options.onEvent?.(event);
   }
+
+  emitError(recoveryDisposition: "retry" | "stop"): void {
+    this.options.onTransportError?.({ recoveryDisposition } as never);
+  }
 }
 
 const systemEvent = (
@@ -215,11 +228,15 @@ const listEvent = (eventType?: OsEventTypeList): EvenHubEvent => ({
   }),
 });
 
-const readyEvent = (targetLanguage: "es" | "tr" = "es"): RelayTransportCallbackEvent => ({
+const readyEvent = (
+  targetLanguage: "es" | "tr" = "es",
+  sessionId = SESSION_ID,
+  sessionEpoch = 1,
+): RelayTransportCallbackEvent => ({
   type: "session.ready",
   result: "new",
-  sessionId: SESSION_ID,
-  sessionEpoch: 1,
+  sessionId,
+  sessionEpoch,
   targetLanguage,
   languageRegistryVersion: "1.0.0",
   gatePolicyVersion: "1.0.0",
@@ -289,6 +306,7 @@ interface HarnessOptions {
   readonly startSession?: (targetLanguage: "es" | "tr") => Promise<void>;
   readonly persistTarget?: (targetLanguage: "es" | "tr") => void | Promise<void>;
   readonly displayDebounceMs?: number;
+  readonly recoveryTiming?: RecoveryTiming;
 }
 
 function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
@@ -312,6 +330,9 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
       },
     },
     displayDebounceMs: harnessOptions.displayDebounceMs ?? 0,
+    ...(harnessOptions.recoveryTiming === undefined
+      ? {}
+      : { recoveryTiming: harnessOptions.recoveryTiming }),
   });
   return { bridge, runtime, transports, operations, persisted };
 }
@@ -323,6 +344,72 @@ async function boot(harness: TestHarness): Promise<void> {
 
 async function flushMicrotasks(count = 12): Promise<void> {
   for (let index = 0; index < count; index += 1) await Promise.resolve();
+}
+
+function fakeRecoveryTiming(random = 0): RecoveryTiming {
+  return {
+    now: () => Date.now(),
+    random: () => random,
+    schedule: (callback, delayMs) => {
+      const handle = setTimeout(callback, delayMs);
+      return () => clearTimeout(handle);
+    },
+  };
+}
+
+interface ManualRecoveryTimer {
+  readonly delayMs: number;
+  readonly callback: () => void;
+  readonly at: number;
+  cancelled: boolean;
+  fired: boolean;
+}
+
+interface ManualRecoveryClock {
+  readonly timing: RecoveryTiming;
+  readonly timers: ManualRecoveryTimer[];
+  now: number;
+  fireNext(delayMs: number): ManualRecoveryTimer;
+}
+
+function manualRecoveryClock(random = 0): ManualRecoveryClock {
+  const timers: ManualRecoveryTimer[] = [];
+  const clock: ManualRecoveryClock = {
+    now: 0,
+    timing: {
+      now: () => clock.now,
+      random: () => random,
+      schedule: (callback, delayMs) => {
+        const timer: ManualRecoveryTimer = {
+          delayMs,
+          callback,
+          at: clock.now + delayMs,
+          cancelled: false,
+          fired: false,
+        };
+        timers.push(timer);
+        return () => {
+          timer.cancelled = true;
+        };
+      },
+    },
+    timers,
+    fireNext: (delayMs) => {
+      const timer = timers.find((candidate) =>
+        !candidate.cancelled && !candidate.fired && candidate.delayMs === delayMs);
+      if (timer === undefined) throw new Error(`No active recovery timer for ${delayMs}ms`);
+      clock.now = timer.at;
+      timer.fired = true;
+      timer.callback();
+      return timer;
+    },
+  };
+  return clock;
+}
+
+function recoverySessionId(index: number): string {
+  const digit = ((index + 3) % 16).toString(16);
+  return `${digit.repeat(8)}-${digit.repeat(4)}-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`;
 }
 
 async function selectSpanishAndStart(harness: TestHarness): Promise<FakeTransport> {
@@ -1055,40 +1142,52 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.runtime.snapshot.state).toBe("Error");
   });
 
-  it("discards a queued PCM fatal for replaced transport A without latching transport B", async () => {
-    const harness = createHarness();
+  it("disables PCM and detaches before queued loss handling starts a fresh session", async () => {
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const firstTransport = await selectSpanishAndStart(harness);
     firstTransport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
-
-    firstTransport.pushPcmImplementation = () => {
-      firstTransport.emit({
-        type: "transport.lost",
-        sessionId: SESSION_ID,
-        sessionEpoch: 1,
-      } as unknown as RelayTransportCallbackEvent);
-      firstTransport.emit({
-        type: "transport.lost",
-        sessionId: SESSION_ID,
-        sessionEpoch: 1,
-      } as unknown as RelayTransportCallbackEvent);
-      throw new Error("PCM sink failed");
-    };
-    harness.bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array([1]) }) });
-    await harness.runtime.whenEventsIdle();
-
-    const secondTransport = harness.transports[1];
-    if (secondTransport === undefined) throw new Error("Replacement transport was not created");
-    secondTransport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-
-    harness.bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array([2]) }) });
-    expect(secondTransport.pcm).toHaveLength(1);
-    expect(harness.runtime.snapshot.state).toBe("Listening");
+    vi.useFakeTimers();
+    try {
+      firstTransport.pushPcmImplementation = () => {
+        firstTransport.emit({
+          type: "transport.lost",
+          sessionId: SESSION_ID,
+          sessionEpoch: 1,
+        });
+        firstTransport.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+        expect(firstTransport.closed).toBe(true);
+        expect(harness.transports).toHaveLength(1);
+      };
+      harness.bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array([1]) }) });
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.runtime.snapshot.state).toBe("Ready");
+      expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Reconnecting");
+      expect(harness.runtime.snapshot.lastDisplayContent.source).toBe("Source: Interrupted turn cleared");
+      expect(harness.runtime.snapshot.lastDisplayContent.english).toBe("English: waiting");
+      expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Please wait");
+      await vi.advanceTimersByTimeAsync(250);
+      await flushMicrotasks();
+      const secondTransport = harness.transports[1];
+      if (secondTransport === undefined) throw new Error("Replacement transport was not created");
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
+      secondTransport.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(20);
+      expect(harness.runtime.snapshot.sessionReady).toBe(true);
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
+      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(20);
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed when serialized transport callbacks exceed the queue bound", async () => {
@@ -1170,84 +1269,271 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(isPairedTurnEffects(stopEffect, commitEffect)).toBe(false);
   });
 
-  it("awaits a standalone stop before completing transport recovery", async () => {
+  it("waits for microphone shutdown before scheduling fresh recovery", async () => {
     let resolveClose: ((closed: boolean) => void) | undefined;
-    const pendingClose = new Promise<boolean>((resolve) => {
-      resolveClose = resolve;
-    });
-    const harness = createHarness();
+    const pendingClose = new Promise<boolean>((resolve) => { resolveClose = resolve; });
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
     harness.bridge.audioCloseImplementation = () => pendingClose;
+    vi.useFakeTimers();
+    try {
+      transport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks();
+      expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Reconnecting");
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+      expect(harness.transports).toHaveLength(1);
 
-    transport.emit({
-      type: "transport.lost",
-      sessionId: SESSION_ID,
-      sessionEpoch: 1,
-      utteranceId: UTTERANCE_ID,
-      clientLastAcknowledgedOffset: 0,
-      oldestRetainedOffset: 0,
-      nextCapturedOffset: 0,
-    } as unknown as RelayTransportCallbackEvent);
-    const idle = harness.runtime.whenEventsIdle();
-    let settled = false;
-    void idle.then(() => { settled = true; }, () => { settled = true; });
-    await flushMicrotasks();
-
-    expect(settled).toBe(false);
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-    expect(harness.runtime.snapshot.state).toBe("Recovering");
-
-    resolveClose?.(true);
-    await idle;
-    expect(settled).toBe(true);
-    expect(harness.runtime.snapshot.state).toBe("Recovering");
+      resolveClose?.(true);
+      await flushMicrotasks(20);
+      expect(harness.transports).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(250);
+      await flushMicrotasks(20);
+      expect(harness.transports).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("blocks a recovery open until an unresolved standalone close settles", async () => {
-    let resolveClose: ((closed: boolean) => void) | undefined;
-    const pendingClose = new Promise<boolean>((resolve) => {
-      resolveClose = resolve;
-    });
-    const harness = createHarness();
+  it("turns an audio-close failure into visible recovery Error without global cleanup", async () => {
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseImplementation = () => pendingClose;
+    harness.bridge.audioCloseImplementation = () => Promise.resolve(false);
 
-    transport.emit({
-      type: "transport.lost",
-      sessionId: SESSION_ID,
-      sessionEpoch: 1,
-      utteranceId: UTTERANCE_ID,
-      clientLastAcknowledgedOffset: 0,
-      oldestRetainedOffset: 0,
-      nextCapturedOffset: 0,
-    } as unknown as RelayTransportCallbackEvent);
-    transport.emit({
-      type: "transport.resumed",
-      sessionId: SESSION_ID,
-      sessionEpoch: 1,
-      resumable: true,
-    } as unknown as RelayTransportCallbackEvent);
-    await flushMicrotasks();
-
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
-
-    resolveClose?.(true);
+    transport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
     await harness.runtime.whenEventsIdle();
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(2);
-    expect(harness.operations.indexOf("audio:close")).toBeLessThan(
-      harness.operations.lastIndexOf("audio:open"),
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.cleanupState).toBe("active");
+    expect(harness.runtime.snapshot.hasEventSubscription).toBe(true);
+    expect(harness.bridge.createCount).toBe(1);
+    expect(harness.bridge.subscriptionCount).toBe(1);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+
+    const audioCalls = harness.bridge.audioCalls.length;
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.bridge.audioCalls).toHaveLength(audioCalls);
+  });
+
+  it("uses equal-jitter backoff and stops after five consecutive attempts", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    expect(clock.timers.find((timer) => !timer.cancelled && !timer.fired)?.delayMs).toBe(
+      RECOVERY_BACKOFF_BASE_MS / 2,
     );
-    expect(harness.runtime.snapshot.state).toBe("Listening");
+
+    const expectedDelays = [250, 500, 1_000, 2_000, 4_000];
+    for (let attempt = 0; attempt < RECOVERY_MAX_CONSECUTIVE_ATTEMPTS; attempt += 1) {
+      clock.fireNext(expectedDelays[attempt]!);
+      await harness.runtime.whenEventsIdle();
+      const transport = harness.transports[attempt + 1];
+      if (transport === undefined) throw new Error("Recovery transport was not created");
+      expect(transport.calls).toContain("start-session:es");
+      transport.emitError("retry");
+      await harness.runtime.whenEventsIdle();
+
+      if (attempt + 1 < RECOVERY_MAX_CONSECUTIVE_ATTEMPTS) {
+        const nextTimer = clock.timers.find((timer) => !timer.cancelled && !timer.fired);
+        expect(nextTimer?.delayMs).toBe(expectedDelays[attempt + 1]);
+      }
+    }
+
+    expect(harness.transports).toHaveLength(RECOVERY_MAX_CONSECUTIVE_ATTEMPTS + 1);
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.cleanupState).toBe("active");
+    expect(harness.bridge.subscriptionCount).toBe(1);
+    expect(harness.bridge.createCount).toBe(1);
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+    expect(RECOVERY_BACKOFF_MAX_MS).toBeGreaterThan(expectedDelays.at(-1)!);
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+  });
+
+  it("blocks a sixth recovery after five successful recoveries inside sixty seconds", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    let current = await selectSpanishAndStart(harness);
+    current.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    for (let recovery = 0; recovery < 5; recovery += 1) {
+      clock.now = 0;
+      current.emit({
+        type: "transport.lost",
+        sessionId: recovery === 0 ? SESSION_ID : recoverySessionId(recovery),
+        sessionEpoch: recovery + 1,
+      });
+      await harness.runtime.whenEventsIdle();
+      clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+      await harness.runtime.whenEventsIdle();
+      const fresh = harness.transports[recovery + 1];
+      if (fresh === undefined) throw new Error("Recovery transport was not created");
+      fresh.emit(readyEvent("es", recoverySessionId(recovery + 1), recovery + 2));
+      await harness.runtime.whenEventsIdle();
+      current = fresh;
+    }
+
+    clock.now = RECOVERY_ATTEMPT_WINDOW_MS - 1;
+    current.emit({
+      type: "transport.lost",
+      sessionId: recoverySessionId(5),
+      sessionEpoch: 6,
+    });
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.transports).toHaveLength(6);
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+  });
+
+  it("preserves rolling recovery attempts across successful sessions", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    let current = await selectSpanishAndStart(harness);
+    current.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    const groupStarts = [
+      0,
+      RECOVERY_ATTEMPT_WINDOW_MS + 1_251,
+      (RECOVERY_ATTEMPT_WINDOW_MS + 1_251) * 2,
+    ];
+    let successfulAttempts = 0;
+    for (let group = 0; group < groupStarts.length; group += 1) {
+      const attemptsInGroup = group < 2 ? 5 : 2;
+      for (let attempt = 0; attempt < attemptsInGroup; attempt += 1) {
+        clock.now = groupStarts[group]!;
+        current.emit({
+          type: "transport.lost",
+          sessionId: successfulAttempts === 0 ? SESSION_ID : recoverySessionId(successfulAttempts),
+          sessionEpoch: successfulAttempts + 1,
+        });
+        await harness.runtime.whenEventsIdle();
+        clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+        await harness.runtime.whenEventsIdle();
+        const fresh = harness.transports[successfulAttempts + 1];
+        if (fresh === undefined) throw new Error("Recovery transport was not created");
+        fresh.emit(readyEvent(
+          "es",
+          recoverySessionId(successfulAttempts + 1),
+          successfulAttempts + 2,
+        ));
+        await harness.runtime.whenEventsIdle();
+        current = fresh;
+        successfulAttempts += 1;
+      }
+    }
+
+    expect(successfulAttempts).toBe(RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW);
+    expect(clock.now - 250).toBeLessThan(RECOVERY_LONG_ATTEMPT_WINDOW_MS);
+    current.emit({
+      type: "transport.lost",
+      sessionId: recoverySessionId(successfulAttempts),
+      sessionEpoch: successfulAttempts + 1,
+    });
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.transports).toHaveLength(successfulAttempts + 1);
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+  });
+
+  it("treats a stop error as terminal and cancels the ready deadline", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+
+    clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+    await harness.runtime.whenEventsIdle();
+    const recoveryTransport = harness.transports[1];
+    if (recoveryTransport === undefined) throw new Error("Recovery transport was not created");
+    expect(clock.timers.find((timer) => !timer.cancelled && !timer.fired)?.delayMs).toBe(
+      RECOVERY_READY_DEADLINE_MS,
+    );
+    recoveryTransport.emitError("stop");
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.cleanupState).toBe("active");
+    expect(recoveryTransport.closed).toBe(true);
+    expect(harness.transports).toHaveLength(2);
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+  });
+
+  it("retries when a recovery transport is lost before its queued ready is reduced", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+    await harness.runtime.whenEventsIdle();
+
+    const recoveryTransport = harness.transports[1];
+    if (recoveryTransport === undefined) throw new Error("Recovery transport was not created");
+    recoveryTransport.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+    recoveryTransport.emit({
+      type: "transport.lost",
+      sessionId: RECOVERY_SESSION_ID,
+      sessionEpoch: 2,
+    });
+    await harness.runtime.whenEventsIdle();
+
+    expect(recoveryTransport.closed).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(false);
+    expect(harness.transports).toHaveLength(2);
+    expect(clock.timers.find((timer) => !timer.cancelled && !timer.fired)?.delayMs).toBe(500);
+
+    clock.fireNext(500);
+    await harness.runtime.whenEventsIdle();
+    const retryTransport = harness.transports[2];
+    if (retryTransport === undefined) throw new Error("Retry transport was not created");
+    retryTransport.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+  });
+
+  it("cancels a pending backoff when cleanup begins", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    const backoff = clock.timers.find((timer) => !timer.cancelled && !timer.fired);
+    expect(backoff?.delayMs).toBe(RECOVERY_BACKOFF_BASE_MS / 2);
+
+    await harness.runtime.cleanup();
+    expect(backoff?.cancelled).toBe(true);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
   });
 
   it("commits immediately and starts a detached audio close", async () => {
@@ -1485,65 +1771,41 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(transport.closed).toBe(true);
   });
 
-  it("waits for a detached close before reopening audio for a fast next turn", async () => {
-    let resolveClose: ((closed: boolean) => void) | undefined;
-    const pendingClose = new Promise<boolean>((resolve) => {
-      resolveClose = resolve;
-    });
-    const harness = createHarness();
+  it("closes a late microphone-open success after transport loss and never enables PCM", async () => {
+    let resolveOpen: ((opened: boolean) => void) | undefined;
+    const pendingOpen = new Promise<boolean>((resolve) => { resolveOpen = resolve; });
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const firstTransport = await selectSpanishAndStart(harness);
     firstTransport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseImplementation = () => pendingClose;
+    vi.useFakeTimers();
+    try {
+      harness.bridge.audioOpenImplementation = () => pendingOpen;
+      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+      await flushMicrotasks(8);
+      expect(harness.bridge.audioCalls.at(-1)?.isOpen).toBe(true);
 
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
-      await Promise.resolve();
+      firstTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(12);
+      expect(firstTransport.closed).toBe(true);
+      expect(harness.transports).toHaveLength(1);
+      resolveOpen?.(true);
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(12);
+      expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Reconnecting");
+      expect(harness.runtime.snapshot.audioOpen).toBe(false);
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+      expect(harness.transports).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(250);
+      await flushMicrotasks(20);
+      expect(harness.transports).toHaveLength(2);
+      expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
     }
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-
-    firstTransport.emit(utteranceEvent());
-    firstTransport.emit(languageDecision());
-    await harness.runtime.whenEventsIdle();
-    firstTransport.emit(translationReady());
-    firstTransport.emit(suggestionsReady());
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.state).toBe("Results");
-
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.state).toBe("Ready");
-    firstTransport.emit({
-      type: "transport.lost",
-      sessionId: SESSION_ID,
-      sessionEpoch: 1,
-    } as unknown as RelayTransportCallbackEvent);
-    await harness.runtime.whenEventsIdle();
-    const secondTransport = harness.transports[1];
-    if (secondTransport === undefined) throw new Error("Replacement transport was not created");
-    secondTransport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    const idle = harness.runtime.whenEventsIdle();
-    let settled = false;
-    void idle.then(() => { settled = true; }, () => { settled = true; });
-    await flushMicrotasks();
-    expect(settled).toBe(false);
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(1);
-
-    resolveClose?.(true);
-    await idle;
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(2);
-    expect(harness.runtime.snapshot.audioOpen).toBe(true);
-
-    harness.bridge.emit({
-      audioEvent: new AudioEvent({ audioPcm: new Uint8Array([4, 5, 6]) }),
-    });
-    expect(secondTransport.pcm).toHaveLength(1);
-    expect([...secondTransport.pcm[0]!]).toEqual([4, 5, 6]);
   });
 
   it("keeps cleanup active after a false audio close and retries without blocking transport close", async () => {
@@ -1587,6 +1849,28 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(closeAttempts).toBe(2);
   });
 
+  it("fails and requests cleanup when retiring the current transport cannot close it", async () => {
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    let closeAttempts = 0;
+    transport.closeImplementation = () => {
+      closeAttempts += 1;
+      if (closeAttempts === 1) throw new Error("retire close failed");
+    };
+
+    transport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+    expect(closeAttempts).toBe(2);
+    expect(transport.closed).toBe(true);
+    expect(harness.bridge.unsubscribeCount).toBe(1);
+    expect(harness.operations).not.toContain("end-session");
+  });
+
   it.each([undefined, null])(
     "normalizes %s from a transport-close failure",
     async (failure) => {
@@ -1606,28 +1890,35 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     },
   );
 
-  it("ignores callbacks from a replaced transport", async () => {
-    const harness = createHarness();
+  it("drops stale callbacks from a dead transport and accepts only the current ready", async () => {
+    const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const firstTransport = await selectSpanishAndStart(harness);
     firstTransport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
+    vi.useFakeTimers();
+    try {
+      firstTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(20);
+      firstTransport.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(20);
+      expect(harness.runtime.snapshot.sessionReady).toBe(false);
 
-    firstTransport.emit({
-      type: "transport.lost",
-      sessionId: SESSION_ID,
-      sessionEpoch: 1,
-    } as unknown as RelayTransportCallbackEvent);
-    await harness.runtime.whenEventsIdle();
-    const secondTransport = harness.transports[1];
-    expect(secondTransport).toBeDefined();
-
-    firstTransport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.sessionReady).toBe(false);
-
-    secondTransport?.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+      await vi.advanceTimersByTimeAsync(250);
+      await flushMicrotasks(20);
+      const secondTransport = harness.transports[1];
+      expect(secondTransport).toBeDefined();
+      secondTransport?.emit(readyEvent("es", RECOVERY_SESSION_ID, 2));
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks(20);
+      expect(harness.runtime.snapshot.sessionReady).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not let target persistence block session start", async () => {
