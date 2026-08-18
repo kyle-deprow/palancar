@@ -19,10 +19,12 @@ not own those Tables because its Table resource uses Shared Key, which is
 disabled on this account. The exact AzAPI Table IDs and names are non-secret
 outputs.
 
-The foundation does not create a relay Container App, cleanup Job, Key Vault,
-private endpoint, custom DNS, CI federation, or placeholder image. The relay
-and cleanup Job require an immutable application image and remain in a later
-workload apply.
+The foundation can optionally create the relay Container App and its workload
+Key Vault once immutable relay and LiteLLM image digests are supplied. The
+runtime workload is relay plus an OpenRouter-only LiteLLM sidecar; Azure
+LiteLLM and Azure transcription remain blocked. The cleanup Job, private
+endpoint, custom DNS, CI federation, and placeholder images remain outside
+this stack.
 
 ## Bootstrap with local state, then migrate
 
@@ -80,10 +82,14 @@ terraform -chdir=infra/environments/dev validate
 terraform -chdir=infra/environments/dev plan
 ```
 
-The dev plan requires live first-of-month UTC budget dates, at least one real
-notification address, and an explicit reviewed Foundry deployment map.
+The dev plan requires live first-of-month UTC budget dates and at least one real
+notification address. `foundry_deployments` defaults to `{}` for a runtime-only
+rollout and creates no cognitive deployment.
 `owner@example.com` is retained only in `terraform.tfvars.example` and is
 deliberately rejected by live validation.
+Set the required `operator_principal_id` to the reviewed canonical lower-case
+Microsoft Entra object ID used for smoke tests. The committed example contains
+only a nil placeholder and must never contain the live principal.
 
 ## Saved-plan and Foundry plan guard
 
@@ -118,6 +124,48 @@ the retired `gpt-5-6-luna` deployment, and other mutations. When the saved
 plan includes the Container App scale configuration, the guard requires
 `minReplicas = 0` and `maxReplicas = 1`. Keep saved plans local and apply the
 same file that was inspected.
+
+For a runtime-only rollout, set `foundry_deployments = {}`, use immutable
+`@sha256` relay and LiteLLM images from the same development ACR, and provide
+the exact versionless
+same-vault `openrouter-api-key` and `litellm-master-key` URLs. The sidecar
+backend must be `openrouter`; disabled sidecar inputs must all be empty.
+
+The required smoke operator receives two deterministic Storage Table Data
+Contributor assignments: one scoped exactly to `SecurityState` and one scoped
+exactly to `RateState`. The operator is not granted storage-account scope.
+The runtime identity's existing storage-account assignment is unchanged.
+
+Rollout preflight: before creating that plan, update the ignored live
+`infra/environments/dev/terraform.tfvars` so it explicitly contains
+`foundry_deployments = {}`. Do not start the rollout plan until the final relay
+and LiteLLM digests and all other rollout inputs are ready. The committed
+example documents the shape; Terraform automation must not rewrite the ignored
+live file.
+
+Inspect the saved plan with:
+
+```sh
+terraform -chdir=infra/environments/dev show -json /tmp/palancar-dev.tfplan \
+  | node infra/scripts/assert-dev-plan.mjs --mode=runtime-rollout
+```
+
+`runtime-rollout` requires the complete foundation, identities, RBAC, Tables,
+Foundry account, and Key Vault inventory to be no-op. The Foundry module's
+single unindexed static `azurerm_cognitive_deployment` declaration is allowed
+only with its exact empty `for_each` map and zero actual instances; indexed,
+malformed, prior, planned, changed, drifted, deferred, or otherwise referenced
+deployments (including no-op) are rejected. The initial reviewed rollout may
+create exactly the two table-scoped operator assignments; after either exists
+in prior state, its action must be no-op. The guard also
+rejects deletes, replacements, failed checks, unknown workload payloads,
+mutable images, identity or revision drift, plaintext credentials,
+Azure/provider helper topology, and any mutation other than a single Container
+App create/update/no-op plus those initial operator grants. The accepted
+workload has exact HTTP ingress and
+health probes, a single revision, min replicas 0 or 1, max replicas 1,
+`PALANCAR_SECURITY_MODE=azure-table`, mock transcription, localhost LiteLLM on
+port 4000, and the `palancar-generation` alias.
 
 ## State recovery verification
 

@@ -16,6 +16,11 @@ run "zero_deployments" {
     condition     = length(resource.azurerm_cognitive_deployment.this) == 0
     error_message = "an empty deployment map must plan no deployment resources"
   }
+
+  assert {
+    condition     = length(output.deployment_names) == 0
+    error_message = "an empty deployment map must report no deployment names"
+  }
 }
 
 run "one_deployment" {
@@ -42,6 +47,11 @@ run "one_deployment" {
   assert {
     condition     = resource.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"].name == "gpt-4o-mini-transcribe"
     error_message = "the single deployment must retain its for_each address"
+  }
+
+  assert {
+    condition     = output.deployment_names == tolist(["gpt-4o-mini-transcribe"])
+    error_message = "deployment names must come from the reviewed deployment map"
   }
 }
 

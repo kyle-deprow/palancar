@@ -152,6 +152,7 @@ variable "foundry_deployments" {
     capacity               = number
     version_upgrade_option = string
   }))
+  default = {}
 
   validation {
     condition = alltrue([
@@ -166,6 +167,16 @@ variable "foundry_deployments" {
       deployment.version_upgrade_option == "NoAutoUpgrade"
     ])
     error_message = "Each deployment requires nonempty names/version, OpenAI format, GlobalStandard SKU, positive integer capacity, and NoAutoUpgrade."
+  }
+}
+
+variable "operator_principal_id" {
+  description = "Microsoft Entra object ID for the human smoke-test operator."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.operator_principal_id))
+    error_message = "operator_principal_id must be a canonical lower-case UUID."
   }
 }
 
@@ -207,6 +218,17 @@ variable "deploy_relay_workload" {
   default     = false
 }
 
+variable "relay_min_replicas" {
+  description = "Minimum relay replicas; development supports scale-to-zero or one warm replica."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = contains([0, 1], var.relay_min_replicas)
+    error_message = "relay_min_replicas must be exactly 0 or 1."
+  }
+}
+
 variable "enable_litellm_sidecar" {
   description = "Whether to add the optional LiteLLM generation sidecar to the relay workload."
   type        = bool
@@ -214,27 +236,27 @@ variable "enable_litellm_sidecar" {
 }
 
 variable "litellm_image_digest" {
-  description = "Immutable LiteLLM sidecar image digest."
+  description = "Immutable LiteLLM sidecar image digest in the development ACR."
   type        = string
   default     = ""
 
   validation {
     condition = var.litellm_image_digest == "" || can(regex(
-      "^[^[:space:]@]+@sha256:[0-9a-f]{64}$",
+      "^[a-z0-9.-]+\\.azurecr\\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$",
       var.litellm_image_digest
     ))
-    error_message = "litellm_image_digest must be empty or an immutable image sha256 digest."
+    error_message = "litellm_image_digest must be empty or an immutable lower-case ACR sha256 digest."
   }
 }
 
 variable "litellm_backend" {
-  description = "LiteLLM upstream backend."
+  description = "LiteLLM upstream backend; only OpenRouter is production-qualified."
   type        = string
-  default     = "openrouter"
+  default     = ""
 
   validation {
-    condition     = contains(["openrouter", "azure"], var.litellm_backend)
-    error_message = "litellm_backend must be openrouter or azure."
+    condition     = contains(["", "openrouter"], var.litellm_backend)
+    error_message = "litellm_backend must be empty or openrouter; Azure is not qualified."
   }
 }
 
@@ -272,46 +294,13 @@ variable "litellm_master_key_secret_url" {
 }
 
 variable "azure_api_base" {
-  description = "Azure OpenAI API base used by LiteLLM in Azure mode."
+  description = "Qualification-blocked LiteLLM Azure API base; must remain empty."
   type        = string
   default     = ""
 }
 
 variable "azure_api_version" {
-  description = "Azure OpenAI API version used by LiteLLM in Azure mode."
+  description = "Qualification-blocked LiteLLM Azure API version; must remain empty."
   type        = string
   default     = ""
-}
-
-variable "azure_api_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the Azure OpenAI API key."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.azure_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.azure_api_key_secret_url))
-    error_message = "azure_api_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "litellm_cpu" {
-  description = "CPU allocation for the LiteLLM sidecar."
-  type        = number
-  default     = 0.25
-
-  validation {
-    condition     = var.litellm_cpu > 0
-    error_message = "litellm_cpu must be positive."
-  }
-}
-
-variable "litellm_memory" {
-  description = "Memory allocation for the LiteLLM sidecar."
-  type        = string
-  default     = "0.5Gi"
-
-  validation {
-    condition     = trimspace(var.litellm_memory) != ""
-    error_message = "litellm_memory must be nonempty."
-  }
 }

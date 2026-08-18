@@ -2,6 +2,31 @@ resource "azurerm_resource_group" "foundation" {
   name     = local.names.resource_group
   location = var.location
   tags     = local.tags
+
+  lifecycle {
+    precondition {
+      condition = var.enable_litellm_sidecar ? (
+        var.deploy_relay_workload &&
+        var.litellm_backend == "openrouter" &&
+        trimspace(var.litellm_image_digest) != "" &&
+        startswith(var.litellm_image_digest, "${local.names.acr}.azurecr.io/") &&
+        startswith(var.litellm_upstream_model, "openrouter/") &&
+        trimspace(var.openrouter_api_key_secret_url) != "" &&
+        trimspace(var.litellm_master_key_secret_url) != "" &&
+        trimspace(var.azure_api_base) == "" &&
+        trimspace(var.azure_api_version) == ""
+        ) : (
+        trimspace(var.litellm_backend) == "" &&
+        trimspace(var.litellm_image_digest) == "" &&
+        trimspace(var.litellm_upstream_model) == "" &&
+        trimspace(var.openrouter_api_key_secret_url) == "" &&
+        trimspace(var.litellm_master_key_secret_url) == "" &&
+        trimspace(var.azure_api_base) == "" &&
+        trimspace(var.azure_api_version) == ""
+      )
+      error_message = "LiteLLM must be a complete OpenRouter-only sidecar configuration when enabled and entirely empty when disabled."
+    }
+  }
 }
 
 module "budget" {
@@ -81,6 +106,9 @@ module "identities_rbac" {
   tags                                      = local.tags
   container_registry_id                     = module.container_registry.id
   workload_state_storage_account_id         = module.workload_state.storage_account_id
+  security_state_table_id                   = module.workload_state.security_state_id
+  rate_state_table_id                       = module.workload_state.rate_state_id
+  operator_principal_id                     = var.operator_principal_id
   cognitive_account_id                      = module.foundry.account_id
   acr_pull_role_definition_id               = var.acr_pull_role_definition_id
   table_data_contributor_role_definition_id = var.table_data_contributor_role_definition_id
@@ -95,8 +123,6 @@ module "workload_key_vault" {
   location             = var.location
   tags                 = local.tags
   runtime_principal_id = module.identities_rbac.runtime_principal_id
-
-  depends_on = [module.identities_rbac]
 }
 
 module "container_app_workload" {
@@ -117,22 +143,21 @@ module "container_app_workload" {
   workload_table_endpoint                 = module.workload_state.table_endpoint
   security_state_table_name               = module.workload_state.security_state_name
   rate_state_table_name                   = module.workload_state.rate_state_name
-  foundry_endpoint                        = module.foundry.endpoint
-  foundry_deployment_names                = sort(keys(var.foundry_deployments))
   environment                             = var.environment
   relay_origin                            = local.relay_origin
+  min_replicas                            = var.relay_min_replicas
+  security_mode                           = "azure-table"
+  transcription_provider                  = "mock"
+  azure_transcription_endpoint            = ""
+  azure_transcription_deployment          = ""
   enable_litellm_sidecar                  = var.enable_litellm_sidecar
   litellm_image_digest                    = var.litellm_image_digest
   litellm_backend                         = var.litellm_backend
   litellm_upstream_model                  = var.litellm_upstream_model
   openrouter_api_key_secret_url           = var.openrouter_api_key_secret_url
   litellm_master_key_secret_url           = var.litellm_master_key_secret_url
+  key_vault_uri                           = module.workload_key_vault.uri
   azure_api_base                          = var.azure_api_base
   azure_api_version                       = var.azure_api_version
-  azure_api_key_secret_url                = var.azure_api_key_secret_url
-  litellm_cpu                             = var.litellm_cpu
-  litellm_memory                          = var.litellm_memory
   runtime_secrets_user_role_assignment_id = module.workload_key_vault.runtime_secrets_user_role_assignment_id
-
-  depends_on = [module.identities_rbac]
 }

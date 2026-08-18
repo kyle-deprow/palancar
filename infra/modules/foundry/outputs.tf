@@ -15,5 +15,5 @@ output "endpoint" {
 
 output "deployment_names" {
   description = "Pinned deployment names."
-  value       = sort(keys(azurerm_cognitive_deployment.this))
+  value       = sort(keys(var.deployments))
 }

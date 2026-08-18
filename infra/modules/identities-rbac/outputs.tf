@@ -27,3 +27,13 @@ output "runtime_principal_id" {
   description = "Runtime user-assigned identity principal ID."
   value       = azurerm_user_assigned_identity.runtime.principal_id
 }
+
+output "operator_security_table_role_assignment_id" {
+  description = "SecurityState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
+  value       = azurerm_role_assignment.operator_security_table.id
+}
+
+output "operator_rate_table_role_assignment_id" {
+  description = "RateState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
+  value       = azurerm_role_assignment.operator_rate_table.id
+}

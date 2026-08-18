@@ -23,6 +23,8 @@ resource "azapi_resource" "this" {
       configuration = {
         activeRevisionsMode = "Single"
 
+        # exposedPort is TCP-only in this API schema; HTTP ingress exposes only
+        # the relay target and has no additional port mappings.
         ingress = {
           external      = true
           targetPort    = var.target_port
@@ -54,28 +56,18 @@ resource "azapi_resource" "this" {
           }
         ]
 
-        secrets = var.enable_litellm_sidecar ? concat(
-          [
-            {
-              name        = "litellm-master-key"
-              keyVaultUrl = var.litellm_master_key_secret_url
-              identity    = var.runtime_identity_id
-            }
-          ],
-          var.litellm_backend == "openrouter" ? [
-            {
-              name        = "openrouter-api-key"
-              keyVaultUrl = var.openrouter_api_key_secret_url
-              identity    = var.runtime_identity_id
-            }
-            ] : [
-            {
-              name        = "azure-api-key"
-              keyVaultUrl = var.azure_api_key_secret_url
-              identity    = var.runtime_identity_id
-            }
-          ]
-        ) : []
+        secrets = var.enable_litellm_sidecar ? [
+          {
+            name        = "litellm-master-key"
+            keyVaultUrl = var.litellm_master_key_secret_url
+            identity    = var.runtime_identity_id
+          },
+          {
+            name        = "openrouter-api-key"
+            keyVaultUrl = var.openrouter_api_key_secret_url
+            identity    = var.runtime_identity_id
+          }
+        ] : []
       }
 
       template = {
@@ -86,8 +78,8 @@ resource "azapi_resource" "this" {
               image = var.image_digest
 
               resources = {
-                cpu    = var.cpu
-                memory = var.memory
+                cpu    = 0.25
+                memory = "0.5Gi"
               }
 
               env = concat(
@@ -125,6 +117,10 @@ resource "azapi_resource" "this" {
                     value = var.runtime_identity_client_id
                   },
                   {
+                    name  = "PALANCAR_SECURITY_MODE"
+                    value = var.security_mode
+                  },
+                  {
                     name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
                     value = var.workload_table_endpoint
                   },
@@ -137,12 +133,8 @@ resource "azapi_resource" "this" {
                     value = var.rate_state_table_name
                   },
                   {
-                    name  = "PALANCAR_FOUNDRY_ENDPOINT"
-                    value = var.foundry_endpoint
-                  },
-                  {
-                    name  = "PALANCAR_FOUNDRY_DEPLOYMENTS"
-                    value = join(",", var.foundry_deployment_names)
+                    name  = "PALANCAR_TRANSCRIPTION_PROVIDER"
+                    value = var.transcription_provider
                   }
                 ],
                 var.enable_litellm_sidecar ? [
@@ -157,18 +149,6 @@ resource "azapi_resource" "this" {
                   {
                     name      = "PALANCAR_LITELLM_API_KEY"
                     secretRef = "litellm-master-key"
-                  },
-                  {
-                    name  = "PALANCAR_LITELLM_EXPECTED_BACKEND"
-                    value = var.litellm_backend
-                  },
-                  {
-                    name  = "PALANCAR_LITELLM_EXPECTED_UPSTREAM_MODEL"
-                    value = var.litellm_upstream_model
-                  },
-                  {
-                    name  = "PALANCAR_LITELLM_METADATA_URL"
-                    value = "http://127.0.0.1:4001"
                   }
                 ] : []
               )
@@ -205,45 +185,28 @@ resource "azapi_resource" "this" {
               image = var.litellm_image_digest
 
               resources = {
-                cpu    = var.litellm_cpu
-                memory = var.litellm_memory
+                cpu    = 0.25
+                memory = "0.5Gi"
               }
 
-              env = concat(
-                [
-                  {
-                    name  = "PALANCAR_LITELLM_BACKEND"
-                    value = var.litellm_backend
-                  },
-                  {
-                    name  = "PALANCAR_LITELLM_UPSTREAM_MODEL"
-                    value = var.litellm_upstream_model
-                  },
-                  {
-                    name      = "LITELLM_MASTER_KEY"
-                    secretRef = "litellm-master-key"
-                  }
-                ],
-                var.litellm_backend == "openrouter" ? [
-                  {
-                    name      = "OPENROUTER_API_KEY"
-                    secretRef = "openrouter-api-key"
-                  }
-                  ] : [
-                  {
-                    name  = "AZURE_API_BASE"
-                    value = var.azure_api_base
-                  },
-                  {
-                    name  = "AZURE_API_VERSION"
-                    value = var.azure_api_version
-                  },
-                  {
-                    name      = "AZURE_API_KEY"
-                    secretRef = "azure-api-key"
-                  }
-                ]
-              )
+              env = [
+                {
+                  name  = "PALANCAR_LITELLM_BACKEND"
+                  value = "openrouter"
+                },
+                {
+                  name  = "PALANCAR_LITELLM_UPSTREAM_MODEL"
+                  value = var.litellm_upstream_model
+                },
+                {
+                  name      = "LITELLM_MASTER_KEY"
+                  secretRef = "litellm-master-key"
+                },
+                {
+                  name      = "OPENROUTER_API_KEY"
+                  secretRef = "openrouter-api-key"
+                }
+              ]
 
               probes = [
                 {
@@ -284,7 +247,7 @@ resource "azapi_resource" "this" {
 
         scale = {
           minReplicas = var.min_replicas
-          maxReplicas = var.max_replicas
+          maxReplicas = 1
         }
       }
     }
@@ -303,61 +266,62 @@ resource "azapi_resource" "this" {
     }
 
     precondition {
-      condition     = trimspace(var.image_digest) != ""
-      error_message = "image_digest must be nonempty when the relay workload is deployed."
+      condition     = var.image_pull_identity_id != var.runtime_identity_id
+      error_message = "image-pull and runtime identities must be distinct."
     }
 
     precondition {
-      condition     = !var.enable_litellm_sidecar || trimspace(var.litellm_image_digest) != ""
-      error_message = "litellm_image_digest must be nonempty when the LiteLLM sidecar is enabled."
+      condition     = startswith(var.image_digest, "${var.acr_login_server}/")
+      error_message = "image_digest must be hosted by acr_login_server."
     }
 
     precondition {
-      condition     = !var.enable_litellm_sidecar || trimspace(var.litellm_master_key_secret_url) != ""
-      error_message = "litellm_master_key_secret_url must be nonempty when the LiteLLM sidecar is enabled."
+      condition     = var.security_mode == "azure-table"
+      error_message = "deployed relay workloads require security_mode azure-table."
     }
 
     precondition {
-      condition     = !var.enable_litellm_sidecar || trimspace(var.litellm_upstream_model) != ""
-      error_message = "litellm_upstream_model must be nonempty when the LiteLLM sidecar is enabled."
+      condition = (
+        var.transcription_provider == "mock" &&
+        trimspace(var.azure_transcription_endpoint) == "" &&
+        trimspace(var.azure_transcription_deployment) == ""
+      )
+      error_message = "transcription_provider must be mock and Azure transcription fields must be empty."
     }
 
     precondition {
       condition = !var.enable_litellm_sidecar || (
-        (var.litellm_backend == "openrouter" && startswith(var.litellm_upstream_model, "openrouter/")) ||
-        (var.litellm_backend == "azure" && startswith(var.litellm_upstream_model, "azure/"))
-      )
-      error_message = "litellm_upstream_model must start with openrouter/ for OpenRouter or azure/ for Azure when the LiteLLM sidecar is enabled."
-    }
-
-    precondition {
-      condition = !var.enable_litellm_sidecar || var.litellm_backend != "openrouter" || (
+        var.litellm_backend == "openrouter" &&
+        trimspace(var.litellm_image_digest) != "" &&
+        startswith(var.litellm_image_digest, "${var.acr_login_server}/") &&
+        startswith(var.litellm_upstream_model, "openrouter/") &&
+        trimspace(var.litellm_master_key_secret_url) != "" &&
         trimspace(var.openrouter_api_key_secret_url) != "" &&
         trimspace(var.azure_api_base) == "" &&
-        trimspace(var.azure_api_version) == "" &&
-        trimspace(var.azure_api_key_secret_url) == ""
+        trimspace(var.azure_api_version) == ""
       )
-      error_message = "OpenRouter sidecar mode requires openrouter_api_key_secret_url and empty Azure API fields."
-    }
-
-    precondition {
-      condition = !var.enable_litellm_sidecar || var.litellm_backend != "azure" || (
-        trimspace(var.azure_api_base) != "" &&
-        trimspace(var.azure_api_version) != "" &&
-        trimspace(var.azure_api_key_secret_url) != "" &&
-        trimspace(var.openrouter_api_key_secret_url) == ""
-      )
-      error_message = "Azure sidecar mode requires azure_api_base, azure_api_version, azure_api_key_secret_url, and an empty OpenRouter secret URL."
+      error_message = "enabled LiteLLM requires the complete OpenRouter configuration, an immutable image in acr_login_server, and empty Azure fields."
     }
 
     precondition {
       condition = var.enable_litellm_sidecar || (
+        trimspace(var.litellm_backend) == "" &&
         trimspace(var.litellm_image_digest) == "" &&
-        trimspace(var.openrouter_api_key_secret_url) == "" &&
+        trimspace(var.litellm_upstream_model) == "" &&
         trimspace(var.litellm_master_key_secret_url) == "" &&
-        trimspace(var.azure_api_key_secret_url) == ""
+        trimspace(var.openrouter_api_key_secret_url) == "" &&
+        trimspace(var.azure_api_base) == "" &&
+        trimspace(var.azure_api_version) == ""
       )
-      error_message = "LiteLLM image and generation secret URLs must be empty when the LiteLLM sidecar is disabled."
+      error_message = "all LiteLLM and provider values must be empty when the sidecar is disabled."
+    }
+
+    precondition {
+      condition = !var.enable_litellm_sidecar || (
+        var.openrouter_api_key_secret_url == "${trimsuffix(var.key_vault_uri, "/")}/secrets/openrouter-api-key" &&
+        var.litellm_master_key_secret_url == "${trimsuffix(var.key_vault_uri, "/")}/secrets/litellm-master-key"
+      )
+      error_message = "sidecar secret URLs must be versionless exact-name references in key_vault_uri."
     }
   }
 }

@@ -38,6 +38,42 @@ variable "workload_state_storage_account_id" {
   type        = string
 }
 
+variable "security_state_table_id" {
+  description = "Exact SecurityState table scope for the smoke-test operator."
+  type        = string
+
+  validation {
+    condition = can(regex(
+      "^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[^/]+/providers/Microsoft\\.Storage/storageAccounts/[^/]+/tableServices/default/tables/SecurityState$",
+      var.security_state_table_id
+    ))
+    error_message = "security_state_table_id must be the exact SecurityState table resource ID."
+  }
+}
+
+variable "rate_state_table_id" {
+  description = "Exact RateState table scope for the smoke-test operator."
+  type        = string
+
+  validation {
+    condition = can(regex(
+      "^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[^/]+/providers/Microsoft\\.Storage/storageAccounts/[^/]+/tableServices/default/tables/RateState$",
+      var.rate_state_table_id
+    ))
+    error_message = "rate_state_table_id must be the exact RateState table resource ID."
+  }
+}
+
+variable "operator_principal_id" {
+  description = "Canonical Microsoft Entra object ID for the human smoke-test operator."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.operator_principal_id))
+    error_message = "operator_principal_id must be a canonical lower-case UUID."
+  }
+}
+
 variable "cognitive_account_id" {
   description = "Foundry/OpenAI account scope for runtime inference access."
   type        = string

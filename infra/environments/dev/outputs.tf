@@ -74,7 +74,7 @@ output "foundry_account_id" {
 }
 
 output "foundry_deployment_names" {
-  description = "Pinned Foundry deployment names."
+  description = "Reviewed Foundry deployment names; empty during the runtime rollout."
   value       = module.foundry.deployment_names
 }
 
@@ -86,6 +86,16 @@ output "runtime_identity_client_id" {
 output "runtime_identity_id" {
   description = "Runtime managed identity resource ID."
   value       = module.identities_rbac.runtime_identity_id
+}
+
+output "operator_security_table_role_assignment_id" {
+  description = "SecurityState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
+  value       = module.identities_rbac.operator_security_table_role_assignment_id
+}
+
+output "operator_rate_table_role_assignment_id" {
+  description = "RateState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
+  value       = module.identities_rbac.operator_rate_table_role_assignment_id
 }
 
 output "key_vault_name" {

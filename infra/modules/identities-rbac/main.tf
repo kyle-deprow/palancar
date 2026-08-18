@@ -7,6 +7,14 @@ locals {
   image_pull_acr_role_assignment_name = uuidv5("url", "${var.container_registry_id}/image-pull/${local.role_definition_ids.acr_pull}")
   runtime_table_role_assignment_name  = uuidv5("url", "${var.workload_state_storage_account_id}/runtime/${local.role_definition_ids.table_data}")
   runtime_openai_role_assignment_name = uuidv5("url", "${var.cognitive_account_id}/runtime/${local.role_definition_ids.openai_user}")
+  operator_security_table_role_assignment_name = uuidv5(
+    "url",
+    "${var.security_state_table_id}/operator/${var.operator_principal_id}/${local.role_definition_ids.table_data}"
+  )
+  operator_rate_table_role_assignment_name = uuidv5(
+    "url",
+    "${var.rate_state_table_id}/operator/${var.operator_principal_id}/${local.role_definition_ids.table_data}"
+  )
 }
 
 resource "azurerm_user_assigned_identity" "image_pull" {
@@ -45,4 +53,30 @@ resource "azurerm_role_assignment" "runtime_openai" {
   role_definition_id = local.role_definition_ids.openai_user
   principal_id       = azurerm_user_assigned_identity.runtime.principal_id
   principal_type     = "ServicePrincipal"
+}
+
+resource "azurerm_role_assignment" "operator_security_table" {
+  name               = local.operator_security_table_role_assignment_name
+  scope              = var.security_state_table_id
+  role_definition_id = local.role_definition_ids.table_data
+  principal_id       = var.operator_principal_id
+  principal_type     = "User"
+
+  lifecycle {
+    precondition {
+      condition = (
+        trimsuffix(var.security_state_table_id, "/tables/SecurityState") ==
+        trimsuffix(var.rate_state_table_id, "/tables/RateState")
+      )
+      error_message = "operator table role assignments must target SecurityState and RateState in the same table service."
+    }
+  }
+}
+
+resource "azurerm_role_assignment" "operator_rate_table" {
+  name               = local.operator_rate_table_role_assignment_name
+  scope              = var.rate_state_table_id
+  role_definition_id = local.role_definition_ids.table_data
+  principal_id       = var.operator_principal_id
+  principal_type     = "User"
 }

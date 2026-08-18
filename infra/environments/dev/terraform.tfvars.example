@@ -17,35 +17,36 @@ budget_forecast_threshold = 80
 
 retention_in_days = 30
 
-foundry_deployments = {
-  "gpt-4o-mini-transcribe" = {
-    model_name             = "gpt-4o-mini-transcribe"
-    model_version          = "2025-12-15"
-    model_format           = "OpenAI"
-    sku_name               = "GlobalStandard"
-    capacity               = 1
-    version_upgrade_option = "NoAutoUpgrade"
-  }
-}
+foundry_deployments = {}
 
-# Optional LiteLLM sidecar. Keep these disabled/empty for the default mock relay.
+# Replace the nil UUID with the reviewed Entra object ID for the smoke operator.
+# Do not commit the live principal ID.
+operator_principal_id = "00000000-0000-0000-0000-000000000000"
+
+# Optional relay workload. Both images must be immutable sha256 references in
+# the same development ACR.
+deploy_relay_workload = false
+relay_image_digest    = ""
+relay_min_replicas    = 0
+
+# Optional OpenRouter-only LiteLLM sidecar. Keep every value empty when disabled.
 enable_litellm_sidecar = false
 litellm_image_digest   = ""
-litellm_backend        = "openrouter"
+litellm_backend        = ""
 litellm_upstream_model = ""
 
 openrouter_api_key_secret_url = ""
 litellm_master_key_secret_url = ""
-azure_api_base               = ""
-azure_api_version            = ""
-azure_api_key_secret_url     = ""
-litellm_cpu                  = 0.25
-litellm_memory               = "0.5Gi"
+azure_api_base                 = ""
+azure_api_version              = ""
 
-# Example enabled OpenRouter values; set all Azure fields above to empty. The
-# image must be the built Palancar LiteLLM proxy image, not an upstream base image.
+# Example enabled OpenRouter values. The secret URLs are exact, versionless
+# references in the workload Key Vault so Container Apps can follow rotation.
+# deploy_relay_workload = true
+# relay_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # enable_litellm_sidecar = true
 # litellm_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-litellm-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# litellm_backend = "openrouter"
 # litellm_upstream_model = "openrouter/openai/gpt-4o-mini"
-# openrouter_api_key_secret_url = "https://<vault-name>.vault.azure.net/secrets/openrouter-api-key/<version>"
-# litellm_master_key_secret_url = "https://<vault-name>.vault.azure.net/secrets/litellm-master-key/<version>"
+# openrouter_api_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/openrouter-api-key"
+# litellm_master_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/litellm-master-key"

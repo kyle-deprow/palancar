@@ -85,10 +85,10 @@ variable "image_pull_identity_id" {
 
   validation {
     condition = can(regex(
-      "^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/[^/]+/[^/]+/.+$",
+      "(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.ManagedIdentity/userAssignedIdentities/[^/]+$",
       var.image_pull_identity_id
     ))
-    error_message = "image_pull_identity_id must be a nonempty ARM resource ID."
+    error_message = "image_pull_identity_id must be a user-assigned managed identity ARM resource ID."
   }
 }
 
@@ -98,10 +98,10 @@ variable "runtime_identity_id" {
 
   validation {
     condition = can(regex(
-      "^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/[^/]+/[^/]+/.+$",
+      "(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.ManagedIdentity/userAssignedIdentities/[^/]+$",
       var.runtime_identity_id
     ))
-    error_message = "runtime_identity_id must be a nonempty ARM resource ID."
+    error_message = "runtime_identity_id must be a user-assigned managed identity ARM resource ID."
   }
 }
 
@@ -128,8 +128,8 @@ variable "workload_table_endpoint" {
   type        = string
 
   validation {
-    condition     = trimspace(var.workload_table_endpoint) != ""
-    error_message = "workload_table_endpoint must be nonempty."
+    condition     = can(regex("^https://[a-z0-9]{3,24}\\.table\\.core\\.windows\\.net/$", var.workload_table_endpoint))
+    error_message = "workload_table_endpoint must be a canonical Azure Table endpoint."
   }
 }
 
@@ -138,8 +138,8 @@ variable "security_state_table_name" {
   type        = string
 
   validation {
-    condition     = trimspace(var.security_state_table_name) != ""
-    error_message = "security_state_table_name must be nonempty."
+    condition     = var.security_state_table_name == "SecurityState"
+    error_message = "security_state_table_name must be exactly SecurityState."
   }
 }
 
@@ -148,28 +148,8 @@ variable "rate_state_table_name" {
   type        = string
 
   validation {
-    condition     = trimspace(var.rate_state_table_name) != ""
-    error_message = "rate_state_table_name must be nonempty."
-  }
-}
-
-variable "foundry_endpoint" {
-  description = "Foundry/OpenAI endpoint."
-  type        = string
-
-  validation {
-    condition     = trimspace(var.foundry_endpoint) != ""
-    error_message = "foundry_endpoint must be nonempty."
-  }
-}
-
-variable "foundry_deployment_names" {
-  description = "Foundry deployment names passed to the relay."
-  type        = list(string)
-
-  validation {
-    condition     = length(var.foundry_deployment_names) > 0 && alltrue([for name in var.foundry_deployment_names : trimspace(name) != ""])
-    error_message = "foundry_deployment_names must contain at least one nonempty name."
+    condition     = var.rate_state_table_name == "RateState"
+    error_message = "rate_state_table_name must be exactly RateState."
   }
 }
 
@@ -222,47 +202,38 @@ variable "target_port" {
 }
 
 variable "min_replicas" {
-  description = "Minimum relay replica count for the development slice."
+  description = "Minimum relay replica count; development may scale to zero or remain warm."
   type        = number
-  default     = 1
+  default     = 0
 
   validation {
-    condition     = var.min_replicas == 1
-    error_message = "min_replicas must be exactly 1 for this development slice."
+    condition     = contains([0, 1], var.min_replicas)
+    error_message = "min_replicas must be exactly 0 or 1."
   }
 }
 
-variable "max_replicas" {
-  description = "Maximum relay replica count for the development slice."
-  type        = number
-  default     = 1
-
-  validation {
-    condition     = var.max_replicas == 1
-    error_message = "max_replicas must be exactly 1 for this development slice."
-  }
-}
-
-variable "cpu" {
-  description = "Container CPU allocation."
-  type        = number
-  default     = 0.25
-
-  validation {
-    condition     = var.cpu > 0
-    error_message = "cpu must be positive."
-  }
-}
-
-variable "memory" {
-  description = "Container memory allocation."
+variable "security_mode" {
+  description = "Relay security persistence mode. Deployed workloads require Azure Table storage."
   type        = string
-  default     = "0.5Gi"
+  default     = "azure-table"
+}
 
-  validation {
-    condition     = trimspace(var.memory) != ""
-    error_message = "memory must be nonempty."
-  }
+variable "transcription_provider" {
+  description = "Relay transcription provider. Azure transcription remains blocked."
+  type        = string
+  default     = "mock"
+}
+
+variable "azure_transcription_endpoint" {
+  description = "Qualification-blocked Azure transcription endpoint; must remain empty."
+  type        = string
+  default     = ""
+}
+
+variable "azure_transcription_deployment" {
+  description = "Qualification-blocked Azure transcription deployment; must remain empty."
+  type        = string
+  default     = ""
 }
 
 variable "enable_litellm_sidecar" {
@@ -272,27 +243,27 @@ variable "enable_litellm_sidecar" {
 }
 
 variable "litellm_image_digest" {
-  description = "Immutable LiteLLM sidecar image digest."
+  description = "Immutable LiteLLM sidecar image digest in acr_login_server."
   type        = string
   default     = ""
 
   validation {
     condition = var.litellm_image_digest == "" || can(regex(
-      "^[^[:space:]@]+@sha256:[0-9a-f]{64}$",
+      "^[a-z0-9.-]+\\.azurecr\\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$",
       var.litellm_image_digest
     ))
-    error_message = "litellm_image_digest must be empty or an immutable image sha256 digest."
+    error_message = "litellm_image_digest must be empty or an immutable lower-case ACR sha256 digest."
   }
 }
 
 variable "litellm_backend" {
-  description = "LiteLLM upstream backend."
+  description = "LiteLLM upstream backend; only OpenRouter is production-qualified."
   type        = string
-  default     = "openrouter"
+  default     = ""
 
   validation {
-    condition     = contains(["openrouter", "azure"], var.litellm_backend)
-    error_message = "litellm_backend must be openrouter or azure."
+    condition     = contains(["", "openrouter"], var.litellm_backend)
+    error_message = "litellm_backend must be empty or openrouter; Azure is not qualified."
   }
 }
 
@@ -329,47 +300,24 @@ variable "litellm_master_key_secret_url" {
   }
 }
 
+variable "key_vault_uri" {
+  description = "Same-vault URI used to validate versionless sidecar secret references."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[a-z0-9-]+\\.vault\\.azure\\.net/$", var.key_vault_uri))
+    error_message = "key_vault_uri must be an Azure Key Vault URI ending in a slash."
+  }
+}
+
 variable "azure_api_base" {
-  description = "Azure OpenAI API base used by LiteLLM in Azure mode."
+  description = "Qualification-blocked LiteLLM Azure API base; must remain empty."
   type        = string
   default     = ""
 }
 
 variable "azure_api_version" {
-  description = "Azure OpenAI API version used by LiteLLM in Azure mode."
+  description = "Qualification-blocked LiteLLM Azure API version; must remain empty."
   type        = string
   default     = ""
-}
-
-variable "azure_api_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the Azure OpenAI API key."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.azure_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.azure_api_key_secret_url))
-    error_message = "azure_api_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "litellm_cpu" {
-  description = "CPU allocation for the LiteLLM sidecar."
-  type        = number
-  default     = 0.25
-
-  validation {
-    condition     = var.litellm_cpu > 0
-    error_message = "litellm_cpu must be positive."
-  }
-}
-
-variable "litellm_memory" {
-  description = "Memory allocation for the LiteLLM sidecar."
-  type        = string
-  default     = "0.5Gi"
-
-  validation {
-    condition     = trimspace(var.litellm_memory) != ""
-    error_message = "litellm_memory must be nonempty."
-  }
 }
