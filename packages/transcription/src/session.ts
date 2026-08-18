@@ -6,8 +6,6 @@ import {
   assertTranscriptFinal,
   assertTranscriptPartial
 } from '@palancar/contracts';
-import { isTargetLanguage } from '@palancar/language-registry';
-
 import { TranscriptionSessionError } from './errors.js';
 import {
   DETERMINISTIC_MOCK_CAPABILITIES,
@@ -293,7 +291,7 @@ interface ActiveUtterance {
 
 type TerminalUtterance =
   | { readonly status: 'cancelled' }
-  | { readonly status: 'finalized'; readonly event: NormalizedTranscriptionFinal };
+  | { readonly status: 'finalized' };
 
 export class DeterministicMockTranscriptionSession implements TranscriptionSession {
   readonly capabilities: typeof DETERMINISTIC_MOCK_CAPABILITIES;
@@ -328,6 +326,9 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
     if (typeof input.onEvent !== 'function') {
       throw new TypeError('Transcription event callback must be a function');
     }
+    if (typeof input.onFailure !== 'function') {
+      throw new TypeError('Transcription failure callback must be a function');
+    }
     if (input.onDeliveryFailure !== undefined && typeof input.onDeliveryFailure !== 'function') {
       throw new TypeError('Delivery-failure callback must be a function');
     }
@@ -360,6 +361,12 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
   get state(): Readonly<TranscriptionSessionState> {
     return Object.freeze({
       closed: this.#closed,
+      connectionState: this.#closed
+        ? 'closed'
+        : this.#active === undefined
+          ? 'idle'
+          : 'ready',
+      finalizationRequested: false,
       ...(this.#active === undefined
         ? {}
         : { activeUtteranceId: this.#active.input.utteranceId }),
@@ -381,15 +388,9 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
   start(input: StartUtteranceInput): StartUtteranceResult {
     this.#assertOpen();
     assertUuid(input.utteranceId, 'Utterance ID');
-    if (!isTargetLanguage(input.selectedTargetLanguage)) {
-      throw new RangeError('Unsupported selected target language');
-    }
     const active = this.#active;
     if (active !== undefined) {
-      if (
-        active.input.utteranceId === input.utteranceId &&
-        active.input.selectedTargetLanguage === input.selectedTargetLanguage
-      ) {
+      if (active.input.utteranceId === input.utteranceId) {
         return Object.freeze({ status: 'already-active' });
       }
       fail('active-utterance', 'A different utterance is already active');
@@ -402,7 +403,7 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
     this.#active = {
       input: Object.freeze({ ...input }),
       script: createDeterministicMockScript(
-        input.selectedTargetLanguage,
+        this.#mockConfiguration.fixtureTargetLanguage ?? 'es',
         this.#mockConfiguration.evidenceCategory,
         {
           languageMode: this.configuration.languageMode,
@@ -465,15 +466,13 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
     assertUuid(utteranceId, 'Utterance ID');
     const terminal = this.#terminalByUtterance.get(utteranceId);
     if (terminal?.status === 'finalized') {
-      return Object.freeze({ status: 'already-finalized', event: terminal.event });
+      return Object.freeze({ status: 'already-finalized' });
     }
     if (terminal?.status === 'cancelled') {
       return Object.freeze({ status: 'already-cancelled' });
     }
-    return Object.freeze({
-      status: 'finalized',
-      event: this.#finish(this.#activeFor(utteranceId), 'explicit')
-    });
+    this.#finish(this.#activeFor(utteranceId), 'explicit');
+    return Object.freeze({ status: 'finalization-requested' });
   }
 
   cancel(utteranceId: string): CancelResult {
@@ -594,8 +593,7 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
       finalizationReason
     });
     this.#terminalByUtterance.set(active.input.utteranceId, {
-      status: 'finalized',
-      event
+      status: 'finalized'
     });
     this.#active = undefined;
     this.#resampler.flush();
@@ -671,5 +669,17 @@ export class DeterministicMockTranscriptionAdapter implements TranscriptionAdapt
     input: CreateTranscriptionSessionInput
   ): DeterministicMockTranscriptionSession {
     return new DeterministicMockTranscriptionSession(input, this.configuration);
+  }
+
+  async checkReadiness(): Promise<Readonly<{
+    readonly ready: boolean;
+    readonly provider: string;
+    readonly model: string;
+  }>> {
+    return Object.freeze({
+      ready: true,
+      provider: DETERMINISTIC_MOCK_CAPABILITIES.identity.provider,
+      model: DETERMINISTIC_MOCK_CAPABILITIES.identity.model
+    });
   }
 }

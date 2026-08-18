@@ -2,14 +2,9 @@ import type {
   TranscriptFinal,
   TranscriptPartial
 } from '@palancar/contracts';
-import type {
-  LanguageEvidenceSource,
-  TargetLanguage
-} from '@palancar/language-registry';
+import type { LanguageEvidenceSource } from '@palancar/language-registry';
 
-export type TranscriptionLanguageMode =
-  | 'automatic'
-  | 'selected-target-hint';
+export type TranscriptionLanguageMode = 'automatic';
 
 export type ServerVadMode = 'enabled' | 'disabled';
 
@@ -100,7 +95,6 @@ export type MockLanguageEvidenceCategory =
 
 export interface StartUtteranceInput {
   readonly utteranceId: string;
-  readonly selectedTargetLanguage: TargetLanguage;
 }
 
 export interface PushAudioInput {
@@ -121,14 +115,9 @@ export interface PushAudioResult {
 }
 
 export type FinalizeResult =
-  | {
-    readonly status: 'finalized';
-    readonly event: NormalizedTranscriptionFinal;
-  }
-  | {
-    readonly status: 'already-finalized';
-    readonly event: NormalizedTranscriptionFinal;
-  }
+  | { readonly status: 'finalization-requested' }
+  | { readonly status: 'already-requested' }
+  | { readonly status: 'already-finalized' }
   | { readonly status: 'already-cancelled' };
 
 export type CancelResult =
@@ -142,9 +131,37 @@ export type CloseResult =
 
 export interface TranscriptionSessionState {
   readonly closed: boolean;
+  readonly connectionState?: TranscriptionConnectionState;
+  readonly finalizationRequested?: boolean;
   readonly activeUtteranceId?: string;
   readonly acceptedThroughOriginalSampleOffset: number;
   /** Increments whenever the adapter resets utterance-local audio state. */
+  readonly audioStateEpoch: number;
+}
+
+export type TranscriptionConnectionState =
+  | 'idle'
+  | 'acquiring-token'
+  | 'connecting'
+  | 'configuring'
+  | 'ready'
+  | 'finalizing'
+  | 'failed'
+  | 'closed';
+
+export type TranscriptionFailureReason =
+  | 'authentication'
+  | 'connect-timeout'
+  | 'configuration'
+  | 'protocol'
+  | 'provider'
+  | 'socket'
+  | 'backpressure'
+  | 'finalization-timeout';
+
+/** Deliberately content-free so provider details never cross the relay boundary. */
+export interface TranscriptionFailure {
+  readonly reason: TranscriptionFailureReason;
   readonly audioStateEpoch: number;
 }
 
@@ -174,10 +191,18 @@ export interface CreateTranscriptionSessionInput {
   readonly configuration: TranscriptionSessionConfiguration;
   readonly onEvent: (event: NormalizedTranscriptionEvent) => void;
   readonly onDeliveryFailure?: (status: Readonly<EventDeliveryFailureStatus>) => void;
+  readonly onFailure: (failure: Readonly<TranscriptionFailure>) => void;
   readonly maxUtteranceSamples?: number;
 }
 
 export interface TranscriptionAdapter {
   readonly capabilities: Readonly<TranscriptionCapabilities>;
   createSession(input: CreateTranscriptionSessionInput): TranscriptionSession;
+  checkReadiness(): Promise<TranscriptionReadiness>;
+}
+
+export interface TranscriptionReadiness {
+  readonly ready: boolean;
+  readonly provider: string;
+  readonly model: string;
 }

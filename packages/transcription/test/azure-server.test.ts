@@ -231,6 +231,14 @@ describe('Azure Realtime GA server event parser', () => {
       }
     });
     expect(parseServerEvent(providerEvent({
+      type: 'rate_limits.updated',
+      event_id: 'event_rate_limits',
+      rate_limits: [
+        { name: 'requests', limit: 100, remaining: 99, reset_seconds: 1.5 },
+        { name: 'tokens', limit: 10_000, remaining: 9_000, reset_seconds: 2 }
+      ]
+    }))).toEqual({ type: 'rate_limits.updated', category: 'advisory' });
+    expect(parseServerEvent(providerEvent({
       type: 'input_audio_buffer.committed',
       event_id: 'event_1121',
       item_id: 'msg_002',
@@ -324,6 +332,10 @@ describe('Azure Realtime GA server event parser', () => {
     const events = [
       { type: 'session.created', session },
       { type: 'session.updated', session },
+      {
+        type: 'rate_limits.updated',
+        rate_limits: [{ name: 'requests', limit: 100, remaining: 99, reset_seconds: 1 }]
+      },
       {
         type: 'input_audio_buffer.committed',
         item_id: 'msg_002',
@@ -965,9 +977,15 @@ describe('Azure Realtime GA server event parser', () => {
     ];
     for (const event of events) {
       const result = parseServerEvent(providerEvent(event));
-      expect(result).toEqual({ type: event.type, category: 'ignored' });
+      expect(result).toEqual(event.type === 'conversation.item.created'
+        ? {
+            type: event.type,
+            category: 'ignored',
+            item_id: 'item_created',
+            previous_item_id: null
+          }
+        : { type: event.type, category: 'ignored' });
       expect(Object.isFrozen(result)).toBe(true);
-      expect(JSON.stringify(result)).not.toContain('item_created');
     }
 
     const malformedEvents = [
@@ -1010,6 +1028,25 @@ describe('Azure Realtime GA server event parser', () => {
       item_id: 'item_commit_without_previous',
       previous_item_id: null
     });
+  });
+
+  it('rejects malformed or ambiguous rate-limit updates', () => {
+    const base = {
+      type: 'rate_limits.updated',
+      event_id: 'event_rate_limits_invalid'
+    };
+    for (const rate_limits of [
+      [],
+      [{ name: 'unknown', limit: 100, remaining: 99, reset_seconds: 1 }],
+      [{ name: 'requests', limit: 100, remaining: 101, reset_seconds: 1 }],
+      [
+        { name: 'requests', limit: 100, remaining: 99, reset_seconds: 1 },
+        { name: 'requests', limit: 100, remaining: 98, reset_seconds: 2 }
+      ],
+      [{ name: 'requests', limit: 100, remaining: 99, reset_seconds: -1 }]
+    ]) {
+      expectReason(() => parseServerEvent(providerEvent({ ...base, rate_limits })), 'invalid-field');
+    }
   });
 
   it('normalizes exact GA transcription segments and rejects every malformed field', () => {

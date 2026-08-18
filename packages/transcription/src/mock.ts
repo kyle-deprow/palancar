@@ -9,6 +9,7 @@ import type {
 
 export interface DeterministicMockTranscriptionAdapterConfiguration {
   readonly evidenceCategory: MockLanguageEvidenceCategory;
+  readonly fixtureTargetLanguage?: TargetLanguage;
 }
 
 export interface DeterministicMockScriptConfiguration {
@@ -56,10 +57,7 @@ export const DETERMINISTIC_MOCK_CAPABILITIES: Readonly<TranscriptionCapabilities
       supported: true,
       cadencesMs: Object.freeze([600, 800, 1_000, 3_000])
     }),
-    languageModes: Object.freeze([
-      'automatic',
-      'selected-target-hint'
-    ] as const),
+    languageModes: Object.freeze(['automatic'] as const),
     partialResults: Object.freeze({ supported: true }),
     providerRetention: Object.freeze({
       status: 'not-applicable-synthetic',
@@ -85,13 +83,22 @@ export function validateDeterministicMockAdapterConfiguration(
     typeof input !== 'object' ||
     input === null ||
     Object.getPrototypeOf(input) !== Object.prototype ||
-    Object.keys(input).length !== 1 ||
+    Object.keys(input).length < 1 ||
+    Object.keys(input).length > 2 ||
     !Object.hasOwn(input, 'evidenceCategory') ||
-    !EVIDENCE_CATEGORY_SET.has(input.evidenceCategory)
+    Object.keys(input).some((key) => key !== 'evidenceCategory' && key !== 'fixtureTargetLanguage') ||
+    !EVIDENCE_CATEGORY_SET.has(input.evidenceCategory) ||
+    (input.fixtureTargetLanguage !== undefined &&
+      input.fixtureTargetLanguage !== 'es' && input.fixtureTargetLanguage !== 'tr')
   ) {
     throw new TypeError('Invalid deterministic mock evidence category');
   }
-  return Object.freeze({ evidenceCategory: input.evidenceCategory });
+  return Object.freeze({
+    evidenceCategory: input.evidenceCategory,
+    ...(input.fixtureTargetLanguage === undefined
+      ? {}
+      : { fixtureTargetLanguage: input.fixtureTargetLanguage })
+  });
 }
 
 function oppositeTarget(selectedTargetLanguage: TargetLanguage): TargetLanguage {
@@ -100,16 +107,11 @@ function oppositeTarget(selectedTargetLanguage: TargetLanguage): TargetLanguage 
 
 function languageEvidence(
   selectedTargetLanguage: TargetLanguage,
-  category: MockLanguageEvidenceCategory,
-  languageMode: TranscriptionLanguageMode
+  category: MockLanguageEvidenceCategory
 ): Readonly<NormalizedLanguageEvidence> {
   const base = {
-    detectorVersion: languageMode === 'automatic'
-      ? 'deterministic-mock-automatic-1.0.0'
-      : `deterministic-mock-selected-target-hint-${selectedTargetLanguage}-1.0.0`,
-    source: languageMode === 'automatic'
-      ? 'transcription-metadata' as const
-      : 'controlled-fixture' as const
+    detectorVersion: 'deterministic-mock-automatic-1.0.0',
+    source: 'controlled-fixture' as const
   };
 
   switch (category) {
@@ -178,8 +180,7 @@ export function createDeterministicMockScript(
     evidenceCategory,
     languageEvidence: languageEvidence(
       selectedTargetLanguage,
-      evidenceCategory,
-      configuration.languageMode
+      evidenceCategory
     ),
     partials: Object.freeze(partials),
     final: Object.freeze({ atAcceptedSamples: finalThreshold, text: `${prefix}-final` })

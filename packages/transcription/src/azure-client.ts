@@ -1,8 +1,7 @@
-import { MAX_AUDIO_PAYLOAD_BYTES } from '@palancar/contracts';
-
 export const AZURE_REALTIME_INPUT_AUDIO_FORMAT = 'audio/pcm' as const;
-export const DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES = MAX_AUDIO_PAYLOAD_BYTES;
-export const MAX_AZURE_REALTIME_APPEND_BYTES = MAX_AUDIO_PAYLOAD_BYTES;
+/** One 100 ms 16 kHz relay frame after 16->24 kHz conversion. */
+export const DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES = 4_800 as const;
+export const MAX_AZURE_REALTIME_APPEND_BYTES = 4_800 as const;
 
 const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/;
 

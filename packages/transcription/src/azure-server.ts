@@ -35,6 +35,7 @@ const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const EVENT_TYPES = new Set([
   'session.created',
   'session.updated',
+  'rate_limits.updated',
   'input_audio_buffer.committed',
   'input_audio_buffer.cleared',
   'input_audio_buffer.speech_started',
@@ -104,6 +105,7 @@ const SEMANTIC_VAD_EAGERNESS = new Set([
 export type AzureRealtimeServerEventType =
   | 'session.created'
   | 'session.updated'
+  | 'rate_limits.updated'
   | 'input_audio_buffer.committed'
   | 'input_audio_buffer.cleared'
   | 'input_audio_buffer.speech_started'
@@ -137,6 +139,11 @@ export interface AzureRealtimeSessionEvent {
   readonly session: AzureRealtimeSessionSummary;
 }
 
+export interface AzureRealtimeRateLimitsUpdatedEvent {
+  readonly type: 'rate_limits.updated';
+  readonly category: 'advisory';
+}
+
 export interface AzureRealtimeInputAudioCommittedEvent {
   readonly type: 'input_audio_buffer.committed';
   readonly item_id: string;
@@ -151,9 +158,15 @@ export interface AzureRealtimeIgnoredTranscriptionStreamEvent {
   readonly type:
     | 'input_audio_buffer.speech_started'
     | 'input_audio_buffer.speech_stopped'
-    | 'input_audio_buffer.timeout_triggered'
-    | 'conversation.item.created';
+    | 'input_audio_buffer.timeout_triggered';
   readonly category: 'ignored';
+}
+
+export interface AzureRealtimeConversationItemCreatedEvent {
+  readonly type: 'conversation.item.created';
+  readonly category: 'ignored';
+  readonly item_id: string;
+  readonly previous_item_id: string | null;
 }
 
 export interface AzureRealtimeInputAudioTranscriptionDeltaEvent {
@@ -225,9 +238,11 @@ export interface AzureRealtimeErrorEvent {
 
 export type AzureRealtimeServerEvent =
   | AzureRealtimeSessionEvent
+  | AzureRealtimeRateLimitsUpdatedEvent
   | AzureRealtimeInputAudioCommittedEvent
   | AzureRealtimeInputAudioClearedEvent
   | AzureRealtimeIgnoredTranscriptionStreamEvent
+  | AzureRealtimeConversationItemCreatedEvent
   | AzureRealtimeInputAudioTranscriptionDeltaEvent
   | AzureRealtimeInputAudioTranscriptionCompletedEvent
   | AzureRealtimeInputAudioTranscriptionSegmentEvent
@@ -1042,7 +1057,7 @@ function parseUsage(value: unknown): AzureRealtimeTranscriptionUsage {
   fail('invalid-field');
 }
 
-function validateCreatedAudioItem(value: unknown): void {
+function validateCreatedAudioItem(value: unknown): string {
   if (!isPlainObject(value) || !hasExactKeys(
     value,
     ['type', 'role', 'content'],
@@ -1056,7 +1071,7 @@ function validateCreatedAudioItem(value: unknown): void {
   if (
     valueOf(value, 'type') !== 'message' ||
     valueOf(value, 'role') !== 'user' ||
-    (id !== undefined && !isIdentifier(id)) ||
+    !isIdentifier(id) ||
     (object !== undefined && object !== 'realtime.item') ||
     (status !== undefined && status !== 'completed' &&
       status !== 'incomplete' && status !== 'in_progress')
@@ -1095,12 +1110,13 @@ function validateCreatedAudioItem(value: unknown): void {
   ) {
     fail('invalid-field');
   }
+  return id;
 }
 
 function parseIgnoredTranscriptionStreamEvent(
   value: Record<string, unknown>,
-  type: AzureRealtimeIgnoredTranscriptionStreamEvent['type']
-): AzureRealtimeIgnoredTranscriptionStreamEvent {
+  type: AzureRealtimeIgnoredTranscriptionStreamEvent['type'] | 'conversation.item.created'
+): AzureRealtimeIgnoredTranscriptionStreamEvent | AzureRealtimeConversationItemCreatedEvent {
   if (type === 'conversation.item.created') {
     if (!hasExactKeys(
       value,
@@ -1114,8 +1130,13 @@ function parseIgnoredTranscriptionStreamEvent(
       !isIdentifier(previousItemId)) {
       fail('invalid-field');
     }
-    validateCreatedAudioItem(valueOf(value, 'item'));
-    return Object.freeze({ type, category: 'ignored' });
+    const itemId = validateCreatedAudioItem(valueOf(value, 'item'));
+    return Object.freeze({
+      type,
+      category: 'ignored',
+      item_id: itemId,
+      previous_item_id: previousItemId ?? null
+    });
   }
 
   const isTimeout = type === 'input_audio_buffer.timeout_triggered';
@@ -1172,6 +1193,45 @@ function parseObjectEvent(
         expectedDeployment
       );
       return Object.freeze({ type, session });
+    }
+    case 'rate_limits.updated': {
+      if (!hasExactKeys(value, ['type', 'event_id', 'rate_limits'])) {
+        fail('invalid-event');
+      }
+      const rateLimits = valueOf(value, 'rate_limits');
+      if (!Array.isArray(rateLimits) ||
+          Object.getPrototypeOf(rateLimits) !== Array.prototype ||
+          rateLimits.length < 1 || rateLimits.length > 16) {
+        fail('invalid-field');
+      }
+      const arrayKeys = ownKeys(rateLimits);
+      if (arrayKeys.length !== rateLimits.length + 1 || !arrayKeys.includes('length')) {
+        fail('invalid-field');
+      }
+      const names = new Set<string>();
+      for (const rateLimit of rateLimits) {
+        if (!isPlainObject(rateLimit) || !hasExactKeys(
+          rateLimit,
+          ['name', 'limit', 'remaining', 'reset_seconds']
+        )) {
+          fail('invalid-field');
+        }
+        const name = valueOf(rateLimit, 'name');
+        const limit = valueOf(rateLimit, 'limit');
+        const remaining = valueOf(rateLimit, 'remaining');
+        const resetSeconds = valueOf(rateLimit, 'reset_seconds');
+        if ((name !== 'requests' && name !== 'tokens') || names.has(name) ||
+            typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 0 ||
+            limit > MAX_AZURE_REALTIME_SERVER_USAGE_COUNT ||
+            typeof remaining !== 'number' || !Number.isSafeInteger(remaining) || remaining < 0 ||
+            remaining > limit ||
+            typeof resetSeconds !== 'number' || !Number.isFinite(resetSeconds) ||
+            resetSeconds < 0 || resetSeconds > MAX_AZURE_REALTIME_SERVER_USAGE_COUNT) {
+          fail('invalid-field');
+        }
+        names.add(name);
+      }
+      return Object.freeze({ type, category: 'advisory' });
     }
     case 'input_audio_buffer.committed': {
       if (!hasExactKeys(

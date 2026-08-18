@@ -1,4 +1,10 @@
-import { evaluateLanguageGate } from '@palancar/language-registry';
+import {
+  CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+  CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  evaluateLanguageGate,
+  validateClassifiedLanguageEvidence,
+  type ClassifiedLanguageEvidence
+} from '@palancar/language-registry';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
@@ -44,6 +50,7 @@ const DEFAULT_CONFIGURATION: TranscriptionSessionConfiguration = {
 function createSession(options: {
   readonly events?: NormalizedTranscriptionEvent[];
   readonly evidenceCategory?: MockLanguageEvidenceCategory;
+  readonly fixtureTargetLanguage?: 'es' | 'tr';
   readonly configuration?: TranscriptionSessionConfiguration;
   readonly maxUtteranceSamples?: number;
   readonly onEvent?: (event: NormalizedTranscriptionEvent) => void;
@@ -53,12 +60,16 @@ function createSession(options: {
 } = {}): TranscriptionSession {
   const events = options.events ?? [];
   return new DeterministicMockTranscriptionAdapter({
-    evidenceCategory: options.evidenceCategory ?? 'selected-target'
+    evidenceCategory: options.evidenceCategory ?? 'selected-target',
+    ...(options.fixtureTargetLanguage === undefined
+      ? {}
+      : { fixtureTargetLanguage: options.fixtureTargetLanguage })
   }).createSession({
     sessionId: SESSION_ID,
     sessionEpoch: 1,
     configuration: options.configuration ?? DEFAULT_CONFIGURATION,
     onEvent: options.onEvent ?? ((event) => events.push(event)),
+    onFailure: () => undefined,
     ...(options.onDeliveryFailure === undefined
       ? {}
       : { onDeliveryFailure: options.onDeliveryFailure }),
@@ -70,14 +81,10 @@ function createSession(options: {
 
 function start(
   session: TranscriptionSession,
-  utteranceId = UTTERANCE_ID,
-  selectedTargetLanguage: 'es' | 'tr' = 'es'
+  utteranceId = UTTERANCE_ID
 ): void {
   expect(
-    session.start({
-      utteranceId,
-      selectedTargetLanguage
-    })
+    session.start({ utteranceId })
   ).toEqual({ status: 'started' });
 }
 
@@ -127,7 +134,7 @@ describe('provider-neutral capabilities', () => {
       resampling: { mode: 'native', stateful: false },
       serverVad: { supported: true, modes: ['enabled', 'disabled'] },
       manualCommit: { supported: true, cadencesMs: [600, 800, 1_000, 3_000] },
-      languageModes: ['automatic', 'selected-target-hint'],
+      languageModes: ['automatic'],
       partialResults: { supported: true },
       providerRetention: {
         status: 'not-applicable-synthetic',
@@ -139,39 +146,36 @@ describe('provider-neutral capabilities', () => {
 
   it('validates and exposes executable immutable session modes', () => {
     for (const serverVadMode of ['enabled', 'disabled'] as const) {
-      for (const languageMode of ['automatic', 'selected-target-hint'] as const) {
-        for (const manualCommitCadenceMs of [600, 800, 1_000, 3_000]) {
-          const configuration = {
-            serverVadMode,
-            languageMode,
-            manualCommitCadenceMs
-          };
-          const session = createSession({ configuration });
-          expect(session.configuration).toEqual(configuration);
-          expect(Object.isFrozen(session.configuration)).toBe(true);
-          configuration.manualCommitCadenceMs = 999;
-          expect(session.configuration.manualCommitCadenceMs).toBe(
-            manualCommitCadenceMs
-          );
-        }
+      for (const manualCommitCadenceMs of [600, 800, 1_000, 3_000]) {
+        const configuration = {
+          serverVadMode,
+          languageMode: 'automatic' as const,
+          manualCommitCadenceMs
+        };
+        const session = createSession({ configuration });
+        expect(session.configuration).toEqual(configuration);
+        expect(Object.isFrozen(session.configuration)).toBe(true);
+        configuration.manualCommitCadenceMs = 999;
+        expect(session.configuration.manualCommitCadenceMs).toBe(
+          manualCommitCadenceMs
+        );
       }
     }
   });
 
-  it('executes every cadence and both language metadata paths', () => {
+  it('executes every cadence in automatic language mode', () => {
     for (const manualCommitCadenceMs of [600, 800, 1_000, 3_000]) {
       const cadenceSamples = manualCommitCadenceMs * 16;
-      for (const languageMode of ['automatic', 'selected-target-hint'] as const) {
-        const events: NormalizedTranscriptionEvent[] = [];
-        const session = createSession({
-          events,
-          evidenceCategory: 'selected-target',
-          configuration: {
-            serverVadMode: 'enabled',
-            languageMode,
-            manualCommitCadenceMs
-          }
-        });
+      const events: NormalizedTranscriptionEvent[] = [];
+      const session = createSession({
+        events,
+        evidenceCategory: 'selected-target',
+        configuration: {
+          serverVadMode: 'enabled',
+          languageMode: 'automatic',
+          manualCommitCadenceMs
+        }
+      });
         start(session);
         pushSamples(session, 0, cadenceSamples);
         expect(events).toHaveLength(1);
@@ -189,15 +193,10 @@ describe('provider-neutral capabilities', () => {
           finalizationReason: 'script-threshold',
           languageEvidence: {
             detectedLanguage: 'es',
-            source: languageMode === 'automatic'
-              ? 'transcription-metadata'
-              : 'controlled-fixture'
+            source: 'controlled-fixture'
           }
         });
-        expect(events.at(-1)?.languageEvidence.detectorVersion).toContain(
-          languageMode === 'automatic' ? 'automatic' : 'selected-target-hint-es'
-        );
-      }
+      expect(events.at(-1)?.languageEvidence.detectorVersion).toContain('automatic');
     }
   });
 
@@ -259,23 +258,47 @@ describe('provider-neutral capabilities', () => {
       sessionId: SESSION_ID,
       sessionEpoch: 1,
       configuration: DEFAULT_CONFIGURATION,
-      onEvent: (event) => events.push(event)
+      onEvent: (event) => events.push(event),
+      onFailure: () => undefined
     }, mockConfiguration);
     mockConfiguration.evidenceCategory = 'mixed';
     start(session);
     pushSamples(session, 0, 28_800);
     expect(events.at(-1)?.languageEvidence.detectedLanguage).toBe('en');
   });
+
+  it('requires the content-free failure callback at runtime', () => {
+    expect(() => new DeterministicMockTranscriptionSession({
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      configuration: DEFAULT_CONFIGURATION,
+      onEvent: () => undefined
+    } as never, { evidenceCategory: 'english' })).toThrowError(/failure callback/i);
+  });
 });
 
 describe('session lifecycle and offsets', () => {
+  it('delivers automatic mock finals through the event callback before acknowledging finalization', () => {
+    const events: NormalizedTranscriptionEvent[] = [];
+    const session = createSession({
+      events,
+      configuration: {
+        serverVadMode: 'disabled',
+        languageMode: 'automatic',
+        manualCommitCadenceMs: 600
+      }
+    });
+    expect(session.start({ utteranceId: UTTERANCE_ID })).toEqual({ status: 'started' });
+    pushSamples(session, 0, 1);
+    expect(session.finalize(UTTERANCE_ID)).toEqual({ status: 'finalization-requested' });
+    expect(events.at(-1)).toMatchObject({ type: 'transcript.final' });
+    expect(session.finalize(UTTERANCE_ID)).toEqual({ status: 'already-finalized' });
+  });
+
   it('enforces one active utterance and idempotent start/finalize/cancel/close', () => {
     const events: NormalizedTranscriptionEvent[] = [];
     const session = createSession({ events });
-    const input = {
-      utteranceId: UTTERANCE_ID,
-      selectedTargetLanguage: 'es' as const
-    };
+    const input = { utteranceId: UTTERANCE_ID };
     expect(session.start(input)).toEqual({ status: 'started' });
     expect(session.start(input)).toEqual({ status: 'already-active' });
     expectErrorReason(() =>
@@ -285,12 +308,12 @@ describe('session lifecycle and offsets', () => {
     pushSamples(session, 0, 1);
     const finalized = session.finalize(UTTERANCE_ID);
     expect(finalized).toMatchObject({
-      status: 'finalized',
-      event: {
-        type: 'transcript.final',
-        finalizationReason: 'explicit',
-        acceptedThroughOriginalSampleOffset: 1
-      }
+      status: 'finalization-requested'
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      finalizationReason: 'explicit',
+      acceptedThroughOriginalSampleOffset: 1
     });
     expect(session.finalize(UTTERANCE_ID)).toMatchObject({
       status: 'already-finalized'
@@ -352,7 +375,7 @@ describe('session lifecycle and offsets', () => {
     });
     expect(session.state.audioStateEpoch).toBe(startEpoch + 1);
 
-    start(session, NEXT_UTTERANCE_ID, 'tr');
+    start(session, NEXT_UTTERANCE_ID);
     expect(session.state.acceptedThroughOriginalSampleOffset).toBe(0);
     expect(session.state.audioStateEpoch).toBe(startEpoch + 2);
     pushSamples(session, 0, 1, NEXT_UTTERANCE_ID);
@@ -364,7 +387,7 @@ describe('session lifecycle and offsets', () => {
       events,
       configuration: {
         serverVadMode: 'disabled',
-        languageMode: 'selected-target-hint',
+        languageMode: 'automatic',
         manualCommitCadenceMs: 800
       }
     });
@@ -376,8 +399,11 @@ describe('session lifecycle and offsets', () => {
     ]);
     expect(session.state.activeUtteranceId).toBe(UTTERANCE_ID);
     expect(session.finalize(UTTERANCE_ID)).toMatchObject({
-      status: 'finalized',
-      event: { finalizationReason: 'explicit' }
+      status: 'finalization-requested'
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      finalizationReason: 'explicit'
     });
   });
 
@@ -505,7 +531,7 @@ describe('session lifecycle and offsets', () => {
         pcm: Uint8Array.of(1, 2)
       }), 'overlap');
     const result = session.finalize(UTTERANCE_ID);
-    expect(result.status).toBe('finalized');
+    expect(result.status).toBe('finalization-requested');
     expect(session.deliveryFailures.failureCount).toBe(2);
     expect(failureHookCalls).toBe(2);
     expect(session.finalize(UTTERANCE_ID).status).toBe('already-finalized');
@@ -696,17 +722,16 @@ describe('normalized deterministic events', () => {
     } as const;
 
     for (const selectedTargetLanguage of ['es', 'tr'] as const) {
-      for (const languageMode of ['automatic', 'selected-target-hint'] as const) {
-        for (const category of CATEGORIES) {
-          const script = createDeterministicMockScript(
-            selectedTargetLanguage,
-            category,
-            {
-              languageMode,
-              manualCommitCadenceMs: 600,
-              maxUtteranceSamples: 480_000
-            }
-          );
+      for (const category of CATEGORIES) {
+        const script = createDeterministicMockScript(
+          selectedTargetLanguage,
+          category,
+          {
+            languageMode: 'automatic',
+            manualCommitCadenceMs: 600,
+            maxUtteranceSamples: 480_000
+          }
+        );
           expect(script.partials.map((partial) => partial.atAcceptedSamples)).toEqual([
             9_600,
             19_200
@@ -720,23 +745,44 @@ describe('normalized deterministic events', () => {
           const session = createSession({
             events,
             evidenceCategory: category,
+            fixtureTargetLanguage: selectedTargetLanguage,
             configuration: {
               serverVadMode: 'enabled',
-              languageMode,
+              languageMode: 'automatic',
               manualCommitCadenceMs: 600
             }
           });
-          start(session, UTTERANCE_ID, selectedTargetLanguage);
+          start(session, UTTERANCE_ID);
           pushSamples(session, 0, 28_800);
           expect(events).toHaveLength(3);
           expect(events.at(-1)?.languageEvidence).toEqual(script.languageEvidence);
+          const controlledDetectedLanguage =
+            expectedDetected[selectedTargetLanguage][category];
+          const controlledEvidence: ClassifiedLanguageEvidence =
+            controlledDetectedLanguage === undefined
+              ? {
+                  status: 'uncalibrated',
+                  detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION
+                }
+              : {
+                  status: 'calibrated',
+                  detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+                  calibrationVersion: CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+                  detectedLanguage: controlledDetectedLanguage,
+                  confidence: 0.95
+                };
           for (const event of events) {
+            expect(() =>
+              validateClassifiedLanguageEvidence(event.languageEvidence)
+            ).toThrow();
+            expect(() => evaluateLanguageGate({
+              selectedLanguage: selectedTargetLanguage,
+              evidence: event.languageEvidence as unknown as ClassifiedLanguageEvidence,
+              isFinal: event.type === 'transcript.final'
+            })).toThrow();
             const result = evaluateLanguageGate({
               selectedLanguage: selectedTargetLanguage,
-              evidence: {
-                ...event.languageEvidence,
-                text: event.text
-              },
+              evidence: controlledEvidence,
               isFinal: event.type === 'transcript.final'
             });
             if (event.type === 'transcript.partial') {
@@ -751,7 +797,6 @@ describe('normalized deterministic events', () => {
               });
             }
           }
-        }
       }
     }
   });
@@ -777,7 +822,7 @@ describe('normalized deterministic events', () => {
             sizeIndex += 1;
           }
           expect(session.state.acceptedThroughOriginalSampleOffset).toBe(sampleCount);
-          expect(session.finalize(UTTERANCE_ID).status).toBe('finalized');
+          expect(session.finalize(UTTERANCE_ID).status).toBe('finalization-requested');
         }
       ),
       { seed: 20_260_810, numRuns: 250, endOnFailure: true }
@@ -829,10 +874,7 @@ describe('normalized deterministic events', () => {
             } else if (model.closed) {
               expectErrorReason(() => {
                 if (action === 'start-same') {
-                  session.start({
-                    utteranceId: UTTERANCE_ID,
-                    selectedTargetLanguage: 'es'
-                  });
+                  session.start({ utteranceId: UTTERANCE_ID });
                 } else if (action === 'finalize') {
                   session.finalize(UTTERANCE_ID);
                 } else if (action === 'cancel') {
@@ -848,20 +890,18 @@ describe('normalized deterministic events', () => {
             } else if (action === 'start-same') {
               if (model.terminal === 'active') {
                 expect(session.start({
-                  utteranceId: UTTERANCE_ID,
-                  selectedTargetLanguage: 'es'
+                  utteranceId: UTTERANCE_ID
                 })).toEqual({ status: 'already-active' });
               } else {
                 expectErrorReason(() => session.start({
-                  utteranceId: UTTERANCE_ID,
-                  selectedTargetLanguage: 'es'
+                  utteranceId: UTTERANCE_ID
                 }), 'stale-utterance');
               }
             } else if (action === 'finalize') {
               const result = session.finalize(UTTERANCE_ID);
               expect(result.status).toBe(
                 model.terminal === 'active'
-                  ? 'finalized'
+                  ? 'finalization-requested'
                   : model.terminal === 'finalized'
                     ? 'already-finalized'
                     : 'already-cancelled'
