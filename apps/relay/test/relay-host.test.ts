@@ -28,9 +28,18 @@ import {
   type TranscriptionAdapter,
   type TranscriptionSession
 } from '@palancar/transcription';
-import type {
-  SecurityRuntimeStore,
-  SecurityStateMaintenanceStore
+import {
+  DURABLE_SECURITY_STATE_STORE,
+  SecurityStateError,
+  assertCanonical256BitToken,
+  assertCanonicalUuid,
+  type CredentialPromotionResult,
+  type DurableSecurityStateStore,
+  type InstallationRevocationResult,
+  type PendingCredentialResult,
+  type SecurityRuntimeStore,
+  type SecurityStateMaintenanceStore,
+  type SessionLease
 } from '@palancar/security-state';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, type RawData } from 'ws';
@@ -53,6 +62,7 @@ const GATE_POLICY_VERSION = '1.0.0';
 const UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
 const CANARY = 'relay-host-canary-ticket-body-provider-error';
 const CONFIG_CANARY = 'relay-host-config-canary-invalid-origin';
+const PENDING_CREDENTIAL = 'C'.repeat(42) + 'E';
 const RELAY_MAIN_PATH = fileURLToPath(new URL('../dist/main.js', import.meta.url));
 
 function createRelayHost(config: RelayHostConfig): RelayHost {
@@ -67,12 +77,58 @@ function testSecurityWith(input: {
   readonly maintenance?: Partial<SecurityStateMaintenanceStore>;
 } = {}) {
   const base = createTestHostSecurityComposition();
-  const runtime = Object.assign(Object.create(base.runtime) as SecurityRuntimeStore, input.runtime);
-  const maintenance = Object.assign(
-    Object.create(base.maintenance) as SecurityStateMaintenanceStore,
-    input.maintenance
-  );
+  const runtime = {
+    ...base.runtime,
+    ...input.runtime,
+    [DURABLE_SECURITY_STATE_STORE]: true as const,
+    deploymentBoundary: 'DURABLE_PROVIDER' as const,
+    capabilities: Object.freeze({
+      durableAcrossProcesses: true as const,
+      paidProvidersAllowed: true as const
+    })
+  } satisfies DurableSecurityStateStore;
+  const maintenance = {
+    ...base.maintenance,
+    ...input.maintenance
+  } satisfies SecurityStateMaintenanceStore;
   return { mode: 'azure-table' as const, runtime, maintenance };
+}
+
+function lifecycleSecurityWith() {
+  const beginCredentialRotation = vi.fn(async (): Promise<PendingCredentialResult> => ({
+    installationId: assertCanonicalUuid('11111111-1111-4111-8111-111111111111'),
+    pendingCredential: assertCanonical256BitToken(PENDING_CREDENTIAL),
+    pendingCredentialVersion: 2,
+    pendingExpiresAt: Date.parse('2026-08-10T12:30:00.000Z'),
+    absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
+  }));
+  const promoteCredential = vi.fn(async (): Promise<CredentialPromotionResult> => ({
+    installationId: assertCanonicalUuid('11111111-1111-4111-8111-111111111111'),
+    credentialVersion: 2,
+    tombstoneVersion: 1,
+    status: 'promoted' as const,
+    confirmedAt: Date.parse('2026-08-10T12:01:00.000Z'),
+    idleExpiresAt: Date.parse('2026-09-01T00:00:00.000Z'),
+    absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
+  }));
+  const revokeCurrentInstallation = vi.fn(async (): Promise<InstallationRevocationResult> => ({
+    installationId: assertCanonicalUuid('11111111-1111-4111-8111-111111111111'),
+    credentialVersion: 2,
+    tombstoneVersion: 2,
+    status: 'revoked' as const,
+    revokedAt: Date.parse('2026-08-10T12:02:00.000Z')
+  }));
+  const security = testSecurityWith({
+    runtime: {
+      beginCredentialRotation,
+      promoteCredential,
+      revokeCurrentInstallation
+    }
+  });
+  return {
+    ...security,
+    spies: { beginCredentialRotation, promoteCredential, revokeCurrentInstallation }
+  };
 }
 
 interface JsonObject {
@@ -154,6 +210,16 @@ function waitForClose(socket: WebSocket): Promise<number> {
   return new Promise((resolve) => socket.once('close', (code) => resolve(code)));
 }
 
+function waitForCloseDetails(socket: WebSocket): Promise<{
+  readonly code: number;
+  readonly reason: string;
+}> {
+  return new Promise((resolve) => socket.once('close', (code, reason) => resolve({
+    code,
+    reason: reason.toString('utf8')
+  })));
+}
+
 function waitForUnexpectedResponse(socket: WebSocket): Promise<number> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -184,6 +250,17 @@ function createDeferred(): { readonly promise: Promise<void>; readonly resolve: 
     resolvePromise = resolve;
   });
   return { promise, resolve: () => resolvePromise() };
+}
+
+function createValueDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolvePromise: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: (value) => resolvePromise(value) };
 }
 
 function runRelayMain(env: NodeJS.ProcessEnv): Promise<{
@@ -248,6 +325,54 @@ function rawUpgradeStatus(port: number, protocolHeader: string): Promise<number>
   });
 }
 
+function rawHttpResponse(port: number, request: string): Promise<{
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1');
+    let response = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('timed out waiting for HTTP response'));
+    }, 5_000);
+    const finish = (): void => {
+      const separator = response.indexOf('\r\n\r\n');
+      if (separator < 0) return;
+      const head = response.subarray(0, separator).toString('latin1');
+      const lines = head.split('\r\n');
+      const statusMatch = /^HTTP\/1\.1 (\d+)/.exec(lines[0] ?? '');
+      if (statusMatch === null) return;
+      const headers: Record<string, string> = {};
+      for (const line of lines.slice(1)) {
+        const colon = line.indexOf(':');
+        if (colon < 0) continue;
+        headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+      }
+      const expectedBytes = Number(headers['content-length'] ?? '0');
+      const bodyBytes = response.subarray(separator + 4);
+      if (bodyBytes.byteLength < expectedBytes) return;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve({
+        status: Number(statusMatch[1]),
+        headers: Object.freeze(headers),
+        body: bodyBytes.subarray(0, expectedBytes).toString('utf8')
+      });
+    };
+    socket.on('connect', () => socket.write(request));
+    socket.on('data', (chunk) => {
+      response = Buffer.concat([response, chunk]);
+      finish();
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 function sessionStartText(): string {
   return JSON.stringify({
     type: 'session.start',
@@ -303,6 +428,22 @@ function audience(origin = ORIGIN): RelayUpgradeAudience {
     path: '/v1/stream',
     protocol: WEBSOCKET_SUBPROTOCOL
   };
+}
+
+function controlledLease(input: {
+  readonly installationId: string;
+  readonly sessionId: string;
+  readonly credentialVersion: number;
+}): SessionLease {
+  return Object.freeze({
+    installationId: assertCanonicalUuid(input.installationId),
+    sessionId: assertCanonicalUuid(input.sessionId),
+    sessionEpoch: 1,
+    credentialVersion: input.credentialVersion,
+    leaseVersion: 1,
+    phase: 'opening' as const,
+    leaseExpiresAt: Date.parse('2099-01-01T00:00:00.000Z')
+  });
 }
 
 function createAsyncCallbackAdapter(): TranscriptionAdapter {
@@ -736,6 +877,70 @@ describe('relay host configuration and readiness', () => {
     });
   });
 
+  it('parses and freezes the browser origin policy, including fail-closed defaults', () => {
+    const defaults = parseRelayHostConfig(mockEnvironment());
+    expect(defaults.browserOriginPolicy).toEqual({
+      allowedOrigins: [],
+      allowNullOrigin: false
+    });
+    expect(Object.isFrozen(defaults.browserOriginPolicy)).toBe(true);
+    expect(Object.isFrozen(defaults.browserOriginPolicy?.allowedOrigins)).toBe(true);
+
+    const configured = parseRelayHostConfig(mockEnvironment({
+      PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON: '["https://app.example"]',
+      PALANCAR_ALLOW_NULL_BROWSER_ORIGIN: 'true'
+    }));
+    expect(configured.browserOriginPolicy).toEqual({
+      allowedOrigins: ['https://app.example'],
+      allowNullOrigin: true
+    });
+    expect(Object.isFrozen(configured.browserOriginPolicy)).toBe(true);
+    expect(Object.isFrozen(configured.browserOriginPolicy?.allowedOrigins)).toBe(true);
+
+    expect(() => parseRelayHostConfig(mockEnvironment({
+      PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON: '["http://app.example"]'
+    }))).toThrow('Invalid relay host configuration.');
+  });
+
+  it('validates and snapshots direct browser origin policy options', async () => {
+    const policy = {
+      allowedOrigins: ['https://app.example'],
+      allowNullOrigin: false
+    };
+    const host = createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: policy
+    });
+    policy.allowedOrigins[0] = 'https://evil.example';
+    policy.allowNullOrigin = true;
+    await host.start();
+    try {
+      const url = `http://127.0.0.1:${hostPort(host)}/healthz`;
+      const accepted = await fetch(url, { headers: { origin: 'https://app.example' } });
+      const mutated = await fetch(url, { headers: { origin: 'https://evil.example' } });
+      const nullOrigin = await fetch(url, { headers: { origin: 'null' } });
+      expect(accepted.status).toBe(200);
+      expect(mutated.status).toBe(403);
+      expect(nullOrigin.status).toBe(403);
+    } finally {
+      await host.stop();
+    }
+
+    expect(() => createRelayHost({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: {
+        allowedOrigins: ['http://app.example'],
+        allowNullOrigin: false
+      }
+    })).toThrow('Invalid relay host configuration.');
+  });
+
   it('accepts only the privately branded built-in generation service in local-mock mode', async () => {
     const builtInConfig = parseRelayHostConfig(mockEnvironment({ PORT: '0' }));
     const localHost = createRelayHostProduction(builtInConfig);
@@ -988,30 +1193,38 @@ describe('relay host configuration and readiness', () => {
   });
 
   it('bounds a hanging transcription readiness check and leaves health unchanged', async () => {
+    const readinessStarted = createDeferred();
     const host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
       transcriptionAdapter: createReadinessAdapter(
-        () => new Promise(() => undefined)
+        () => {
+          readinessStarted.resolve();
+          return new Promise(() => undefined);
+        }
       ),
       languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
-      const startedAt = Date.now();
-      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
-      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      const readyRequest = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      await readinessStarted.promise;
+      await vi.advanceTimersByTimeAsync(2_000);
+      const ready = await readyRequest;
       expect(ready.status).toBe(503);
       expect(await responseJson(ready)).toEqual({ ready: false });
+      vi.useRealTimers();
       const health = await fetch(`http://127.0.0.1:${hostPort(host)}/healthz`);
       expect(health.status).toBe(200);
       expect(await responseJson(health)).toEqual({ ok: true });
     } finally {
+      vi.useRealTimers();
       await host.stop();
     }
-  }, 5_000);
+  });
 
   it.each(['rejected', 'timeout'] as const)(
     'fails readiness content-free when classifier readiness is %s',
@@ -1111,6 +1324,856 @@ describe('relay HTTP/WebSocket host', () => {
     expect(ready.status).toBe(200);
     expect(await responseJson(ready)).toEqual({ ready: true });
   });
+
+  it('applies actual-request origin policy to health without invoking readiness state', async () => {
+    await host.stop();
+    const checkReadiness = vi.fn(async () => undefined);
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: Object.freeze({
+        allowedOrigins: Object.freeze(['https://app.example']),
+        allowNullOrigin: true
+      }),
+      security: testSecurityWith({ maintenance: { checkReadiness } })
+    });
+    await host.start();
+
+    const url = `http://127.0.0.1:${hostPort(host)}/healthz`;
+    const originless = await fetch(url);
+    expect(originless.status).toBe(200);
+    expect(originless.headers.get('access-control-allow-origin')).toBeNull();
+    expect(originless.headers.get('vary')).toBeNull();
+    expect(await responseJson(originless)).toEqual({ ok: true });
+
+    const allowed = await fetch(url, { headers: { origin: 'https://app.example' } });
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get('access-control-allow-origin')).toBe('https://app.example');
+    expect(allowed.headers.get('vary')).toBe('Origin');
+    expect(allowed.headers.get('cache-control')).toBe('no-store');
+    expect(await responseJson(allowed)).toEqual({ ok: true });
+
+    const nullOrigin = await fetch(url, { headers: { origin: 'null' } });
+    expect(nullOrigin.status).toBe(200);
+    expect(nullOrigin.headers.get('access-control-allow-origin')).toBe('null');
+    expect(nullOrigin.headers.get('vary')).toBe('Origin');
+
+    const rejected = await fetch(url, { headers: { origin: 'https://evil.example' } });
+    expect(rejected.status).toBe(403);
+    expect(rejected.headers.get('access-control-allow-origin')).toBeNull();
+    expect(rejected.headers.get('cache-control')).toBe('no-store');
+    expect(await responseJson(rejected)).toEqual({ error: 'request_rejected' });
+
+    const healthOptions = await fetch(url, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://app.example' }
+    });
+    expect(healthOptions.status).toBe(405);
+    expect(healthOptions.headers.get('allow')).toBe('GET');
+    expect(checkReadiness).not.toHaveBeenCalled();
+  });
+
+  it('serves lifecycle routes with exact contracts, CORS, and preflight metadata', async () => {
+    await host.stop();
+    const security = lifecycleSecurityWith();
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: Object.freeze({
+        allowedOrigins: Object.freeze(['https://app.example']),
+        allowNullOrigin: false
+      }),
+      security
+    });
+    await host.start();
+
+    const baseUrl = `http://127.0.0.1:${hostPort(host)}`;
+    const origin = 'https://app.example';
+    const begin = await fetch(`${baseUrl}/v1/credential-rotations`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TEST_CREDENTIAL}`,
+        'content-type': 'application/json',
+        origin
+      },
+      body: '{}'
+    });
+    expect(begin.status).toBe(200);
+    expect(begin.headers.get('access-control-allow-origin')).toBe(origin);
+    expect(begin.headers.get('vary')).toBe('Origin');
+    expect(begin.headers.get('cache-control')).toBe('no-store');
+    expect(await responseJson(begin)).toEqual({
+      pendingCredential: PENDING_CREDENTIAL,
+      pendingCredentialVersion: 2,
+      pendingCredentialExpiresAt: '2026-08-10T12:30:00.000Z'
+    });
+
+    const preflight = await fetch(`${baseUrl}/v1/credential-rotation-confirmations`, {
+      method: 'OPTIONS',
+      headers: {
+        origin,
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'content-type, authorization'
+      }
+    });
+    expect(preflight.status).toBe(204);
+    expect(await preflight.text()).toBe('');
+    expect(preflight.headers.get('access-control-allow-origin')).toBe(origin);
+    expect(preflight.headers.get('access-control-allow-methods')).toBe('POST');
+    expect(preflight.headers.get('access-control-allow-headers')).toBe('Authorization, Content-Type');
+    expect(preflight.headers.get('cache-control')).toBe('no-store');
+    expect(preflight.headers.get('vary')).toBe(
+      'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+    );
+
+    const invalidPreflight = await fetch(`${baseUrl}/v1/credential-rotations`, {
+      method: 'OPTIONS',
+      headers: {
+        origin,
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, authorization'
+      }
+    });
+    expect(invalidPreflight.status).toBe(400);
+    expect(invalidPreflight.headers.get('cache-control')).toBe('no-store');
+    expect(invalidPreflight.headers.get('access-control-allow-origin')).toBe(origin);
+    expect(invalidPreflight.headers.get('vary')).toBe(
+      'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+    );
+
+    const confirmation = await fetch(`${baseUrl}/v1/credential-rotation-confirmations`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${PENDING_CREDENTIAL}`,
+        'content-type': 'application/json',
+        origin
+      },
+      body: '{}'
+    });
+    expect(confirmation.status).toBe(200);
+    expect(await responseJson(confirmation)).toEqual({
+      credentialVersion: 2,
+      promoted: true,
+      confirmedAt: '2026-08-10T12:01:00.000Z',
+      expiresAt: '2026-10-01T00:00:00.000Z'
+    });
+
+    const deletion = await fetch(`${baseUrl}/v1/installations/current`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${TEST_CREDENTIAL}`, origin }
+    });
+    expect(deletion.status).toBe(204);
+    expect(await deletion.text()).toBe('');
+    expect(deletion.headers.get('content-type')).toBeNull();
+    expect(deletion.headers.get('content-length')).toBeNull();
+    expect(deletion.headers.get('cache-control')).toBe('no-store');
+    expect(deletion.headers.get('access-control-allow-origin')).toBe(origin);
+  });
+
+  it('rejects browser origin and malformed preflight before lifecycle state', async () => {
+    await host.stop();
+    const security = lifecycleSecurityWith();
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: Object.freeze({
+        allowedOrigins: Object.freeze(['https://app.example']),
+        allowNullOrigin: false
+      }),
+      security
+    });
+    await host.start();
+    const baseUrl = `http://127.0.0.1:${hostPort(host)}`;
+
+    const rejected = await fetch(`${baseUrl}/v1/credential-rotations`, {
+      method: 'POST',
+      headers: {
+        origin: 'https://evil.example',
+        authorization: `Bearer ${TEST_CREDENTIAL}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ canary: CANARY })
+    });
+    expect(rejected.status).toBe(403);
+    expect(await responseJson(rejected)).toEqual({ error: 'request_rejected' });
+
+    const malformed = await fetch(`${baseUrl}/v1/credential-rotations`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'https://app.example',
+        'access-control-request-method': 'DELETE',
+        'access-control-request-headers': 'Authorization'
+      }
+    });
+    expect(malformed.status).toBe(400);
+    expect(await responseJson(malformed)).toEqual({ error: 'request_rejected' });
+    expect(security.spies.beginCredentialRotation).not.toHaveBeenCalled();
+  });
+
+  it('rejects disallowed WebSocket Origin before consuming the session ticket', async () => {
+    await host.stop();
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: Object.freeze({
+        allowedOrigins: Object.freeze(['https://app.example']),
+        allowNullOrigin: false
+      }),
+      security: createTestHostSecurityComposition()
+    });
+    await host.start();
+
+    const issued = await issueTicket(host);
+    const address = host.server.address() as { readonly port: number };
+    const url = `ws://127.0.0.1:${address.port}/v1/stream`;
+    const rejected = new WebSocket(
+      url,
+      [...createWebSocketSubprotocols(String(issued.ticket))],
+      { headers: { Origin: 'https://evil.example' } }
+    );
+    await expect(waitForUnexpectedResponse(rejected)).resolves.toBe(403);
+
+    const retry = await openSocket(host, String(issued.ticket));
+    const closed = waitForClose(retry);
+    retry.close(1000, 'test_done');
+    await closed;
+  });
+
+  it.each([
+    ['/v1/pairing-redemptions', 'POST'],
+    ['/v1/session-tickets', 'POST'],
+    ['/v1/credential-rotations', 'POST'],
+    ['/v1/credential-rotation-confirmations', 'POST'],
+    ['/v1/installations/current', 'DELETE']
+  ] as const)('returns exact Allow for recognized %s', async (path, allow) => {
+    const response = await fetch(`http://127.0.0.1:${hostPort(host)}${path}`, {
+      method: 'GET'
+    });
+    expect(response.status).toBe(405);
+    expect(response.headers.get('allow')).toBe(allow);
+    expect(await responseJson(response)).toEqual({ error: 'request_rejected' });
+  });
+
+  it('maps auth failures generically and enforces canonical singleton bearer and body limits', async () => {
+    await host.stop();
+    let failure: Error | undefined;
+    const beginCredentialRotation = vi.fn(async (): Promise<PendingCredentialResult> => {
+      if (failure !== undefined) throw failure;
+      return {
+        installationId: assertCanonicalUuid('11111111-1111-4111-8111-111111111111'),
+        pendingCredential: assertCanonical256BitToken(PENDING_CREDENTIAL),
+        pendingCredentialVersion: 2,
+        pendingExpiresAt: Date.parse('2026-08-10T12:30:00.000Z'),
+        absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
+      };
+    });
+    const promoteCredential = vi.fn(async (): Promise<never> => {
+      throw new Error(CANARY);
+    });
+    const security = testSecurityWith({
+      runtime: { beginCredentialRotation, promoteCredential }
+    });
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: {
+        allowedOrigins: ['https://app.example'],
+        allowNullOrigin: false
+      },
+      security
+    });
+    await host.start();
+    const port = hostPort(host);
+    const url = `http://127.0.0.1:${port}/v1/credential-rotations`;
+    const request = (body: string, headers: Record<string, string> = {}) => fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body
+    });
+
+    const missing = await request('{}');
+    expect(missing.status).toBe(401);
+    expect(beginCredentialRotation).not.toHaveBeenCalled();
+
+    const noncanonical = await request('{}', {
+      authorization: `Bearer ${'A'.repeat(42)}B`
+    });
+    expect(noncanonical.status).toBe(401);
+    expect(beginCredentialRotation).not.toHaveBeenCalled();
+
+    const duplicate = await rawHttpResponse(port, [
+      'POST /v1/credential-rotations HTTP/1.1',
+      'Host: 127.0.0.1',
+      `Authorization: Bearer ${TEST_CREDENTIAL}`,
+      `Authorization: Bearer ${TEST_CREDENTIAL}`,
+      'Content-Type: application/json',
+      'Content-Length: 2',
+      'Connection: close',
+      '',
+      '{}'
+    ].join('\r\n'));
+    expect(duplicate.status).toBe(401);
+    expect(beginCredentialRotation).not.toHaveBeenCalled();
+
+    const rejectedOrigin = await request(JSON.stringify({ canary: CANARY }), {
+      authorization: `Bearer ${TEST_CREDENTIAL}`,
+      origin: 'https://evil.example'
+    });
+    expect(rejectedOrigin.status).toBe(403);
+    expect(JSON.stringify(await responseJson(rejectedOrigin))).not.toContain(CANARY);
+    expect(beginCredentialRotation).not.toHaveBeenCalled();
+
+    const strictBody = await request(JSON.stringify({ canary: CANARY }), {
+      authorization: `Bearer ${TEST_CREDENTIAL}`
+    });
+    expect(strictBody.status).toBe(400);
+    expect(JSON.stringify(await responseJson(strictBody))).not.toContain(CANARY);
+    expect(beginCredentialRotation).not.toHaveBeenCalled();
+
+    const strictConfirmation = await fetch(
+      `http://127.0.0.1:${port}/v1/credential-rotation-confirmations`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${PENDING_CREDENTIAL}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ canary: CANARY })
+      }
+    );
+    expect(strictConfirmation.status).toBe(400);
+    expect(JSON.stringify(await responseJson(strictConfirmation))).not.toContain(CANARY);
+    expect(promoteCredential).not.toHaveBeenCalled();
+
+    const exactLimit = `${' '.repeat(4_094)}{}`;
+    expect(Buffer.byteLength(exactLimit)).toBe(4_096);
+    const accepted = await request(exactLimit, {
+      authorization: `Bearer ${TEST_CREDENTIAL}`
+    });
+    expect(accepted.status).toBe(200);
+    expect(beginCredentialRotation).toHaveBeenCalledTimes(1);
+
+    const overLimit = `${' '.repeat(4_095)}{}`;
+    expect(Buffer.byteLength(overLimit)).toBe(4_097);
+    const tooLarge = await request(overLimit, {
+      authorization: `Bearer ${TEST_CREDENTIAL}`
+    });
+    expect(tooLarge.status).toBe(413);
+    expect(beginCredentialRotation).toHaveBeenCalledTimes(1);
+
+    for (const [category, expected] of [
+      ['invalid-credential', 401],
+      ['credential-conflict', 409],
+      ['rate-limited', 429],
+      ['state-unavailable', 503]
+    ] as const) {
+      failure = new SecurityStateError(category);
+      const response = await request('{}', {
+        authorization: `Bearer ${TEST_CREDENTIAL}`,
+        origin: 'https://app.example'
+      });
+      expect(response.status).toBe(expected);
+      expect(response.headers.get('access-control-allow-origin')).toBe('https://app.example');
+      expect(response.headers.get('vary')).toBe('Origin');
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await responseJson(response)).toEqual({ error: 'request_rejected' });
+    }
+
+    failure = new Error(CANARY);
+    const internal = await request('{}', {
+      authorization: `Bearer ${TEST_CREDENTIAL}`
+    });
+    expect(internal.status).toBe(503);
+    expect(JSON.stringify(await responseJson(internal))).not.toContain(CANARY);
+  });
+
+  it('rejects body-bearing installation deletion before revocation state', async () => {
+    await host.stop();
+    const revokeCurrentInstallation = vi.fn(async (): Promise<InstallationRevocationResult> => ({
+      installationId: assertCanonicalUuid('11111111-1111-4111-8111-111111111111'),
+      credentialVersion: 1,
+      tombstoneVersion: 1,
+      status: 'revoked',
+      revokedAt: Date.parse('2026-08-10T12:02:00.000Z')
+    }));
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith({ runtime: { revokeCurrentInstallation } })
+    });
+    await host.start();
+    const port = hostPort(host);
+    const url = `http://127.0.0.1:${port}/v1/installations/current`;
+
+    const empty = await fetch(url, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${TEST_CREDENTIAL}` }
+    });
+    expect(empty.status).toBe(204);
+    expect(revokeCurrentInstallation).toHaveBeenCalledTimes(1);
+
+    const positiveLength = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        authorization: `Bearer ${TEST_CREDENTIAL}`,
+        'content-type': 'application/json'
+      },
+      body: '{}'
+    });
+    expect(positiveLength.status).toBe(400);
+    expect(revokeCurrentInstallation).toHaveBeenCalledTimes(1);
+
+    const firstChunk = await rawHttpResponse(port, [
+      'DELETE /v1/installations/current HTTP/1.1',
+      'Host: 127.0.0.1',
+      `Authorization: Bearer ${TEST_CREDENTIAL}`,
+      'Transfer-Encoding: chunked',
+      'Connection: keep-alive',
+      '',
+      '2',
+      '{}',
+      ''
+    ].join('\r\n'));
+    expect(firstChunk.status).toBe(400);
+    expect(revokeCurrentInstallation).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves the exact five-route preflight matrix without state access', async () => {
+    await host.stop();
+    const rejectIfCalled = async (): Promise<never> => {
+      throw new Error(CANARY);
+    };
+    const stateSpies = {
+      redeemPairing: vi.fn(rejectIfCalled),
+      issueSessionTicket: vi.fn(rejectIfCalled),
+      beginCredentialRotation: vi.fn(rejectIfCalled),
+      promoteCredential: vi.fn(rejectIfCalled),
+      revokeCurrentInstallation: vi.fn(rejectIfCalled)
+    };
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      browserOriginPolicy: {
+        allowedOrigins: ['https://app.example'],
+        allowNullOrigin: true
+      },
+      security: testSecurityWith({ runtime: stateSpies })
+    });
+    await host.start();
+    const port = hostPort(host);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const routes = [
+      ['/v1/pairing-redemptions', 'POST', 'Content-Type'],
+      ['/v1/session-tickets', 'POST', 'Authorization, Content-Type'],
+      ['/v1/credential-rotations', 'POST', 'Authorization, Content-Type'],
+      ['/v1/credential-rotation-confirmations', 'POST', 'Authorization, Content-Type'],
+      ['/v1/installations/current', 'DELETE', 'Authorization']
+    ] as const;
+    for (const [path, method, headers] of routes) {
+      const requestedHeaders = headers.split(', ').reverse().join(', ').toLowerCase();
+      const response = await fetch(`${baseUrl}${path}`, {
+        method: 'OPTIONS',
+        headers: {
+          origin: 'https://app.example',
+          'access-control-request-method': method,
+          'access-control-request-headers': requestedHeaders
+        }
+      });
+      expect(response.status).toBe(204);
+      expect(await response.text()).toBe('');
+      expect(response.headers.get('access-control-allow-origin')).toBe('https://app.example');
+      expect(response.headers.get('access-control-allow-methods')).toBe(method);
+      expect(response.headers.get('access-control-allow-headers')).toBe(headers);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(response.headers.get('vary')).toBe(
+        'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+      );
+    }
+
+    const nullOrigin = await fetch(`${baseUrl}/v1/pairing-redemptions`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'null',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Content-Type'
+      }
+    });
+    expect(nullOrigin.status).toBe(204);
+    expect(nullOrigin.headers.get('access-control-allow-origin')).toBe('null');
+
+    const originless = await fetch(`${baseUrl}/v1/session-tickets`, {
+      method: 'OPTIONS',
+      headers: {
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, Content-Type'
+      }
+    });
+    expect(originless.status).toBe(400);
+
+    const malformed = await fetch(`${baseUrl}/v1/session-tickets`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'https://app.example, https://evil.example',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, Content-Type'
+      }
+    });
+    expect(malformed.status).toBe(403);
+
+    const unexpectedMetadata = await fetch(`${baseUrl}/v1/session-tickets`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'https://app.example',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, Content-Type',
+        'access-control-request-private-network': 'true'
+      }
+    });
+    expect(unexpectedMetadata.status).toBe(400);
+
+    const multipleOrigin = await rawHttpResponse(port, [
+      'OPTIONS /v1/session-tickets HTTP/1.1',
+      'Host: 127.0.0.1',
+      'Origin: https://app.example',
+      'Origin: https://app.example',
+      'Access-Control-Request-Method: POST',
+      'Access-Control-Request-Headers: Authorization, Content-Type',
+      'Connection: close',
+      '',
+      ''
+    ].join('\r\n'));
+    expect(multipleOrigin.status).toBe(403);
+
+    for (const spy of Object.values(stateSpies)) {
+      expect(spy).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['promoted', 'already-promoted'] as const)(
+    'closes stale provider/session work before %s confirmation response',
+    async (status) => {
+      await host.stop();
+      const oldTicket = `${'D'.repeat(42)}E`;
+      const currentTicket = `${'F'.repeat(42)}E`;
+      const otherTicket = `${'G'.repeat(42)}E`;
+      const staleTicket = `${'H'.repeat(42)}E`;
+      for (const ticket of [oldTicket, currentTicket, otherTicket, staleTicket]) {
+        assertCanonical256BitToken(ticket);
+      }
+      const oldLease = controlledLease({
+        installationId: '11111111-1111-4111-8111-111111111111',
+        sessionId: '11111111-1111-4111-8111-111111111111',
+        credentialVersion: 1
+      });
+      const currentLease = controlledLease({
+        installationId: '11111111-1111-4111-8111-111111111111',
+        sessionId: '66666666-6666-4666-8666-666666666666',
+        credentialVersion: 2
+      });
+      const otherLease = controlledLease({
+        installationId: '77777777-7777-4777-8777-777777777777',
+        sessionId: '88888888-8888-4888-8888-888888888888',
+        credentialVersion: 1
+      });
+      const tickets = new Map<string, SessionLease>([
+        [oldTicket, oldLease],
+        [currentTicket, currentLease],
+        [otherTicket, otherLease],
+        [staleTicket, oldLease]
+      ]);
+      const consumeSessionTicket = vi.fn(async ({ ticket }: {
+        readonly ticket: string;
+      }): Promise<SessionLease> => {
+        const lease = tickets.get(ticket);
+        if (lease === undefined) throw new SecurityStateError('invalid-ticket');
+        tickets.delete(ticket);
+        return lease;
+      });
+      const promoteCredential = vi.fn(async (): Promise<CredentialPromotionResult> => ({
+        installationId: oldLease.installationId,
+        credentialVersion: 2,
+        tombstoneVersion: 1,
+        status,
+        confirmedAt: Date.parse('2026-08-10T12:01:00.000Z'),
+        idleExpiresAt: Date.parse('2026-09-01T00:00:00.000Z'),
+        absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
+      }));
+      const providerStarted = createDeferred();
+      let providerAborted = false;
+      const provider: GenerationProvider = {
+        id: 'stale-session-provider',
+        version: '1.0.0',
+        complete: async (_input, context) => new Promise<GenerationProviderCompletion>(
+          (_resolve, reject) => {
+            const abort = (): void => {
+              providerAborted = true;
+              reject(new Error(CANARY));
+            };
+            if (context.signal.aborted) {
+              abort();
+              return;
+            }
+            context.signal.addEventListener('abort', abort, { once: true });
+            providerStarted.resolve();
+          }
+        )
+      };
+      host = createRelayHostProduction({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        security: testSecurityWith({
+          runtime: { consumeSessionTicket, promoteCredential }
+        }),
+        transcriptionAdapter: createSynchronousFinalEventAdapter(),
+        languageClassifier: observingControlledClassifier(() => undefined),
+        generationService: new GenerationService(provider)
+      });
+      await host.start();
+
+      const oldSocket = await openSocket(host, oldTicket);
+      const readyPromise = nextMessage(oldSocket, (message) => message.type === 'session.ready');
+      oldSocket.send(sessionStartText());
+      const ready = await readyPromise;
+      oldSocket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID
+      }));
+      oldSocket.send(JSON.stringify({
+        type: 'utterance.commit',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID,
+        finalOriginalSampleOffset: 0
+      }));
+      await providerStarted.promise;
+
+      const currentSocket = await openSocket(host, currentTicket);
+      const otherSocket = await openSocket(host, otherTicket);
+      const oldClosed = waitForCloseDetails(oldSocket);
+      const confirmation = await fetch(
+        `http://127.0.0.1:${hostPort(host)}/v1/credential-rotation-confirmations`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${PENDING_CREDENTIAL}`,
+            'content-type': 'application/json'
+          },
+          body: '{}'
+        }
+      );
+      const close = await oldClosed;
+      expect(confirmation.status).toBe(200);
+      expect(close).toEqual({ code: 4401, reason: 'authentication_failed' });
+      expect(close.reason).not.toContain(CANARY);
+      expect(providerAborted).toBe(true);
+      expect(currentSocket.readyState).toBe(WebSocket.OPEN);
+      expect(otherSocket.readyState).toBe(WebSocket.OPEN);
+
+      const stale = new WebSocket(
+        `ws://127.0.0.1:${hostPort(host)}/v1/stream`,
+        [...createWebSocketSubprotocols(staleTicket)]
+      );
+      await expect(waitForUnexpectedResponse(stale)).resolves.toBe(401);
+
+      const currentClosed = waitForClose(currentSocket);
+      const otherClosed = waitForClose(otherSocket);
+      currentSocket.close(1000, 'test_done');
+      otherSocket.close(1000, 'test_done');
+      await Promise.all([currentClosed, otherClosed]);
+    }
+  );
+
+  it('closes all matching sessions before first/replayed revocation success', async () => {
+    await host.stop();
+    const firstTicket = `${'J'.repeat(42)}E`;
+    const secondTicket = `${'K'.repeat(42)}E`;
+    const otherTicket = `${'L'.repeat(42)}E`;
+    const delayedTicket = `${'M'.repeat(42)}E`;
+    for (const ticket of [firstTicket, secondTicket, otherTicket, delayedTicket]) {
+      assertCanonical256BitToken(ticket);
+    }
+    const installationId = assertCanonicalUuid('11111111-1111-4111-8111-111111111111');
+    const firstLease = controlledLease({
+      installationId,
+      sessionId: '11111111-1111-4111-8111-111111111111',
+      credentialVersion: 1
+    });
+    const secondLease = controlledLease({
+      installationId,
+      sessionId: '66666666-6666-4666-8666-666666666666',
+      credentialVersion: 2
+    });
+    const otherLease = controlledLease({
+      installationId: '77777777-7777-4777-8777-777777777777',
+      sessionId: '88888888-8888-4888-8888-888888888888',
+      credentialVersion: 1
+    });
+    const tickets = new Map<string, SessionLease>([
+      [firstTicket, firstLease],
+      [secondTicket, secondLease],
+      [otherTicket, otherLease],
+      [delayedTicket, firstLease]
+    ]);
+    const consumeSessionTicket = vi.fn(async ({ ticket }: {
+      readonly ticket: string;
+    }): Promise<SessionLease> => {
+      const lease = tickets.get(ticket);
+      if (lease === undefined) throw new SecurityStateError('invalid-ticket');
+      tickets.delete(ticket);
+      return lease;
+    });
+    let revocationCount = 0;
+    const revokeCurrentInstallation = vi.fn(
+      async (): Promise<InstallationRevocationResult> => {
+        revocationCount += 1;
+        return {
+          installationId,
+          credentialVersion: 2,
+          tombstoneVersion: 2,
+          status: revocationCount === 1 ? 'revoked' : 'already-revoked',
+          revokedAt: Date.parse('2026-08-10T12:02:00.000Z')
+        };
+      }
+    );
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith({
+        runtime: { consumeSessionTicket, revokeCurrentInstallation }
+      })
+    });
+    await host.start();
+
+    const firstSocket = await openSocket(host, firstTicket);
+    const secondSocket = await openSocket(host, secondTicket);
+    const otherSocket = await openSocket(host, otherTicket);
+    const firstClosed = waitForCloseDetails(firstSocket);
+    const secondClosed = waitForCloseDetails(secondSocket);
+    const url = `http://127.0.0.1:${hostPort(host)}/v1/installations/current`;
+    const revoke = () => fetch(url, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${TEST_CREDENTIAL}` }
+    });
+
+    const first = await revoke();
+    expect(first.status).toBe(204);
+    await expect(firstClosed).resolves.toEqual({ code: 4401, reason: 'authentication_failed' });
+    await expect(secondClosed).resolves.toEqual({ code: 4401, reason: 'authentication_failed' });
+    expect(otherSocket.readyState).toBe(WebSocket.OPEN);
+
+    const replay = await revoke();
+    expect(replay.status).toBe(204);
+    expect(revokeCurrentInstallation).toHaveBeenCalledTimes(2);
+    expect(otherSocket.readyState).toBe(WebSocket.OPEN);
+
+    const delayed = new WebSocket(
+      `ws://127.0.0.1:${hostPort(host)}/v1/stream`,
+      [...createWebSocketSubprotocols(delayedTicket)]
+    );
+    await expect(waitForUnexpectedResponse(delayed)).resolves.toBe(401);
+
+    const otherClosed = waitForClose(otherSocket);
+    otherSocket.close(1000, 'test_done');
+    await otherClosed;
+  });
+
+  it.each(['promotion', 'revocation'] as const)(
+    'rejects delayed ticket consumption after durable %s',
+    async (operation) => {
+      await host.stop();
+      const ticket = (operation === 'promotion' ? 'N' : 'P').repeat(42) + 'E';
+      assertCanonical256BitToken(ticket);
+      const lease = controlledLease({
+        installationId: '11111111-1111-4111-8111-111111111111',
+        sessionId: '11111111-1111-4111-8111-111111111111',
+        credentialVersion: 1
+      });
+      const consumeStarted = createDeferred();
+      const delayedLease = createValueDeferred<SessionLease>();
+      const consumeSessionTicket = vi.fn(async (): Promise<SessionLease> => {
+        consumeStarted.resolve();
+        return delayedLease.promise;
+      });
+      const promoteCredential = vi.fn(async (): Promise<CredentialPromotionResult> => ({
+        installationId: lease.installationId,
+        credentialVersion: 2,
+        tombstoneVersion: 1,
+        status: 'promoted',
+        confirmedAt: Date.parse('2026-08-10T12:01:00.000Z'),
+        idleExpiresAt: Date.parse('2026-09-01T00:00:00.000Z'),
+        absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
+      }));
+      const revokeCurrentInstallation = vi.fn(
+        async (): Promise<InstallationRevocationResult> => ({
+          installationId: lease.installationId,
+          credentialVersion: 1,
+          tombstoneVersion: 2,
+          status: 'revoked',
+          revokedAt: Date.parse('2026-08-10T12:02:00.000Z')
+        })
+      );
+      host = createRelayHostProduction({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        security: testSecurityWith({
+          runtime: {
+            consumeSessionTicket,
+            promoteCredential,
+            revokeCurrentInstallation
+          }
+        })
+      });
+      await host.start();
+
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${hostPort(host)}/v1/stream`,
+        [...createWebSocketSubprotocols(ticket)]
+      );
+      const rejected = waitForUnexpectedResponse(socket);
+      await consumeStarted.promise;
+      const response = operation === 'promotion'
+        ? await fetch(
+            `http://127.0.0.1:${hostPort(host)}/v1/credential-rotation-confirmations`,
+            {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${PENDING_CREDENTIAL}`,
+                'content-type': 'application/json'
+              },
+              body: '{}'
+            }
+          )
+        : await fetch(`http://127.0.0.1:${hostPort(host)}/v1/installations/current`, {
+            method: 'DELETE',
+            headers: { authorization: `Bearer ${TEST_CREDENTIAL}` }
+          });
+      expect(response.status).toBe(operation === 'promotion' ? 200 : 204);
+      delayedLease.resolve(lease);
+      await expect(rejected).resolves.toBe(401);
+    }
+  );
 
   it('issues a contract-valid development ticket and rejects malformed requests generically', async () => {
     const issued = await issueTicket(host);

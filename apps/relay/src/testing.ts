@@ -15,7 +15,9 @@ import {
   assertCanonical256BitToken,
   assertCanonicalUuid,
   hashCorrelationKey,
+  type DurableSecurityStateStore,
   type GenerationClaim,
+  type InstallationRevocationResult,
   type SecurityRuntimeStore,
   type SessionLease
 } from '@palancar/security-state';
@@ -35,6 +37,62 @@ export const TEST_ERROR_ID = '44444444-4444-4444-8444-444444444444';
 export const TEST_GATE_POLICY_VERSION = '1.0.0';
 export const TEST_TICKET = 'A'.repeat(42) + 'E';
 export const TEST_CREDENTIAL = 'B'.repeat(42) + 'E';
+const TEST_REVOCATION_AT = Date.parse('2026-08-10T12:02:00.000Z');
+
+interface TestRevocationState {
+  activeLease: SessionLease | undefined;
+  invalidatedSession: InstallationRevocationResult['invalidatedSession'];
+  revokedAt: number | undefined;
+  tombstoneVersion: number;
+}
+
+function createTestRevocationState(): TestRevocationState {
+  return {
+    activeLease: undefined,
+    invalidatedSession: undefined,
+    revokedAt: undefined,
+    tombstoneVersion: 0
+  };
+}
+
+function revokeTestInstallation(
+  state: TestRevocationState,
+  credential: string
+): InstallationRevocationResult {
+  if (credential !== TEST_CREDENTIAL) throw new SecurityStateError('invalid-credential');
+  if (state.revokedAt !== undefined) {
+    return Object.freeze({
+      installationId: assertCanonicalUuid(TEST_SESSION_ID),
+      credentialVersion: 1,
+      tombstoneVersion: state.tombstoneVersion,
+      status: 'already-revoked' as const,
+      revokedAt: state.revokedAt,
+      ...(state.invalidatedSession === undefined
+        ? {}
+        : { invalidatedSession: state.invalidatedSession })
+    });
+  }
+  state.revokedAt = TEST_REVOCATION_AT;
+  state.tombstoneVersion += 1;
+  state.invalidatedSession = state.activeLease === undefined
+    ? undefined
+    : Object.freeze({
+        installationId: state.activeLease.installationId,
+        sessionId: state.activeLease.sessionId,
+        sessionEpoch: state.activeLease.sessionEpoch
+      });
+  state.activeLease = undefined;
+  return Object.freeze({
+    installationId: assertCanonicalUuid(TEST_SESSION_ID),
+    credentialVersion: 1,
+    tombstoneVersion: state.tombstoneVersion,
+    status: 'revoked' as const,
+    revokedAt: state.revokedAt,
+    ...(state.invalidatedSession === undefined
+      ? {}
+      : { invalidatedSession: state.invalidatedSession })
+  });
+}
 
 export function createTestSessionLease(): SessionLease {
   return Object.freeze({
@@ -67,6 +125,7 @@ function testGenerationClaim(phase: GenerationClaim['phase']): GenerationClaim {
 export function createTestSecurityRuntime(
   overrides: Partial<SecurityRuntimeStore> = {}
 ): SecurityRuntimeStore {
+  const revocation = createTestRevocationState();
   const unsupported = async (): Promise<never> => {
     throw new Error('unsupported_test_security_operation');
   };
@@ -76,11 +135,29 @@ export function createTestSecurityRuntime(
     beginCredentialRotation: unsupported,
     promoteCredential: unsupported,
     revokeInstallation: unsupported,
+    revokeCurrentInstallation: async ({ credential }) =>
+      revokeTestInstallation(revocation, credential),
     issueSessionTicket: unsupported,
     consumeSessionTicket: unsupported,
-    activateSession: async ({ lease }) => ({ ...lease, phase: 'active' }),
-    heartbeatSession: async ({ lease }) => ({ ...lease, leaseVersion: lease.leaseVersion + 1 }),
-    endSession: async () => undefined,
+    activateSession: async ({ lease }) => {
+      const activeLease = Object.freeze({ ...lease, phase: 'active' as const });
+      revocation.activeLease = activeLease;
+      return activeLease;
+    },
+    heartbeatSession: async ({ lease }) => {
+      const activeLease = Object.freeze({ ...lease, leaseVersion: lease.leaseVersion + 1 });
+      revocation.activeLease = activeLease;
+      return activeLease;
+    },
+    endSession: async ({ lease }) => {
+      const activeLease = revocation.activeLease;
+      if (
+        activeLease?.sessionId === lease.sessionId &&
+        activeLease.sessionEpoch === lease.sessionEpoch
+      ) {
+        revocation.activeLease = undefined;
+      }
+    },
     reserveAudio: unsupported,
     authorizeGeneration: async () => ({
       status: 'acquired',
@@ -106,7 +183,8 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
   let leaseVersion = 1;
   let grantCounter = 0;
   const tickets = new Set<string>();
-  const runtime = createTestSecurityRuntime({
+  const revocation = createTestRevocationState();
+  const baseRuntime = createTestSecurityRuntime({
     redeemPairing: async () => ({
       installationId: assertCanonicalUuid(TEST_SESSION_ID),
       credential: assertCanonical256BitToken(TEST_CREDENTIAL),
@@ -115,7 +193,9 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
       absoluteExpiresAt: Date.parse('2026-10-01T00:00:00.000Z')
     }),
     issueSessionTicket: async ({ credential, environment, audience, intent }) => {
-      if (credential !== TEST_CREDENTIAL) throw new SecurityStateError('invalid-credential');
+      if (credential !== TEST_CREDENTIAL || revocation.revokedAt !== undefined) {
+        throw new SecurityStateError('invalid-credential');
+      }
       ticketCounter += 1;
       const ticket = `${String(ticketCounter).padStart(42, 'A')}E`;
       tickets.add(ticket);
@@ -131,17 +211,36 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
       };
     },
     consumeSessionTicket: async ({ ticket }) => {
-      if (!tickets.delete(ticket)) throw new SecurityStateError('invalid-ticket');
-      return { ...createTestSessionLease(), phase: 'opening' };
+      if (revocation.revokedAt !== undefined || !tickets.delete(ticket)) {
+        throw new SecurityStateError('invalid-ticket');
+      }
+      const lease = Object.freeze({ ...createTestSessionLease(), phase: 'opening' as const });
+      revocation.activeLease = lease;
+      return lease;
     },
     activateSession: async ({ lease }) => {
       leaseVersion += 1;
-      return { ...lease, phase: 'active', leaseVersion };
+      const activeLease = Object.freeze({ ...lease, phase: 'active' as const, leaseVersion });
+      revocation.activeLease = activeLease;
+      return activeLease;
     },
     heartbeatSession: async ({ lease }) => {
       leaseVersion += 1;
-      return { ...lease, leaseVersion };
+      const activeLease = Object.freeze({ ...lease, leaseVersion });
+      revocation.activeLease = activeLease;
+      return activeLease;
     },
+    endSession: async ({ lease }) => {
+      const activeLease = revocation.activeLease;
+      if (
+        activeLease?.sessionId === lease.sessionId &&
+        activeLease.sessionEpoch === lease.sessionEpoch
+      ) {
+        revocation.activeLease = undefined;
+      }
+    },
+    revokeCurrentInstallation: async ({ credential }) =>
+      revokeTestInstallation(revocation, credential),
     reserveAudio: async ({ lease, utteranceId, fromOriginalSampleOffset, originalSamples }) => {
       grantCounter += 1;
       return {
@@ -160,21 +259,15 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
         reservedOriginalSamples: originalSamples
       };
     }
-  }) as SecurityRuntimeStore & {
-    readonly [DURABLE_SECURITY_STATE_STORE]: true;
-    readonly deploymentBoundary: 'DURABLE_PROVIDER';
-    readonly capabilities: {
-      readonly durableAcrossProcesses: true;
-      readonly paidProvidersAllowed: true;
-    };
-  };
-  Object.defineProperties(runtime, {
-    [DURABLE_SECURITY_STATE_STORE]: { value: true, enumerable: false },
-    deploymentBoundary: { value: 'DURABLE_PROVIDER', enumerable: true },
-    capabilities: {
-      value: Object.freeze({ durableAcrossProcesses: true, paidProvidersAllowed: true }),
-      enumerable: true
-    }
+  });
+  const runtime: DurableSecurityStateStore = Object.freeze({
+    ...baseRuntime,
+    [DURABLE_SECURITY_STATE_STORE]: true as const,
+    deploymentBoundary: 'DURABLE_PROVIDER',
+    capabilities: Object.freeze({
+      durableAcrossProcesses: true,
+      paidProvidersAllowed: true
+    })
   });
   const maintenance = {
     checkReadiness: async (): Promise<void> => undefined,
