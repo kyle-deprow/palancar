@@ -13,6 +13,11 @@ import {
   type TargetLanguage,
 } from "@palancar/language-registry";
 
+import type {
+  AuthOutcome,
+  AuthRequiredReason,
+  G2AuthController,
+} from "../auth/types.js";
 import { PAGE_LAYOUTS } from "../display/index.js";
 import {
   createInitialState,
@@ -31,8 +36,6 @@ import {
 import { toStartUpPageContainer } from "./sdk-layout.js";
 
 export const PALANCAR_G2_READY = "PALANCAR_G2_READY";
-export const DEFAULT_RELAY_ORIGIN =
-  "https://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io";
 
 const TARGET_STORAGE_KEY = "palancar.target-language";
 const DISPLAY_DEBOUNCE_MS = 175;
@@ -52,6 +55,7 @@ export const RECOVERY_BACKOFF_MAX_MS = 8_000;
 export const RECOVERY_READY_DEADLINE_MS = 10_000;
 
 const CLEANUP_PREEMPTED = Symbol("cleanup-preempted");
+const AUTH_OPERATION_PREEMPTED = Symbol("auth-operation-preempted");
 
 type TransportCloseResult =
   | { readonly ok: true }
@@ -79,6 +83,12 @@ export type G2BridgePort = Pick<
 
 export type BridgeBootState = "idle" | "booting" | "ready" | "failed";
 export type BridgeCleanupState = "active" | "cleaned";
+
+export type G2PhoneAuthState =
+  | { readonly status: "starting" | "checking" | "revoking" | "enrolling" | "ready" | "storage-error" | "error" }
+  | { readonly status: "required"; readonly reason: AuthRequiredReason };
+
+export type G2PhoneAuthStateListener = (state: G2PhoneAuthState) => void;
 
 export interface BridgeRuntimeSnapshot {
   readonly bootState: BridgeBootState;
@@ -117,12 +127,13 @@ export type G2TransportFactory = (
 ) => G2Transport;
 
 export interface G2BridgeRuntimeOptions {
+  readonly relayOrigin: string;
+  readonly authController: G2AuthController;
   readonly waitForBridge?: () => Promise<G2BridgePort>;
   readonly readyLogger?:
     (marker: typeof PALANCAR_G2_READY) => unknown | Promise<unknown>;
   readonly createTransport?: G2TransportFactory;
   readonly idGenerator?: () => string;
-  readonly relayOrigin?: string;
   readonly storage?: G2TargetStorage;
   readonly displayDebounceMs?: number;
   readonly recoveryTiming?: RecoveryTiming;
@@ -171,6 +182,82 @@ export function isPairedTurnEffects(
     stopEffect.utteranceId === commitEffect.utteranceId;
 }
 
+function toClientEvent(event: RelayTransportCallbackEvent): ClientEvent | undefined {
+  switch (event.type) {
+    case "session.ready":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        targetLanguage: event.targetLanguage,
+        result: event.result,
+      };
+    case "transcript.partial":
+    case "transcript.final":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        utteranceId: event.utteranceId,
+        segmentId: event.segmentId,
+        revision: event.revision,
+        text: event.text,
+      };
+    case "language.decision":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        utteranceId: event.utteranceId,
+        segmentId: event.segmentId,
+        revision: event.revision,
+        decision: event.decision,
+        selectedTargetLanguage: event.selectedTargetLanguage,
+      };
+    case "translation.ready":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        utteranceId: event.utteranceId,
+        segmentId: event.segmentId,
+        acceptedFinalRevision: event.acceptedFinalRevision,
+        englishTranslation: event.englishTranslation,
+      };
+    case "suggestions.ready":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        utteranceId: event.utteranceId,
+        segmentId: event.segmentId,
+        acceptedFinalRevision: event.acceptedFinalRevision,
+        suggestions: event.suggestions,
+      };
+    case "utterance.aborted":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+        utteranceId: event.utteranceId,
+        category: event.category,
+      };
+    case "transport.lost":
+      return {
+        type: event.type,
+        sessionId: event.sessionId,
+        sessionEpoch: event.sessionEpoch,
+      };
+    case "fatal":
+      return { type: event.type };
+    case "credential.rejected":
+    case "credential.storage-error":
+      return { type: event.type };
+    case "session.rejected":
+      return undefined;
+  }
+}
+
 function randomUuidV4(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
@@ -203,6 +290,10 @@ function targetName(target: TargetLanguage | undefined): string {
 function targetForState(state: ClientState): TargetLanguage | undefined {
   switch (state.state) {
     case "Starting":
+    case "EnrollmentChecking":
+    case "EnrollmentRequired":
+    case "Enrolling":
+    case "StorageError":
     case "TargetSelection":
       return state.highlightedTarget;
     case "Ready":
@@ -219,6 +310,89 @@ function sessionReadyForState(state: ClientState): boolean {
   return state.state === "Ready" && state.sessionReady;
 }
 
+function phoneAuthState(state: ClientState): G2PhoneAuthState {
+  switch (state.state) {
+    case "Starting":
+      return Object.freeze({ status: "starting" });
+    case "EnrollmentChecking":
+      return Object.freeze({
+        status: state.phase === "revoking" ? "revoking" : "checking",
+      });
+    case "EnrollmentRequired":
+      return state.reason === "relay-unavailable"
+        ? Object.freeze({ status: "error" })
+        : Object.freeze({ status: "required", reason: state.reason });
+    case "Enrolling":
+      return Object.freeze({ status: "enrolling" });
+    case "StorageError":
+      return Object.freeze({ status: "storage-error" });
+    case "TargetSelection":
+    case "Ready":
+    case "Listening":
+    case "Finalizing":
+    case "Translating":
+    case "Results":
+      return Object.freeze({ status: "ready" });
+    case "Error":
+      return Object.freeze({ status: "error" });
+  }
+}
+
+function samePhoneAuthState(left: G2PhoneAuthState, right: G2PhoneAuthState): boolean {
+  return left.status === right.status &&
+    (left.status !== "required" ||
+      (right.status === "required" && left.reason === right.reason));
+}
+
+function enrollmentOutcomeEvent(outcome: AuthOutcome): ClientEvent {
+  switch (outcome.kind) {
+    case "ready":
+      return { type: "enrollment.ready" };
+    case "required":
+      return { type: "enrollment.required", reason: outcome.reason };
+    case "storage-error":
+      return { type: "enrollment.storage-error" };
+    case "unavailable":
+      return { type: "enrollment.unavailable" };
+  }
+}
+
+function enrollmentAttemptOutcomeEvent(outcome: AuthOutcome): ClientEvent {
+  switch (outcome.kind) {
+    case "ready":
+      return { type: "enrollment.ready" };
+    case "required":
+      return outcome.reason === "pairing-failed" || outcome.reason === "pairing-uncertain"
+        ? { type: "enrollment.failed", reason: outcome.reason }
+        : { type: "enrollment.failed", reason: "pairing-uncertain" };
+    case "storage-error":
+      return { type: "enrollment.storage-error" };
+    case "unavailable":
+      return { type: "enrollment.unavailable" };
+  }
+}
+
+function sessionAuthOutcomeEvent(outcome: AuthOutcome, authAttempt: number): ClientEvent {
+  switch (outcome.kind) {
+    case "ready":
+      return { type: "session.authenticated", authAttempt };
+    case "required":
+      return { type: "session.auth-required", authAttempt, reason: outcome.reason };
+    case "storage-error":
+      return { type: "session.auth-storage-error", authAttempt };
+    case "unavailable":
+      return { type: "session.auth-unavailable", authAttempt };
+  }
+}
+
+function revocationOutcomeEvent(outcome: AuthOutcome): ClientEvent {
+  if (outcome.kind === "storage-error") return { type: "enrollment.storage-error" };
+  if (outcome.kind === "required" && outcome.reason === "revoked") {
+    return { type: "revocation.completed", reason: "revoked" };
+  }
+  return { type: "revocation.completed", reason: "revocation-unconfirmed" };
+}
+
 function displayTexts(state: ClientState): readonly string[] {
   const target = targetForState(state);
   const targetLine = `Target: ${targetName(target)}`;
@@ -230,6 +404,38 @@ function displayTexts(state: ClientState): readonly string[] {
         "Source: waiting",
         "English: waiting",
         "Suggestion: ready",
+      ];
+    case "EnrollmentChecking":
+      return [
+        state.phase === "revoking" ? "Revoking enrollment" : "Checking enrollment",
+        targetLine,
+        "Source: unavailable",
+        "English: unavailable",
+        "Please wait",
+      ];
+    case "EnrollmentRequired":
+      return [
+        "Enrollment required",
+        targetLine,
+        "Source: unavailable",
+        "English: unavailable",
+        "Continue on phone",
+      ];
+    case "Enrolling":
+      return [
+        "Enrolling",
+        targetLine,
+        "Source: unavailable",
+        "English: unavailable",
+        "Complete on phone",
+      ];
+    case "StorageError":
+      return [
+        "Enrollment storage error",
+        targetLine,
+        "Source: unavailable",
+        "English: unavailable",
+        "Retry on phone",
       ];
     case "TargetSelection":
       return [
@@ -247,6 +453,15 @@ function displayTexts(state: ClientState): readonly string[] {
           "Source: Interrupted turn cleared",
           "English: waiting",
           "Please wait",
+        ];
+      }
+      if (state.pending === "authentication") {
+        return [
+          state.message === undefined ? "Authenticating" : "Authentication unavailable",
+          targetLine,
+          "Source: unavailable",
+          "English: unavailable",
+          state.message === undefined ? "Please wait" : "Press to retry",
         ];
       }
       return [
@@ -386,6 +601,7 @@ export class G2BridgeRuntime {
   readonly #waitForBridge: () => Promise<G2BridgePort>;
   readonly #readyLogger: (marker: typeof PALANCAR_G2_READY) => unknown | Promise<unknown>;
   readonly #createTransport: G2TransportFactory;
+  readonly #authController: G2AuthController;
   readonly #idGenerator: () => string;
   readonly #relayOrigin: string;
   readonly #storage: G2TargetStorage | undefined;
@@ -398,6 +614,13 @@ export class G2BridgeRuntime {
   #recoveryCycle = 0;
   #recoveryContext: RecoveryContext | undefined;
   #pendingRecoveryLoss = false;
+  #authGeneration = 0;
+  readonly #authCancellationWaiters = new Set<() => void>();
+  readonly #pendingAuthOperations = new Set<Promise<void>>();
+  #revocationPromise: Promise<void> | undefined;
+  #authControllerDisposed = false;
+  readonly #phoneAuthListeners = new Set<G2PhoneAuthStateListener>();
+  #lastPhoneAuthState: G2PhoneAuthState = Object.freeze({ status: "starting" });
   readonly #pendingTransportStarts = new Set<G2Transport>();
   readonly #pendingTransportCloses = new Set<G2Transport>();
   #bootPromise: Promise<void> | undefined;
@@ -442,18 +665,34 @@ export class G2BridgeRuntime {
   #pendingStartupCreation: Promise<StartUpPageCreateResult> | undefined;
   #startupTeardownPromise: Promise<void> | undefined;
   #audioCloseGeneration = 0;
-  #detachedAudioCloseMonitor: Promise<void> | undefined;
-  #detachedAudioCloseTimer: ReturnType<typeof setTimeout> | undefined;
-  #detachedAudioCloseMonitorGeneration: number | undefined;
-  #detachedAudioCloseFailureGeneration: number | undefined;
 
-  constructor(options: G2BridgeRuntimeOptions = {}) {
+  constructor(options: G2BridgeRuntimeOptions) {
+    if (options === undefined || options === null) {
+      throw new TypeError("G2 bridge runtime options are required");
+    }
     this.#waitForBridge = options.waitForBridge ?? waitForEvenAppBridge;
     this.#readyLogger = options.readyLogger ?? ((marker) => console.info(marker));
     this.#createTransport = options.createTransport ?? ((transportOptions) =>
       createRelayTransport(transportOptions) as RelayTransport);
+    this.#authController = options.authController;
+    if (
+      this.#authController === undefined ||
+      typeof this.#authController.initialize !== "function" ||
+      typeof this.#authController.enroll !== "function" ||
+      typeof this.#authController.retryPersistence !== "function" ||
+      typeof this.#authController.resetEnrollment !== "function" ||
+      typeof this.#authController.prepareSessionBoundary !== "function" ||
+      typeof this.#authController.revokeCurrent !== "function" ||
+      typeof this.#authController.dispose !== "function" ||
+      this.#authController.credentialProvider === undefined
+    ) {
+      throw new TypeError("authController must provide the G2 authentication contract");
+    }
     this.#idGenerator = options.idGenerator ?? randomUuidV4;
-    this.#relayOrigin = options.relayOrigin ?? DEFAULT_RELAY_ORIGIN;
+    if (typeof options.relayOrigin !== "string" || options.relayOrigin.length === 0) {
+      throw new TypeError("relayOrigin is required");
+    }
+    this.#relayOrigin = options.relayOrigin;
     this.#storage = options.storage ?? defaultStorage();
     const displayDebounceMs = options.displayDebounceMs ?? DISPLAY_DEBOUNCE_MS;
     if (!Number.isFinite(displayDebounceMs) || displayDebounceMs < 0) {
@@ -491,6 +730,95 @@ export class G2BridgeRuntime {
   boot(): Promise<void> {
     this.#bootPromise ??= this.#bootOnce();
     return this.#bootPromise;
+  }
+
+  #currentState(): ClientState {
+    return this.#state;
+  }
+
+  async enroll(pairingCode: string): Promise<void> {
+    let completion: Promise<void> | undefined;
+    await this.#queueSerializedEvent(async () => {
+      if (this.#state.state !== "EnrollmentRequired") return;
+      await this.#dispatchAndRunEffects({ type: "enrollment.started" });
+      const postDispatchState = this.#currentState();
+      if (postDispatchState.state !== "Enrolling" || this.#isRuntimeInactive()) return;
+      completion = this.#launchAuthOperation(
+        () => this.#authController.enroll(pairingCode),
+        (outcome) => this.#dispatchAndRunEffects(enrollmentAttemptOutcomeEvent(outcome)),
+      );
+    });
+    await completion;
+  }
+
+  async retryEnrollment(): Promise<void> {
+    let completion: Promise<void> | undefined;
+    await this.#queueSerializedEvent(() => this.#dispatchAndRunEffects(
+      { type: "enrollment.retry" },
+      undefined,
+      (operation) => { completion = operation; },
+    ));
+    await completion;
+  }
+
+  async resetEnrollment(): Promise<void> {
+    let completion: Promise<void> | undefined;
+    await this.#queueSerializedEvent(() => this.#dispatchAndRunEffects(
+      { type: "enrollment.reset" },
+      undefined,
+      (operation) => { completion = operation; },
+    ));
+    await completion;
+  }
+
+  revokeEnrollment(): Promise<void> {
+    const existing = this.#revocationPromise;
+    if (existing !== undefined) return existing;
+    const revocation = this.#revokeEnrollmentOnce();
+    this.#revocationPromise = revocation;
+    const clear = (): void => {
+      if (this.#revocationPromise === revocation) this.#revocationPromise = undefined;
+    };
+    void revocation.then(clear, clear);
+    return revocation;
+  }
+
+  async #revokeEnrollmentOnce(): Promise<void> {
+    let completion: Promise<void> | undefined;
+    await this.#queueSerializedEvent(async () => {
+      const previousState = this.#state;
+      await this.#dispatchAndRunEffects({ type: "revocation.started" });
+      if (
+        this.#state === previousState ||
+        this.#state.state !== "EnrollmentChecking" ||
+        this.#state.phase !== "revoking" ||
+        this.#isRuntimeInactive()
+      ) return;
+      completion = this.#launchAuthOperation(
+        () => this.#authController.revokeCurrent(),
+        (outcome) => this.#dispatchAndRunEffects(revocationOutcomeEvent(outcome)),
+      );
+    });
+    await completion;
+  }
+
+  subscribePhoneAuthState(listener: G2PhoneAuthStateListener): () => void {
+    if (typeof listener !== "function") {
+      throw new TypeError("Phone authentication listener must be a function");
+    }
+    if (this.#cleanupRequested || this.#cleanupState === "cleaned") return () => undefined;
+    this.#phoneAuthListeners.add(listener);
+    try {
+      listener(this.#lastPhoneAuthState);
+    } catch {
+      // A phone listener cannot interrupt bridge or authentication work.
+    }
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.#phoneAuthListeners.delete(listener);
+    };
   }
 
   cleanup(): Promise<void> {
@@ -542,12 +870,20 @@ export class G2BridgeRuntime {
         break;
       }
       if (this.#cleanupState === "cleaned" || this.#bootState === "failed") break;
+      const pendingAuthOperations = [...this.#pendingAuthOperations];
+      if (pendingAuthOperations.length > 0) {
+        const authPreempted = await this.#awaitEventTailOrCleanup(
+          Promise.all(pendingAuthOperations).then(() => undefined),
+        );
+        if (authPreempted || this.#cleanupRequested || this.#cleanupInProgress) continue;
+      }
       const displayTimer = this.#displayTimerPromise;
       if (displayTimer !== undefined) await displayTimer;
       const displayTail = this.#displayTail;
       await displayTail;
       if (
         eventTail === this.#eventTail &&
+        this.#pendingAuthOperations.size === 0 &&
         displayTimer === this.#displayTimerPromise &&
         this.#pendingDisplayState === undefined &&
         !this.#displayInProgress
@@ -616,7 +952,7 @@ export class G2BridgeRuntime {
       this.#displayAvailable = true;
       this.#unsubscribe = bridge.onEvenHubEvent((event) => this.#receiveBridgeEvent(event));
       this.#bootState = "ready";
-      this.#dispatch({ type: "startup.ready" });
+      await this.#dispatchAndRunEffects({ type: "startup.ready" });
       await this.#awaitBootDependency(
         this.#whenDisplayIdle(),
         "G2 initial display was interrupted during startup",
@@ -709,7 +1045,76 @@ export class G2BridgeRuntime {
     }
   }
 
+  #invalidateAuthOperations(): void {
+    this.#authGeneration += 1;
+    for (const cancel of this.#authCancellationWaiters) cancel();
+    this.#authCancellationWaiters.clear();
+  }
+
+  #disposeAuthController(): Error | undefined {
+    if (this.#authControllerDisposed) return undefined;
+    this.#authControllerDisposed = true;
+    try {
+      this.#authController.dispose();
+      return undefined;
+    } catch (error: unknown) {
+      return normalizeError(error, "G2 authentication controller disposal failed");
+    }
+  }
+
+  #launchAuthOperation(
+    operation: () => Promise<AuthOutcome>,
+    applyOutcome: (outcome: AuthOutcome) => void | Promise<void>,
+  ): Promise<void> {
+    this.#invalidateAuthOperations();
+    const generation = this.#authGeneration;
+    let cancelOperation = (): void => undefined;
+    const cancelled = new Promise<typeof AUTH_OPERATION_PREEMPTED>((resolve) => {
+      cancelOperation = () => resolve(AUTH_OPERATION_PREEMPTED);
+    });
+    this.#authCancellationWaiters.add(cancelOperation);
+
+    const completion = (async () => {
+      let operationResult: AuthOutcome | typeof AUTH_OPERATION_PREEMPTED;
+      try {
+        operationResult = await Promise.race([
+          Promise.resolve().then(operation).catch(() => ({ kind: "unavailable" } as const)),
+          cancelled,
+        ]);
+      } finally {
+        this.#authCancellationWaiters.delete(cancelOperation);
+      }
+      if (
+        operationResult === AUTH_OPERATION_PREEMPTED ||
+        generation !== this.#authGeneration ||
+        this.#isRuntimeInactive()
+      ) return;
+      await this.#queueSerializedEvent(async () => {
+        if (generation !== this.#authGeneration || this.#isRuntimeInactive()) return;
+        await applyOutcome(operationResult);
+      });
+    })();
+    this.#pendingAuthOperations.add(completion);
+    void completion.finally(() => this.#pendingAuthOperations.delete(completion));
+    return completion;
+  }
+
+  #publishPhoneAuthState(): void {
+    const next = phoneAuthState(this.#state);
+    if (samePhoneAuthState(this.#lastPhoneAuthState, next)) return;
+    this.#lastPhoneAuthState = next;
+    for (const listener of this.#phoneAuthListeners) {
+      try {
+        listener(next);
+      } catch {
+        // Phone projection is observational and cannot affect runtime work.
+      }
+    }
+  }
+
   async #teardownAfterBootFailure(): Promise<void> {
+    this.#invalidateAuthOperations();
+    const authFailure = this.#disposeAuthController();
     this.#cancelRecoveryTimers();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
@@ -724,7 +1129,7 @@ export class G2BridgeRuntime {
     }
     this.#pendingDisplayState = undefined;
 
-    let cleanupFailure: Error | undefined;
+    let cleanupFailure: Error | undefined = authFailure;
     try {
       await this.#detachEventSubscription();
     } catch (error: unknown) {
@@ -840,6 +1245,9 @@ export class G2BridgeRuntime {
     this.#cleanupSignalResolve = undefined;
     for (const waiter of this.#cleanupWaiters) waiter();
     this.#cleanupWaiters.clear();
+    this.#invalidateAuthOperations();
+    let controllerFailure = this.#disposeAuthController();
+    this.#phoneAuthListeners.clear();
     this.#cancelRecoveryTimers();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
@@ -869,7 +1277,8 @@ export class G2BridgeRuntime {
     this.#pendingTransportStarts.clear();
 
     while (true) {
-      let cleanupFailure = subscriptionFailure;
+      let cleanupFailure = controllerFailure ?? subscriptionFailure;
+      controllerFailure = undefined;
       subscriptionFailure = undefined;
       for (const transport of transports) {
         const closeResult = this.#tryCloseTransport(transport);
@@ -1031,7 +1440,7 @@ export class G2BridgeRuntime {
 
   #queueTransportEvent(
     transport: G2Transport,
-    event: RelayTransportCallbackEvent | ClientEvent,
+    event: ClientEvent,
     generation = this.#transportGeneration,
     recoveryAttempt: number | undefined = undefined,
   ): void {
@@ -1039,10 +1448,9 @@ export class G2BridgeRuntime {
     const guard: TransportEventGuard = { transport, generation, recoveryAttempt };
     this.#queueSerializedEvent(async () => {
       if (this.#isRuntimeInactive() || !this.#isCurrentTransport(guard.transport, guard.generation)) return;
-      const clientEvent = event as ClientEvent;
-      await this.#dispatchAndRunEffects(clientEvent, guard);
+      await this.#dispatchAndRunEffects(event, guard);
       if (
-        clientEvent.type === "fatal" &&
+        event.type === "fatal" &&
         !this.#isRuntimeInactive() &&
         this.#isCurrentTransport(guard.transport, guard.generation)
       ) {
@@ -1057,11 +1465,11 @@ export class G2BridgeRuntime {
     });
   }
 
-  #queueSerializedEvent(operation: () => void | Promise<void>): void {
-    if (this.#isRuntimeInactive()) return;
+  #queueSerializedEvent(operation: () => void | Promise<void>): Promise<void> {
+    if (this.#isRuntimeInactive()) return Promise.resolve();
     if (this.#queuedEventCount >= MAX_QUEUED_EVENTS) {
       this.#handleEventQueueOverflow();
-      return;
+      return Promise.resolve();
     }
     this.#queuedEventCount += 1;
     const queuedOperation = this.#eventTail.then(async () => {
@@ -1071,9 +1479,11 @@ export class G2BridgeRuntime {
         this.#queuedEventCount -= 1;
       }
     });
-    this.#eventTail = queuedOperation.catch((error: unknown) => {
+    const settledOperation = queuedOperation.catch((error: unknown) => {
       this.#lastEventError = normalizeError(error, "G2 bridge event handling failed");
     });
+    this.#eventTail = settledOperation;
+    return settledOperation;
   }
 
   #handleEventQueueOverflow(): void {
@@ -1210,7 +1620,10 @@ export class G2BridgeRuntime {
     }
     if (eventType === undefined || isEventType(eventType, OsEventTypeList.CLICK_EVENT)) {
       let press: ClientEvent = { type: "press" };
-      if (this.#state.state === "Ready" && this.#state.sessionReady) {
+      if (
+        (this.#state.state === "Ready" && this.#state.sessionReady) ||
+        this.#state.state === "Results"
+      ) {
         try {
           press = { type: "press", utteranceId: this.#idGenerator() };
         } catch {
@@ -1225,6 +1638,7 @@ export class G2BridgeRuntime {
   #dispatchAndRunEffects(
     event: ClientEvent,
     guard?: TransportEventGuard,
+    onAuthOperation?: (operation: Promise<void>) => void,
   ): Promise<void> {
     if (this.#isRuntimeInactive()) return Promise.resolve();
     const reduction = this.#dispatch(event);
@@ -1241,7 +1655,7 @@ export class G2BridgeRuntime {
     ) {
       this.#cancelRecoveryTimers();
     }
-    return this.#runEffects(reduction.effects);
+    return this.#runEffects(reduction.effects, onAuthOperation);
   }
 
   #dispatch(
@@ -1253,32 +1667,52 @@ export class G2BridgeRuntime {
     }
     const reduction = reduceClientState(this.#state, event);
     this.#state = reduction.state;
+    this.#publishPhoneAuthState();
     if (scheduleDisplay) this.#scheduleDisplay(this.#state);
     return reduction;
   }
 
-  async #runEffects(effects: readonly ClientEffect[]): Promise<void> {
-    const orderedEffects = [
-      ...effects.filter((effect) => effect.type === "start-utterance"),
-      ...effects.filter((effect) => effect.type !== "start-utterance"),
-    ];
-    for (let index = 0; index < orderedEffects.length; index += 1) {
-      const effect = orderedEffects[index];
+  async #runEffects(
+    effects: readonly ClientEffect[],
+    onAuthOperation?: (operation: Promise<void>) => void,
+  ): Promise<void> {
+    for (let index = 0; index < effects.length; index += 1) {
+      const effect = effects[index];
       if (effect === undefined) continue;
       if (this.#isRuntimeInactive()) return;
       try {
-        const followingEffect = orderedEffects[index + 1];
-        if (followingEffect !== undefined && isPairedTurnEffects(effect, followingEffect)) {
-          this.#audioPcmEnabled = false;
-          try {
-            this.#transport?.commitUtterance();
-          } finally {
-            this.#startDetachedAudioClose();
-          }
-          index += 1;
-          continue;
-        }
         switch (effect.type) {
+          case "check-enrollment": {
+            const operation = this.#launchAuthOperation(
+              effect.mode === "initialize"
+                ? () => this.#authController.initialize()
+                : () => this.#authController.retryPersistence(),
+              (outcome) => this.#dispatchAndRunEffects(enrollmentOutcomeEvent(outcome)),
+            );
+            onAuthOperation?.(operation);
+            break;
+          }
+          case "reset-enrollment": {
+            const operation = this.#launchAuthOperation(
+              () => this.#authController.resetEnrollment(),
+              (outcome) => this.#dispatchAndRunEffects(enrollmentOutcomeEvent(outcome)),
+            );
+            onAuthOperation?.(operation);
+            break;
+          }
+          case "prepare-session-auth": {
+            const operation = this.#launchAuthOperation(
+              () => this.#authController.prepareSessionBoundary({ allowRotation: true }),
+              (outcome) => this.#dispatchAndRunEffects(
+                sessionAuthOutcomeEvent(outcome, effect.authAttempt),
+              ),
+            );
+            onAuthOperation?.(operation);
+            break;
+          }
+          case "cancel-session-boundary":
+            await this.#cancelSessionBoundary();
+            break;
           case "persist-target":
             void this.#persistTarget(effect.targetLanguage);
             break;
@@ -1316,6 +1750,27 @@ export class G2BridgeRuntime {
         return;
       }
     }
+  }
+
+  async #cancelSessionBoundary(): Promise<void> {
+    this.#audioPcmEnabled = false;
+    this.#invalidateAuthOperations();
+    this.#cancelRecoveryTimers();
+    this.#recoveryCycle += 1;
+    this.#recoveryContext = undefined;
+    this.#pendingRecoveryLoss = false;
+
+    const transport = this.#transport;
+    if (transport !== undefined) {
+      const closeResult = this.#retireCurrentTransport(
+        transport,
+        this.#transportGeneration,
+        false,
+      );
+      if (!closeResult.ok) throw closeResult.error;
+    }
+
+    await this.#stopAudio();
   }
 
   #handleEffectFailure(): void {
@@ -1357,6 +1812,7 @@ export class G2BridgeRuntime {
     const transportReference: { current?: G2Transport } = {};
     const transportOptions: RelayTransportOptions = {
       relayOrigin: this.#relayOrigin,
+      credentialProvider: this.#authController.credentialProvider,
       onEvent: (event) => {
         if (transportReference.current !== undefined) {
           this.#handleTransportCallback(
@@ -1476,7 +1932,10 @@ export class G2BridgeRuntime {
       this.#queueTransportEvent(transport, { type: "fatal" }, generation, recoveryAttempt);
       return;
     }
-    this.#queueTransportEvent(transport, event, generation, recoveryAttempt);
+    const clientEvent = toClientEvent(event);
+    if (clientEvent !== undefined) {
+      this.#queueTransportEvent(transport, clientEvent, generation, recoveryAttempt);
+    }
   }
 
   #isCurrentTransport(transport: G2Transport, generation: number): boolean {
@@ -1531,14 +1990,7 @@ export class G2BridgeRuntime {
         this.#pendingRecoveryLoss = false;
         return;
       }
-      // Fresh recovery owns the microphone shutdown. The reducer lists the
-      // stop-audio effect before start-fresh-session, but starting recovery
-      // first is required so a close failure has a recovery context in which
-      // to dispatch recovery.failed instead of being discarded as a generic
-      // effect failure.
-      await this.#runEffects(
-        reduction.effects.filter((effect) => effect.type !== "stop-audio"),
-      );
+      await this.#runEffects(reduction.effects);
     });
   }
 
@@ -1686,39 +2138,64 @@ export class G2BridgeRuntime {
     };
     context.activeAttempt = active;
 
-    let binding: { readonly transport: G2Transport; readonly generation: number } | undefined;
-    try {
-      binding = this.#startSession(context.targetLanguage, attempt);
-    } catch {
-      this.#finishRecoveryAttemptFailure(context, active, "retry");
-      return;
-    }
-    if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
-    if (binding === undefined) {
-      this.#finishRecoveryAttemptFailure(context, active, "retry");
-      return;
-    }
-    active.transport = binding.transport;
-    active.transportGeneration = binding.generation;
-    try {
-      active.deadlineCancel = this.#recoveryTiming.schedule(() => {
+    this.#launchAuthOperation(
+      () => this.#authController.prepareSessionBoundary({ allowRotation: true }),
+      async (outcome) => {
+        if (
+          this.#recoveryContext !== context ||
+          context.activeAttempt !== active ||
+          !this.#isRecoveryPending()
+        ) return;
+        if (outcome.kind === "unavailable") {
+          this.#finishRecoveryAttemptFailure(context, active, "retry");
+          return;
+        }
+        if (outcome.kind === "required") {
+          context.activeAttempt = undefined;
+          await this.#dispatchAndRunEffects({ type: "credential.rejected" });
+          return;
+        }
+        if (outcome.kind === "storage-error") {
+          context.activeAttempt = undefined;
+          await this.#dispatchAndRunEffects({ type: "credential.storage-error" });
+          return;
+        }
+
+        let binding: { readonly transport: G2Transport; readonly generation: number } | undefined;
+        try {
+          binding = this.#startSession(context.targetLanguage, attempt);
+        } catch {
+          this.#finishRecoveryAttemptFailure(context, active, "retry");
+          return;
+        }
         if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
-        active.deadlineCancel = undefined;
-        this.#handleRecoveryAttemptFailure(
-          binding!.transport,
-          binding!.generation,
-          active.attempt,
-          "retry",
-        );
-      }, RECOVERY_READY_DEADLINE_MS);
-    } catch {
-      this.#handleRecoveryAttemptFailure(
-        binding.transport,
-        binding.generation,
-        active.attempt,
-        "stop",
-      );
-    }
+        if (binding === undefined) {
+          this.#finishRecoveryAttemptFailure(context, active, "retry");
+          return;
+        }
+        active.transport = binding.transport;
+        active.transportGeneration = binding.generation;
+        try {
+          active.deadlineCancel = this.#recoveryTiming.schedule(() => {
+            if (this.#recoveryContext !== context || context.activeAttempt !== active) return;
+            active.deadlineCancel = undefined;
+            this.#handleRecoveryAttemptFailure(
+              binding!.transport,
+              binding!.generation,
+              active.attempt,
+              "retry",
+            );
+          }, RECOVERY_READY_DEADLINE_MS);
+        } catch {
+          this.#handleRecoveryAttemptFailure(
+            binding.transport,
+            binding.generation,
+            active.attempt,
+            "stop",
+          );
+        }
+      },
+    );
   }
 
   #handleRecoveryAttemptFailure(
@@ -1799,79 +2276,18 @@ export class G2BridgeRuntime {
 
   #failRecovery(): void {
     const context = this.#recoveryContext;
+    const pendingState = this.#state.state === "Ready" && this.#state.pending === "recovery"
+      ? this.#state
+      : undefined;
     this.#cancelRecoveryTimers();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
     this.#pendingRecoveryLoss = false;
-    if (
-      context === undefined ||
-      !this.#isRecoveryPending()
-    ) return;
+    if (!this.#isRecoveryPending()) return;
     this.#dispatch({
       type: "recovery.failed",
-      sessionId: context.previousSessionId,
-      sessionEpoch: context.previousSessionEpoch,
-    });
-  }
-
-  #startDetachedAudioClose(): void {
-    let closing: Promise<boolean>;
-    try {
-      closing = this.#closeAudio();
-    } catch (error: unknown) {
-      this.#queueSerializedEvent(() => {
-        if (error !== undefined) this.#lastEventError = normalizeError(error, "G2 audio close failed");
-        this.#handleEffectFailure();
-      });
-      return;
-    }
-
-    const generation = this.#audioCloseGeneration;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let finished = false;
-    let resolveMonitor: (() => void) | undefined;
-    const finish = (failed: boolean): void => {
-      if (finished) return;
-      finished = true;
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        if (this.#detachedAudioCloseTimer === timer) {
-          this.#detachedAudioCloseTimer = undefined;
-        }
-        timer = undefined;
-      }
-
-      const isCurrent = this.#detachedAudioCloseMonitor === monitor &&
-        this.#detachedAudioCloseMonitorGeneration === generation &&
-        this.#audioCloseGeneration === generation;
-      if (isCurrent) {
-        this.#detachedAudioCloseMonitor = undefined;
-        this.#detachedAudioCloseTimer = undefined;
-        this.#detachedAudioCloseMonitorGeneration = undefined;
-      }
-      resolveMonitor?.();
-
-      if (failed && isCurrent) this.#queueDetachedAudioFailure(generation);
-    };
-    const monitor = new Promise<void>((resolve) => {
-      resolveMonitor = resolve;
-      timer = setTimeout(() => finish(true), AUDIO_CLOSE_TIMEOUT_MS);
-      this.#detachedAudioCloseTimer = timer;
-      this.#detachedAudioCloseMonitorGeneration = generation;
-      void closing.then(
-        (closed) => finish(!closed),
-        () => finish(true),
-      );
-    });
-    this.#detachedAudioCloseMonitor = monitor;
-  }
-
-  #queueDetachedAudioFailure(generation: number): void {
-    if (this.#isRuntimeInactive() || this.#detachedAudioCloseFailureGeneration === generation) return;
-    this.#detachedAudioCloseFailureGeneration = generation;
-    this.#queueSerializedEvent(() => {
-      if (this.#audioCloseGeneration !== generation) return;
-      this.#handleEffectFailure();
+      sessionId: context?.previousSessionId ?? pendingState!.previousSessionId,
+      sessionEpoch: context?.previousSessionEpoch ?? pendingState!.previousSessionEpoch,
     });
   }
 

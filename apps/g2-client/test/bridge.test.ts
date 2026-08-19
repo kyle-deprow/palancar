@@ -14,8 +14,12 @@ import {
 import { DEFAULT_NEGOTIATED_LIMITS } from "@palancar/contracts";
 import { describe, expect, it, vi } from "vitest";
 
+import type {
+  AuthOutcome,
+  G2AuthController,
+  SessionCredentialProvider,
+} from "../src/auth/types.js";
 import {
-  DEFAULT_RELAY_ORIGIN,
   G2BridgeRuntime,
   PALANCAR_G2_READY,
   RECOVERY_ATTEMPT_WINDOW_MS,
@@ -36,9 +40,11 @@ import type {
   RelayTransportOptions,
 } from "../src/transport/index.js";
 
+const RELAY_ORIGIN = "https://relay.example";
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const RECOVERY_SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
+const NEXT_UTTERANCE_ID = "66666666-6666-4666-8666-666666666666";
 
 class FakeBridge implements G2BridgePort {
   startupResult = StartUpPageCreateResult.success;
@@ -204,6 +210,78 @@ class FakeTransport implements G2Transport {
   }
 }
 
+const fakeCredentialProvider: SessionCredentialProvider = Object.freeze({
+  acquire: async () => ({ kind: "required" as const }),
+  recordAuthenticated: async () => "stale" as const,
+  reject: async () => "stale" as const,
+});
+
+class FakeAuthController implements G2AuthController {
+  readonly credentialProvider = fakeCredentialProvider;
+  readonly calls: string[];
+  readonly pairingCodes: string[] = [];
+  readonly boundaryOptions: { readonly allowRotation: boolean }[] = [];
+  initializeImplementation: () => Promise<AuthOutcome> = async () => ({ kind: "ready" });
+  enrollImplementation: (pairingCode: string) => Promise<AuthOutcome> = async () => ({ kind: "ready" });
+  retryPersistenceImplementation: () => Promise<AuthOutcome> = async () => ({ kind: "ready" });
+  resetEnrollmentImplementation: () => Promise<AuthOutcome> = async () => ({
+    kind: "required",
+    reason: "missing",
+  });
+  prepareSessionBoundaryImplementation:
+    (options: { readonly allowRotation: boolean }) => Promise<AuthOutcome> = async () => ({
+      kind: "ready",
+    });
+  revokeCurrentImplementation: () => Promise<AuthOutcome> = async () => ({
+    kind: "required",
+    reason: "revoked",
+  });
+  disposeCount = 0;
+
+  constructor(calls: string[]) {
+    this.calls = calls;
+  }
+
+  initialize(): Promise<AuthOutcome> {
+    this.calls.push("auth:initialize");
+    return this.initializeImplementation();
+  }
+
+  enroll(pairingCode: string): Promise<AuthOutcome> {
+    this.calls.push("auth:enroll");
+    this.pairingCodes.push(pairingCode);
+    return this.enrollImplementation(pairingCode);
+  }
+
+  retryPersistence(): Promise<AuthOutcome> {
+    this.calls.push("auth:retry-persistence");
+    return this.retryPersistenceImplementation();
+  }
+
+  resetEnrollment(): Promise<AuthOutcome> {
+    this.calls.push("auth:reset-enrollment");
+    return this.resetEnrollmentImplementation();
+  }
+
+  prepareSessionBoundary(
+    options: { readonly allowRotation: boolean },
+  ): Promise<AuthOutcome> {
+    this.calls.push("auth:prepare-session-boundary");
+    this.boundaryOptions.push({ ...options });
+    return this.prepareSessionBoundaryImplementation(options);
+  }
+
+  revokeCurrent(): Promise<AuthOutcome> {
+    this.calls.push("auth:revoke-current");
+    return this.revokeCurrentImplementation();
+  }
+
+  dispose(): void {
+    this.calls.push("auth:dispose");
+    this.disposeCount += 1;
+  }
+}
+
 const systemEvent = (
   eventType?: OsEventTypeList,
   eventSource?: EventSourceType,
@@ -296,15 +374,19 @@ const suggestionsReady = (): RelayTransportCallbackEvent => ({
 interface TestHarness {
   readonly bridge: FakeBridge;
   readonly runtime: G2BridgeRuntime;
+  readonly auth: FakeAuthController;
   readonly transports: FakeTransport[];
   readonly operations: string[];
   readonly persisted: string[];
 }
 
 interface HarnessOptions {
+  readonly authController?: FakeAuthController;
   readonly waitForBridge?: () => Promise<G2BridgePort>;
   readonly startSession?: (targetLanguage: "es" | "tr") => Promise<void>;
   readonly persistTarget?: (targetLanguage: "es" | "tr") => void | Promise<void>;
+  readonly idGenerator?: () => string;
+  readonly utteranceIds?: readonly string[];
   readonly displayDebounceMs?: number;
   readonly recoveryTiming?: RecoveryTiming;
 }
@@ -313,8 +395,17 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
   const transports: FakeTransport[] = [];
   const operations: string[] = [];
   const bridge = new FakeBridge(operations);
+  const auth = harnessOptions.authController ?? new FakeAuthController(operations);
   const persisted: string[] = [];
+  let generatedUtteranceIndex = 0;
+  const idGenerator = harnessOptions.idGenerator ?? (() => {
+    const generated = harnessOptions.utteranceIds?.[generatedUtteranceIndex] ?? UTTERANCE_ID;
+    generatedUtteranceIndex += 1;
+    return generated;
+  });
   const runtime = new G2BridgeRuntime({
+    relayOrigin: RELAY_ORIGIN,
+    authController: auth,
     waitForBridge: harnessOptions.waitForBridge ?? (async () => bridge),
     readyLogger: (marker) => bridge.calls.push(`ready:${marker}`),
     createTransport: (options) => {
@@ -322,7 +413,7 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
       transports.push(transport);
       return transport;
     },
-    idGenerator: () => UTTERANCE_ID,
+    idGenerator,
     storage: {
       setTarget: (target) => {
         persisted.push(target);
@@ -334,11 +425,19 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
       ? {}
       : { recoveryTiming: harnessOptions.recoveryTiming }),
   });
-  return { bridge, runtime, transports, operations, persisted };
+  return { bridge, runtime, auth, transports, operations, persisted };
+}
+
+async function bootToEnrollmentChecking(harness: TestHarness): Promise<void> {
+  await harness.runtime.boot();
 }
 
 async function boot(harness: TestHarness): Promise<void> {
-  await harness.runtime.boot();
+  await bootToEnrollmentChecking(harness);
+  await harness.runtime.whenEventsIdle();
+}
+
+async function authenticateSession(harness: TestHarness): Promise<void> {
   await harness.runtime.whenEventsIdle();
 }
 
@@ -416,15 +515,25 @@ async function selectSpanishAndStart(harness: TestHarness): Promise<FakeTranspor
   await boot(harness);
   harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
   await harness.runtime.whenEventsIdle();
+  await authenticateSession(harness);
   const transport = harness.transports[0];
   if (transport === undefined) throw new Error("Transport was not created");
   return transport;
 }
 
 describe("G2BridgeRuntime startup", () => {
-  it("creates the Starting page once, subscribes once, then displays TargetSelection", async () => {
+  it("creates one startup container and renders EnrollmentChecking before initialization completes", async () => {
     const harness = createHarness();
-    await boot(harness);
+    let resolveInitialize: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.initializeImplementation = () => new Promise((resolve) => {
+      resolveInitialize = resolve;
+    });
+    const phoneStates: unknown[] = [];
+    harness.runtime.subscribePhoneAuthState((state) => phoneStates.push(state));
+    await harness.runtime.boot();
+    await vi.waitFor(() => {
+      expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Checking enrollment");
+    });
 
     expect(harness.bridge.createCount).toBe(1);
     expect(harness.bridge.subscriptionCount).toBe(1);
@@ -440,16 +549,343 @@ describe("G2BridgeRuntime startup", () => {
       "english",
       "suggestion",
     ]);
-    expect(harness.runtime.snapshot.state).toBe("TargetSelection");
-    expect(harness.runtime.snapshot.lastDisplayContent.target).toContain("[Spanish]");
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toContain(
-      "press to confirm, swipe to change",
-    );
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentChecking");
+    expect(harness.runtime.snapshot.target).toBe("es");
+    expect(harness.runtime.snapshot.lastDisplayContent).toEqual({
+      status: "Checking enrollment",
+      target: "Target: Spanish",
+      source: "Source: unavailable",
+      english: "English: unavailable",
+      suggestion: "Please wait",
+    });
+    expect(harness.auth.calls).toEqual(["auth:initialize"]);
+    expect(harness.transports).toHaveLength(0);
+    expect(harness.bridge.audioCalls).toHaveLength(0);
+    expect(phoneStates).toEqual([{ status: "starting" }, { status: "checking" }]);
     expect(harness.bridge.calls).toContain(`ready:${PALANCAR_G2_READY}`);
+
+    resolveInitialize?.({ kind: "required", reason: "missing" });
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+  });
+
+  it("maps enrollment commands to fixed redacted lifecycle states without retaining the pairing code", async () => {
+    const harness = createHarness();
+    harness.auth.initializeImplementation = async () => ({
+      kind: "required",
+      reason: "missing",
+    });
+    await boot(harness);
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Enrollment required");
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Continue on phone");
+
+    let resolveEnroll: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.enrollImplementation = () => new Promise((resolve) => {
+      resolveEnroll = resolve;
+    });
+    const pairingCode = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ";
+    const enrollment = harness.runtime.enroll(pairingCode);
+    await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("Enrolling"));
+    expect(harness.runtime.snapshot.state).toBe("Enrolling");
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Enrolling");
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Complete on phone");
+
+    expect(JSON.stringify(harness.runtime.snapshot)).not.toContain(pairingCode);
+    resolveEnroll?.({ kind: "storage-error" });
+    await enrollment;
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("StorageError");
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe(
+      "Enrollment storage error",
+    );
+    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Retry on phone");
+
+    let resolveRetry: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.retryPersistenceImplementation = () => new Promise((resolve) => {
+      resolveRetry = resolve;
+    });
+    const retry = harness.runtime.retryEnrollment();
+    await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("EnrollmentChecking"));
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentChecking");
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Checking enrollment");
+    resolveRetry?.({ kind: "ready" });
+    await retry;
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("TargetSelection");
+
+    let resolveRevocation: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.revokeCurrentImplementation = () => new Promise((resolve) => {
+      resolveRevocation = resolve;
+    });
+    const revocation = harness.runtime.revokeEnrollment();
+    await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("EnrollmentChecking"));
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe(
+      "Revoking enrollment",
+    );
+    resolveRevocation?.({ kind: "required", reason: "revoked" });
+    await revocation;
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+  });
+
+  it("prepares each auth attempt and ignores a stale completion after revocation", async () => {
+    const harness = createHarness();
+    await boot(harness);
+    expect(harness.runtime.snapshot.state).toBe("TargetSelection");
+
+    let resolveFirstPrepare: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.prepareSessionBoundaryImplementation = () => new Promise((resolve) => {
+      resolveFirstPrepare = resolve;
+    });
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("Ready"));
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(false);
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Authenticating");
+    expect(harness.transports).toHaveLength(0);
+
+    const revocation = harness.runtime.revokeEnrollment();
+    await vi.waitFor(() => expect(harness.auth.calls).toContain("auth:revoke-current"));
+    resolveFirstPrepare?.({ kind: "ready" });
+    await revocation;
+    await flushMicrotasks();
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+    expect(harness.transports).toHaveLength(0);
+    expect(harness.auth.boundaryOptions).toEqual([{ allowRotation: true }]);
+  });
+
+  it("shares one in-flight revocation across concurrent duplicate commands", async () => {
+    const harness = createHarness();
+    await boot(harness);
+    let resolveRevocation: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.revokeCurrentImplementation = () => new Promise((resolve) => {
+      resolveRevocation = resolve;
+    });
+    const phoneStates: unknown[] = [];
+    harness.runtime.subscribePhoneAuthState((state) => phoneStates.push(state));
+
+    const first = harness.runtime.revokeEnrollment();
+    const duplicate = harness.runtime.revokeEnrollment();
+    expect(duplicate).toBe(first);
+    await vi.waitFor(() => {
+      expect(harness.auth.calls.filter((call) => call === "auth:revoke-current")).toHaveLength(1);
+    });
+    const lateDuplicate = harness.runtime.revokeEnrollment();
+    expect(lateDuplicate).toBe(first);
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Revoking enrollment");
+
+    resolveRevocation?.({ kind: "required", reason: "revoked" });
+    await Promise.all([first, duplicate, lateDuplicate]);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.auth.calls.filter((call) => call === "auth:revoke-current")).toHaveLength(1);
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+    expect(phoneStates.at(-1)).toEqual({ status: "required", reason: "revoked" });
+  });
+
+  it("enters Enrolling before the controller performs pairing health work", async () => {
+    const harness = createHarness();
+    harness.auth.initializeImplementation = async () => ({
+      kind: "required",
+      reason: "missing",
+    });
+    await boot(harness);
+    harness.auth.enrollImplementation = async () => {
+      expect(harness.runtime.snapshot.state).toBe("Enrolling");
+      harness.operations.push("auth:pairing-health");
+      harness.operations.push("auth:pairing-redeem");
+      return { kind: "ready" };
+    };
+
+    await harness.runtime.enroll("ABCD-EFGH-JKLM-NPQR-STUV-WXYZ");
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.operations.slice(-3)).toEqual([
+      "auth:enroll",
+      "auth:pairing-health",
+      "auth:pairing-redeem",
+    ]);
+    expect(harness.runtime.snapshot.state).toBe("TargetSelection");
+  });
+
+  it("executes reset-enrollment through the controller", async () => {
+    const harness = createHarness();
+    harness.auth.initializeImplementation = async () => ({ kind: "storage-error" });
+    await boot(harness);
+    expect(harness.runtime.snapshot.state).toBe("StorageError");
+
+    await harness.runtime.resetEnrollment();
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.auth.calls).toContain("auth:reset-enrollment");
+    expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
+  });
+
+  it.each([
+    {
+      outcome: { kind: "required" as const, reason: "credential-rejected" as const },
+      expectedState: "EnrollmentRequired",
+    },
+    {
+      outcome: { kind: "storage-error" as const },
+      expectedState: "StorageError",
+    },
+  ])("maps a prepare-session $outcome.kind outcome", async ({ outcome, expectedState }) => {
+    const harness = createHarness();
+    await boot(harness);
+    harness.auth.prepareSessionBoundaryImplementation = async () => outcome;
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe(expectedState);
+    expect(harness.transports).toHaveLength(0);
+  });
+
+  it("cancels a pending pre-ticket transport before later enrollment work", async () => {
+    let rejectStart: ((error: Error) => void) | undefined;
+    const pendingStart = new Promise<void>((_resolve, reject) => {
+      rejectStart = reject;
+    });
+    const harness = createHarness({ startSession: () => pendingStart });
+    await boot(harness);
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    const transport = harness.transports[0];
+    if (transport === undefined) throw new Error("Transport was not created");
+
+    transport.emit({ type: "credential.rejected" });
+    await harness.runtime.whenEventsIdle();
+    harness.auth.enrollImplementation = () => new Promise(() => undefined);
+    const enrollment = harness.runtime.enroll("ABCD-EFGH-JKLM-NPQR-STUV-WXYZ");
+    await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("Enrolling"));
+
+    expect(harness.runtime.snapshot.state).toBe("Enrolling");
+    expect(transport.closed).toBe(true);
+    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
+    expect(harness.operations).not.toContain("end-session");
+    expect(harness.bridge.audioCalls).toHaveLength(0);
+
+    transport.emit(readyEvent());
+    rejectStart?.(new Error("stale ticket request failed"));
+    await flushMicrotasks();
+    expect(harness.runtime.snapshot.state).toBe("Enrolling");
+    expect(harness.transports).toHaveLength(1);
+    await harness.runtime.cleanup();
+    await enrollment;
+  });
+
+  it("cancels a live socket and microphone before accepting no stale callbacks", async () => {
+    let resolveClose: ((closed: boolean) => void) | undefined;
+    const pendingClose = new Promise<boolean>((resolve) => {
+      resolveClose = resolve;
+    });
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.audioOpen).toBe(true);
+    harness.bridge.audioCloseImplementation = () => pendingClose;
+
+    const operationCount = harness.operations.length;
+    transport.emit({ type: "credential.storage-error" });
+    const idle = harness.runtime.whenEventsIdle();
+    await flushMicrotasks();
+
+    expect(harness.runtime.snapshot.state).toBe("StorageError");
+    expect(transport.closed).toBe(true);
+    expect(harness.operations.slice(operationCount)).toEqual(["close", "audio:close"]);
+
+    resolveClose?.(true);
+    await idle;
+    expect(harness.runtime.snapshot.audioOpen).toBe(false);
+
+    transport.emit({ type: "fatal" });
+    harness.bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array([9]) }) });
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("StorageError");
+    expect(transport.pcm).toHaveLength(0);
+  });
+
+  it("exposes only the public phone commands and a fixed redacted projection", async () => {
+    const harness = createHarness();
+    harness.auth.initializeImplementation = async () => ({
+      kind: "required",
+      reason: "missing",
+    });
+    const states: unknown[] = [];
+    const unsubscribe = harness.runtime.subscribePhoneAuthState((state) => states.push(state));
+    await boot(harness);
+
+    let resolveEnroll: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.enrollImplementation = () => new Promise((resolve) => {
+      resolveEnroll = resolve;
+    });
+    const canary = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ";
+    const enrollment = harness.runtime.enroll(canary);
+    await vi.waitFor(() => expect(states).toContainEqual({ status: "enrolling" }));
+    resolveEnroll?.({ kind: "required", reason: "pairing-failed" });
+    await enrollment;
+    await harness.runtime.whenEventsIdle();
+
+    expect(states).toEqual([
+      { status: "starting" },
+      { status: "checking" },
+      { status: "required", reason: "missing" },
+      { status: "enrolling" },
+      { status: "required", reason: "pairing-failed" },
+    ]);
+    expect(JSON.stringify(states)).not.toContain(canary);
+    expect(JSON.stringify(harness.runtime.snapshot)).not.toContain(canary);
+    expect("receiveAuthEvent" in harness.runtime).toBe(false);
+    unsubscribe();
+  });
+
+  it("disposes the owned controller exactly once before closing live resources", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    await harness.runtime.cleanup();
+    await harness.runtime.cleanup();
+
+    expect(harness.auth.disposeCount).toBe(1);
+    expect(harness.operations.indexOf("auth:dispose")).toBeLessThan(
+      harness.operations.indexOf("close"),
+    );
+    expect(harness.operations.indexOf("auth:dispose")).toBeLessThan(
+      harness.operations.indexOf("audio:close"),
+    );
+  });
+
+  it("preempts a pending controller operation and suppresses its late completion", async () => {
+    const harness = createHarness();
+    let resolveInitialize: ((outcome: AuthOutcome) => void) | undefined;
+    harness.auth.initializeImplementation = () => new Promise((resolve) => {
+      resolveInitialize = resolve;
+    });
+    await harness.runtime.boot();
+    await vi.waitFor(() => expect(harness.auth.calls).toContain("auth:initialize"));
+
+    await harness.runtime.cleanup();
+    resolveInitialize?.({ kind: "ready" });
+    await flushMicrotasks();
+
+    expect(harness.auth.disposeCount).toBe(1);
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+    expect(harness.transports).toHaveLength(0);
+    expect(harness.bridge.audioCalls).toHaveLength(0);
   });
 
   it("surfaces a typed startup error without subscription or retry", async () => {
     const harness = createHarness();
+    const phoneStates: unknown[] = [];
+    harness.runtime.subscribePhoneAuthState((state) => phoneStates.push(state));
     harness.bridge.startupResult = StartUpPageCreateResult.invalid;
 
     const firstBoot = harness.runtime.boot();
@@ -462,6 +898,8 @@ describe("G2BridgeRuntime startup", () => {
     expect(harness.bridge.subscriptionCount).toBe(0);
     expect(harness.bridge.textUpdates).toHaveLength(0);
     expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(phoneStates).toEqual([{ status: "starting" }, { status: "error" }]);
+    expect(harness.auth.disposeCount).toBe(1);
   });
 
   it("fails boot when the first display upgrade fails and does not log ready", async () => {
@@ -552,6 +990,8 @@ describe("G2BridgeRuntime startup", () => {
             },
           };
       const runtime = new G2BridgeRuntime({
+        relayOrigin: RELAY_ORIGIN,
+        authController: harness.auth,
         waitForBridge: async () => harness.bridge,
         readyLogger: (marker) => harness.bridge.calls.push(`ready:${marker}`),
         storage,
@@ -597,6 +1037,8 @@ describe("G2BridgeRuntime startup", () => {
   it("makes a ready logger failure safe and rejects boot", async () => {
     const harness = createHarness();
     const runtime = new G2BridgeRuntime({
+      relayOrigin: RELAY_ORIGIN,
+      authController: harness.auth,
       waitForBridge: async () => harness.bridge,
       readyLogger: () => {
         throw new Error("logger failed");
@@ -752,6 +1194,8 @@ describe("G2BridgeRuntime startup", () => {
   it("handles async ready logger rejection and cleanup preemption", async () => {
     const rejectionHarness = createHarness();
     const rejectingRuntime = new G2BridgeRuntime({
+      relayOrigin: RELAY_ORIGIN,
+      authController: rejectionHarness.auth,
       waitForBridge: async () => rejectionHarness.bridge,
       readyLogger: async () => {
         throw new Error("async logger failed");
@@ -768,6 +1212,8 @@ describe("G2BridgeRuntime startup", () => {
     });
     const preemptHarness = createHarness();
     const preemptedRuntime = new G2BridgeRuntime({
+      relayOrigin: RELAY_ORIGIN,
+      authController: preemptHarness.auth,
       waitForBridge: async () => preemptHarness.bridge,
       readyLogger: () => pendingLogger,
       displayDebounceMs: 0,
@@ -794,10 +1240,14 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     harness.bridge.emit(listEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
+    await authenticateSession(harness);
 
     expect(harness.transports).toHaveLength(1);
     expect(harness.transports[0]?.targetLanguage).toBe("tr");
-    expect(harness.transports[0]?.options.relayOrigin).toBe(DEFAULT_RELAY_ORIGIN);
+    expect(harness.transports[0]?.options.relayOrigin).toBe(RELAY_ORIGIN);
+    expect(harness.transports[0]?.options.credentialProvider).toBe(
+      harness.auth.credentialProvider,
+    );
     expect(harness.persisted).toEqual(["tr"]);
     expect(harness.runtime.snapshot.state).toBe("Ready");
     expect(harness.runtime.snapshot.sessionReady).toBe(false);
@@ -807,6 +1257,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     const harness = createHarness();
     await boot(harness);
     const initialUpdateCount = harness.runtime.snapshot.displayUpdateCount;
+    const initialTextUpdateCount = harness.bridge.textUpdates.length;
 
     harness.bridge.emit(listEvent(OsEventTypeList.SCROLL_BOTTOM_EVENT));
     harness.bridge.emit(listEvent(OsEventTypeList.SCROLL_TOP_EVENT));
@@ -814,7 +1265,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     expect(harness.runtime.snapshot.target).toBe("es");
     expect(harness.runtime.snapshot.displayUpdateCount).toBe(initialUpdateCount);
-    expect(harness.bridge.textUpdates).toHaveLength(5);
+    expect(harness.bridge.textUpdates).toHaveLength(initialTextUpdateCount);
 
     harness.bridge.emit(listEvent(OsEventTypeList.SCROLL_BOTTOM_EVENT));
     await harness.runtime.whenEventsIdle();
@@ -851,7 +1302,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     await harness.runtime.whenEventsIdle();
     expect(harness.runtime.snapshot.state).toBe("Listening");
     expect(harness.runtime.snapshot.audioOpen).toBe(true);
-    expect(harness.operations).toEqual([
+    expect(harness.operations.slice(-3)).toEqual([
       "start-session:es",
       `start-utterance:${UTTERANCE_ID}`,
       "audio:open",
@@ -1300,6 +1751,70 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     }
   });
 
+  it("prepares a fresh credential grant before every recovery transport", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    expect(harness.auth.boundaryOptions).toEqual([{ allowRotation: true }]);
+
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.auth.boundaryOptions).toEqual([
+      { allowRotation: true },
+      { allowRotation: true },
+    ]);
+    expect(harness.transports).toHaveLength(2);
+    expect(harness.transports[1]?.options.credentialProvider).toBe(
+      harness.auth.credentialProvider,
+    );
+    expect(harness.operations.lastIndexOf("auth:prepare-session-boundary")).toBeLessThan(
+      harness.operations.lastIndexOf("start-session:es"),
+    );
+  });
+
+  it("keeps unavailable recovery preparation inside the bounded retry path", async () => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.auth.prepareSessionBoundaryImplementation = async () => ({ kind: "unavailable" });
+
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.transports).toHaveLength(1);
+    expect(clock.timers.some((timer) => !timer.cancelled && timer.delayMs === 500)).toBe(true);
+  });
+
+  it.each([
+    { outcome: { kind: "required" as const, reason: "missing" as const }, state: "EnrollmentRequired" },
+    { outcome: { kind: "storage-error" as const }, state: "StorageError" },
+  ])("maps recovery auth $outcome.kind without creating a stale transport", async ({ outcome, state }) => {
+    const clock = manualRecoveryClock(0);
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const initialTransport = await selectSpanishAndStart(harness);
+    initialTransport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.auth.prepareSessionBoundaryImplementation = async () => outcome;
+
+    initialTransport.emit({ type: "transport.lost", sessionId: SESSION_ID, sessionEpoch: 1 });
+    await harness.runtime.whenEventsIdle();
+    clock.fireNext(RECOVERY_BACKOFF_BASE_MS / 2);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe(state);
+    expect(harness.transports).toHaveLength(1);
+  });
+
   it("turns an audio-close failure into visible recovery Error without global cleanup", async () => {
     const harness = createHarness({ recoveryTiming: fakeRecoveryTiming() });
     const transport = await selectSpanishAndStart(harness);
@@ -1536,7 +2051,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
   });
 
-  it("commits immediately and starts a detached audio close", async () => {
+  it("stops audio before committing in declared reducer order", async () => {
     const harness = createHarness();
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
@@ -1550,159 +2065,13 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.runtime.snapshot.audioOpen).toBe(false);
     expect(harness.bridge.audioCalls.at(-1)?.isOpen).toBe(false);
     expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
-    expect(harness.operations.indexOf("commit")).toBeLessThan(
-      harness.operations.indexOf("audio:close"),
+    expect(harness.operations.indexOf("audio:close")).toBeLessThan(
+      harness.operations.indexOf("commit"),
     );
     expect(harness.bridge.calls.indexOf("audio:close")).toBeGreaterThan(-1);
   });
 
-  it("routes a false detached close through fatal handling after one commit", async () => {
-    const harness = createHarness();
-    const transport = await selectSpanishAndStart(harness);
-    transport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseResults = [false, true];
-
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.state).toBe("Error");
-    expect(harness.runtime.snapshot.audioOpen).toBe(false);
-    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
-    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(2);
-    expect(transport.closed).toBe(true);
-    expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
-    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
-  });
-
-  it("routes a rejected detached close through fatal handling after one commit", async () => {
-    const harness = createHarness();
-    const transport = await selectSpanishAndStart(harness);
-    transport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-
-    let closeAttempts = 0;
-    harness.bridge.audioCloseImplementation = () => {
-      closeAttempts += 1;
-      return closeAttempts === 1
-        ? Promise.reject(new Error("detached close failed"))
-        : Promise.resolve(true);
-    };
-
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.state).toBe("Error");
-    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
-    expect(closeAttempts).toBe(2);
-    expect(transport.closed).toBe(true);
-    expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
-    expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
-  });
-
-  it("times out a detached close without overlapping SDK close calls", async () => {
-    const pendingClose = new Promise<boolean>(() => undefined);
-    const harness = createHarness();
-    const transport = await selectSpanishAndStart(harness);
-    transport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseImplementation = () => pendingClose;
-
-    vi.useFakeTimers();
-    try {
-      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-      for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
-        await Promise.resolve();
-      }
-      await vi.advanceTimersByTimeAsync(0);
-      await harness.runtime.whenEventsIdle();
-      expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
-      await vi.advanceTimersByTimeAsync(1_000);
-      for (let attempt = 0; attempt < 10; attempt += 1) await Promise.resolve();
-      const idle = harness.runtime.whenEventsIdle();
-      const idleExpectation = expect(idle).rejects.toThrow("G2 audio close timed out");
-      for (let attempt = 0; attempt < 10; attempt += 1) await Promise.resolve();
-      await vi.advanceTimersByTimeAsync(1_000);
-      await idleExpectation;
-      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-      expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
-      expect(transport.closed).toBe(true);
-      expect(harness.runtime.snapshot.state).toBe("Error");
-      expect(harness.runtime.snapshot.cleanupState).toBe("active");
-      expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
-      expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each(["success", "false", "reject"] as const)(
-    "reconciles a detached timeout followed by a late %s settlement",
-    async (settlement) => {
-      let resolveClose: ((closed: boolean) => void) | undefined;
-      let rejectClose: ((error: unknown) => void) | undefined;
-      const pendingClose = new Promise<boolean>((resolve, reject) => {
-        resolveClose = resolve;
-        rejectClose = reject;
-      });
-      let closeAttempts = 0;
-      const harness = createHarness();
-      const transport = await selectSpanishAndStart(harness);
-      transport.emit(readyEvent());
-      await harness.runtime.whenEventsIdle();
-      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-      await harness.runtime.whenEventsIdle();
-      harness.bridge.audioCloseImplementation = () => {
-        closeAttempts += 1;
-        return closeAttempts === 1 ? pendingClose : Promise.resolve(true);
-      };
-
-      vi.useFakeTimers();
-      try {
-        harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-        for (let attempt = 0; attempt < 20 && closeAttempts < 1; attempt += 1) {
-          await Promise.resolve();
-        }
-        expect(closeAttempts).toBe(1);
-
-        await vi.advanceTimersByTimeAsync(1_000);
-        await flushMicrotasks();
-        const idle = harness.runtime.whenEventsIdle();
-        const idleExpectation = expect(idle).rejects.toThrow("G2 audio close timed out");
-        await vi.advanceTimersByTimeAsync(1_000);
-        await idleExpectation;
-        expect(harness.runtime.snapshot.cleanupState).toBe("active");
-        expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-
-        if (settlement === "success") {
-          resolveClose?.(true);
-        } else if (settlement === "false") {
-          resolveClose?.(false);
-        } else {
-          rejectClose?.(new Error("late detached close failed"));
-        }
-        await flushMicrotasks(20);
-        await harness.runtime.cleanup();
-
-        expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
-        expect(harness.runtime.snapshot.audioOpen).toBe(false);
-        expect(closeAttempts).toBe(settlement === "success" ? 1 : 2);
-        expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(
-          settlement === "success" ? 1 : 2,
-        );
-        expect(harness.operations.filter((operation) => operation === "end-session")).toHaveLength(1);
-        expect(harness.operations.filter((operation) => operation === "close")).toHaveLength(1);
-      } finally {
-        vi.useRealTimers();
-      }
-    },
-  );
-
-  it("adopts the same unresolved close after its detached timeout", async () => {
+  it("waits for microphone shutdown before committing", async () => {
     let resolveClose: ((closed: boolean) => void) | undefined;
     const pendingClose = new Promise<boolean>((resolve) => {
       resolveClose = resolve;
@@ -1714,61 +2083,25 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
     harness.bridge.audioCloseImplementation = () => pendingClose;
-
-    vi.useFakeTimers();
-    try {
-      harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-      for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
-        await Promise.resolve();
-      }
-      await vi.advanceTimersByTimeAsync(1_000);
-      await flushMicrotasks();
-      const cleanup = harness.runtime.cleanup();
-      let settled = false;
-      void cleanup.then(() => { settled = true; }, () => { settled = true; });
-      await flushMicrotasks();
-      expect(settled).toBe(false);
-      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-
-      resolveClose?.(true);
-      await cleanup;
-      expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
-      expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
-      expect(transport.closed).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("adopts unresolved detached close work during cleanup", async () => {
-    let resolveClose: ((closed: boolean) => void) | undefined;
-    const pendingClose = new Promise<boolean>((resolve) => {
-      resolveClose = resolve;
-    });
-    const harness = createHarness();
-    const transport = await selectSpanishAndStart(harness);
-    transport.emit(readyEvent());
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
-    await harness.runtime.whenEventsIdle();
-    harness.bridge.audioCloseImplementation = () => {
-      return pendingClose;
-    };
 
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
     for (let attempt = 0; attempt < 20 && harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen).length < 1; attempt += 1) {
       await Promise.resolve();
     }
-    const cleanup = harness.runtime.cleanup();
-    await Promise.resolve();
+    const idle = harness.runtime.whenEventsIdle();
+    let settled = false;
+    void idle.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+    expect(settled).toBe(false);
     expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(0);
 
     resolveClose?.(true);
-    await cleanup;
+    await idle;
     expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
     expect(harness.runtime.snapshot.audioOpen).toBe(false);
-    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
-    expect(transport.closed).toBe(true);
+    expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(transport.closed).toBe(false);
   });
 
   it("closes a late microphone-open success after transport loss and never enables PCM", async () => {
@@ -1928,6 +2261,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
+    await authenticateSession(harness);
     expect(harness.transports).toHaveLength(1);
     expect(harness.transports[0]?.calls).toContain("start-session:es");
   });
@@ -1945,6 +2279,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
+    await authenticateSession(harness);
     const transport = harness.transports[0];
     if (transport === undefined) throw new Error("Transport was not created");
 
@@ -1989,6 +2324,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     await boot(harness);
     harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
     await harness.runtime.whenEventsIdle();
+    await authenticateSession(harness);
     const transport = harness.transports[0];
     if (transport === undefined) throw new Error("Transport was not created");
 
@@ -2008,6 +2344,9 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     await boot(harness);
 
     harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    await authenticateSession(harness);
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
     harness.bridge.emit(systemEvent(OsEventTypeList.SYSTEM_EXIT_EVENT));
     await harness.runtime.whenEventsIdle();
 
@@ -2023,7 +2362,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.transports).toHaveLength(1);
   });
 
-  it("routes transcript, translation, and suggestion events through the state machine", async () => {
+  it("projects full relay contract events through the state machine", async () => {
     const harness = createHarness();
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
@@ -2048,6 +2387,118 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     await harness.runtime.whenEventsIdle();
     expect(harness.runtime.snapshot.state).toBe("Results");
     expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toContain("hello → hola");
+  });
+
+  it("projects the contract utterance-aborted event and stops its microphone", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    transport.emit({
+      type: "utterance.aborted",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      category: "cancellation",
+    });
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.audioOpen).toBe(false);
+    expect(harness.operations.at(-1)).toBe("audio:close");
+  });
+
+  it("starts a fresh next turn directly from Results without recreating the session", async () => {
+    const harness = createHarness({ utteranceIds: [UTTERANCE_ID, NEXT_UTTERANCE_ID] });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(systemEvent(
+      OsEventTypeList.CLICK_EVENT,
+      EventSourceType.TOUCH_EVENT_FROM_GLASSES_R,
+    ));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(
+      OsEventTypeList.CLICK_EVENT,
+      EventSourceType.TOUCH_EVENT_FROM_GLASSES_R,
+    ));
+    await harness.runtime.whenEventsIdle();
+    transport.emit(utteranceEvent());
+    transport.emit(languageDecision());
+    transport.emit(translationReady());
+    transport.emit(suggestionsReady());
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Results");
+    const resultDisplay = harness.runtime.snapshot.lastDisplayContent;
+    const operationCount = harness.operations.length;
+    const sessionStartCount = harness.operations.filter((operation) =>
+      operation.startsWith("start-session:")).length;
+    expect(resultDisplay.suggestion).toContain("hello → hola");
+
+    harness.bridge.emit(systemEvent(
+      OsEventTypeList.CLICK_EVENT,
+      EventSourceType.TOUCH_EVENT_FROM_GLASSES_R,
+    ));
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+    expect(harness.runtime.snapshot.audioOpen).toBe(true);
+    expect(harness.transports).toHaveLength(1);
+    expect(harness.operations.filter((operation) => operation.startsWith("start-session:"))).toHaveLength(
+      sessionStartCount,
+    );
+    expect(harness.operations.slice(operationCount)).toEqual([
+      `start-utterance:${NEXT_UTTERANCE_ID}`,
+      "audio:open",
+    ]);
+    expect(harness.runtime.snapshot.lastDisplayContent).not.toEqual(resultDisplay);
+    expect(JSON.stringify(harness.runtime.snapshot.lastDisplayContent)).not.toContain("hello → hola");
+  });
+
+  it("fails from Results when next-turn secure randomness fails without starting audio or utterance", async () => {
+    let generationCount = 0;
+    const harness = createHarness({
+      idGenerator: () => {
+        generationCount += 1;
+        if (generationCount === 1) return UTTERANCE_ID;
+        throw new Error("secure randomness unavailable");
+      },
+    });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    transport.emit(utteranceEvent());
+    transport.emit(languageDecision());
+    transport.emit(translationReady());
+    transport.emit(suggestionsReady());
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Results");
+    const operationCount = harness.operations.length;
+    const audioOpenCount = harness.bridge.audioCalls.filter(({ isOpen }) => isOpen).length;
+    const utteranceStarts = harness.operations.filter((operation) =>
+      operation.startsWith("start-utterance:")).length;
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    expect(generationCount).toBe(2);
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.operations.slice(operationCount).filter((operation) =>
+      operation === "audio:open" || operation.startsWith("start-utterance:"))).toEqual([]);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => isOpen)).toHaveLength(audioOpenCount);
+    expect(harness.operations.filter((operation) => operation.startsWith("start-utterance:"))).toHaveLength(
+      utteranceStarts,
+    );
   });
 
   it("cycles the selected result suggestion with a swipe", async () => {
@@ -2209,6 +2660,8 @@ describe("G2BridgeRuntime event normalization", () => {
 
     expect(harness.transports).toHaveLength(1);
     expect(harness.runtime.snapshot.state).toBe("Ready");
+    await authenticateSession(harness);
+    expect(harness.transports).toHaveLength(1);
   });
 
   it("treats undefined text/list event types as press and ignores malformed double-clicks", async () => {
@@ -2216,6 +2669,8 @@ describe("G2BridgeRuntime event normalization", () => {
     await boot(harness);
     harness.bridge.emit(textEvent());
     await harness.runtime.whenEventsIdle();
+    expect(harness.transports).toHaveLength(1);
+    await authenticateSession(harness);
     expect(harness.transports).toHaveLength(1);
 
     harness.bridge.emit(listEvent());
