@@ -7,6 +7,12 @@ import {
 import { LANGUAGE_REGISTRY_VERSION } from "@palancar/language-registry";
 import { describe, expect, it, vi } from "vitest";
 
+import type {
+  CredentialAcquisition,
+  SessionCredentialGrantToken,
+  SessionCredentialProvider,
+} from "../src/auth/types.js";
+
 import {
   RelayTransportError,
   RelayTransport,
@@ -17,6 +23,8 @@ import {
 } from "../src/transport/index.js";
 
 const TICKET = `${"A".repeat(42)}E`;
+const CREDENTIAL = `${"B".repeat(42)}I`;
+const GRANT_TOKEN = Object.freeze({}) as SessionCredentialGrantToken;
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_UTTERANCE_ID = "33333333-3333-4333-8333-333333333333";
@@ -49,7 +57,6 @@ const TERMINAL_CLOSE_CODES = [
   1008,
   1009,
   4400,
-  4401,
   4403,
   4406,
   4408,
@@ -117,26 +124,85 @@ class FakeWebSocket implements BrowserWebSocket {
 
 const fakeWebSocketConstructor = FakeWebSocket as unknown as BrowserWebSocketConstructor;
 
-function ticketResponse(): Response {
-  return {
-    ok: true,
-    status: 200,
-    json: async () => ({
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((innerResolve) => { resolve = innerResolve; });
+  return { promise, resolve };
+}
+
+class FakeCredentialProvider implements SessionCredentialProvider {
+  acquisition: CredentialAcquisition = Object.freeze({
+    kind: "ready",
+    lease: Object.freeze({
+      credential: CREDENTIAL,
+      credentialVersion: 7,
+      grantToken: GRANT_TOKEN,
+    }),
+  });
+  acquireError: unknown;
+  recordError: unknown;
+  rejectError: unknown;
+  recordResult: "recorded" | "stale" | "storage-error" = "recorded";
+  rejectResult: "required" | "stale" | "storage-error" = "required";
+  acquireWait: Promise<void> | undefined;
+  recordWait: Promise<void> | undefined;
+  rejectWait: Promise<void> | undefined;
+  readonly calls: string[];
+  readonly recordCalls: Array<readonly [number, SessionCredentialGrantToken]> = [];
+  readonly rejectCalls: Array<readonly [number, SessionCredentialGrantToken]> = [];
+
+  constructor(calls: string[] = []) {
+    this.calls = calls;
+  }
+
+  async acquire(): Promise<CredentialAcquisition> {
+    this.calls.push("acquire");
+    await this.acquireWait;
+    if (this.acquireError !== undefined) throw this.acquireError;
+    return this.acquisition;
+  }
+
+  async recordAuthenticated(
+    version: number,
+    grantToken: SessionCredentialGrantToken,
+  ): Promise<"recorded" | "stale" | "storage-error"> {
+    this.calls.push("record");
+    this.recordCalls.push([version, grantToken]);
+    await this.recordWait;
+    if (this.recordError !== undefined) throw this.recordError;
+    return this.recordResult;
+  }
+
+  async reject(
+    version: number,
+    grantToken: SessionCredentialGrantToken,
+  ): Promise<"required" | "stale" | "storage-error"> {
+    this.calls.push("reject");
+    this.rejectCalls.push([version, grantToken]);
+    await this.rejectWait;
+    if (this.rejectError !== undefined) throw this.rejectError;
+    return this.rejectResult;
+  }
+}
+
+function ticketResponse(overrides: Record<string, unknown> = {}): Response {
+  return new Response(JSON.stringify({
       ticket: TICKET,
       wssOrigin: "wss://relay.example",
       wssPath: "/v1/stream",
       protocolVersion: 1,
       expiresAt: "2026-08-10T12:01:00.000Z",
-    }),
-  } as Response;
+      ...overrides,
+  }), { status: 200 });
 }
 
 function ticketHttpResponse(status: number): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => ({}),
-  } as Response;
+  return new Response("{}", { status });
 }
 
 function readyMessage(
@@ -191,7 +257,7 @@ function serverError(
 ): Record<string, unknown> {
   return {
     type: "error",
-    code: recoverable ? "provider_unavailable" : "authentication_failed",
+    code: recoverable ? "provider_unavailable" : "internal_failure",
     scope,
     recoverable,
     displaySafeMessage: "The request could not be completed.",
@@ -220,14 +286,17 @@ function createTransport(
   onEvent?: (event: RelayTransportEvent) => void,
   onTransportError?: (error: RelayTransportError) => void,
   onCallbackEvent?: (event: RelayTransportCallbackEvent) => void,
+  credentialProvider = new FakeCredentialProvider(),
 ): {
   readonly transport: RelayTransport;
+  readonly credentialProvider: FakeCredentialProvider;
   readonly requests: Array<{ readonly input: RequestInfo | URL; readonly init: RequestInit | undefined }>;
 } {
   FakeWebSocket.instances.length = 0;
   const requests: Array<{ readonly input: RequestInfo | URL; readonly init: RequestInit | undefined }> = [];
   const transport = new RelayTransport({
     relayOrigin: "https://relay.example",
+    credentialProvider,
     fetch: async (input, init) => {
       requests.push({ input, init });
       return ticketResponse();
@@ -237,7 +306,7 @@ function createTransport(
     ...(onCallbackEvent === undefined ? {} : { onEvent: onCallbackEvent }),
     ...(onTransportError === undefined ? {} : { onTransportError }),
   });
-  return { transport, requests };
+  return { transport, credentialProvider, requests };
 }
 
 function sentControl(socket: FakeWebSocket, index: number): Record<string, unknown> {
@@ -259,7 +328,7 @@ function pcmCallback(value: number): Uint8Array {
 }
 
 async function flushMicrotasks(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) await Promise.resolve();
+  for (let index = 0; index < 32; index += 1) await Promise.resolve();
 }
 
 function expectClosedEmpty(transport: RelayTransport): void {
@@ -333,6 +402,378 @@ describe("G2 relay transport", () => {
     expect(events).toHaveLength(0);
   });
 
+  it("orders acquire, authenticated ticket fetch, persistence, then socket without leaking credentials", async () => {
+    FakeWebSocket.instances.length = 0;
+    const calls: string[] = [];
+    const provider = new FakeCredentialProvider(calls);
+    const requests: Array<{ readonly input: RequestInfo | URL; readonly init?: RequestInit }> = [];
+    class OrderedWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string | string[] = []) {
+        calls.push("socket");
+        super(url, protocols);
+      }
+    }
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: provider,
+      fetch: async (input, init) => {
+        calls.push("fetch");
+        requests.push({ input, ...(init === undefined ? {} : { init }) });
+        return ticketResponse();
+      },
+      WebSocket: OrderedWebSocket as unknown as BrowserWebSocketConstructor,
+    });
+
+    const start = transport.startSession("es");
+    await flushMicrotasks();
+    expect(calls).toEqual(["acquire", "fetch", "record", "socket"]);
+    expect(provider.recordCalls).toEqual([[7, GRANT_TOKEN]]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      input: "https://relay.example/v1/session-tickets",
+      init: {
+        method: "POST",
+        credentials: "omit",
+        redirect: "error",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${CREDENTIAL}`,
+        },
+        body: JSON.stringify({ protocolVersion: 1, intent: "new" }),
+      },
+    });
+    const request = requests[0];
+    if (request === undefined) throw new Error("Ticket request missing");
+    expect(String(request.input)).not.toContain(CREDENTIAL);
+    expect(String(request.init?.body)).not.toContain(CREDENTIAL);
+    const socket = FakeWebSocket.instances[0];
+    if (socket === undefined) throw new Error("WebSocket missing");
+    expect(socket.url).toBe("wss://relay.example/v1/stream");
+    expect(socket.url).not.toContain(CREDENTIAL);
+    expect(socket.protocols.join("\u0000")).not.toContain(CREDENTIAL);
+    expect(JSON.stringify(transport.snapshot)).not.toContain(CREDENTIAL);
+    socket.open();
+    await start;
+  });
+
+  it("requires a valid provider and normalizes absent, throwing, and malformed acquisition", async () => {
+    expect(() => new RelayTransport({
+      relayOrigin: "https://relay.example",
+      WebSocket: fakeWebSocketConstructor,
+    } as unknown as ConstructorParameters<typeof RelayTransport>[0])).toThrowError(RelayTransportError);
+    expect(() => new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: {} as SessionCredentialProvider,
+      WebSocket: fakeWebSocketConstructor,
+    })).toThrowError(RelayTransportError);
+
+    const cases: Array<{
+      readonly name: string;
+      readonly configure: (provider: FakeCredentialProvider) => void;
+      readonly expected: "credential.rejected" | "credential.storage-error";
+    }> = [
+      {
+        name: "required",
+        configure: (provider) => { provider.acquisition = Object.freeze({ kind: "required" }); },
+        expected: "credential.rejected",
+      },
+      {
+        name: "storage",
+        configure: (provider) => { provider.acquisition = Object.freeze({ kind: "storage-error" }); },
+        expected: "credential.storage-error",
+      },
+      {
+        name: "throw",
+        configure: (provider) => { provider.acquireError = new Error(`acquire-canary:${CREDENTIAL}`); },
+        expected: "credential.storage-error",
+      },
+      {
+        name: "malformed",
+        configure: (provider) => {
+          provider.acquisition = { kind: "ready", lease: {} } as unknown as CredentialAcquisition;
+        },
+        expected: "credential.storage-error",
+      },
+    ];
+
+    for (const testCase of cases) {
+      FakeWebSocket.instances.length = 0;
+      const provider = new FakeCredentialProvider();
+      testCase.configure(provider);
+      const events: RelayTransportCallbackEvent[] = [];
+      let fetches = 0;
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        credentialProvider: provider,
+        fetch: async () => { fetches += 1; return ticketResponse(); },
+        WebSocket: fakeWebSocketConstructor,
+        onEvent: (event) => events.push(event),
+      });
+      await transport.startSession("es");
+      expect(provider.calls, testCase.name).toEqual(["acquire"]);
+      expect(fetches, testCase.name).toBe(0);
+      expect(FakeWebSocket.instances, testCase.name).toHaveLength(0);
+      expect(events, testCase.name).toEqual([{ type: testCase.expected }]);
+      expect(JSON.stringify(events), testCase.name).not.toContain(CREDENTIAL);
+    }
+  });
+
+  it("permits socket construction only after recordAuthenticated records the exact grant", async () => {
+    for (const result of ["stale", "storage-error"] as const) {
+      FakeWebSocket.instances.length = 0;
+      const provider = new FakeCredentialProvider();
+      provider.recordResult = result;
+      const events: RelayTransportCallbackEvent[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        credentialProvider: provider,
+        fetch: async () => ticketResponse(),
+        WebSocket: fakeWebSocketConstructor,
+        onEvent: (event) => events.push(event),
+      });
+      await transport.startSession("es");
+      expect(provider.recordCalls).toEqual([[7, GRANT_TOKEN]]);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+      expect(events).toEqual(result === "stale" ? [] : [{ type: "credential.storage-error" }]);
+    }
+
+    const provider = new FakeCredentialProvider();
+    provider.recordError = new Error(`record-canary:${CREDENTIAL}`);
+    const events: RelayTransportCallbackEvent[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: provider,
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => events.push(event),
+    });
+    await transport.startSession("es");
+    expect(events).toEqual([{ type: "credential.storage-error" }]);
+    expect(JSON.stringify(events)).not.toContain(CREDENTIAL);
+  });
+
+  it("rejects the grant exactly once for ticket 401 and suppresses stale outcomes", async () => {
+    const cases: Array<{
+      readonly result: "required" | "stale" | "storage-error";
+      readonly expected: readonly RelayTransportCallbackEvent[];
+    }> = [
+      { result: "required", expected: [{ type: "credential.rejected" }] },
+      { result: "storage-error", expected: [{ type: "credential.storage-error" }] },
+      { result: "stale", expected: [] },
+    ];
+    for (const testCase of cases) {
+      FakeWebSocket.instances.length = 0;
+      const provider = new FakeCredentialProvider();
+      provider.rejectResult = testCase.result;
+      const events: RelayTransportCallbackEvent[] = [];
+      const errors: RelayTransportError[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        credentialProvider: provider,
+        fetch: async () => ticketHttpResponse(401),
+        WebSocket: fakeWebSocketConstructor,
+        onEvent: (event) => events.push(event),
+        onTransportError: (error) => errors.push(error),
+      });
+      await transport.startSession("es");
+      expect(provider.rejectCalls).toEqual([[7, GRANT_TOKEN]]);
+      expect(events).toEqual(testCase.expected);
+      expect(errors).toHaveLength(0);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+    }
+
+    const throwing = new FakeCredentialProvider();
+    throwing.rejectError = new Error(`reject-canary:${CREDENTIAL}`);
+    const events: RelayTransportCallbackEvent[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: throwing,
+      fetch: async () => ticketHttpResponse(401),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => events.push(event),
+    });
+    await transport.startSession("es");
+    expect(events).toEqual([{ type: "credential.storage-error" }]);
+    expect(JSON.stringify(events)).not.toContain(CREDENTIAL);
+  });
+
+  it("never rejects credentials for non-401 ticket statuses", async () => {
+    for (const status of [403, 409, 429, 500]) {
+      const provider = new FakeCredentialProvider();
+      const errors: RelayTransportError[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        credentialProvider: provider,
+        fetch: async () => ticketHttpResponse(status),
+        WebSocket: fakeWebSocketConstructor,
+        onTransportError: (error) => errors.push(error),
+      });
+      await transport.startSession("es");
+      expect(provider.rejectCalls, String(status)).toHaveLength(0);
+      expect(errors, String(status)).toHaveLength(1);
+    }
+  });
+
+  it("bounds ticket bodies at exactly 16 KiB and cancels chunked overflow", async () => {
+    const body = await ticketResponse().text();
+    const exact = `${body}${" ".repeat(16 * 1024 - body.length)}`;
+    FakeWebSocket.instances.length = 0;
+    const exactTransport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
+      fetch: async () => new Response(exact, {
+        status: 200,
+        headers: { "content-length": String(16 * 1024) },
+      }),
+      WebSocket: fakeWebSocketConstructor,
+    });
+    const exactStart = exactTransport.startSession("es");
+    await flushMicrotasks();
+    const socket = FakeWebSocket.instances[0];
+    if (socket === undefined) throw new Error("Exact-boundary socket missing");
+    socket.open();
+    await exactStart;
+
+    let cancelled = 0;
+    const errors: RelayTransportError[] = [];
+    const oversized = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(16 * 1024));
+          controller.enqueue(new Uint8Array(1));
+        },
+        cancel() { cancelled += 1; },
+      }), { status: 200 }),
+      WebSocket: fakeWebSocketConstructor,
+      onTransportError: (error) => errors.push(error),
+    });
+    await oversized.startSession("es");
+    expect(cancelled).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "ticket", recoveryDisposition: "stop" });
+
+    let fixedCancelled = 0;
+    const fixedErrors: RelayTransportError[] = [];
+    const fixedOversized = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        cancel() { fixedCancelled += 1; },
+      }), {
+        status: 200,
+        headers: { "content-length": String(16 * 1024 + 1) },
+      }),
+      WebSocket: fakeWebSocketConstructor,
+      onTransportError: (error) => fixedErrors.push(error),
+    });
+    await fixedOversized.startSession("es");
+    expect(fixedCancelled).toBe(1);
+    expect(fixedErrors).toHaveLength(1);
+    expect(fixedErrors[0]).toMatchObject({ kind: "ticket", recoveryDisposition: "stop" });
+  });
+
+  it("cancels and settles a stalled ticket body on replacement or explicit close", async () => {
+    for (const operation of ["replacement", "close"] as const) {
+      FakeWebSocket.instances.length = 0;
+      let cancelled = 0;
+      let requestCount = 0;
+      const provider = new FakeCredentialProvider();
+      const events: RelayTransportCallbackEvent[] = [];
+      const transport = new RelayTransport({
+        relayOrigin: "https://relay.example",
+        credentialProvider: provider,
+        fetch: async () => {
+          requestCount += 1;
+          if (requestCount > 1) return ticketResponse();
+          return new Response(new ReadableStream<Uint8Array>({
+            pull: async () => new Promise<void>(() => undefined),
+            cancel() { cancelled += 1; },
+          }), { status: 200 });
+        },
+        WebSocket: fakeWebSocketConstructor,
+        onEvent: (event) => events.push(event),
+      });
+      const stalled = transport.startSession("es");
+      await flushMicrotasks();
+      expect(provider.recordCalls).toHaveLength(0);
+
+      if (operation === "close") {
+        transport.close();
+        await stalled;
+        expect(FakeWebSocket.instances).toHaveLength(0);
+      } else {
+        const replacement = transport.startSession("es");
+        await stalled;
+        await flushMicrotasks();
+        const socket = FakeWebSocket.instances[0];
+        if (socket === undefined) throw new Error("Replacement socket missing");
+        socket.open();
+        await replacement;
+        expect(provider.recordCalls).toEqual([[7, GRANT_TOKEN]]);
+      }
+      expect(cancelled, operation).toBe(1);
+      expect(provider.rejectCalls, operation).toHaveLength(0);
+      expect(events.filter((event) => event.type.startsWith("credential.")), operation)
+        .toHaveLength(0);
+    }
+  });
+
+  it("cancels a late response from a replaced fetch with zero stale activity", async () => {
+    FakeWebSocket.instances.length = 0;
+    const late = deferred<Response>();
+    let requestCount = 0;
+    let cancelled = 0;
+    const provider = new FakeCredentialProvider();
+    const events: RelayTransportCallbackEvent[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: provider,
+      fetch: async () => {
+        requestCount += 1;
+        return requestCount === 1 ? late.promise : ticketResponse();
+      },
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => events.push(event),
+    });
+
+    const first = transport.startSession("es");
+    await flushMicrotasks();
+    const replacement = transport.startSession("es");
+    await flushMicrotasks();
+    late.resolve(new Response(new ReadableStream<Uint8Array>({
+      cancel() { cancelled += 1; },
+    }), { status: 200 }));
+    await first;
+    const socket = FakeWebSocket.instances[0];
+    if (socket === undefined) throw new Error("Replacement socket missing");
+    socket.open();
+    await replacement;
+
+    expect(cancelled).toBe(1);
+    expect(provider.recordCalls).toEqual([[7, GRANT_TOKEN]]);
+    expect(provider.rejectCalls).toHaveLength(0);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(events.filter((event) => event.type.startsWith("credential."))).toHaveLength(0);
+  });
+
+  it("rejects a ticket WebSocket origin that is not the configured HTTPS origin transformed to WSS", async () => {
+    FakeWebSocket.instances.length = 0;
+    const errors: RelayTransportError[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
+      fetch: async () => ticketResponse({ wssOrigin: "wss://attacker.example" }),
+      WebSocket: fakeWebSocketConstructor,
+      onTransportError: (error) => errors.push(error),
+    });
+    await transport.startSession("es");
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "ticket", recoveryDisposition: "stop" });
+  });
+
   it("validates and emits session.ready while installing negotiated queue limits", async () => {
     const events: RelayTransportEvent[] = [];
     const { transport } = createTransport((event) => events.push(event));
@@ -365,6 +806,26 @@ describe("G2 relay transport", () => {
     expect(Object.isFrozen(transport.snapshot)).toBe(true);
   });
 
+  it("validates an invalid target before teardown and preserves the active session", async () => {
+    const errors: RelayTransportError[] = [];
+    const created = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(created.transport);
+    const snapshot = created.transport.snapshot;
+    const calls = [...created.credentialProvider.calls];
+    const requestCount = created.requests.length;
+
+    await created.transport.startSession("not-a-target" as never);
+
+    expect(created.transport.snapshot).toEqual(snapshot);
+    expect(socket.readyState).toBe(1);
+    expect(socket.closeCalls).toBe(0);
+    expect(created.credentialProvider.calls).toEqual(calls);
+    expect(created.requests).toHaveLength(requestCount);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "configuration", recoveryDisposition: "stop" });
+  });
+
   it("classifies pre-ready ticket failures for retry without emitting transport.lost", async () => {
     const cases: Array<{
       readonly name: string;
@@ -381,7 +842,7 @@ describe("G2 relay transport", () => {
         fetch: async () => ticketHttpResponse(status),
         disposition: "retry" as const,
       })),
-      ...[400, 401, 403, 429].map((status) => ({
+      ...[400, 403, 429].map((status) => ({
         name: `HTTP ${status}`,
         fetch: async () => ticketHttpResponse(status),
         disposition: "stop" as const,
@@ -394,6 +855,7 @@ describe("G2 relay transport", () => {
       const events: RelayTransportCallbackEvent[] = [];
       const transport = new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: testCase.fetch,
         WebSocket: fakeWebSocketConstructor,
         onEvent: (event) => events.push(event),
@@ -424,6 +886,7 @@ describe("G2 relay transport", () => {
       const errors: RelayTransportError[] = [];
       const transport = new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: async () => ({ ok: true, status: 200, json } as unknown as Response),
         WebSocket: fakeWebSocketConstructor,
         onTransportError: (error) => errors.push(error),
@@ -443,6 +906,7 @@ describe("G2 relay transport", () => {
     const errors: RelayTransportError[] = [];
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => { throw new Error(canary); },
       WebSocket: fakeWebSocketConstructor,
       onTransportError: (error) => errors.push(error),
@@ -458,6 +922,8 @@ describe("G2 relay transport", () => {
       disposition: "retry",
       message: "Relay session ticket request failed",
     }, canary);
+    expect(error.stack).not.toContain(CREDENTIAL);
+    expect(JSON.stringify(error)).not.toContain(CREDENTIAL);
 
     const constructed = new RelayTransportError("protocol", "stop");
     expectRedactedError(constructed, {
@@ -479,6 +945,7 @@ describe("G2 relay transport", () => {
     ]) {
       expect(() => new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: async () => ticketResponse(),
         WebSocket: fakeWebSocketConstructor,
         readyTimeoutMs,
@@ -487,6 +954,7 @@ describe("G2 relay transport", () => {
 
     expect(() => new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       readyTimeoutMs: 2_147_483_647,
@@ -500,6 +968,7 @@ describe("G2 relay transport", () => {
     } as unknown as BrowserWebSocketConstructor;
     const constructionTransport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: throwingWebSocketConstructor,
       onTransportError: (error) => constructionErrors.push(error),
@@ -517,6 +986,7 @@ describe("G2 relay transport", () => {
       const timeoutEvents: RelayTransportCallbackEvent[] = [];
       const transport = new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: async () => ticketResponse(),
         WebSocket: fakeWebSocketConstructor,
         readyTimeoutMs: 25,
@@ -547,6 +1017,7 @@ describe("G2 relay transport", () => {
       const errors: RelayTransportError[] = [];
       const transport = new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: async () => ticketResponse(),
         WebSocket: fakeWebSocketConstructor,
         readyTimeoutMs: 30,
@@ -712,6 +1183,108 @@ describe("G2 relay transport", () => {
         sessionReady: false,
       });
       expectClosedEmpty(transport);
+    }
+  });
+
+  it("detaches first and rejects exactly once for 4401 while 4403 preserves the grant", async () => {
+    const events: RelayTransportCallbackEvent[] = [];
+    const errors: RelayTransportError[] = [];
+    const provider = new FakeCredentialProvider();
+    const { transport } = createTransport(
+      undefined,
+      (error) => errors.push(error),
+      (event) => events.push(event),
+      provider,
+    );
+    const socket = await openReady(transport);
+    events.length = 0;
+    socket.unexpectedClose(4401);
+    expectClosedEmpty(transport);
+    socket.error();
+    socket.unexpectedClose(4401);
+    await flushMicrotasks();
+    expect(provider.rejectCalls).toEqual([[7, GRANT_TOKEN]]);
+    expect(events).toEqual([{ type: "credential.rejected" }]);
+    expect(errors).toHaveLength(0);
+
+    const forbiddenProvider = new FakeCredentialProvider();
+    const forbiddenErrors: RelayTransportError[] = [];
+    const forbidden = createTransport(
+      undefined,
+      (error) => forbiddenErrors.push(error),
+      undefined,
+      forbiddenProvider,
+    );
+    const forbiddenSocket = await openReady(forbidden.transport);
+    forbiddenSocket.unexpectedClose(4403);
+    await flushMicrotasks();
+    expect(forbiddenProvider.rejectCalls).toHaveLength(0);
+    expect(forbiddenErrors).toHaveLength(1);
+    expect(forbiddenErrors[0]).toMatchObject({ kind: "websocket", recoveryDisposition: "stop" });
+  });
+
+  it("rejects once for authentication_failed session rejection and error envelopes", async () => {
+    for (const message of [
+      {
+        type: "session.rejected",
+        code: "authentication_failed",
+        displaySafeMessage: "The session could not be started.",
+      },
+      {
+        type: "error",
+        code: "authentication_failed",
+        scope: "session",
+        recoverable: false,
+        displaySafeMessage: "The request could not be completed.",
+        errorId: ERROR_ID,
+        time: SESSION_READY_TIME,
+      },
+    ]) {
+      const provider = new FakeCredentialProvider();
+      const events: RelayTransportCallbackEvent[] = [];
+      const created = createTransport(
+        undefined,
+        undefined,
+        (event) => events.push(event),
+        provider,
+      );
+      const socket = await openReady(created.transport);
+      socket.message(JSON.stringify(message));
+      socket.unexpectedClose(4401);
+      await flushMicrotasks();
+      expect(provider.rejectCalls).toEqual([[7, GRANT_TOKEN]]);
+      expect(events).toEqual([{ type: "session.ready", ...readyMessage() }, {
+        type: "credential.rejected",
+      }]);
+      expectClosedEmpty(created.transport);
+    }
+  });
+
+  it("suppresses stale live rejection outcomes and never rejects on explicit close or end", async () => {
+    const staleProvider = new FakeCredentialProvider();
+    staleProvider.rejectResult = "stale";
+    const staleEvents: RelayTransportCallbackEvent[] = [];
+    const stale = createTransport(
+      undefined,
+      undefined,
+      (event) => staleEvents.push(event),
+      staleProvider,
+    );
+    const staleSocket = await openReady(stale.transport);
+    staleEvents.length = 0;
+    staleSocket.unexpectedClose(4401);
+    await flushMicrotasks();
+    expect(staleProvider.rejectCalls).toHaveLength(1);
+    expect(staleEvents).toEqual([]);
+
+    for (const operation of ["close", "end"] as const) {
+      const provider = new FakeCredentialProvider();
+      const created = createTransport(undefined, undefined, undefined, provider);
+      await openReady(created.transport);
+      if (operation === "close") created.transport.close();
+      else created.transport.endSession();
+      await flushMicrotasks();
+      expect(provider.rejectCalls, operation).toHaveLength(0);
     }
   });
 
@@ -908,6 +1481,7 @@ describe("G2 relay transport", () => {
     const ticketErrors: RelayTransportError[] = [];
     const malformedTicketTransport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ({ ok: true, status: 200, json: async () => ({ invalid: true }) } as Response),
       WebSocket: fakeWebSocketConstructor,
       onTransportError: (error) => ticketErrors.push(error),
@@ -1056,6 +1630,7 @@ describe("G2 relay transport", () => {
     FakeWebSocket.instances.length = 0;
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => events.push(event),
@@ -1072,6 +1647,7 @@ describe("G2 relay transport", () => {
     FakeWebSocket.instances.length = 0;
     const second = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => events.push(event),
@@ -1092,6 +1668,7 @@ describe("G2 relay transport", () => {
     FakeWebSocket.instances.length = 0;
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => events.push(event),
@@ -1125,6 +1702,7 @@ describe("G2 relay transport", () => {
     FakeWebSocket.instances.length = 0;
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => {
@@ -1184,6 +1762,7 @@ describe("G2 relay transport", () => {
     const endEvents: RelayTransportCallbackEvent[] = [];
     const endTransport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => endEvents.push(event),
@@ -1211,8 +1790,10 @@ describe("G2 relay transport", () => {
     let rejectFirst!: (error: unknown) => void;
     let requestCount = 0;
     const errors: RelayTransportError[] = [];
+    const provider = new FakeCredentialProvider();
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: provider,
       fetch: async () => {
         requestCount += 1;
         if (requestCount === 1) {
@@ -1237,7 +1818,98 @@ describe("G2 relay transport", () => {
     socket.open();
     await second;
     expect(errors).toHaveLength(0);
+    expect(provider.rejectCalls).toHaveLength(0);
+    expect(provider.recordCalls).toHaveLength(1);
     expect(transport.snapshot.connectionState).toBe("open");
+  });
+
+  it("suppresses displaced generations during acquire and record persistence", async () => {
+    const acquireGate = deferred<void>();
+    const acquireProvider = new FakeCredentialProvider();
+    acquireProvider.acquireWait = acquireGate.promise;
+    const acquireEvents: RelayTransportCallbackEvent[] = [];
+    const acquireTransport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: acquireProvider,
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => acquireEvents.push(event),
+    });
+    FakeWebSocket.instances.length = 0;
+    const firstAcquire = acquireTransport.startSession("es");
+    await flushMicrotasks();
+    acquireProvider.acquireWait = undefined;
+    const secondAcquire = acquireTransport.startSession("es");
+    await flushMicrotasks();
+    const acquireSocket = FakeWebSocket.instances[0];
+    if (acquireSocket === undefined) throw new Error("Replacement acquire socket missing");
+    acquireGate.resolve();
+    await firstAcquire;
+    acquireSocket.open();
+    await secondAcquire;
+    expect(acquireProvider.calls.filter((call) => call === "acquire")).toHaveLength(2);
+    expect(acquireProvider.recordCalls).toHaveLength(1);
+    expect(acquireEvents.filter((event) => event.type.startsWith("credential."))).toHaveLength(0);
+
+    const recordGate = deferred<void>();
+    const recordProvider = new FakeCredentialProvider();
+    recordProvider.recordWait = recordGate.promise;
+    const recordEvents: RelayTransportCallbackEvent[] = [];
+    const recordTransport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: recordProvider,
+      fetch: async () => ticketResponse(),
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => recordEvents.push(event),
+    });
+    FakeWebSocket.instances.length = 0;
+    const firstRecord = recordTransport.startSession("es");
+    await flushMicrotasks();
+    expect(recordProvider.recordCalls).toHaveLength(1);
+    recordProvider.recordWait = undefined;
+    const secondRecord = recordTransport.startSession("es");
+    await flushMicrotasks();
+    const recordSocket = FakeWebSocket.instances[0];
+    if (recordSocket === undefined) throw new Error("Replacement record socket missing");
+    recordGate.resolve();
+    await firstRecord;
+    recordSocket.open();
+    await secondRecord;
+    expect(recordProvider.recordCalls).toHaveLength(2);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(recordEvents.filter((event) => event.type.startsWith("credential."))).toHaveLength(0);
+  });
+
+  it("suppresses a ticket rejection callback displaced by a replacement generation", async () => {
+    const rejectGate = deferred<void>();
+    const provider = new FakeCredentialProvider();
+    provider.rejectWait = rejectGate.promise;
+    let requestCount = 0;
+    const events: RelayTransportCallbackEvent[] = [];
+    const transport = new RelayTransport({
+      relayOrigin: "https://relay.example",
+      credentialProvider: provider,
+      fetch: async () => {
+        requestCount += 1;
+        return requestCount === 1 ? ticketHttpResponse(401) : ticketResponse();
+      },
+      WebSocket: fakeWebSocketConstructor,
+      onEvent: (event) => events.push(event),
+    });
+    FakeWebSocket.instances.length = 0;
+    const rejected = transport.startSession("es");
+    await flushMicrotasks();
+    expect(provider.rejectCalls).toHaveLength(1);
+    provider.rejectWait = undefined;
+    const replacement = transport.startSession("es");
+    await flushMicrotasks();
+    const socket = FakeWebSocket.instances[0];
+    if (socket === undefined) throw new Error("Rejection replacement socket missing");
+    rejectGate.resolve();
+    await rejected;
+    socket.open();
+    await replacement;
+    expect(events.filter((event) => event.type.startsWith("credential."))).toHaveLength(0);
   });
 
   it("does not let a stale socket loss clear or report a replacement generation", async () => {
@@ -1246,6 +1918,7 @@ describe("G2 relay transport", () => {
     const events: RelayTransportCallbackEvent[] = [];
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => events.push(event),
@@ -1282,6 +1955,7 @@ describe("G2 relay transport", () => {
     const errors: RelayTransportError[] = [];
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onServerEvent: (event) => {
@@ -1323,6 +1997,7 @@ describe("G2 relay transport", () => {
     const errors: RelayTransportError[] = [];
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onTransportError: (error) => {
@@ -1373,6 +2048,7 @@ describe("G2 relay transport", () => {
     let rejectedSnapshot: RelayTransport["snapshot"] | undefined;
     const rejected = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onEvent: (event) => {
@@ -1386,7 +2062,7 @@ describe("G2 relay transport", () => {
     const rejectedSocket = await openSocket(rejected);
     rejectedSocket.message(JSON.stringify({
       type: "session.rejected",
-      code: "authentication_failed",
+      code: "origin_rejected",
       displaySafeMessage: "The session could not be started.",
     }));
     expect(rejectedSocket.readyState).toBe(3);
@@ -1406,6 +2082,7 @@ describe("G2 relay transport", () => {
     FakeWebSocket.instances.length = 0;
     const transport = new RelayTransport({
       relayOrigin: "https://relay.example",
+      credentialProvider: new FakeCredentialProvider(),
       fetch: async () => ticketResponse(),
       WebSocket: fakeWebSocketConstructor,
       onServerEvent: () => {
@@ -1467,6 +2144,7 @@ describe("G2 relay transport", () => {
       const errors: RelayTransportError[] = [];
       const transport = new RelayTransport({
         relayOrigin: "https://relay.example",
+        credentialProvider: new FakeCredentialProvider(),
         fetch: async () => ticketResponse(),
         WebSocket: fakeWebSocketConstructor,
         onTransportError: (error) => errors.push(error),

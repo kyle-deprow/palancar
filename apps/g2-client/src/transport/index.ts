@@ -10,6 +10,7 @@ import {
   assertUtteranceCommit,
   assertUtteranceStart,
   createWebSocketSubprotocols,
+  isBase64UrlSecret,
   type ClientControlMessage,
   type NegotiatedLimits,
   type ServerControlMessage,
@@ -27,8 +28,18 @@ import {
 } from "@palancar/language-registry";
 
 import type { FatalEvent } from "../state/index.js";
+import type {
+  CredentialRejectedEvent,
+  CredentialStorageErrorEvent,
+} from "../state/index.js";
+import type {
+  SessionCredentialGrantToken,
+  SessionCredentialLease,
+  SessionCredentialProvider,
+} from "../auth/types.js";
 
 const SESSION_TICKET_PATH = "/v1/session-tickets" as const;
+const MAX_TICKET_BODY_BYTES = 16 * 1024;
 const DEFAULT_GATE_POLICY_VERSION = "1.0.0" as const;
 const DEFAULT_CLIENT_BUILD = "g2-client-dev" as const;
 const DEFAULT_READY_TIMEOUT_MS = 10_000 as const;
@@ -80,7 +91,9 @@ export interface RelayTransportLostEvent {
 export type RelayTransportCallbackEvent =
   | RelayTransportEvent
   | FatalEvent
-  | RelayTransportLostEvent;
+  | RelayTransportLostEvent
+  | CredentialRejectedEvent
+  | CredentialStorageErrorEvent;
 
 export type RelayTransportRecoveryDisposition = "retry" | "stop";
 
@@ -139,6 +152,7 @@ export interface BrowserWebSocketConstructor {
 export interface RelayTransportOptions {
   /** HTTPS origin of the configured relay, without a path or credentials. */
   readonly relayOrigin: string;
+  readonly credentialProvider: SessionCredentialProvider;
   readonly fetch?: typeof globalThis.fetch;
   readonly fetchImpl?: typeof globalThis.fetch;
   readonly WebSocket?: BrowserWebSocketConstructor;
@@ -193,6 +207,26 @@ interface ReadyTimeoutRegistration {
   readonly handle: ReturnType<typeof setTimeout>;
   readonly source: TransportSource;
 }
+
+interface AuthenticatedTicket {
+  readonly ticket: SessionTicketResponse;
+  readonly credentialVersion: number;
+  readonly grantToken: SessionCredentialGrantToken;
+}
+
+interface LiveCredentialGrant {
+  readonly generation: number;
+  readonly credentialVersion: number;
+  readonly grantToken: SessionCredentialGrantToken;
+  rejectionStarted: boolean;
+}
+
+const CREDENTIAL_REJECTED_EVENT: CredentialRejectedEvent = Object.freeze({
+  type: "credential.rejected",
+});
+const CREDENTIAL_STORAGE_ERROR_EVENT: CredentialStorageErrorEvent = Object.freeze({
+  type: "credential.storage-error",
+});
 
 function cloneAndFreeze<T>(value: T): T {
   const seen = new WeakMap<object, unknown>();
@@ -251,6 +285,154 @@ function configuredRelayOrigin(value: string): string {
   return url.origin;
 }
 
+function expectedWebSocketOrigin(relayOrigin: string): string {
+  return `wss://${new URL(relayOrigin).host}`;
+}
+
+function exactOwnKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length && keys.every(
+    (key) => typeof key === "string" && expected.includes(key),
+  );
+}
+
+function acquiredLease(value: unknown): SessionCredentialLease | "required" | "storage-error" | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  if (!exactOwnKeys(value, ["kind", ...(Reflect.get(value, "kind") === "ready" ? ["lease"] : [])])) {
+    return undefined;
+  }
+  const kind = Reflect.get(value, "kind");
+  if (kind === "required" || kind === "storage-error") return kind;
+  if (kind !== "ready") return undefined;
+  const lease = Reflect.get(value, "lease");
+  if (
+    typeof lease !== "object" || lease === null ||
+    !exactOwnKeys(lease, ["credential", "credentialVersion", "grantToken"])
+  ) return undefined;
+  const credential = Reflect.get(lease, "credential");
+  const credentialVersion = Reflect.get(lease, "credentialVersion");
+  const grantToken = Reflect.get(lease, "grantToken");
+  if (
+    !isBase64UrlSecret(credential) ||
+    typeof credentialVersion !== "number" ||
+    !Number.isSafeInteger(credentialVersion) ||
+    credentialVersion <= 0 ||
+    typeof grantToken !== "object" ||
+    grantToken === null
+  ) return undefined;
+  return lease as SessionCredentialLease;
+}
+
+function cancelResponseBody(body: ReadableStream<Uint8Array> | null): void {
+  if (body === null) return;
+  try {
+    void body.cancel().catch(() => undefined);
+  } catch {
+    // Cancellation is best effort and never exposes a response failure.
+  }
+}
+
+function cancelResponse(response: Response): void {
+  try {
+    cancelResponseBody(response.body);
+  } catch {
+    // A late or rejected response is discarded even if its body accessor fails.
+  }
+}
+
+async function awaitWithAbort<T>(
+  operation: Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): Promise<T> {
+  if (signal === undefined) return operation;
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const abort = (): void => {
+    onAbort();
+    rejectAbort(new Error("ticket body aborted"));
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+async function readBoundedTicketJson(
+  response: Response,
+  signal: AbortSignal | undefined,
+): Promise<unknown> {
+  if (signal?.aborted) {
+    cancelResponse(response);
+    throw new Error("ticket body aborted");
+  }
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength)) {
+    const length = Number(contentLength);
+    if (!Number.isSafeInteger(length) || length > MAX_TICKET_BODY_BYTES) {
+      cancelResponse(response);
+      throw new Error("ticket body overflow");
+    }
+  }
+  if (response.body === null) {
+    const text = await awaitWithAbort(
+      response.text(),
+      signal,
+      () => cancelResponse(response),
+    );
+    if (new TextEncoder().encode(text).byteLength > MAX_TICKET_BODY_BYTES) {
+      throw new Error("ticket body overflow");
+    }
+    return JSON.parse(text) as unknown;
+  }
+
+  const reader = response.body.getReader();
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const cancelReader = (): void => {
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // Cancellation is best effort; the abort race settles the operation.
+    }
+    if (signal !== undefined) rejectAbort(new Error("ticket body aborted"));
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  if (signal?.aborted) cancelReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const read = reader.read();
+      const next = signal === undefined ? await read : await Promise.race([read, aborted]);
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > MAX_TICKET_BODY_BYTES) {
+        cancelReader();
+        throw new Error("ticket body overflow");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A noncooperative pending read may keep its lock after local cancellation.
+    }
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+}
+
 function copyLimits(limits: NegotiatedLimits): Readonly<NegotiatedLimits> {
   return Object.freeze({ ...limits });
 }
@@ -277,6 +459,8 @@ function httpRecoveryDisposition(status: number): RelayTransportRecoveryDisposit
 
 export class RelayTransport {
   readonly #relayOrigin: string;
+  readonly #wssOrigin: string;
+  readonly #credentialProvider: SessionCredentialProvider;
   readonly #fetch: typeof globalThis.fetch;
   readonly #webSocket: BrowserWebSocketConstructor;
   readonly #gatePolicyVersion: string;
@@ -298,9 +482,24 @@ export class RelayTransport {
   #negotiatedLimits: Readonly<NegotiatedLimits> | undefined;
   #active: ActiveUtterance | undefined;
   #expectedSessionNegotiation: ExpectedSessionNegotiation | undefined;
+  #liveCredentialGrant: LiveCredentialGrant | undefined;
 
   constructor(options: RelayTransportOptions) {
     this.#relayOrigin = configuredRelayOrigin(options.relayOrigin);
+    this.#wssOrigin = expectedWebSocketOrigin(this.#relayOrigin);
+    let credentialProvider: SessionCredentialProvider;
+    try {
+      credentialProvider = options.credentialProvider;
+      if (
+        typeof credentialProvider !== "object" || credentialProvider === null ||
+        typeof credentialProvider.acquire !== "function" ||
+        typeof credentialProvider.recordAuthenticated !== "function" ||
+        typeof credentialProvider.reject !== "function"
+      ) throw new Error("invalid credential provider");
+    } catch {
+      throw new RelayTransportError("configuration");
+    }
+    this.#credentialProvider = credentialProvider;
     this.#fetch =
       options.fetchImpl ?? options.fetch ?? globalThis.fetch.bind(globalThis);
     const webSocket =
@@ -346,11 +545,6 @@ export class RelayTransport {
   }
 
   async startSession(targetLanguage: TargetLanguage): Promise<void> {
-    this.close();
-    this.#connectionState = "connecting";
-    const generation = ++this.#generation;
-    const ticketSource: TransportSource = { socket: undefined, generation };
-
     let start: ClientControlMessage;
     try {
       if (!isTargetLanguage(targetLanguage)) {
@@ -367,9 +561,14 @@ export class RelayTransport {
         requestedLimits: DEFAULT_NEGOTIATED_LIMITS,
       });
     } catch {
-      this.#fail(ticketSource, "configuration", "stop");
+      this.#report(this.#currentSource(), "configuration", "stop");
       return;
     }
+
+    this.close();
+    this.#connectionState = "connecting";
+    const generation = ++this.#generation;
+    const ticketSource: TransportSource = { socket: undefined, generation };
 
     this.#expectedSessionNegotiation = Object.freeze({
       generation,
@@ -381,8 +580,15 @@ export class RelayTransport {
       ? undefined
       : new AbortController();
     this.#ticketAbortController = ticketAbortController;
-    const ticket = await this.#fetchTicket(generation, ticketAbortController);
-    if (ticket === undefined || generation !== this.#generation) return;
+    const authenticated = await this.#authorizeTicket(generation, ticketAbortController);
+    if (authenticated === undefined || generation !== this.#generation) return;
+    const { ticket, credentialVersion, grantToken } = authenticated;
+    this.#liveCredentialGrant = {
+      generation,
+      credentialVersion,
+      grantToken,
+      rejectionStarted: false,
+    };
 
     let socket: BrowserWebSocket;
     try {
@@ -443,6 +649,11 @@ export class RelayTransport {
           return;
         }
         const code = Number.isInteger(event.code) ? event.code : 0;
+        if (code === 4401) {
+          this.#beginLiveCredentialRejection(source);
+          settle();
+          return;
+        }
         this.#fail(source, "websocket", closeRecoveryDisposition(code));
         settle();
       };
@@ -603,6 +814,7 @@ export class RelayTransport {
   async #fetchTicket(
     generation: number,
     abortController: AbortController | undefined,
+    lease: SessionCredentialLease,
   ): Promise<SessionTicketResponse | undefined> {
     const request = assertSessionTicketRequest({
       protocolVersion: PROTOCOL_VERSION,
@@ -619,8 +831,11 @@ export class RelayTransport {
             method: "POST",
             headers: {
               "content-type": "application/json",
+              Authorization: `Bearer ${lease.credential}`,
             },
             body: JSON.stringify(request),
+            credentials: "omit",
+            redirect: "error",
             ...(abortController === undefined ? {} : { signal: abortController.signal }),
           },
         );
@@ -630,29 +845,43 @@ export class RelayTransport {
         }
         return undefined;
       }
-      if (!this.#isSourceCurrent(source)) return undefined;
+      if (!this.#isSourceCurrent(source)) {
+        cancelResponse(response);
+        return undefined;
+      }
+      if (response.status === 401) {
+        cancelResponse(response);
+        await this.#rejectTicketCredential(source, lease);
+        return undefined;
+      }
       if (
         response.ok === false ||
         response.status < 200 ||
         response.status >= 300
       ) {
+        cancelResponse(response);
         this.#fail(source, "ticket", httpRecoveryDisposition(response.status));
         return undefined;
       }
 
       let body: unknown;
       try {
-        body = await response.json();
+        body = await readBoundedTicketJson(response, abortController?.signal);
       } catch {
         if (this.#isSourceCurrent(source)) {
           this.#fail(source, "ticket", "stop");
         }
         return undefined;
       }
-      if (!this.#isSourceCurrent(source)) return undefined;
+      if (!this.#isSourceCurrent(source)) {
+        cancelResponse(response);
+        return undefined;
+      }
 
       try {
-        return assertSessionTicketResponse(body);
+        const ticket = assertSessionTicketResponse(body);
+        if (ticket.wssOrigin !== this.#wssOrigin) throw new Error("unexpected ticket origin");
+        return ticket;
       } catch {
         this.#fail(source, "ticket", "stop");
         return undefined;
@@ -661,6 +890,100 @@ export class RelayTransport {
       if (this.#ticketAbortController === abortController) {
         this.#ticketAbortController = undefined;
       }
+    }
+  }
+
+  async #authorizeTicket(
+    generation: number,
+    abortController: AbortController | undefined,
+  ): Promise<AuthenticatedTicket | undefined> {
+    const source: TransportSource = { socket: undefined, generation };
+    let acquisition: unknown;
+    try {
+      acquisition = await this.#credentialProvider.acquire();
+    } catch {
+      if (this.#isSourceCurrent(source)) {
+        this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
+      }
+      return undefined;
+    }
+    if (!this.#isSourceCurrent(source)) return undefined;
+
+    let lease: SessionCredentialLease | "required" | "storage-error" | undefined;
+    try {
+      lease = acquiredLease(acquisition);
+    } catch {
+      lease = undefined;
+    }
+    if (lease === "required") {
+      this.#emitCredentialOutcome(source, CREDENTIAL_REJECTED_EVENT);
+      return undefined;
+    }
+    if (lease === "storage-error" || lease === undefined) {
+      this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
+      return undefined;
+    }
+
+    let ticket: SessionTicketResponse | undefined;
+    try {
+      ticket = await this.#fetchTicket(generation, abortController, lease);
+    } catch {
+      if (this.#isSourceCurrent(source)) this.#fail(source, "ticket", "stop");
+      return undefined;
+    }
+    if (ticket === undefined || !this.#isSourceCurrent(source)) return undefined;
+
+    let result: unknown;
+    try {
+      result = await this.#credentialProvider.recordAuthenticated(
+        lease.credentialVersion,
+        lease.grantToken,
+      );
+    } catch {
+      if (this.#isSourceCurrent(source)) {
+        this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
+      }
+      return undefined;
+    }
+    if (!this.#isSourceCurrent(source)) return undefined;
+    if (result === "stale") {
+      this.#detachAndClear(source);
+      return undefined;
+    }
+    if (result !== "recorded") {
+      this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
+      return undefined;
+    }
+    return Object.freeze({
+      ticket,
+      credentialVersion: lease.credentialVersion,
+      grantToken: lease.grantToken,
+    });
+  }
+
+  async #rejectTicketCredential(
+    source: TransportSource,
+    lease: SessionCredentialLease,
+  ): Promise<void> {
+    let result: unknown;
+    try {
+      result = await this.#credentialProvider.reject(
+        lease.credentialVersion,
+        lease.grantToken,
+      );
+    } catch {
+      if (this.#isSourceCurrent(source)) {
+        this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
+      }
+      return;
+    }
+    if (!this.#isSourceCurrent(source)) return;
+    if (result === "stale") {
+      this.#detachAndClear(source);
+    } else if (result === "required") {
+      this.#emitCredentialOutcome(source, CREDENTIAL_REJECTED_EVENT);
+    } else {
+      this.#emitCredentialOutcome(source, CREDENTIAL_STORAGE_ERROR_EVENT);
     }
   }
 
@@ -755,6 +1078,13 @@ export class RelayTransport {
       const parsed: unknown = typeof input === "string" ? JSON.parse(input) : input;
       const message = cloneAndFreeze(assertServerControlMessage(parsed));
       if (!this.#isSourceCurrent(source)) return;
+      if (
+        (message.type === "session.rejected" || message.type === "error") &&
+        message.code === "authentication_failed"
+      ) {
+        this.#beginLiveCredentialRejection(source);
+        return;
+      }
       if (message.type === "audio.ack") {
         this.#handleAcknowledgement(source, message);
         return;
@@ -851,7 +1181,11 @@ export class RelayTransport {
 
   #emitCallbackEvent(
     source: TransportSource,
-    event: FatalEvent | RelayTransportLostEvent,
+    event:
+      | FatalEvent
+      | RelayTransportLostEvent
+      | CredentialRejectedEvent
+      | CredentialStorageErrorEvent,
   ): void {
     if (!this.#isSourceCurrent(source)) return;
     try {
@@ -859,6 +1193,51 @@ export class RelayTransport {
     } catch {
       this.#report(source, "callback");
     }
+  }
+
+  #emitCredentialOutcome(
+    source: TransportSource,
+    event: CredentialRejectedEvent | CredentialStorageErrorEvent,
+  ): void {
+    const deliverySource = this.#detachAndClear(source);
+    if (deliverySource !== undefined) this.#emitCallbackEvent(deliverySource, event);
+  }
+
+  #beginLiveCredentialRejection(source: TransportSource): void {
+    const liveGrant = this.#liveCredentialGrant;
+    if (
+      !this.#isSourceCurrent(source) ||
+      liveGrant === undefined ||
+      liveGrant.generation !== source.generation ||
+      liveGrant.rejectionStarted
+    ) return;
+    liveGrant.rejectionStarted = true;
+    const deliverySource = this.#detachAndClear(source);
+    if (deliverySource === undefined) return;
+    void this.#finishDetachedCredentialRejection(deliverySource, liveGrant);
+  }
+
+  async #finishDetachedCredentialRejection(
+    deliverySource: TransportSource,
+    liveGrant: LiveCredentialGrant,
+  ): Promise<void> {
+    let result: unknown;
+    try {
+      result = await this.#credentialProvider.reject(
+        liveGrant.credentialVersion,
+        liveGrant.grantToken,
+      );
+    } catch {
+      if (this.#isSourceCurrent(deliverySource)) {
+        this.#emitCallbackEvent(deliverySource, CREDENTIAL_STORAGE_ERROR_EVENT);
+      }
+      return;
+    }
+    if (!this.#isSourceCurrent(deliverySource) || result === "stale") return;
+    this.#emitCallbackEvent(
+      deliverySource,
+      result === "required" ? CREDENTIAL_REJECTED_EVENT : CREDENTIAL_STORAGE_ERROR_EVENT,
+    );
   }
 
   #sendUtteranceCancel(): boolean {
@@ -950,6 +1329,7 @@ export class RelayTransport {
     this.#socket = undefined;
     this.#generation += 1;
     this.#expectedSessionNegotiation = undefined;
+    this.#liveCredentialGrant = undefined;
     this.#connectionState = "closed";
     this.#clearSessionState();
     const deliverySource = this.#currentSource();
