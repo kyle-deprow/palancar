@@ -1,0 +1,30 @@
+{
+  "name": "@palancar/realtime-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "palancar-realtime-spike": "./dist/main.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@palancar/transcription": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run build && vitest run",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  }
+}
