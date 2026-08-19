@@ -135,6 +135,14 @@ resource "azapi_resource" "this" {
                   {
                     name  = "PALANCAR_TRANSCRIPTION_PROVIDER"
                     value = var.transcription_provider
+                  },
+                  {
+                    name  = "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON"
+                    value = jsonencode(var.browser_allowed_origins)
+                  },
+                  {
+                    name  = "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN"
+                    value = tostring(var.allow_null_browser_origin)
                   }
                 ],
                 var.enable_litellm_sidecar ? [

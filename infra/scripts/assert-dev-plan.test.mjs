@@ -120,7 +120,21 @@ function containerAppAfter(scale = { minReplicas: 0, maxReplicas: 1 }) {
   return {
     body: {
       properties: {
-        template: { scale },
+        template: {
+          containers: [
+            {
+              name: "relay",
+              env: [
+                envValue(
+                  "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+                  '["https://even-webview.synthetic.invalid"]',
+                ),
+                envValue("PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"),
+              ],
+            },
+          ],
+          scale,
+        },
       },
     },
   };
@@ -244,6 +258,11 @@ function runtimeContainerAppAfter(minReplicas = 0) {
                 envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
                 envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
                 envValue("PALANCAR_TRANSCRIPTION_PROVIDER", "mock"),
+                envValue(
+                  "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+                  '["https://even-webview.synthetic.invalid"]',
+                ),
+                envValue("PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"),
                 envValue(
                   "PALANCAR_LITELLM_BASE_URL",
                   "http://127.0.0.1:4000",
@@ -599,6 +618,50 @@ test("full-deploy accepts a complete no-op inventory after deployment", () => {
   ], { checks: [{ status: "pass" }] });
 
   assert.equal(acceptsPlan(noOpPlan, "full-deploy"), true);
+});
+
+test("full-deploy requires the exact fail-closed browser origin policy for Container App mutations and no-ops", () => {
+  const policyMutations = [
+    (after) => {
+      after.body.properties.template.containers[0].env = after.body.properties.template.containers[0].env.filter(
+        (item) => item.name !== "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env = after.body.properties.template.containers[0].env.filter(
+        (item) => item.name !== "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      ).value = '["https://even-webview.example.com"]';
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      ).value = "true";
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      ).value = "null";
+    },
+  ];
+
+  for (const actions of [["update"], ["no-op"]]) {
+    for (const mutate of policyMutations) {
+      const after = containerAppAfter();
+      mutate(after);
+      assert.equal(
+        acceptsPlan(
+          fullPlan([change(containerAppAddress, actions, after)]),
+          "full-deploy",
+        ),
+        false,
+      );
+    }
+  }
 });
 
 test("full-deploy requires configured identities RBAC role assignments", () => {
@@ -1405,6 +1468,85 @@ test("runtime-rollout requires exact security, mock transcription, localhost ali
   ];
 
   for (const mutate of mutations) {
+    const after = runtimeContainerAppAfter();
+    mutate(after);
+    assert.equal(acceptsPlan(runtimePlan(after), "runtime-rollout"), false);
+  }
+});
+
+test("runtime-rollout requires the exact fail-closed browser origin policy", () => {
+  const policyMutations = [
+    (after) => {
+      after.body.properties.template.containers[0].env = after.body.properties.template.containers[0].env.filter(
+        (item) => item.name !== "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env = after.body.properties.template.containers[0].env.filter(
+        (item) => item.name !== "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.push(
+        envValue(
+          "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+          '["https://even-webview.synthetic.invalid"]',
+        ),
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.push(
+        envValue("PALANCAR_BROWSER_ORIGIN_EXTRA", "fixture"),
+      );
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      ).value = "not-json";
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      ).value = '["https://*.example.com"]';
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      ).value =
+        '["https://even-webview.synthetic.invalid","https://even-webview.synthetic.invalid"]';
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      ).value = '["https://even-webview.example.com"]';
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      ).value = "true";
+    },
+    (after) => {
+      after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      ).value = "null";
+    },
+    (after) => {
+      const entry = after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      );
+      delete entry.value;
+      entry.secretRef = "browser-origins";
+    },
+    (after) => {
+      const entry = after.body.properties.template.containers[0].env.find(
+        (item) => item.name === "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      );
+      delete entry.value;
+      entry.secretRef = "allow-null-origin";
+    },
+  ];
+
+  for (const mutate of policyMutations) {
     const after = runtimeContainerAppAfter();
     mutate(after);
     assert.equal(acceptsPlan(runtimePlan(after), "runtime-rollout"), false);

@@ -229,6 +229,40 @@ variable "relay_min_replicas" {
   }
 }
 
+variable "browser_allowed_origins" {
+  description = "Canonical HTTPS browser origins allowed to access the relay."
+  type        = list(string)
+  nullable    = false
+  default     = ["https://even-webview.synthetic.invalid"]
+
+  validation {
+    condition = (
+      length(var.browser_allowed_origins) <= 32 &&
+      length(var.browser_allowed_origins) == length(toset(var.browser_allowed_origins)) &&
+      alltrue([
+        for origin in var.browser_allowed_origins :
+        can(regex(
+          "^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
+          origin
+        )) &&
+        !can(regex(
+          "^https://(?:[a-z0-9-]+\\.)*(?:0x[0-9a-f]*|[0-9]+)(?::[0-9]+)?$",
+          origin
+        )) &&
+        !can(regex(":443$", origin))
+      ])
+    )
+    error_message = "browser_allowed_origins must contain 0-32 unique canonical HTTPS origins with lowercase DNS hosts, a non-numeric/IP-like final host label, and no credentials, wildcard, whitespace, path, query, fragment, trailing slash, or explicit default port."
+  }
+}
+
+variable "allow_null_browser_origin" {
+  description = "Whether the relay may accept the literal null browser Origin."
+  type        = bool
+  nullable    = false
+  default     = false
+}
+
 variable "enable_litellm_sidecar" {
   description = "Whether to add the optional LiteLLM generation sidecar to the relay workload."
   type        = bool

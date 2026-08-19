@@ -29,6 +29,11 @@ deploy_relay_workload = false
 relay_image_digest    = ""
 relay_min_replicas    = 0
 
+# Keep this synthetic origin until physical Even WebView evidence supplies a
+# reviewed exact origin. Null browser origins remain rejected by default.
+browser_allowed_origins   = ["https://even-webview.synthetic.invalid"]
+allow_null_browser_origin  = false
+
 # Optional OpenRouter-only LiteLLM sidecar. Keep every value empty when disabled.
 enable_litellm_sidecar = false
 litellm_image_digest   = ""

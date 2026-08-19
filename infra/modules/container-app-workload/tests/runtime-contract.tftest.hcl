@@ -43,6 +43,22 @@ run "disabled_sidecar_is_empty_and_scale_to_zero" {
     condition     = length(azapi_resource.this.body.properties.configuration.secrets) == 0
     error_message = "a disabled sidecar must emit no generation secrets"
   }
+
+  assert {
+    condition = azapi_resource.this.body.properties.template.containers[0].env[13] == {
+      name  = "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON"
+      value = "[\"https://even-webview.synthetic.invalid\"]"
+    }
+    error_message = "the relay must emit the exact fail-closed browser origin JSON default"
+  }
+
+  assert {
+    condition = azapi_resource.this.body.properties.template.containers[0].env[14] == {
+      name  = "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN"
+      value = "false"
+    }
+    error_message = "the relay must reject null browser origins by default"
+  }
 }
 
 run "enabled_openrouter_contract" {
@@ -330,4 +346,250 @@ run "reject_case_only_duplicate_identities" {
   }
 
   expect_failures = [azapi_resource.this]
+}
+
+run "reject_malformed_browser_origin" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["http://app.example.com"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_duplicate_browser_origins" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = [
+      "https://app.example.com",
+      "https://app.example.com",
+    ]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_too_many_browser_origins" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = [for index in range(33) : "https://app-${index}.example.com"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_wildcard_browser_origin" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://*.example.com"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_trailing_slash_browser_origin" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.example.com/"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_explicit_default_browser_origin_port" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.example.com:443"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_uppercase_browser_origin_host" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://APP.example.com"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_numeric_browser_origin_host" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://127.0.0.01"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_hex_numeric_browser_origin_host" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://0x7f000001"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_decimal_numeric_browser_origin_final_label" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://example.01"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_hex_numeric_browser_origin_final_label" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.0x7f"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_bare_hex_browser_origin_host" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://0x"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_bare_hex_browser_origin_final_label" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.0x"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_too_many_ipv4_browser_origin_components" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://1.2.3.4.5"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "reject_browser_origin_path" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.example.com/path"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "explicit_null_browser_allowed_origins_use_default" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = null
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[13].value == "[\"https://even-webview.synthetic.invalid\"]"
+    error_message = "explicit null must resolve to the non-null browser origin default"
+  }
+}
+
+run "explicit_null_allow_null_browser_origin_uses_default" {
+  command = plan
+
+  variables {
+    allow_null_browser_origin = null
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[14].value == "false"
+    error_message = "explicit null must resolve to the non-null null-origin default"
+  }
+}
+
+run "accept_empty_browser_origins" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = []
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[13].value == "[]"
+    error_message = "an empty browser origin list must serialize as an empty JSON array"
+  }
+}
+
+run "accept_exactly_32_unique_browser_origins" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = [for index in range(32) : "https://app-${index}.example.com"]
+  }
+
+  assert {
+    condition = jsondecode(azapi_resource.this.body.properties.template.containers[0].env[13].value) == [
+      for index in range(32) : "https://app-${index}.example.com"
+    ]
+    error_message = "exactly 32 unique canonical DNS browser origins must serialize unchanged"
+  }
+}
+
+run "accept_canonical_non_default_browser_origin_port" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://app.example.com:8443"]
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[13].value == "[\"https://app.example.com:8443\"]"
+    error_message = "a canonical non-default browser origin port must serialize unchanged"
+  }
+}
+
+run "accept_numeric_non_final_browser_origin_label" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["https://1.example.com"]
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[13].value == "[\"https://1.example.com\"]"
+    error_message = "a numeric non-final DNS label must serialize unchanged"
+  }
+}
+
+run "accept_true_allow_null_browser_origin" {
+  command = plan
+
+  variables {
+    allow_null_browser_origin = true
+  }
+
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[14].value == "true"
+    error_message = "allow_null_browser_origin=true must serialize exactly as true"
+  }
 }

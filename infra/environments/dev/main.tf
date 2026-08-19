@@ -146,6 +146,8 @@ module "container_app_workload" {
   environment                             = var.environment
   relay_origin                            = local.relay_origin
   min_replicas                            = var.relay_min_replicas
+  browser_allowed_origins                 = var.browser_allowed_origins
+  allow_null_browser_origin               = var.allow_null_browser_origin
   security_mode                           = "azure-table"
   transcription_provider                  = "mock"
   azure_transcription_endpoint            = ""

@@ -9,6 +9,8 @@ const MODEL_SPIKE_MODE = "model-spike";
 const FULL_DEPLOY_MODE = "full-deploy";
 const RUNTIME_ROLLOUT_MODE = "runtime-rollout";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
+const EXPECTED_BROWSER_ALLOWED_ORIGINS =
+  "https://even-webview.synthetic.invalid";
 const MODEL_SPIKE_DEPLOYMENT =
   `module.foundry.azurerm_cognitive_deployment.this["${PINNED_DEPLOYMENT_NAME}"]`;
 const RETIRED_DEPLOYMENT = "gpt-5-6-luna";
@@ -427,6 +429,37 @@ function hasEnvSecret(entries, name, secretRef) {
   );
 }
 
+function hasExactFailClosedBrowserOriginPolicy(entries) {
+  const allowedOrigins = entries?.get("PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON");
+  const allowNullOrigin = entries?.get("PALANCAR_ALLOW_NULL_BROWSER_ORIGIN");
+
+  if (
+    !hasExactKeys(allowedOrigins, ["name", "value"]) ||
+    !hasExactKeys(allowNullOrigin, ["name", "value"]) ||
+    typeof allowedOrigins.value !== "string" ||
+    allowNullOrigin.value !== "false"
+  ) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(allowedOrigins.value);
+    return (
+      Array.isArray(parsed) &&
+      parsed.length === 1 &&
+      parsed[0] === EXPECTED_BROWSER_ALLOWED_ORIGINS
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasExactFailClosedBrowserOriginPolicyInContainerApp(after) {
+  const containers = valuesByName(after?.body?.properties?.template?.containers);
+  const relay = containers?.get("relay");
+  return hasExactFailClosedBrowserOriginPolicy(valuesByName(relay?.env));
+}
+
 function isImmutableAcrImage(value) {
   return (
     typeof value === "string" &&
@@ -766,6 +799,8 @@ function hasExactRuntimeContainerApp(change) {
     "PALANCAR_SECURITY_STATE_TABLE",
     "PALANCAR_RATE_STATE_TABLE",
     "PALANCAR_TRANSCRIPTION_PROVIDER",
+    "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+    "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
     "PALANCAR_LITELLM_BASE_URL",
     "PALANCAR_LITELLM_MODEL",
     "PALANCAR_LITELLM_API_KEY",
@@ -787,6 +822,7 @@ function hasExactRuntimeContainerApp(change) {
     !hasEnvValue(relayEnv, "PALANCAR_LITELLM_MODEL", "palancar-generation") ||
     !hasEnvValue(relayEnv, "PALANCAR_SECURITY_MODE", "azure-table") ||
     !hasEnvValue(relayEnv, "PALANCAR_TRANSCRIPTION_PROVIDER", "mock") ||
+    !hasExactFailClosedBrowserOriginPolicy(relayEnv) ||
     !hasEnvValue(relayEnv, "PALANCAR_SECURITY_STATE_TABLE", "SecurityState") ||
     !hasEnvValue(relayEnv, "PALANCAR_RATE_STATE_TABLE", "RateState") ||
     !isUserAssignedIdentity(runtimeIdentity) ||
@@ -1048,7 +1084,8 @@ function acceptsFullDeploy(changes, requiredNoOpAddresses) {
     if (
       change.address === CONTAINER_APP &&
       (isUpdate(actions) || isNoOp(actions)) &&
-      hasAllowedScale(change.change.after)
+      hasAllowedScale(change.change.after) &&
+      hasExactFailClosedBrowserOriginPolicyInContainerApp(change.change.after)
     ) {
       continue;
     }
