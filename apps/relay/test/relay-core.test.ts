@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_NEGOTIATED_LIMITS, encodeAudioFrame } from '@palancar/contracts';
 import {
+  DeterministicFixtureLanguageValidator,
   GenerationService,
   type GenerationProvider,
   type GenerationProviderCompletion
@@ -26,6 +27,7 @@ import type {
   StartUtteranceResult
 } from '@palancar/transcription';
 import { DETERMINISTIC_MOCK_CAPABILITIES } from '@palancar/transcription';
+import { sanitizeTelemetryForExport } from '@palancar/telemetry';
 import {
   SecurityStateError,
   assertCanonicalUuid,
@@ -44,8 +46,13 @@ import {
   TEST_UTTERANCE_ID,
   negotiateLimits,
   prepareStreamUpgrade,
-  selectStreamSubprotocols
+  selectStreamSubprotocols,
+  type RelayClock,
+  type RelayMetricSink,
+  type RelayProductionMetricInput,
+  type RelaySessionCoreOptions
 } from '../src/index.js';
+import { RELAY_METRIC_NAMES } from '../src/types.js';
 
 const START_LIMITS = DEFAULT_NEGOTIATED_LIMITS;
 
@@ -304,10 +311,14 @@ function openNew(
   targetLanguage: 'es' | 'tr' = 'es',
   options: Parameters<typeof createTestOptions>[0] = {}
 ): { readonly core: RelaySessionCore; readonly adapter: RecordingAdapter } {
-  const core = new RelaySessionCore(createTestOptions({
-    transcriptionAdapter: adapter,
-    ...options
-  }));
+  const hasAdapterOption =
+    Object.hasOwn(options, 'transcriptionAdapters') ||
+    Object.hasOwn(options, 'transcriptionAdapterForTarget') ||
+    Object.hasOwn(options, 'transcriptionAdapter');
+  const configuredOptions = hasAdapterOption
+    ? options
+    : { ...options, transcriptionAdapter: adapter } as Parameters<typeof createTestOptions>[0];
+  const core = new RelaySessionCore(createTestOptions(configuredOptions));
   const ready = core.openWithFirstText(startText(targetLanguage));
   expect(ready.outgoing[0]?.type).toBe('session.ready');
   return { core, adapter };
@@ -331,6 +342,32 @@ function calibratedEvidence(detectedLanguage: string): ClassifiedLanguageEvidenc
     calibrationVersion: CONTROLLED_FIXTURE_CALIBRATION_VERSION,
     detectedLanguage,
     confidence: 0.95
+  };
+}
+
+function generationService(provider: GenerationProvider): GenerationService {
+  return new GenerationService({
+    provider,
+    validator: new DeterministicFixtureLanguageValidator()
+  });
+}
+
+function recordingMetricSink(): {
+  readonly sink: RelayMetricSink;
+  readonly records: RelayProductionMetricInput[];
+} {
+  const records: RelayProductionMetricInput[] = [];
+  return {
+    sink: { record: (input) => records.push(input) },
+    records
+  };
+}
+
+function monotonicClock(...values: number[]): RelayClock {
+  let index = 0;
+  return {
+    nowIso: () => '2026-08-10T12:00:00.000Z',
+    nowMonotonicMs: () => values[index++] ?? values.at(-1) ?? 0
   };
 }
 
@@ -453,7 +490,7 @@ describe('relay session core', () => {
     });
     const { core } = openNew(recordingAdapter(), 'es', {
       securityRuntime,
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'durable-generation-test',
         version: '1.0.0',
         complete: providerComplete
@@ -474,7 +511,7 @@ describe('relay session core', () => {
     });
     const rejected = openNew(recordingAdapter(), 'es', {
       securityRuntime: rejectedSecurity,
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'suppressed-generation-test',
         version: '1.0.0',
         complete: providerComplete
@@ -510,7 +547,7 @@ describe('relay session core', () => {
     });
     const { core } = openNew(recordingAdapter(), 'es', {
       securityRuntime,
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'heartbeat-race-provider',
         version: '1.0.0',
         complete: async () => providerResult.promise
@@ -563,7 +600,7 @@ describe('relay session core', () => {
       });
       const { core } = openNew(recordingAdapter(), 'es', {
         securityRuntime,
-        generationService: new GenerationService({
+        generationService: generationService({
           id: `heartbeat-${mode}`,
           version: '1.0.0',
           complete: async () => providerResult.promise
@@ -1006,7 +1043,7 @@ describe('relay session core', () => {
   it('cancels pending generation when the utterance is cancelled', async () => {
     let providerSignal: AbortSignal | undefined;
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+      generationService: generationService(pendingGenerationProvider((signal) => {
         providerSignal = signal;
       }))
     });
@@ -1024,7 +1061,7 @@ describe('relay session core', () => {
   it('cancels pending generation when the session ends', async () => {
     let providerSignal: AbortSignal | undefined;
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+      generationService: generationService(pendingGenerationProvider((signal) => {
         providerSignal = signal;
       }))
     });
@@ -1043,7 +1080,7 @@ describe('relay session core', () => {
   it('cancels pending generation on a terminal utterance conflict', async () => {
     let providerSignal: AbortSignal | undefined;
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(pendingGenerationProvider((signal) => {
+      generationService: generationService(pendingGenerationProvider((signal) => {
         providerSignal = signal;
       }))
     });
@@ -1068,7 +1105,7 @@ describe('relay session core', () => {
       ]
     }));
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'one-call-provider',
         version: '1.0.0',
         complete
@@ -1100,7 +1137,7 @@ describe('relay session core', () => {
       ]
     }));
     const { core, adapter } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'ordered-queue-provider',
         version: '1.0.0',
         complete
@@ -1169,7 +1206,7 @@ describe('relay session core', () => {
       }
     };
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(provider)
+      generationService: generationService(provider)
     });
     core.handleText(utteranceStartText());
     const finalPromise = core.handleTranscriptionEvent(finalEvent());
@@ -1202,7 +1239,7 @@ describe('relay session core', () => {
       }));
       const provider: GenerationProvider = { id: 'provider', version: '1.0.0', complete };
       const { core } = openNew(recordingAdapter(), 'es', {
-        generationService: new GenerationService(provider)
+        generationService: generationService(provider)
       });
       core.handleText(utteranceStartText());
       const result = await core.handleTranscriptionEvent(finalEvent(category));
@@ -1322,7 +1359,7 @@ describe('relay session core', () => {
     ] satisfies readonly TextLanguageClassifier[]) {
       const { core } = openNew(recordingAdapter(), 'es', {
         languageClassifier,
-        generationService: new GenerationService({
+        generationService: generationService({
           id: 'must-not-run',
           version: '1.0.0',
           complete
@@ -1359,7 +1396,7 @@ describe('relay session core', () => {
     }));
     const { core } = openNew(recordingAdapter(), 'es', {
       languageClassifier,
-      generationService: new GenerationService({
+      generationService: generationService({
         id: 'stale-classification-provider',
         version: '1.0.0',
         complete
@@ -1377,45 +1414,36 @@ describe('relay session core', () => {
     expect(complete).not.toHaveBeenCalled();
   });
 
-  it.each(['throw', 'unavailable'] as const)(
-    'suppresses a partial classifier %s and keeps the utterance active for its final',
-    async (mode) => {
-      let classifyCalls = 0;
-      const languageClassifier: TextLanguageClassifier = {
-        ready: Promise.resolve(),
-        classify: async (text) => {
-          classifyCalls += 1;
-          if (text.includes('-partial-')) {
-            if (mode === 'throw') {
-              throw new Error('partial classifier secret');
-            }
-            return {
-              status: 'unavailable',
-              detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION
-            };
-          }
-          return calibratedEvidence('es');
+  it('does not classify a hidden partial and keeps the utterance active for its final', async () => {
+    let classifyCalls = 0;
+    const languageClassifier: TextLanguageClassifier = {
+      ready: Promise.resolve(),
+      classify: async (text) => {
+        classifyCalls += 1;
+        if (text.includes('-partial-')) {
+          throw new Error('partial classifier must not run');
         }
-      };
-      const { core } = openNew(recordingAdapter(), 'es', { languageClassifier });
-      core.handleText(utteranceStartText());
+        return calibratedEvidence('es');
+      }
+    };
+    const { core } = openNew(recordingAdapter(), 'es', { languageClassifier });
+    core.handleText(utteranceStartText());
 
-      const partial = await core.handleTranscriptionEvent(partialEvent(1));
-      expect(partial).toEqual({ outgoing: [] });
-      expect(JSON.stringify(partial)).not.toContain('partial classifier secret');
-      expect(await core.handleTranscriptionEvent(partialEvent(1))).toEqual({ outgoing: [] });
-      expect(classifyCalls).toBe(1);
+    const partial = await core.handleTranscriptionEvent(partialEvent(1));
+    expect(partial).toEqual({ outgoing: [] });
+    expect(JSON.stringify(partial)).not.toContain('partial classifier must not run');
+    expect(await core.handleTranscriptionEvent(partialEvent(1))).toEqual({ outgoing: [] });
+    expect(classifyCalls).toBe(0);
 
-      const final = await core.handleTranscriptionEvent(
-        finalEvent('target', TEST_UTTERANCE_ID, 2)
-      );
-      expect(final.outgoing.map((message) => message.type)).toEqual([
-        'transcript.final',
-        'language.decision'
-      ]);
-      expect(classifyCalls).toBe(2);
-    }
-  );
+    const final = await core.handleTranscriptionEvent(
+      finalEvent('target', TEST_UTTERANCE_ID, 2)
+    );
+    expect(final.outgoing.map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+    expect(classifyCalls).toBe(1);
+  });
 
   it('ignores stale, duplicate, and post-final events', async () => {
     const { core } = openNew();
@@ -1482,7 +1510,7 @@ describe('relay session core', () => {
       }
     };
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(provider)
+      generationService: generationService(provider)
     });
     core.handleText(utteranceStartText());
     const staged = await core.handleTranscriptionEvent(finalEvent());
@@ -1611,7 +1639,7 @@ describe('relay session core', () => {
       complete: async () => completion
     };
     const { core, adapter } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(provider)
+      generationService: generationService(provider)
     });
     core.handleText(utteranceStartText());
     await core.handleTranscriptionEvent(finalEvent());
@@ -1650,7 +1678,7 @@ describe('relay session core', () => {
     expect(JSON.stringify(malformed)).not.toContain(hostile);
 
     const { core } = openNew(recordingAdapter(), 'es', {
-      generationService: new GenerationService(provider)
+      generationService: generationService(provider)
     });
     const event = finalEvent();
     core.handleText(utteranceStartText());
@@ -1660,6 +1688,820 @@ describe('relay session core', () => {
     const result = await core.drainAsyncEvents();
     expect(JSON.stringify(result)).not.toContain(hostile);
     expect(result.outgoing.some((message) => message.type === 'error' && message.code === 'provider_unavailable')).toBe(true);
+  });
+
+  it('forces a forged calibrated target final to exact uncertain in deny-all mode', async () => {
+    const classify = vi.fn(async () => calibratedEvidence('es'));
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const baseSecurity = createTestSecurityRuntime();
+    const authorizeGeneration = vi.fn(baseSecurity.authorizeGeneration);
+    const { core } = openNew(recordingAdapter(), 'es', {
+      languageBoundaryMode: 'deny-all',
+      languageClassifier: { ready: Promise.resolve(), classify },
+      securityRuntime: createTestSecurityRuntime({ authorizeGeneration }),
+      generationService: generationService({
+        id: 'deny-all-must-not-run',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+
+    const result = await core.handleTranscriptionEvent({
+      ...finalEvent(),
+      text: 'private target transcript',
+      languageEvidence: {
+        detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+        source: 'controlled-fixture',
+        detectedLanguage: 'es',
+        confidence: 1
+      }
+    });
+
+    expect(result.outgoing).toEqual([
+      expect.objectContaining({
+        type: 'language.decision',
+        decision: 'uncertain',
+        selectedTargetLanguage: 'es'
+      })
+    ]);
+    expect(JSON.stringify(result)).not.toContain('private target transcript');
+    expect(classify).not.toHaveBeenCalled();
+    expect(authorizeGeneration).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown language boundary mode before any provider boundary is reachable', () => {
+    const classify = vi.fn(async () => calibratedEvidence('es'));
+    const baseSecurity = createTestSecurityRuntime();
+    const authorizeGeneration = vi.fn(baseSecurity.authorizeGeneration);
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const adapter = recordingAdapter();
+    const invalid = {
+      ...createTestOptions({
+        transcriptionAdapter: adapter,
+        languageClassifier: { ready: Promise.resolve(), classify },
+        securityRuntime: createTestSecurityRuntime({ authorizeGeneration }),
+        generationService: generationService({
+          id: 'invalid-boundary-must-not-run',
+          version: '1.0.0',
+          complete
+        })
+      }),
+      languageBoundaryMode: 'allow-all'
+    };
+
+    expect(() => new RelaySessionCore(
+      invalid as unknown as RelaySessionCoreOptions
+    )).toThrow('Invalid relay language boundary mode.');
+    expect(adapter.sessions).toHaveLength(0);
+    expect(classify).not.toHaveBeenCalled();
+    expect(authorizeGeneration).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('keeps production-approved target gating reachable only by explicit injection', async () => {
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      languageBoundaryMode: 'production-approved',
+      languageClassifier: {
+        ready: Promise.resolve(),
+        classify: async () => calibratedEvidence('es')
+      },
+      generationService: generationService({
+        id: 'production-approved-injected-provider',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+
+    const result = await core.handleTranscriptionEvent(finalEvent());
+
+    expect(result.outgoing.map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves the transcription adapter for the selected target', () => {
+    const spanish = recordingAdapter();
+    const turkish = recordingAdapter();
+    const { core } = openNew(recordingAdapter(), 'tr', {
+      transcriptionAdapters: { es: spanish, tr: turkish }
+    });
+
+    expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+    expect(spanish.sessions).toHaveLength(0);
+    expect(turkish.sessions).toHaveLength(1);
+  });
+
+  it('accepts exactly one callback adapter mechanism', () => {
+    const spanish = recordingAdapter();
+    const turkish = recordingAdapter();
+    const callback = vi.fn((target: 'es' | 'tr') =>
+      target === 'es' ? spanish : turkish
+    );
+    const { core } = openNew(recordingAdapter(), 'tr', {
+      transcriptionAdapterForTarget: callback
+    });
+
+    expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+    expect(callback).toHaveBeenCalledWith('tr');
+    expect(spanish.sessions).toHaveLength(0);
+    expect(turkish.sessions).toHaveLength(1);
+  });
+
+  it.each(['es', 'tr'] as const)(
+    'records one selected %s transcription provider failure for unsupported capabilities',
+    (targetLanguage) => {
+      const metrics = recordingMetricSink();
+      const unsupported = recordingAdapter({
+        ...DETERMINISTIC_MOCK_CAPABILITIES,
+        manualCommit: {
+          ...DETERMINISTIC_MOCK_CAPABILITIES.manualCommit,
+          supported: false
+        }
+      });
+      const unselected = recordingAdapter();
+      const adapters = targetLanguage === 'es'
+        ? { es: unsupported, tr: unselected }
+        : { es: unselected, tr: unsupported };
+      const { core } = openNew(recordingAdapter(), targetLanguage, {
+        transcriptionAdapters: adapters,
+        metricSink: metrics.sink
+      });
+
+      const first = core.handleText(utteranceStartText());
+      const terminalRetry = core.handleText(utteranceStartText());
+
+      expect(first).toMatchObject({
+        outgoing: [expect.objectContaining({
+          type: 'error',
+          code: 'provider_unavailable'
+        })],
+        close: { code: 4503, reason: 'provider_unavailable' }
+      });
+      expect(terminalRetry).toEqual({
+        outgoing: [],
+        close: { code: 1000, reason: 'closed' }
+      });
+      expect(unsupported.sessions).toHaveLength(0);
+      expect(unselected.sessions).toHaveLength(0);
+      expect(metrics.records.filter((record) => record.name === 'provider.failure')).toEqual([
+        {
+          name: 'provider.failure',
+          timestamp: '2026-08-10T12:00:00.000Z',
+          count: 1,
+          targetLanguage,
+          operation: 'transcription',
+          outcome: 'failure',
+          providerId: 'deterministic-mock',
+          providerVersion: '1.0.0'
+        }
+      ]);
+    }
+  );
+
+  it.each([
+    'map+single',
+    'callback+single',
+    'map+callback',
+    'all',
+    'missing'
+  ] as const)('rejects %s adapter configuration without silent precedence', (kind) => {
+    const single = recordingAdapter();
+    const adapters = { es: recordingAdapter(), tr: recordingAdapter() };
+    const callback = (target: 'es' | 'tr'): TranscriptionAdapter => adapters[target];
+    const base = createTestOptions({ transcriptionAdapter: single });
+    const withoutAdapters = { ...base } as Record<string, unknown>;
+    delete withoutAdapters.transcriptionAdapter;
+    delete withoutAdapters.transcriptionAdapters;
+    delete withoutAdapters.transcriptionAdapterForTarget;
+    const invalid = kind === 'map+single'
+      ? { ...withoutAdapters, transcriptionAdapters: adapters, transcriptionAdapter: single }
+      : kind === 'callback+single'
+        ? { ...withoutAdapters, transcriptionAdapterForTarget: callback, transcriptionAdapter: single }
+        : kind === 'map+callback'
+          ? { ...withoutAdapters, transcriptionAdapters: adapters, transcriptionAdapterForTarget: callback }
+          : kind === 'all'
+            ? {
+                ...withoutAdapters,
+                transcriptionAdapters: adapters,
+                transcriptionAdapterForTarget: callback,
+                transcriptionAdapter: single
+              }
+            : withoutAdapters;
+
+    expect(() => new RelaySessionCore(invalid as unknown as RelaySessionCoreOptions)).toThrow(
+      'Invalid relay transcription adapter configuration.'
+    );
+  });
+
+  it('rejects an explicitly undefined second adapter mechanism', () => {
+    const invalid = {
+      ...createTestOptions({ transcriptionAdapter: recordingAdapter() }),
+      transcriptionAdapterForTarget: undefined
+    };
+
+    expect(() => new RelaySessionCore(invalid as unknown as RelaySessionCoreOptions)).toThrow(
+      'Invalid relay transcription adapter configuration.'
+    );
+  });
+
+  it.each(['missing-target', 'extra-target', 'accessor'] as const)(
+    'rejects a non-exact %s adapter map',
+    (kind) => {
+      const adapter = recordingAdapter();
+      const map: unknown = kind === 'missing-target'
+        ? { es: adapter }
+        : kind === 'extra-target'
+          ? { es: adapter, tr: adapter, fr: adapter }
+          : Object.defineProperty({ tr: adapter }, 'es', { get: () => adapter });
+      expect(() => new RelaySessionCore(createTestOptions({
+        transcriptionAdapters: map as Record<'es' | 'tr', TranscriptionAdapter>
+      }))).toThrow('Invalid relay transcription adapter configuration.');
+    }
+  );
+
+  it('publishes only the closed 19-name metadata vocabulary', () => {
+    expect(RELAY_METRIC_NAMES).toEqual([
+      'session.start',
+      'session.reject',
+      'session.end',
+      'utterance.start',
+      'utterance.abort',
+      'utterance.complete',
+      'audio.samples.accepted',
+      'audio.samples.duplicate',
+      'audio.samples.rejected',
+      'transport.reconnect',
+      'transcription.first_partial_latency',
+      'transcription.final_latency',
+      'language.decision',
+      'translation.latency',
+      'translation.result',
+      'suggestion.latency',
+      'suggestion.result',
+      'provider.failure',
+      'state_store.failure'
+    ]);
+    expect(new Set(RELAY_METRIC_NAMES).size).toBe(19);
+  });
+
+  it('records exact metadata-only lifecycle values once for a suppressed final', async () => {
+    const metrics = recordingMetricSink();
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      clock: monotonicClock(100, 175)
+    });
+    expect(metrics.records[0]).toEqual({
+      name: 'session.start',
+      timestamp: '2026-08-10T12:00:00.000Z',
+      count: 1,
+      protocolVersion: 1,
+      targetLanguage: 'es',
+      operation: 'session',
+      outcome: 'success'
+    });
+    core.handleText(utteranceStartText());
+
+    const first = await core.handleTranscriptionEvent(finalEvent('english'));
+    const duplicate = await core.handleTranscriptionEvent(finalEvent('english'));
+    core.close();
+
+    expect(first.outgoing).toMatchObject([
+      { type: 'language.decision', decision: 'english' }
+    ]);
+    expect(duplicate).toEqual({ outgoing: [] });
+    expect(metrics.records.filter((record) => record.name === 'language.decision')).toEqual([
+      {
+        name: 'language.decision',
+        timestamp: '2026-08-10T12:00:00.000Z',
+        count: 1,
+        targetLanguage: 'es',
+        gateDecision: 'english',
+        operation: 'language',
+        outcome: 'rejected'
+      }
+    ]);
+    expect(metrics.records.filter((record) => record.name === 'utterance.complete')).toHaveLength(1);
+    expect(metrics.records.filter((record) => record.name === 'session.end')).toHaveLength(1);
+    const forbiddenKeys = [
+      'correlationId',
+      'sessionId',
+      'utteranceId',
+      'installationId',
+      'requestId',
+      'traceId',
+      'spanId',
+      'errorId',
+      'text',
+      'transcript',
+      'translation',
+      'suggestions',
+      'content',
+      'audio',
+      'pcm',
+      'prompt',
+      'message'
+    ];
+    for (const record of metrics.records) {
+      expect(Object.keys(record).some((key) => forbiddenKeys.includes(key))).toBe(false);
+    }
+
+    const rejectedMetrics = recordingMetricSink();
+    const rejected = new RelaySessionCore(createTestOptions({ metricSink: rejectedMetrics.sink }));
+    rejected.openWithFirstText('{');
+    expect(rejectedMetrics.records).toEqual([
+      {
+        name: 'session.reject',
+        timestamp: '2026-08-10T12:00:00.000Z',
+        count: 1,
+        protocolVersion: 1,
+        operation: 'session',
+        outcome: 'rejected'
+      }
+    ]);
+  });
+
+  it('records first partial latency once without classifier or content', async () => {
+    const metrics = recordingMetricSink();
+    const classify = vi.fn(async () => calibratedEvidence('es'));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      clock: monotonicClock(10, 40),
+      languageClassifier: { ready: Promise.resolve(), classify }
+    });
+    core.handleText(utteranceStartText());
+
+    expect(await core.handleTranscriptionEvent(partialEvent(1))).toEqual({ outgoing: [] });
+    expect(await core.handleTranscriptionEvent(partialEvent(2))).toEqual({ outgoing: [] });
+
+    expect(classify).not.toHaveBeenCalled();
+    expect(metrics.records.filter(
+      (record) => record.name === 'transcription.first_partial_latency'
+    )).toEqual([
+      expect.objectContaining({ durationMs: 30, outcome: 'success' })
+    ]);
+  });
+
+  it('uses one combined generation call and the same translation/suggestion latency', async () => {
+    const metrics = recordingMetricSink();
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'hello',
+      suggestions: [
+        { englishText: 'hello', selectedTargetText: 'hola' },
+        { englishText: 'hi', selectedTargetText: 'buenas' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      clock: monotonicClock(100, 250, 300, 450),
+      generationService: generationService({
+        id: 'combined-latency-provider',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    await core.drainAsyncEvents();
+
+    expect(complete).toHaveBeenCalledTimes(1);
+    const translationLatency = metrics.records.find(
+      (record) => record.name === 'translation.latency'
+    );
+    const suggestionLatency = metrics.records.find(
+      (record) => record.name === 'suggestion.latency'
+    );
+    expect(translationLatency).toMatchObject({ durationMs: 150, outcome: 'success' });
+    expect(suggestionLatency).toMatchObject({ durationMs: 150, outcome: 'success' });
+    expect(metrics.records.filter((record) => record.name === 'translation.result')).toHaveLength(1);
+    expect(metrics.records.filter((record) => record.name === 'suggestion.result')).toHaveLength(1);
+  });
+
+  it('contains a reentrant monotonic clock at utterance start', async () => {
+    const metrics = recordingMetricSink();
+    const holder: { core?: RelaySessionCore } = {};
+    let calls = 0;
+    const clock: RelayClock = {
+      nowIso: () => '2026-08-10T12:00:00.000Z',
+      nowMonotonicMs: () => {
+        calls += 1;
+        if (calls === 1) {
+          expect(holder.core?.close()).toEqual({ outgoing: [] });
+        }
+        return calls * 100;
+      }
+    };
+    const { core } = openNew(recordingAdapter(), 'es', { clock, metricSink: metrics.sink });
+    holder.core = core;
+
+    expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+    const final = await core.handleTranscriptionEvent(finalEvent());
+    expect(final.outgoing.map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+    await flushAsyncEvents();
+    expect((await core.drainAsyncEvents()).outgoing.map((message) => message.type)).toEqual([
+      'translation.ready',
+      'suggestions.ready'
+    ]);
+  });
+
+  it('drops nonfinite partial latency and normalizes a regressive final clock', async () => {
+    const metrics = recordingMetricSink();
+    const values = [100, Number.NaN, 50, 200, 300];
+    const clock: RelayClock = {
+      nowIso: () => '2026-08-10T12:00:00.000Z',
+      nowMonotonicMs: () => values.shift() ?? 300
+    };
+    const { core } = openNew(recordingAdapter(), 'es', { clock, metricSink: metrics.sink });
+    core.handleText(utteranceStartText());
+
+    expect(await core.handleTranscriptionEvent(partialEvent(1))).toEqual({ outgoing: [] });
+    const final = await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 2));
+
+    expect(final.outgoing.map((message) => message.type)).toEqual([
+      'transcript.final',
+      'language.decision'
+    ]);
+    expect(metrics.records.some(
+      (record) => record.name === 'transcription.first_partial_latency'
+    )).toBe(false);
+    expect(metrics.records).toContainEqual(expect.objectContaining({
+      name: 'transcription.final_latency',
+      durationMs: 0
+    }));
+  });
+
+  it.each(['generation-start', 'generation-result'] as const)(
+    'contains a throwing monotonic clock at %s without stranding durable claims',
+    async (stage) => {
+      const baseSecurity = createTestSecurityRuntime();
+      const authorizeGeneration = vi.fn(baseSecurity.authorizeGeneration);
+      const providerStart = vi.fn(baseSecurity.providerStart);
+      const completeGeneration = vi.fn(baseSecurity.completeGeneration);
+      const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+        englishTranslation: 'hello',
+        suggestions: [
+          { englishText: 'hello', selectedTargetText: 'hola' },
+          { englishText: 'hi', selectedTargetText: 'buenas' }
+        ]
+      }));
+      let calls = 0;
+      const throwAt = stage === 'generation-start' ? 3 : 4;
+      const clock: RelayClock = {
+        nowIso: () => '2026-08-10T12:00:00.000Z',
+        nowMonotonicMs: () => {
+          calls += 1;
+          if (calls === throwAt) throw new Error('hostile monotonic clock');
+          return calls * 100;
+        }
+      };
+      const { core } = openNew(recordingAdapter(), 'es', {
+        clock,
+        securityRuntime: createTestSecurityRuntime({
+          authorizeGeneration,
+          providerStart,
+          completeGeneration
+        }),
+        generationService: generationService({
+          id: 'hostile-clock-generation-provider',
+          version: '1.0.0',
+          complete
+        })
+      });
+      core.handleText(utteranceStartText());
+      const final = await core.handleTranscriptionEvent(finalEvent());
+      await flushAsyncEvents();
+      const generated = await core.drainAsyncEvents();
+
+      expect(final.outgoing.map((message) => message.type)).toEqual([
+        'transcript.final',
+        'language.decision'
+      ]);
+      expect(generated.outgoing.map((message) => message.type)).toEqual([
+        'translation.ready',
+        'suggestions.ready'
+      ]);
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(authorizeGeneration).toHaveBeenCalledTimes(1);
+      expect(providerStart).toHaveBeenCalledTimes(1);
+      expect(completeGeneration).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('contains hostile metric sinks without changing protocol behavior', async () => {
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'es', {
+      languageBoundaryMode: 'deny-all',
+      metricSink: { record: () => { throw new Error('hostile metric sink'); } },
+      generationService: generationService({
+        id: 'hostile-sink-must-not-run',
+        version: '1.0.0',
+        complete
+      })
+    });
+
+    expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+    await expect(core.handleTranscriptionEvent(finalEvent())).resolves.toMatchObject({
+      outgoing: [{ type: 'language.decision', decision: 'uncertain' }]
+    });
+    expect(core.close()).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('blocks metric-sink reentrancy while session.start is observed', () => {
+    const holder: { core?: RelaySessionCore } = {};
+    const records: RelayProductionMetricInput[] = [];
+    let nestedClose: ReturnType<RelaySessionCore['close']> | undefined;
+    const metricSink: RelayMetricSink = {
+      record: (record) => {
+        records.push(record);
+        if (record.name === 'session.start') {
+          nestedClose = holder.core?.close();
+        }
+      }
+    };
+    const core = new RelaySessionCore(createTestOptions({ metricSink }));
+    holder.core = core;
+
+    const opened = core.openWithFirstText(startText());
+
+    expect(opened.close).toBeUndefined();
+    expect(opened.outgoing).toEqual([
+      expect.objectContaining({ type: 'session.ready' })
+    ]);
+    expect(nestedClose).toEqual({ outgoing: [] });
+    expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+    expect(records.filter((record) => record.name === 'session.start')).toHaveLength(1);
+  });
+
+  it.each([
+    ['sync-throw', 'success'],
+    ['sync-throw', 'failure'],
+    ['async-reject', 'success'],
+    ['async-reject', 'failure'],
+    ['throwing-then-accessor', 'success'],
+    ['throwing-thenable', 'failure']
+  ] as const)(
+    'contains a %s notifier after %s generation and settles the durable claim',
+    async (notifierKind, outcome) => {
+      const baseSecurity = createTestSecurityRuntime();
+      const completeGeneration = vi.fn(baseSecurity.completeGeneration);
+      const notifier = vi.fn((): unknown => {
+        if (notifierKind === 'sync-throw') {
+          throw new Error('hostile synchronous notifier');
+        }
+        if (notifierKind === 'async-reject') {
+          return (async (): Promise<void> => {
+            await Promise.resolve();
+            throw new Error('hostile asynchronous notifier');
+          })();
+        }
+        if (notifierKind === 'throwing-then-accessor') {
+          return Object.defineProperty({}, 'then', {
+            get: () => {
+              throw new Error('hostile then accessor');
+            }
+          });
+        }
+        return {
+          then: (): never => {
+            throw new Error('hostile thenable');
+          }
+        };
+      });
+      const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => {
+        if (outcome === 'failure') {
+          throw new Error('generation failed');
+        }
+        return {
+          englishTranslation: 'hello',
+          suggestions: [
+            { englishText: 'hello', selectedTargetText: 'hola' },
+            { englishText: 'hi', selectedTargetText: 'buenas' }
+          ]
+        };
+      });
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+      let drained: Awaited<ReturnType<RelaySessionCore['drainAsyncEvents']>>;
+      try {
+        const { core } = openNew(recordingAdapter(), 'es', {
+          onAsyncEventsAvailable: notifier,
+          securityRuntime: createTestSecurityRuntime({ completeGeneration }),
+          generationService: generationService({
+            id: 'deterministic-mock-generation',
+            version: '1.0.0',
+            complete
+          })
+        });
+        core.handleText(utteranceStartText());
+        await core.handleTranscriptionEvent(finalEvent());
+        await flushAsyncEvents();
+        await flushAsyncEvents();
+        drained = await core.drainAsyncEvents();
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+
+      expect(notifier).toHaveBeenCalledTimes(1);
+      expect(completeGeneration).toHaveBeenCalledTimes(1);
+      expect(completeGeneration.mock.calls[0]?.[0]).toMatchObject({
+        outcome: outcome === 'success' ? 'completed' : 'failed'
+      });
+      expect(unhandled).toEqual([]);
+      expect(drained.outgoing.map((message) => message.type)).toEqual(
+        outcome === 'success'
+          ? ['translation.ready', 'suggestions.ready']
+          : ['error']
+      );
+    }
+  );
+
+  it('records accepted, duplicate, and rejected sample counts at exact producer points', () => {
+    const metrics = recordingMetricSink();
+    const { core } = openNew(recordingAdapter(), 'es', { metricSink: metrics.sink });
+    core.handleText(utteranceStartText());
+
+    core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(2)));
+    core.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(2)));
+    core.handleBinary(frame(TEST_UTTERANCE_ID, 2, 2, pcmSamples(2)));
+
+    expect(metrics.records.filter((record) => record.name.startsWith('audio.samples.'))).toEqual([
+      expect.objectContaining({ name: 'audio.samples.accepted', sampleCount: 2 }),
+      expect.objectContaining({ name: 'audio.samples.duplicate', sampleCount: 2 }),
+      expect.objectContaining({ name: 'audio.samples.rejected', sampleCount: 2 })
+    ]);
+  });
+
+  it('records reconnect, provider, and state-store failures without identifiers', async () => {
+    const reconnectMetrics = recordingMetricSink();
+    const lease = { ...createTestSessionLease(), sessionEpoch: 2 };
+    const reconnectCore = new RelaySessionCore(createTestOptions({
+      sessionLease: lease,
+      metricSink: reconnectMetrics.sink
+    }));
+    reconnectCore.openWithFirstText(startText());
+    expect(reconnectMetrics.records).toContainEqual(expect.objectContaining({
+      name: 'transport.reconnect',
+      count: 1,
+      outcome: 'reconnected'
+    }));
+
+    const providerMetrics = recordingMetricSink();
+    const providerFailure = openNew(
+      recordingAdapter(DETERMINISTIC_MOCK_CAPABILITIES, undefined, new Error('provider')),
+      'es',
+      { metricSink: providerMetrics.sink }
+    ).core;
+    providerFailure.handleText(utteranceStartText());
+    providerFailure.handleBinary(frame());
+    expect(providerMetrics.records.filter((record) => record.name === 'provider.failure')).toHaveLength(1);
+
+    const stateMetrics = recordingMetricSink();
+    const stateFailure = openNew(recordingAdapter(), 'es', {
+      metricSink: stateMetrics.sink,
+      securityRuntime: createTestSecurityRuntime({
+        authorizeGeneration: async () => { throw new SecurityStateError('state-unavailable'); }
+      })
+    }).core;
+    stateFailure.handleText(utteranceStartText());
+    await stateFailure.handleTranscriptionEvent(finalEvent());
+    expect(stateMetrics.records.filter((record) => record.name === 'state_store.failure')).toHaveLength(1);
+    expect([...providerMetrics.records, ...stateMetrics.records].some(
+      (record) => Object.hasOwn(record, 'errorId') || Object.hasOwn(record, 'sessionId')
+    )).toBe(false);
+  });
+
+  it('enriches every core metric for exact production sanitizer acceptance', async () => {
+    const metrics = recordingMetricSink();
+
+    const successful = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      clock: monotonicClock(0, 10, 20, 30, 40)
+    }).core;
+    successful.handleText(utteranceStartText());
+    successful.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(2)));
+    successful.handleBinary(frame(TEST_UTTERANCE_ID, 0, 0, pcmSamples(2)));
+    await successful.handleTranscriptionEvent(partialEvent(1));
+    await successful.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 2));
+    await flushAsyncEvents();
+    await successful.drainAsyncEvents();
+    successful.close();
+
+    const rejected = new RelaySessionCore(createTestOptions({ metricSink: metrics.sink }));
+    rejected.openWithFirstText('{');
+
+    const aborted = openNew(recordingAdapter(), 'es', { metricSink: metrics.sink }).core;
+    aborted.handleText(utteranceStartText());
+    aborted.handleBinary(frame(TEST_UTTERANCE_ID, 1, 1, pcmSamples(2)));
+
+    const reconnectLease = { ...createTestSessionLease(), sessionEpoch: 2 };
+    const reconnected = new RelaySessionCore(createTestOptions({
+      sessionLease: reconnectLease,
+      metricSink: metrics.sink
+    }));
+    reconnected.openWithFirstText(startText());
+    reconnected.close();
+
+    const transcriptionFailure = openNew(
+      recordingAdapter(DETERMINISTIC_MOCK_CAPABILITIES, undefined, new Error('provider')),
+      'es',
+      { metricSink: metrics.sink }
+    ).core;
+    transcriptionFailure.handleText(utteranceStartText());
+    transcriptionFailure.handleBinary(frame());
+
+    const generationFailure = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      generationService: generationService({
+        id: 'deterministic-mock-generation',
+        version: '1.0.0',
+        complete: async () => { throw new Error('provider'); }
+      })
+    }).core;
+    generationFailure.handleText(utteranceStartText());
+    await generationFailure.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    await generationFailure.drainAsyncEvents();
+    generationFailure.close();
+
+    const stateFailure = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      securityRuntime: createTestSecurityRuntime({
+        authorizeGeneration: async () => { throw new SecurityStateError('state-unavailable'); }
+      })
+    }).core;
+    stateFailure.handleText(utteranceStartText());
+    await stateFailure.handleTranscriptionEvent(finalEvent());
+    stateFailure.close();
+
+    expect(new Set(metrics.records.map((record) => record.name))).toEqual(
+      new Set(RELAY_METRIC_NAMES)
+    );
+    for (const record of metrics.records) {
+      const enriched = { ...record, deploymentSlot: 'dev' as const };
+      const sanitized = sanitizeTelemetryForExport(enriched, 'dev');
+      expect({ ...sanitized }).toEqual(enriched);
+      expect(Object.hasOwn(sanitized, 'errorCategory')).toBe(false);
+      expect(Object.hasOwn(sanitized, 'errorId')).toBe(false);
+    }
+    expect(metrics.records.filter((record) => record.name === 'provider.failure')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          operation: 'transcription',
+          providerId: 'deterministic-mock',
+          providerVersion: '1.0.0'
+        }),
+        expect.objectContaining({
+          operation: 'provider',
+          providerId: 'deterministic-mock-generation',
+          providerVersion: '1.0.0'
+        })
+      ])
+    );
+    expect(metrics.records.some((record) => record.name === 'state_store.failure')).toBe(true);
+  });
+
+  it('constructs every test generation consumer with its mandatory validator', () => {
+    expect(createTestOptions().generationService.validator).toEqual({
+      id: 'deterministic-language-fixture',
+      version: '1.0.0'
+    });
   });
 
   it('negotiates fresh frozen limits', () => {

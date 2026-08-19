@@ -4,6 +4,7 @@ import {
   type NegotiatedLimits
 } from '@palancar/contracts';
 import {
+  DeterministicFixtureLanguageValidator,
   GenerationService,
   type GenerationProvider,
   type GenerationProviderCompletion
@@ -27,6 +28,7 @@ import type { RelaySecurityComposition } from './security.js';
 import type {
   RelayClock,
   RelayIdGenerator,
+  RelayMetricSink,
   RelaySessionCoreOptions
 } from './types.js';
 
@@ -277,7 +279,14 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
 }
 
 export function createTestClock(): RelayClock {
-  return { nowIso: () => '2026-08-10T12:00:00.000Z' };
+  return {
+    nowIso: () => '2026-08-10T12:00:00.000Z',
+    nowMonotonicMs: () => 0
+  };
+}
+
+export function createTestMetricSink(): RelayMetricSink {
+  return { record: () => undefined };
 }
 
 export function createTestIds(): RelayIdGenerator {
@@ -306,27 +315,40 @@ export function createTestGenerationService(
     })
   }
 ): GenerationService {
-  return new GenerationService(provider);
+  return new GenerationService({
+    provider,
+    validator: new DeterministicFixtureLanguageValidator()
+  });
 }
 
 export function createTestOptions(
   overrides: Partial<RelaySessionCoreOptions> = {},
   limits: NegotiatedLimits = DEFAULT_NEGOTIATED_LIMITS
 ): RelaySessionCoreOptions {
+  const hasAdapterOverride =
+    Object.hasOwn(overrides, 'transcriptionAdapters') ||
+    Object.hasOwn(overrides, 'transcriptionAdapterForTarget') ||
+    Object.hasOwn(overrides, 'transcriptionAdapter');
   return {
     sessionLease: createTestSessionLease(),
     securityRuntime: createTestSecurityRuntime(),
     clock: createTestClock(),
     ids: createTestIds(),
-    transcriptionAdapter: new DeterministicMockTranscriptionAdapter({
-      evidenceCategory: 'selected-target'
-    }),
+    ...(hasAdapterOverride
+      ? {}
+      : {
+          transcriptionAdapter: new DeterministicMockTranscriptionAdapter({
+            evidenceCategory: 'selected-target'
+          })
+        }),
     languageClassifier: createControlledFixtureTextLanguageClassifier(),
     generationService: createTestGenerationService(),
+    languageBoundaryMode: 'fixture',
+    metricSink: createTestMetricSink(),
     gatePolicyVersion: TEST_GATE_POLICY_VERSION,
     serverLimits: limits,
     ...overrides
-  };
+  } as RelaySessionCoreOptions;
 }
 
 export function createTestSubprotocols(): readonly [string, string] {

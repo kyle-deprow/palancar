@@ -34,6 +34,7 @@ export type PreparedStreamUpgrade =
 
 export interface RelayClock {
   nowIso(): string;
+  nowMonotonicMs(): number;
 }
 
 export interface RelayIdGenerator {
@@ -41,19 +42,160 @@ export interface RelayIdGenerator {
   errorId(): string;
 }
 
-export interface RelaySessionCoreOptions {
+export type RelayLanguageBoundaryMode = 'fixture' | 'deny-all' | 'production-approved';
+
+export const RELAY_METRIC_NAMES = Object.freeze([
+  'session.start',
+  'session.reject',
+  'session.end',
+  'utterance.start',
+  'utterance.abort',
+  'utterance.complete',
+  'audio.samples.accepted',
+  'audio.samples.duplicate',
+  'audio.samples.rejected',
+  'transport.reconnect',
+  'transcription.first_partial_latency',
+  'transcription.final_latency',
+  'language.decision',
+  'translation.latency',
+  'translation.result',
+  'suggestion.latency',
+  'suggestion.result',
+  'provider.failure',
+  'state_store.failure'
+] as const);
+
+export type RelayMetricName = (typeof RELAY_METRIC_NAMES)[number];
+
+export type RelayMetricOperation =
+  | 'session'
+  | 'utterance'
+  | 'audio'
+  | 'transport'
+  | 'transcription'
+  | 'language'
+  | 'translation'
+  | 'suggestion'
+  | 'provider'
+  | 'state_store';
+
+export type RelayMetricOutcome =
+  | 'accepted'
+  | 'duplicate'
+  | 'rejected'
+  | 'completed'
+  | 'aborted'
+  | 'reconnected'
+  | 'success'
+  | 'failure';
+
+export type RelayMetricGateDecision =
+  | 'provisional'
+  | 'target'
+  | 'mixed'
+  | 'english'
+  | 'supported_unselected'
+  | 'unsupported'
+  | 'uncertain';
+
+/**
+ * Metadata-only producer input. Correlation identifiers, error identifiers,
+ * user/provider content, and audio are structurally excluded at the core
+ * boundary; a host adapter may add deployment metadata after this boundary.
+ */
+export interface RelayProductionMetricInput {
+  readonly name: RelayMetricName;
+  readonly timestamp: string;
+  readonly protocolVersion?: 1;
+  readonly durationMs?: number;
+  readonly sampleCount?: number;
+  readonly count?: number;
+  readonly targetLanguage?: TargetLanguage;
+  readonly gateDecision?: RelayMetricGateDecision;
+  readonly operation?: RelayMetricOperation;
+  readonly outcome?: RelayMetricOutcome;
+  readonly providerId?: string;
+  readonly providerVersion?: string;
+  readonly reconnectReason?: 'network' | 'server' | 'heartbeat' | 'abnormal_exit' | 'session_expired' | 'unknown';
+  readonly errorCategory?: never;
+  readonly correlationId?: never;
+  readonly sessionId?: never;
+  readonly sessionIdHash?: never;
+  readonly utteranceId?: never;
+  readonly utteranceIdHash?: never;
+  readonly segmentId?: never;
+  readonly installationId?: never;
+  readonly installationIdHash?: never;
+  readonly requestId?: never;
+  readonly requestIdHash?: never;
+  readonly traceId?: never;
+  readonly traceIdHash?: never;
+  readonly spanId?: never;
+  readonly spanIdHash?: never;
+  readonly authorizationId?: never;
+  readonly claimId?: never;
+  readonly providerRequestId?: never;
+  readonly errorId?: never;
+  readonly text?: never;
+  readonly transcript?: never;
+  readonly translation?: never;
+  readonly englishTranslation?: never;
+  readonly englishText?: never;
+  readonly selectedTargetText?: never;
+  readonly suggestion?: never;
+  readonly suggestions?: never;
+  readonly content?: never;
+  readonly audio?: never;
+  readonly pcm?: never;
+  readonly prompt?: never;
+  readonly request?: never;
+  readonly response?: never;
+  readonly providerBody?: never;
+  readonly message?: never;
+}
+
+export type RelayMetricInput = RelayProductionMetricInput;
+
+/** `record` is a nonthrowing contract. The core still contains hostile sinks. */
+export interface RelayMetricSink {
+  record(input: RelayProductionMetricInput): void;
+}
+
+interface RelaySessionCoreBaseOptions {
   readonly sessionLease: SessionLease;
   readonly securityRuntime: SecurityRuntimeStore;
   readonly clock: RelayClock;
   readonly ids: RelayIdGenerator;
-  readonly transcriptionAdapter: TranscriptionAdapter;
-  readonly transcriptionAdapterForTarget?: (target: TargetLanguage) => TranscriptionAdapter;
   readonly languageClassifier: TextLanguageClassifier;
   readonly generationService: GenerationService;
+  readonly languageBoundaryMode: RelayLanguageBoundaryMode;
+  readonly metricSink: RelayMetricSink;
   readonly gatePolicyVersion: string;
   readonly serverLimits?: NegotiatedLimits;
-  readonly onAsyncEventsAvailable?: () => void;
+  readonly onAsyncEventsAvailable?: () => unknown;
 }
+
+type RelayTranscriptionAdapterOptions =
+  | {
+      readonly transcriptionAdapters: Readonly<Record<TargetLanguage, TranscriptionAdapter>>;
+      readonly transcriptionAdapterForTarget?: never;
+      readonly transcriptionAdapter?: never;
+    }
+  | {
+      readonly transcriptionAdapters?: never;
+      readonly transcriptionAdapterForTarget: (target: TargetLanguage) => TranscriptionAdapter;
+      readonly transcriptionAdapter?: never;
+    }
+  | {
+      readonly transcriptionAdapters?: never;
+      readonly transcriptionAdapterForTarget?: never;
+      /** Test-only migration shorthand. Production composition selects by target. */
+      readonly transcriptionAdapter: TranscriptionAdapter;
+    };
+
+export type RelaySessionCoreOptions = RelaySessionCoreBaseOptions &
+  RelayTranscriptionAdapterOptions;
 
 export interface FinalProcessingToken {
   readonly sessionId: string;
@@ -64,6 +206,7 @@ export interface FinalProcessingToken {
   readonly selectedTargetLanguage: string;
   readonly gatePolicyVersion: string;
   readonly targetTranscript: string;
+  readonly generationStartedMonotonicMs: number | undefined;
   readonly generationClaim: GenerationClaim;
 }
 
