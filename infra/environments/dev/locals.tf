@@ -31,7 +31,7 @@ locals {
   relay_transcription_deployment = var.deploy_relay_workload ? "gpt-4o-mini-transcribe" : ""
   relay_deployment_slot          = var.deploy_relay_workload ? "dev" : ""
 
-  required_foundry_deployments = {
+  required_foundry_deployments = tomap({
     "gpt-4o-mini-transcribe" = {
       model_name             = "gpt-4o-mini-transcribe"
       model_version          = "2025-12-15"
@@ -40,5 +40,5 @@ locals {
       capacity               = 1
       version_upgrade_option = "NoAutoUpgrade"
     }
-  }
+  })
 }
