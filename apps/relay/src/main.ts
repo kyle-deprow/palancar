@@ -9,17 +9,22 @@ try {
 }
 
 if (host !== undefined) {
-  let shuttingDown = false;
+  let shutdownPromise: Promise<void> | undefined;
 
+  const removeSignalListeners = (): void => {
+    process.removeListener('SIGTERM', shutdown);
+    process.removeListener('SIGINT', shutdown);
+  };
   const shutdown = (): void => {
-    if (shuttingDown) {
+    if (shutdownPromise !== undefined) {
+      process.exitCode = 1;
       return;
     }
-    shuttingDown = true;
-    void host?.stop().then(
-      () => process.exit(0),
-      () => process.exit(1)
-    );
+    shutdownPromise = (async (): Promise<void> => {
+      await host?.stop().catch(() => undefined);
+      removeSignalListeners();
+      process.exitCode ??= 0;
+    })();
   };
 
   process.once('SIGTERM', shutdown);
@@ -27,9 +32,17 @@ if (host !== undefined) {
 
   void host.start().then(
     ({ port }) => {
-      process.stdout.write(`relay listening on ${port}\n`);
+      if (shutdownPromise === undefined) {
+        process.stdout.write(`relay listening on ${port}\n`);
+      }
     },
-    () => {
+    async () => {
+      if (shutdownPromise !== undefined) {
+        await shutdownPromise;
+        return;
+      }
+      await host?.stop().catch(() => undefined);
+      removeSignalListeners();
       process.stderr.write('relay failed to start\n');
       process.exitCode = 1;
     }

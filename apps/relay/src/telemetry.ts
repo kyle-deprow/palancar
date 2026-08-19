@@ -815,10 +815,35 @@ const PRODUCTION_RUNTIME: RelayMetricSinkRuntime = Object.freeze({
   clearTimer: (handle: TimerHandle) => clearTimeout(handle)
 });
 
+const DISABLED_SINK_REGISTRY = new WeakSet<object>();
 const DISABLED_SINK: RelayMetricSink = Object.freeze(new DisabledRelayMetricSink());
+DISABLED_SINK_REGISTRY.add(DISABLED_SINK);
 
 export function createDisabledRelayMetricSink(): RelayMetricSink {
   return DISABLED_SINK;
+}
+
+export function isDisabledRelayMetricSink(value: unknown): boolean {
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+    return false;
+  }
+  const visited = new Set<object>();
+  let current: object | null = value;
+  try {
+    while (current !== null) {
+      if (utilTypes.isProxy(current) || visited.has(current)) {
+        return false;
+      }
+      visited.add(current);
+      if (DISABLED_SINK_REGISTRY.has(current)) {
+        return true;
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 export function createProductionRelayMetricSink(

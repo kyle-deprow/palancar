@@ -5,6 +5,11 @@ import {
 import { describe, expect, it } from 'vitest';
 
 import * as relayRoot from '../src/index.js';
+import {
+  createFailClosedDeployedTextLanguageClassifier,
+  isControlledFixtureTextLanguageClassifier,
+  isFailClosedDeployedTextLanguageClassifier
+} from '../src/language-classifier.js';
 import { createTestOptions } from '../src/testing.js';
 
 function controlledClassifier() {
@@ -69,5 +74,23 @@ describe('controlled fixture text classifier', () => {
       status: 'unavailable',
       detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION
     });
+  });
+});
+
+describe('deployed language boundary classifier', () => {
+  it('is branded separately from the controlled fixture and never calibrates', async () => {
+    const classifier = createFailClosedDeployedTextLanguageClassifier();
+
+    expect(isFailClosedDeployedTextLanguageClassifier(classifier)).toBe(true);
+    expect(isControlledFixtureTextLanguageClassifier(classifier)).toBe(false);
+    await expect(classifier.classify('private transcript')).resolves.toEqual({
+      status: 'uncalibrated',
+      detectorVersion: 'deployed-language-boundary-unavailable-1'
+    });
+  });
+
+  it('does not expose the controlled fixture factory from the relay root', () => {
+    expect('createControlledFixtureTextLanguageClassifier' in relayRoot).toBe(false);
+    expect('createFailClosedDeployedTextLanguageClassifier' in relayRoot).toBe(true);
   });
 });

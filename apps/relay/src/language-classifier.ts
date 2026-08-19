@@ -18,6 +18,9 @@ const CONTROLLED_FIXTURE_TEXT =
   /^(es|tr)-(selected-target|english|supported-unselected|mixed|unsupported|uncertain)-(?:final|partial-(?:[1-9]|[1-9][0-9]{1,5}))$/;
 const MAX_CONTROLLED_FIXTURE_TEXT_LENGTH = 96;
 const controlledFixtureClassifiers = new WeakSet<object>();
+const failClosedDeployedClassifiers = new WeakSet<object>();
+
+const FAIL_CLOSED_DEPLOYED_DETECTOR_VERSION = 'deployed-language-boundary-unavailable-1';
 
 function oppositeTarget(language: TargetLanguage): TargetLanguage {
   return language === 'es' ? 'tr' : 'es';
@@ -101,3 +104,38 @@ export function isControlledFixtureTextLanguageClassifier(
 ): boolean {
   return controlledFixtureClassifiers.has(classifier);
 }
+
+/**
+ * Deployed boundary classifier. Calibration is intentionally absent in the
+ * deployed composition, so this classifier can never produce evidence that
+ * the language gate would accept. Its identity is branded to prevent a
+ * lookalike classifier from being treated as the deployed fail-closed path.
+ */
+class FailClosedDeployedTextLanguageClassifier implements TextLanguageClassifier {
+  readonly ready = Promise.resolve();
+
+  constructor() {
+    failClosedDeployedClassifiers.add(this);
+    Object.freeze(this);
+  }
+
+  async classify(): Promise<ClassifiedLanguageEvidence> {
+    return Object.freeze({
+      status: 'uncalibrated',
+      detectorVersion: FAIL_CLOSED_DEPLOYED_DETECTOR_VERSION
+    });
+  }
+}
+
+export function createFailClosedDeployedTextLanguageClassifier(): TextLanguageClassifier {
+  return new FailClosedDeployedTextLanguageClassifier();
+}
+
+export function isFailClosedDeployedTextLanguageClassifier(
+  classifier: TextLanguageClassifier
+): boolean {
+  return failClosedDeployedClassifiers.has(classifier);
+}
+
+export const createFailClosedLanguageClassifier = createFailClosedDeployedTextLanguageClassifier;
+export const isFailClosedLanguageClassifier = isFailClosedDeployedTextLanguageClassifier;

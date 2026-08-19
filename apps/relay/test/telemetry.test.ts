@@ -24,6 +24,7 @@ import {
   RelayMetricSinkConfigurationError,
   createDisabledRelayMetricSink,
   createProductionRelayMetricSink,
+  isDisabledRelayMetricSink,
   type RelayMetricSinkConfig
 } from '../src/telemetry.js';
 
@@ -945,5 +946,63 @@ describe('shutdown and disabled sink', () => {
     await expect(first.checkReadiness()).resolves.toBe(true);
     await expect(first.shutdown()).resolves.toBeUndefined();
     await expect(first.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('classifies the disabled singleton and every finite inherited wrapper', () => {
+    const disabled = createDisabledRelayMetricSink();
+    const inherited = Object.create(disabled) as object;
+    const deeplyInherited = Object.create(Object.create(inherited)) as object;
+
+    expect(isDisabledRelayMetricSink(disabled)).toBe(true);
+    expect(isDisabledRelayMetricSink(inherited)).toBe(true);
+    expect(isDisabledRelayMetricSink(deeplyInherited)).toBe(true);
+  });
+
+  it('does not classify production sinks, test doubles, or primitive values as disabled', async () => {
+    const harness = createHarness();
+    const production = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    const fake = {
+      record: () => undefined,
+      checkReadiness: async () => true,
+      shutdown: async () => undefined
+    };
+
+    expect(isDisabledRelayMetricSink(production)).toBe(false);
+    expect(isDisabledRelayMetricSink(Object.create(production))).toBe(false);
+    expect(isDisabledRelayMetricSink(fake)).toBe(false);
+    expect(isDisabledRelayMetricSink(undefined)).toBe(false);
+    expect(isDisabledRelayMetricSink('disabled')).toBe(false);
+    await production.shutdown();
+  });
+
+  it('contains proxies, hostile prototype traversal, and prototype cycles', () => {
+    const disabled = createDisabledRelayMetricSink();
+    const getPrototypeOf = vi.fn(() => {
+      throw new Error('hostile prototype canary');
+    });
+    const hostileProxy = new Proxy(Object.create(disabled) as object, { getPrototypeOf });
+    const inheritedFromHostileProxy = Object.create(hostileProxy) as object;
+    const revocable = Proxy.revocable(Object.create(disabled) as object, {});
+    revocable.revoke();
+
+    expect(() => isDisabledRelayMetricSink(hostileProxy)).not.toThrow();
+    expect(isDisabledRelayMetricSink(hostileProxy)).toBe(false);
+    expect(isDisabledRelayMetricSink(inheritedFromHostileProxy)).toBe(false);
+    expect(getPrototypeOf).not.toHaveBeenCalled();
+    expect(() => isDisabledRelayMetricSink(revocable.proxy)).not.toThrow();
+    expect(isDisabledRelayMetricSink(revocable.proxy)).toBe(false);
+
+    const cyclic = {};
+    const originalGetPrototypeOf = Object.getPrototypeOf;
+    const prototypeSpy = vi.spyOn(Object, 'getPrototypeOf').mockImplementation((value) =>
+      value === cyclic ? cyclic : originalGetPrototypeOf(value)
+    );
+    let cyclicResult: boolean;
+    try {
+      cyclicResult = isDisabledRelayMetricSink(cyclic);
+    } finally {
+      prototypeSpy.mockRestore();
+    }
+    expect(cyclicResult).toBe(false);
   });
 });

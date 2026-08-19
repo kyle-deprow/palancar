@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { performance } from 'node:perf_hooks';
+import { types as utilTypes } from 'node:util';
 
 import {
   MAX_CONTROL_MESSAGE_BYTES,
@@ -21,12 +23,21 @@ import {
   type ServerControlMessage
 } from '@palancar/contracts';
 import {
+  DeterministicFixtureLanguageValidator,
+  DeterministicMockProvider,
+  FailClosedGeneratedLanguageValidator,
   GenerationService,
   LiteLLMChatGenerationProvider,
-  type GenerationProviderCompletion
+  isDeterministicFixtureLanguageValidator,
+  isFailClosedGeneratedLanguageValidator,
+  type GeneratedLanguageValidator,
+  type GenerationProviderCompletion,
 } from '@palancar/generation';
 import {
+  AzureRealtimeTranscriptionAdapter,
+  createAzureManagedIdentityTokenSource,
   DeterministicMockTranscriptionAdapter,
+  type AzureTokenProvider,
   type TranscriptionAdapter
 } from '@palancar/transcription';
 import type { TargetLanguage, TextLanguageClassifier } from '@palancar/language-registry';
@@ -50,7 +61,9 @@ import { negotiateLimits, prepareStreamUpgrade } from './protocol.js';
 import { RelaySessionCore } from './session.js';
 import {
   createControlledFixtureTextLanguageClassifier,
-  isControlledFixtureTextLanguageClassifier
+  createFailClosedDeployedTextLanguageClassifier,
+  isControlledFixtureTextLanguageClassifier,
+  isFailClosedDeployedTextLanguageClassifier
 } from './language-classifier.js';
 import {
   createAzureTableSecurityComposition,
@@ -62,9 +75,17 @@ import {
 import type {
   RelayClock,
   RelayIdGenerator,
+  RelayLanguageBoundaryMode,
+  RelayMetricSink,
   RelayStepResult,
   RelayUpgradeAudience
 } from './types.js';
+import {
+  createDisabledRelayMetricSink,
+  createProductionRelayMetricSink,
+  isDisabledRelayMetricSink,
+  type RelayMetricSinkConfig
+} from './telemetry.js';
 import {
   evaluateBrowserOrigin,
   parseBrowserOriginPolicy,
@@ -84,10 +105,21 @@ const DEFAULT_GATE_POLICY_VERSION = '1.0.0';
 const DEFAULT_BIND_HOST = '127.0.0.1' as const;
 const REQUEST_REJECTED_BODY = Object.freeze({ error: 'request_rejected' });
 const RELAY_CONFIGURATION_ERROR = 'Invalid relay host configuration.';
-const READINESS_TIMEOUT_MS = 2_000;
+const READINESS_TIMEOUT_MS = 6_000;
+const READINESS_FETCH_TIMEOUT_MS = 2_000;
+const READINESS_SUCCESS_CACHE_MS = 30_000;
+const READINESS_FAILURE_CACHE_MS = 2_000;
+const DISABLED_RELAY_METRIC_SINK = createDisabledRelayMetricSink();
 const READINESS_MAX_RESPONSE_BYTES = 16_384;
 const SOCKET_CLOSE_WAIT_MS = 1_000;
+const CONNECTION_WORK_DRAIN_TIMEOUT_MS = 6_000;
+const REQUEST_WORK_DRAIN_TIMEOUT_MS = 6_000;
+const DURABLE_CLEANUP_TIMEOUT_MS = 6_000;
+const SHUTDOWN_TELEMETRY_TIMEOUT_MS = 5_000;
+const RESOURCE_ROLLBACK_TIMEOUT_MS = 5_000;
 const BODYLESS_REQUEST_TIMEOUT_MS = 1_000;
+const DEPLOYED_LITELLM_BASE_URL = 'http://127.0.0.1:4000' as const;
+const DEPLOYED_LITELLM_MODEL = 'palancar-generation' as const;
 const PREFLIGHT_VARY = 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers';
 const DEFAULT_BROWSER_ORIGIN_POLICY: BrowserOriginPolicy = Object.freeze({
   allowedOrigins: Object.freeze([]),
@@ -105,11 +137,36 @@ interface MockGenerationReadiness {
 interface LiteLLMGenerationReadiness {
   readonly provider: 'litellm';
   readonly providerId: string;
-  readonly model: string;
-  readonly check: () => Promise<boolean>;
+  readonly baseUrl: typeof DEPLOYED_LITELLM_BASE_URL;
+  readonly model: typeof DEPLOYED_LITELLM_MODEL;
+  readonly check: (signal?: AbortSignal) => Promise<boolean>;
 }
 
 export type RelayGenerationReadiness = MockGenerationReadiness | LiteLLMGenerationReadiness;
+
+export type RelayHostLifecycleState =
+  | 'created'
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'stopped';
+
+export interface RelayAzureTokenSource {
+  readonly tokenProvider: AzureTokenProvider;
+  close(): void;
+}
+
+export type RelayAzureTokenSourceFactory = (
+  options: Readonly<{ readonly clientId: string }>
+) => RelayAzureTokenSource;
+
+export type RelayAzureTranscriptionAdapterFactory = (
+  options: Readonly<{
+    readonly endpoint: string;
+    readonly deployment: string;
+    readonly tokenProvider: AzureTokenProvider;
+  }>
+) => TranscriptionAdapter;
 
 export interface RelayHostConfig {
   readonly environment: string;
@@ -118,13 +175,25 @@ export interface RelayHostConfig {
   readonly port: number;
   readonly bindHost?: RelayBindHost;
   readonly gatePolicyVersion: string;
+  readonly securityMode?: RelaySecurityComposition['mode'];
   readonly security?: RelaySecurityComposition;
+  readonly securityFactory?: () => RelaySecurityComposition;
   readonly clock?: RelayClock;
   readonly ids?: RelayIdGenerator;
-  readonly transcriptionAdapter?: TranscriptionAdapter;
+  readonly languageBoundaryMode?: RelayLanguageBoundaryMode;
+  readonly transcriptionAdapters?: Readonly<Record<TargetLanguage, TranscriptionAdapter>>;
   readonly languageClassifier?: TextLanguageClassifier;
   readonly generationService?: GenerationService;
+  readonly productionApprovedGenerationValidator?: GeneratedLanguageValidator;
   readonly generationReadiness?: RelayGenerationReadiness;
+  readonly metricSink?: RelayMetricSink;
+  readonly metricSinkFactory?: () => RelayMetricSink;
+  readonly transcriptionProvider?: 'mock' | 'azure-realtime';
+  readonly azureTranscriptionEndpoint?: string;
+  readonly azureTranscriptionDeployment?: string;
+  readonly managedIdentityClientId?: string;
+  readonly azureTokenSourceFactory?: RelayAzureTokenSourceFactory;
+  readonly azureTranscriptionAdapterFactory?: RelayAzureTranscriptionAdapterFactory;
   readonly beforeServerMessageDelivery?: (message: ServerControlMessage) => void | Promise<void>;
 }
 
@@ -132,6 +201,7 @@ export interface RelayHost {
   readonly server: Server;
   readonly securityRuntime: SecurityRuntimeStore;
   readonly securityMaintenance: SecurityStateMaintenanceStore;
+  readonly lifecycleState: RelayHostLifecycleState;
   start(): Promise<{ readonly port: number }>;
   stop(): Promise<void>;
 }
@@ -146,6 +216,7 @@ interface RelayConnection {
   lease: SessionLease;
   activated: boolean;
   ended: boolean;
+  endPromise: Promise<void> | undefined;
   heartbeat: ReturnType<typeof setInterval> | undefined;
   audio: RelayConnectionAudio | undefined;
   limits: NegotiatedLimits | undefined;
@@ -197,7 +268,10 @@ const AUTH_ROUTES: Readonly<Record<string, AuthRouteDefinition>> = Object.freeze
 });
 
 function systemClock(): RelayClock {
-  return { nowIso: () => new Date().toISOString() };
+  return {
+    nowIso: () => new Date().toISOString(),
+    nowMonotonicMs: () => performance.now()
+  };
 }
 
 function systemIds(): RelayIdGenerator {
@@ -207,7 +281,32 @@ function systemIds(): RelayIdGenerator {
   };
 }
 
-const BUILT_IN_MOCK_GENERATION_SERVICES = new WeakSet<GenerationService>();
+const BUILT_IN_FIXTURE_GENERATION_SERVICES = new WeakSet<GenerationService>();
+const BUILT_IN_DEPLOYED_GENERATION_SERVICES = new WeakSet<GenerationService>();
+
+class RelayDeterministicMockProvider extends DeterministicMockProvider {
+  override async complete(
+    input: Parameters<DeterministicMockProvider['complete']>[0],
+    context: Parameters<DeterministicMockProvider['complete']>[1]
+  ): Promise<GenerationProviderCompletion> {
+    if (context.signal.aborted) throw new Error('aborted');
+    return input.selectedTargetLanguage === 'es'
+      ? {
+          englishTranslation: 'A Spanish phrase translated to English.',
+          suggestions: [
+            { englishText: 'Yes, please.', selectedTargetText: 'Sí, por favor.' },
+            { englishText: 'No, thank you.', selectedTargetText: 'No, gracias.' }
+          ]
+        }
+      : {
+          englishTranslation: 'A Turkish phrase translated to English.',
+          suggestions: [
+            { englishText: 'Yes, please.', selectedTargetText: 'Evet, lütfen.' },
+            { englishText: 'No, thank you.', selectedTargetText: 'Hayır, teşekkürler.' }
+          ]
+        };
+  }
+}
 
 function defaultTranscriptionAdapters(): Readonly<Record<TargetLanguage, TranscriptionAdapter>> {
   return Object.freeze({
@@ -222,30 +321,33 @@ function defaultTranscriptionAdapters(): Readonly<Record<TargetLanguage, Transcr
   });
 }
 
-function defaultGenerationService(): GenerationService {
-  const service = new GenerationService({
+function defaultGenerationService(
+  boundary: 'fixture' | 'deny-all'
+): GenerationService {
+  const provider = new RelayDeterministicMockProvider({
     id: 'deterministic-mock-generation',
     version: '1.0.0',
-    complete: async (input, context): Promise<GenerationProviderCompletion> => {
-      if (context.signal.aborted) throw new Error('aborted');
-      return input.selectedTargetLanguage === 'es'
-        ? {
-            englishTranslation: 'A Spanish phrase translated to English.',
-            suggestions: [
-              { englishText: 'Yes, please.', selectedTargetText: 'Sí, por favor.' },
-              { englishText: 'No, thank you.', selectedTargetText: 'No, gracias.' }
-            ]
-          }
-        : {
-            englishTranslation: 'A Turkish phrase translated to English.',
-            suggestions: [
-              { englishText: 'Yes, please.', selectedTargetText: 'Evet, lütfen.' },
-              { englishText: 'No, thank you.', selectedTargetText: 'Hayır, teşekkürler.' }
-            ]
-          };
+    complete: {
+      result: {
+        englishTranslation: 'A Spanish phrase translated to English.',
+        suggestions: [
+          { englishText: 'Yes, please.', selectedTargetText: 'Sí, por favor.' },
+          { englishText: 'No, thank you.', selectedTargetText: 'No, gracias.' }
+        ]
+      }
     }
   });
-  BUILT_IN_MOCK_GENERATION_SERVICES.add(service);
+  const service = new GenerationService({
+    provider,
+    validator: boundary === 'fixture'
+      ? new DeterministicFixtureLanguageValidator()
+      : new FailClosedGeneratedLanguageValidator()
+  });
+  if (boundary === 'fixture') {
+    BUILT_IN_FIXTURE_GENERATION_SERVICES.add(service);
+  } else {
+    BUILT_IN_DEPLOYED_GENERATION_SERVICES.add(service);
+  }
   return service;
 }
 
@@ -304,28 +406,118 @@ function parseOptionalTimeout(value: string | undefined): number | undefined {
   return timeoutMs;
 }
 
-function normalizedReadinessUrl(value: string): string {
-  let url: URL;
-  try {
-    if (value.trim() !== value) {
-      throw new TypeError(RELAY_CONFIGURATION_ERROR);
-    }
-    url = new URL(value);
-  } catch {
+const CANONICAL_AZURE_CLIENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_AZURE_TRANSCRIPTION_ENDPOINT =
+  /^wss:\/\/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.openai\.azure\.com\/openai\/v1\/realtime\?intent=transcription$/;
+const CANONICAL_AZURE_TRANSCRIPTION_DEPLOYMENT =
+  /^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/;
+const APPLICATION_INSIGHTS_REGIONAL_SUFFIX = '.in.applicationinsights.azure.com';
+const APPLICATION_INSIGHTS_CLASSIC_HOST = 'dc.services.visualstudio.com';
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+function hasEnvironmentValue(env: NodeJS.ProcessEnv, name: string): boolean {
+  return env[name] !== undefined;
+}
+
+function rejectEnvironmentKeys(
+  env: NodeJS.ProcessEnv,
+  predicate: (name: string) => boolean
+): void {
+  if (Object.keys(env).some((name) => predicate(name) && hasEnvironmentValue(env, name))) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
+}
+
+function rejectBoundarySelectionEnvironment(env: NodeJS.ProcessEnv): void {
+  rejectEnvironmentKeys(env, (name) => {
+    const normalized = name.toUpperCase();
+    return normalized.includes('LANGUAGE_BOUNDARY') ||
+      normalized.includes('BOUNDARY_MODE') ||
+      normalized.includes('PRODUCTION_APPROVED') ||
+      normalized.includes('CALIBRATION_PROFILE');
+  });
+}
+
+function canonicalAzureClientId(value: string): string {
+  if (value !== value.toLowerCase() || !CANONICAL_AZURE_CLIENT_ID.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function canonicalAzureTranscriptionEndpoint(value: string): string {
+  if (!CANONICAL_AZURE_TRANSCRIPTION_ENDPOINT.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function canonicalAzureTranscriptionDeployment(value: string): string {
+  if (!CANONICAL_AZURE_TRANSCRIPTION_DEPLOYMENT.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function validateApplicationInsightsConnectionString(value: string): string {
   if (
-    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
-    url.search !== '' ||
-    url.hash !== '' ||
-    url.username !== '' ||
-    url.password !== '' ||
-    value.includes('?') ||
-    value.includes('#')
+    value.trim() !== value ||
+    value.length === 0 ||
+    value.length > 2_048 ||
+    /[\r\n\0]/u.test(value)
   ) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
-  return url.toString().replace(/\/+$/, '');
+  const entries = value.endsWith(';') ? value.slice(0, -1).split(';') : value.split(';');
+  if (entries.length !== 2) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  const values = new Map<string, string>();
+  for (const entry of entries) {
+    const separator = entry.indexOf('=');
+    if (separator < 1) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    const key = entry.slice(0, separator);
+    const item = entry.slice(separator + 1);
+    if (key.length === 0 || item.length === 0 || values.has(key)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    values.set(key, item);
+  }
+  const instrumentationKey = values.get('InstrumentationKey');
+  const ingestionEndpoint = values.get('IngestionEndpoint');
+  let parsedIngestionEndpoint: URL | undefined;
+  try {
+    parsedIngestionEndpoint = ingestionEndpoint === undefined
+      ? undefined
+      : new URL(ingestionEndpoint);
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  const ingestionHost = parsedIngestionEndpoint?.hostname;
+  const regionalPrefix = ingestionHost?.endsWith(APPLICATION_INSIGHTS_REGIONAL_SUFFIX)
+    ? ingestionHost.slice(0, -APPLICATION_INSIGHTS_REGIONAL_SUFFIX.length)
+    : undefined;
+  const approvedIngestionHost = ingestionHost === APPLICATION_INSIGHTS_CLASSIC_HOST ||
+    (regionalPrefix !== undefined &&
+      regionalPrefix.length > 0 &&
+      regionalPrefix.split('.').every((label) => DNS_LABEL.test(label)));
+  if (
+    values.size !== 2 ||
+    instrumentationKey === undefined ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(instrumentationKey) ||
+    parsedIngestionEndpoint === undefined ||
+    parsedIngestionEndpoint.protocol !== 'https:' ||
+    parsedIngestionEndpoint.username !== '' ||
+    parsedIngestionEndpoint.password !== '' ||
+    parsedIngestionEndpoint.port !== '' ||
+    parsedIngestionEndpoint.pathname !== '/' ||
+    parsedIngestionEndpoint.search !== '' ||
+    parsedIngestionEndpoint.hash !== '' ||
+    ingestionHost !== ingestionHost?.toLowerCase() ||
+    !approvedIngestionHost
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
 }
 
 function readinessUrl(baseUrl: string, path: string): string {
@@ -393,8 +585,22 @@ async function readBoundedReadinessBody(response: Response): Promise<string | un
   }
 }
 
-async function fetchReadinessJson(url: string, apiKey?: string): Promise<unknown | undefined> {
+async function fetchReadinessJson(
+  url: string,
+  apiKey?: string,
+  signal?: AbortSignal
+): Promise<unknown | undefined> {
   const controller = new AbortController();
+  let callerAbortListener: (() => void) | undefined;
+  if (signal !== undefined) {
+    callerAbortListener = () => controller.abort();
+    try {
+      signal.addEventListener('abort', callerAbortListener, { once: true });
+      if (signal.aborted) controller.abort();
+    } catch {
+      controller.abort();
+    }
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const request = (async (): Promise<unknown | undefined> => {
     try {
@@ -428,10 +634,10 @@ async function fetchReadinessJson(url: string, apiKey?: string): Promise<unknown
     }
   })();
   const timeoutPromise = new Promise<undefined>((_resolve, reject) => {
-    timeout = setTimeout(() => {
-      controller.abort();
-      reject(new Error('readiness_timeout'));
-    }, READINESS_TIMEOUT_MS);
+      timeout = setTimeout(() => {
+        controller.abort();
+        reject(new Error('readiness_timeout'));
+      }, READINESS_FETCH_TIMEOUT_MS);
   });
 
   try {
@@ -442,15 +648,365 @@ async function fetchReadinessJson(url: string, apiKey?: string): Promise<unknown
     if (timeout !== undefined) {
       clearTimeout(timeout);
     }
+    if (callerAbortListener !== undefined && signal !== undefined) {
+      try {
+        signal.removeEventListener('abort', callerAbortListener);
+      } catch {
+        // Readiness is fail-closed and cleanup is best effort.
+      }
+    }
   }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value)
+    ) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
     return false;
   }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+}
+
+const RELAY_HOST_CONFIG_KEYS = new Set<PropertyKey>([
+  'environment',
+  'origin',
+  'browserOriginPolicy',
+  'port',
+  'bindHost',
+  'gatePolicyVersion',
+  'securityMode',
+  'security',
+  'securityFactory',
+  'clock',
+  'ids',
+  'languageBoundaryMode',
+  'transcriptionAdapters',
+  'languageClassifier',
+  'generationService',
+  'productionApprovedGenerationValidator',
+  'generationReadiness',
+  'metricSink',
+  'metricSinkFactory',
+  'transcriptionProvider',
+  'azureTranscriptionEndpoint',
+  'azureTranscriptionDeployment',
+  'managedIdentityClientId',
+  'azureTokenSourceFactory',
+  'azureTranscriptionAdapterFactory',
+  'beforeServerMessageDelivery'
+]);
+
+const SECURITY_RUNTIME_METHODS = Object.freeze([
+  'redeemPairing',
+  'authenticateCredential',
+  'beginCredentialRotation',
+  'promoteCredential',
+  'revokeInstallation',
+  'revokeCurrentInstallation',
+  'issueSessionTicket',
+  'consumeSessionTicket',
+  'activateSession',
+  'heartbeatSession',
+  'endSession',
+  'reserveAudio',
+  'authorizeGeneration',
+  'providerStart',
+  'heartbeatGeneration',
+  'completeGeneration',
+  'releaseGeneration'
+] as const);
+
+function exactOwnDataValues(
+  value: unknown,
+  allowedKeys: ReadonlySet<PropertyKey>
+): Readonly<Record<PropertyKey, unknown>> {
+  if (!isPlainObject(value)) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  let descriptors: Record<PropertyKey, PropertyDescriptor>;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value) as Record<PropertyKey, PropertyDescriptor>;
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  const result: Record<PropertyKey, unknown> = Object.create(null) as Record<PropertyKey, unknown>;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined ||
+      !allowedKeys.has(key) ||
+      !Object.hasOwn(descriptor, 'value')
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    result[key] = descriptor.value;
+  }
+  return Object.freeze(result);
+}
+
+function dataProperty(value: unknown, key: PropertyKey): unknown {
+  try {
+    if (typeof value !== 'object' || value === null || utilTypes.isProxy(value)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const visited = new Set<object>();
+    let current: object | null = value;
+    while (current !== null) {
+      if (utilTypes.isProxy(current) || visited.has(current)) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      visited.add(current);
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) {
+        if (!Object.hasOwn(descriptor, 'value')) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+        return descriptor.value;
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  throw new TypeError(RELAY_CONFIGURATION_ERROR);
+}
+
+function optionalDataProperty(value: unknown, key: PropertyKey): unknown | undefined {
+  try {
+    return dataProperty(value, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function hasMethods(value: unknown, names: readonly PropertyKey[]): boolean {
+  try {
+    return names.every((name) => typeof dataProperty(value, name) === 'function');
+  } catch {
+    return false;
+  }
+}
+
+function validateSecurityCompositionShape(
+  value: unknown,
+  expectedMode?: RelaySecurityComposition['mode']
+): RelaySecurityComposition {
+  const values = exactOwnDataValues(value, new Set(['mode', 'runtime', 'maintenance']));
+  if (Reflect.ownKeys(values).length !== 3) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  const mode = values.mode;
+  if (
+    (mode !== 'local-mock' && mode !== 'azure-table') ||
+    (expectedMode !== undefined && mode !== expectedMode) ||
+    !hasMethods(values.runtime, SECURITY_RUNTIME_METHODS) ||
+    !hasMethods(values.maintenance, ['checkReadiness', 'cleanupExpired'])
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return Object.freeze({
+    mode,
+    runtime: values.runtime as SecurityRuntimeStore,
+    maintenance: values.maintenance as SecurityStateMaintenanceStore
+  });
+}
+
+function validateTranscriptionAdapter(value: unknown): TranscriptionAdapter {
+  if (
+    !hasMethods(value, ['createSession', 'checkReadiness']) ||
+    optionalDataProperty(value, 'capabilities') === undefined
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value as TranscriptionAdapter;
+}
+
+function validateTranscriptionAdapterMap(
+  value: unknown
+): Readonly<Record<TargetLanguage, TranscriptionAdapter>> {
+  const values = exactOwnDataValues(value, new Set(['es', 'tr']));
+  if (Reflect.ownKeys(values).length !== 2) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  return Object.freeze({
+    es: validateTranscriptionAdapter(values.es),
+    tr: validateTranscriptionAdapter(values.tr)
+  });
+}
+
+function validateLanguageClassifier(value: unknown): TextLanguageClassifier {
+  const ready = optionalDataProperty(value, 'ready');
+  if (
+    ready === undefined ||
+    !hasMethods(ready, ['then']) ||
+    !hasMethods(value, ['classify'])
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value as TextLanguageClassifier;
+}
+
+function validateGeneratedLanguageValidator(value: unknown): GeneratedLanguageValidator {
+  const id = optionalDataProperty(value, 'id');
+  const version = optionalDataProperty(value, 'version');
+  if (
+    typeof id !== 'string' ||
+    id.length === 0 ||
+    typeof version !== 'string' ||
+    version.length === 0 ||
+    !hasMethods(value, ['validate'])
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value as GeneratedLanguageValidator;
+}
+
+function validateMetricSink(value: unknown): RelayMetricSink & {
+  checkReadiness(signal?: AbortSignal): Promise<boolean>;
+  shutdown(): Promise<void>;
+} {
+  if (!hasMethods(value, ['record', 'checkReadiness', 'shutdown'])) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value as RelayMetricSink & {
+    checkReadiness(signal?: AbortSignal): Promise<boolean>;
+    shutdown(): Promise<void>;
+  };
+}
+
+function validateGenerationReadiness(
+  value: unknown,
+  generationService: GenerationService
+): RelayGenerationReadiness {
+  if (!isPlainObject(value)) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  const provider = dataProperty(value, 'provider');
+  if (provider === 'mock') {
+    const values = exactOwnDataValues(value, new Set(['provider', 'providerId', 'model']));
+    if (
+      Reflect.ownKeys(values).length !== 3 ||
+      values.providerId !== generationService.provider.id ||
+      values.model !== 'mock'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    return Object.freeze({
+      provider: 'mock',
+      providerId: values.providerId as string,
+      model: 'mock'
+    });
+  }
+  if (provider === 'litellm') {
+    const values = exactOwnDataValues(
+      value,
+      new Set(['provider', 'providerId', 'baseUrl', 'model', 'check'])
+    );
+    if (
+      Reflect.ownKeys(values).length !== 5 ||
+      values.providerId !== generationService.provider.id ||
+      values.baseUrl !== DEPLOYED_LITELLM_BASE_URL ||
+      values.model !== DEPLOYED_LITELLM_MODEL ||
+      typeof values.check !== 'function'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    return Object.freeze({
+      provider: 'litellm',
+      providerId: values.providerId as string,
+      baseUrl: DEPLOYED_LITELLM_BASE_URL,
+      model: DEPLOYED_LITELLM_MODEL,
+      check: values.check as LiteLLMGenerationReadiness['check']
+    });
+  }
+  throw new TypeError(RELAY_CONFIGURATION_ERROR);
+}
+
+function snapshotRelayHostConfig(config: RelayHostConfig): RelayHostConfig {
+  const values = exactOwnDataValues(config, RELAY_HOST_CONFIG_KEYS);
+  for (const required of ['environment', 'origin', 'port', 'gatePolicyVersion'] as const) {
+    if (!Object.hasOwn(values, required)) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    typeof values.environment !== 'string' ||
+    values.environment.length === 0 ||
+    typeof values.origin !== 'string' ||
+    typeof values.port !== 'number' ||
+    typeof values.gatePolicyVersion !== 'string' ||
+    values.gatePolicyVersion.length === 0
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    values.securityMode !== undefined &&
+    values.securityMode !== 'local-mock' &&
+    values.securityMode !== 'azure-table'
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    values.languageBoundaryMode !== undefined &&
+    values.languageBoundaryMode !== 'fixture' &&
+    values.languageBoundaryMode !== 'deny-all' &&
+    values.languageBoundaryMode !== 'production-approved'
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    values.transcriptionProvider !== undefined &&
+    values.transcriptionProvider !== 'mock' &&
+    values.transcriptionProvider !== 'azure-realtime'
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  for (const key of [
+    'securityFactory',
+    'metricSinkFactory',
+    'azureTokenSourceFactory',
+    'azureTranscriptionAdapterFactory',
+    'beforeServerMessageDelivery'
+  ] as const) {
+    if (values[key] !== undefined && typeof values[key] !== 'function') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+  }
+  if (values.clock !== undefined && !hasMethods(values.clock, ['nowIso', 'nowMonotonicMs'])) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (values.ids !== undefined && !hasMethods(values.ids, ['sessionId', 'errorId'])) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    values.generationService !== undefined &&
+    !(values.generationService instanceof GenerationService)
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (values.productionApprovedGenerationValidator !== undefined) {
+    validateGeneratedLanguageValidator(values.productionApprovedGenerationValidator);
+  }
+  if (values.languageClassifier !== undefined) validateLanguageClassifier(values.languageClassifier);
+  if (values.transcriptionAdapters !== undefined) {
+    validateTranscriptionAdapterMap(values.transcriptionAdapters);
+  }
+  if (values.metricSink !== undefined) validateMetricSink(values.metricSink);
+  if (values.azureTranscriptionEndpoint !== undefined) {
+    if (typeof values.azureTranscriptionEndpoint !== 'string') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    canonicalAzureTranscriptionEndpoint(values.azureTranscriptionEndpoint);
+  }
+  if (values.azureTranscriptionDeployment !== undefined) {
+    if (typeof values.azureTranscriptionDeployment !== 'string') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    canonicalAzureTranscriptionDeployment(values.azureTranscriptionDeployment);
+  }
+  if (values.managedIdentityClientId !== undefined) {
+    if (typeof values.managedIdentityClientId !== 'string') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    canonicalAzureClientId(values.managedIdentityClientId);
+  }
+  return Object.freeze({ ...values }) as unknown as RelayHostConfig;
 }
 
 function normalizeBrowserOriginPolicy(
@@ -495,28 +1051,57 @@ async function checkLiteLLMReadiness(config: {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly model: string;
+  readonly signal?: AbortSignal;
 }): Promise<boolean> {
   const catalog = await fetchReadinessJson(
     readinessUrl(config.baseUrl, '/v1/models'),
-    config.apiKey
+    config.apiKey,
+    config.signal
   );
   return hasExpectedModel(catalog, config.model);
 }
 
-async function boundedReadinessCheck(check: () => Promise<boolean>): Promise<boolean> {
+async function boundedReadinessCheck(
+  parentSignal: AbortSignal,
+  check: (signal: AbortSignal) => Promise<boolean>
+): Promise<boolean> {
+  const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let parentListener: (() => void) | undefined;
+  const abortedResult = new Promise<boolean>((resolve) => {
+    parentListener = () => {
+      controller.abort();
+      resolve(false);
+    };
+    try {
+      parentSignal.addEventListener('abort', parentListener, { once: true });
+      if (parentSignal.aborted) parentListener();
+    } catch {
+      parentListener();
+    }
+  });
   const timeoutResult = new Promise<boolean>((resolve) => {
-    timeout = setTimeout(() => resolve(false), READINESS_TIMEOUT_MS);
+    timeout = setTimeout(() => {
+      controller.abort();
+      resolve(false);
+    }, READINESS_TIMEOUT_MS);
   });
   try {
-    const checkResult = Promise.resolve().then(check).then(
+    const checkResult = Promise.resolve().then(() => check(controller.signal)).then(
       (ready) => ready === true,
       () => false
     );
-    return await Promise.race([checkResult, timeoutResult]);
+    return await Promise.race([checkResult, timeoutResult, abortedResult]);
   } finally {
     if (timeout !== undefined) {
       clearTimeout(timeout);
+    }
+    if (parentListener !== undefined) {
+      try {
+        parentSignal.removeEventListener('abort', parentListener);
+      } catch {
+        // Readiness cancellation cleanup is best effort.
+      }
     }
   }
 }
@@ -857,6 +1442,12 @@ function rawDataBuffer(data: unknown): Buffer | undefined {
 
 export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): RelayHostConfig {
   try {
+    rejectBoundarySelectionEnvironment(env);
+    rejectEnvironmentKeys(env, (name) =>
+      name.startsWith('PALANCAR_OTLP') ||
+      name.startsWith('OTEL_EXPORTER') ||
+      name === 'AZURE_LOG_LEVEL'
+    );
     const port = parsePort(env.PORT);
     const origin = env.PALANCAR_RELAY_ORIGIN ??
       (port === 0 ? 'wss://127.0.0.1' : `wss://127.0.0.1:${port}`);
@@ -877,47 +1468,167 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
     if (generationProvider !== 'mock' && generationProvider !== 'litellm') {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
+    const transcriptionProvider = env.PALANCAR_TRANSCRIPTION_PROVIDER;
+    if (transcriptionProvider !== 'mock' && transcriptionProvider !== 'azure-realtime') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
 
     const environment = securityMode === 'local-mock'
       ? 'local-mock'
       : requiredEnvironmentString(env, 'PALANCAR_RELAY_ENVIRONMENT');
     const bindHost = parseBindHost(env.PALANCAR_RELAY_BIND_HOST);
+    const originHost = new URL(origin).hostname;
     const audience = Object.freeze({
       origin,
       path: STREAM_PATH,
       protocol: WEBSOCKET_SUBPROTOCOL
     });
-    const security = securityMode === 'local-mock'
-      ? createLocalMockSecurityComposition({ audience })
-      : createAzureTableSecurityComposition({
-          endpoint: requiredEnvironmentString(env, 'PALANCAR_WORKLOAD_TABLE_ENDPOINT'),
-          environment,
-          audience,
-          managedIdentityClientId: requiredEnvironmentString(env, 'AZURE_CLIENT_ID')
-        });
-    const baseConfig = {
+
+    if (securityMode === 'local-mock') {
+      if (
+        generationProvider !== 'mock' ||
+        transcriptionProvider !== 'mock' ||
+        bindHost !== '127.0.0.1' ||
+        originHost !== '127.0.0.1' ||
+        hasEnvironmentValue(env, 'PALANCAR_RELAY_ENVIRONMENT')
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      rejectEnvironmentKeys(env, (name) =>
+        name.startsWith('PALANCAR_LITELLM_') ||
+        name.startsWith('PALANCAR_AZURE_') ||
+        name === 'PALANCAR_WORKLOAD_TABLE_ENDPOINT' ||
+        name === 'PALANCAR_SECURITY_STATE_TABLE' ||
+        name === 'PALANCAR_RATE_STATE_TABLE' ||
+        name === 'AZURE_CLIENT_ID' ||
+        name === 'PALANCAR_DEPLOYMENT_SLOT' ||
+        name === 'APPLICATIONINSIGHTS_CONNECTION_STRING' ||
+        name === 'APPLICATIONINSIGHTS_STATSBEAT_DISABLED' ||
+        name === 'APPLICATION_INSIGHTS_NO_STATSBEAT' ||
+        name === 'AZURE_OPENAI_API_KEY' ||
+        name === 'AZURE_API_KEY' ||
+        name === 'OPENAI_API_KEY'
+      );
+      const generationService = defaultGenerationService('fixture');
+      return Object.freeze({
+        environment,
+        origin,
+        browserOriginPolicy,
+        port,
+        bindHost,
+        gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION,
+        securityMode: 'local-mock' as const,
+        languageBoundaryMode: 'fixture' as const,
+        transcriptionProvider: 'mock' as const,
+        generationService,
+        generationReadiness: defaultGenerationReadiness(generationService)
+      });
+    }
+
+    if (
+      env.PALANCAR_SECURITY_STATE_TABLE !== 'SecurityState' ||
+      env.PALANCAR_RATE_STATE_TABLE !== 'RateState'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    rejectEnvironmentKeys(env, (name) =>
+      name === 'PALANCAR_TRANSCRIPTION_API_KEY' ||
+      name === 'AZURE_OPENAI_API_KEY' ||
+      name === 'AZURE_API_KEY' ||
+      name === 'OPENAI_API_KEY'
+    );
+    const tableEndpoint = requiredEnvironmentString(env, 'PALANCAR_WORKLOAD_TABLE_ENDPOINT');
+    const managedIdentityClientId = canonicalAzureClientId(
+      requiredEnvironmentString(env, 'AZURE_CLIENT_ID')
+    );
+    const deploymentSlot = env.PALANCAR_DEPLOYMENT_SLOT;
+    if (deploymentSlot !== 'dev' && deploymentSlot !== 'staging' && deploymentSlot !== 'production') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (env.APPLICATIONINSIGHTS_STATSBEAT_DISABLED !== 'true' ||
+      env.APPLICATION_INSIGHTS_NO_STATSBEAT !== 'true') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const connectionString = validateApplicationInsightsConnectionString(
+      requiredEnvironmentString(env, 'APPLICATIONINSIGHTS_CONNECTION_STRING')
+    );
+    const azureTranscriptionEndpoint = transcriptionProvider === 'azure-realtime'
+      ? canonicalAzureTranscriptionEndpoint(
+          requiredEnvironmentString(env, 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT')
+        )
+      : undefined;
+    const azureTranscriptionDeployment = transcriptionProvider === 'azure-realtime'
+      ? canonicalAzureTranscriptionDeployment(
+          requiredEnvironmentString(env, 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT')
+        )
+      : undefined;
+    if (transcriptionProvider === 'mock') {
+      rejectEnvironmentKeys(env, (name) => name.startsWith('PALANCAR_AZURE_'));
+    } else {
+      rejectEnvironmentKeys(env, (name) =>
+        name.startsWith('PALANCAR_AZURE_') &&
+        name !== 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT' &&
+        name !== 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT'
+      );
+    }
+
+    let liteLLMConfiguration: Readonly<{
+      readonly baseUrl: typeof DEPLOYED_LITELLM_BASE_URL;
+      readonly apiKey: string;
+      readonly model: typeof DEPLOYED_LITELLM_MODEL;
+      readonly timeoutMs?: number;
+    }> | undefined;
+    if (generationProvider === 'mock') {
+      rejectEnvironmentKeys(env, (name) => name.startsWith('PALANCAR_LITELLM_'));
+    } else {
+      const baseUrl = requiredEnvironmentString(env, 'PALANCAR_LITELLM_BASE_URL');
+      const model = requiredEnvironmentString(env, 'PALANCAR_LITELLM_MODEL');
+      const timeoutMs = parseOptionalTimeout(env.PALANCAR_LITELLM_TIMEOUT_MS);
+      if (baseUrl !== DEPLOYED_LITELLM_BASE_URL || model !== DEPLOYED_LITELLM_MODEL) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      const apiKey = requiredEnvironmentString(env, 'PALANCAR_LITELLM_API_KEY');
+      liteLLMConfiguration = Object.freeze({
+        baseUrl,
+        apiKey,
+        model,
+        ...(timeoutMs === undefined ? {} : { timeoutMs })
+      });
+    }
+
+    const baseConfig: Omit<RelayHostConfig, 'generationService' | 'generationReadiness'> = {
       environment,
       origin,
       browserOriginPolicy,
       port,
       bindHost,
       gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION,
-      security
+      securityMode: 'azure-table' as const,
+      securityFactory: () => createAzureTableSecurityComposition({
+        endpoint: tableEndpoint,
+        environment,
+        audience,
+        managedIdentityClientId
+      }),
+      languageBoundaryMode: 'deny-all' as const,
+      transcriptionProvider: transcriptionProvider as 'mock' | 'azure-realtime',
+      ...(azureTranscriptionEndpoint === undefined
+        ? {}
+        : { azureTranscriptionEndpoint }),
+      ...(azureTranscriptionDeployment === undefined
+        ? {}
+        : { azureTranscriptionDeployment }),
+      managedIdentityClientId,
+      metricSinkFactory: () => createProductionRelayMetricSink({
+        clientId: managedIdentityClientId,
+        deploymentSlot,
+        connectionString,
+        applicationInsightsStatsbeatDisabled: true,
+        applicationInsightsNoStatsbeat: true
+      } satisfies RelayMetricSinkConfig)
     };
     if (generationProvider === 'mock') {
-      if (
-        securityMode === 'local-mock' &&
-        (bindHost !== '127.0.0.1' || new URL(origin).hostname !== '127.0.0.1' ||
-          env.PALANCAR_TRANSCRIPTION_PROVIDER !== 'mock' ||
-          Object.keys(env).some((key) =>
-            (key.startsWith('PALANCAR_LITELLM_') || key.startsWith('PALANCAR_AZURE_') ||
-              key === 'PALANCAR_WORKLOAD_TABLE_ENDPOINT' || key === 'AZURE_CLIENT_ID') &&
-            env[key] !== undefined
-          ))
-      ) {
-        throw new TypeError(RELAY_CONFIGURATION_ERROR);
-      }
-      const generationService = defaultGenerationService();
+      const generationService = defaultGenerationService('deny-all');
       return Object.freeze({
         ...baseConfig,
         generationService,
@@ -925,29 +1636,30 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       });
     }
 
-    if (securityMode !== 'azure-table' || !isDurableSecurityRuntime(security.runtime)) {
+    if (liteLLMConfiguration === undefined) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
-    const baseUrl = requiredEnvironmentString(env, 'PALANCAR_LITELLM_BASE_URL');
-    const apiKey = requiredEnvironmentString(env, 'PALANCAR_LITELLM_API_KEY');
-    const model = requiredEnvironmentString(env, 'PALANCAR_LITELLM_MODEL');
-    const timeoutMs = parseOptionalTimeout(env.PALANCAR_LITELLM_TIMEOUT_MS);
-    const normalizedBaseUrl = normalizedReadinessUrl(baseUrl);
+    const { baseUrl, apiKey, model, timeoutMs } = liteLLMConfiguration;
     const provider = new LiteLLMChatGenerationProvider({
       baseUrl,
       apiKey,
       model,
       ...(timeoutMs === undefined ? {} : { timeoutMs })
     });
-    const generationService = new GenerationService(provider);
+    const generationService = new GenerationService({
+      provider,
+      validator: new FailClosedGeneratedLanguageValidator()
+    });
     const generationReadiness: LiteLLMGenerationReadiness = Object.freeze({
       provider: 'litellm',
       providerId: generationService.provider.id,
+      baseUrl,
       model,
-      check: () => checkLiteLLMReadiness({
-        baseUrl: normalizedBaseUrl,
+      check: (signal: AbortSignal | undefined) => checkLiteLLMReadiness({
+        baseUrl,
         apiKey,
-        model
+        model,
+        ...(signal === undefined ? {} : { signal })
       })
     });
     return Object.freeze({
@@ -960,64 +1672,330 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
   }
 }
 
-export function createRelayHost(config: RelayHostConfig): RelayHost {
-  const environment = config.environment;
-  const origin = assertCanonicalWssOrigin(config.origin);
-  const browserOriginPolicy = normalizeBrowserOriginPolicy(config.browserOriginPolicy);
-  const port = normalizePort(config.port);
-  const bindHost = parseBindHost(config.bindHost);
-  const gatePolicyVersion = config.gatePolicyVersion;
-  const clock = config.clock ?? systemClock();
-  const ids = config.ids ?? systemIds();
-  const builtInTranscriptionAdapters = config.transcriptionAdapter === undefined
-    ? defaultTranscriptionAdapters()
-    : undefined;
-  const transcriptionAdapter = config.transcriptionAdapter ?? builtInTranscriptionAdapters?.es;
-  if (transcriptionAdapter === undefined) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+function containCleanupPromise(value: unknown, timeoutMs: number): void {
+  if (value === undefined || value === null || !hasMethods(value, ['then'])) {
+    return;
   }
-  const transcriptionAdapterForTarget = (target: TargetLanguage): TranscriptionAdapter =>
-    builtInTranscriptionAdapters?.[target] ?? transcriptionAdapter;
-  const languageClassifier = config.languageClassifier ??
-    (transcriptionAdapter instanceof DeterministicMockTranscriptionAdapter
-      ? createControlledFixtureTextLanguageClassifier()
-      : undefined);
-  if (languageClassifier === undefined) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
-  }
-  if (
-    isControlledFixtureTextLanguageClassifier(languageClassifier) &&
-    !(transcriptionAdapter instanceof DeterministicMockTranscriptionAdapter)
-  ) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
-  }
-  const generationService = config.generationService ?? defaultGenerationService();
-  const beforeServerMessageDelivery = config.beforeServerMessageDelivery;
-  const generationReadiness = config.generationReadiness ??
-    defaultGenerationReadiness(generationService);
-  const audience: RelayUpgradeAudience = Object.freeze({
-    origin,
-    path: STREAM_PATH,
-    protocol: WEBSOCKET_SUBPROTOCOL
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
   });
-  const security = config.security ?? createLocalMockSecurityComposition({ audience });
-  if (
-    security.mode === 'local-mock' &&
-    (environment !== 'local-mock' || bindHost !== '127.0.0.1' ||
-      new URL(origin).hostname !== '127.0.0.1' ||
-      generationReadiness.provider !== 'mock' ||
-      !BUILT_IN_MOCK_GENERATION_SERVICES.has(generationService) ||
-      !(transcriptionAdapter instanceof DeterministicMockTranscriptionAdapter) ||
-      !isControlledFixtureTextLanguageClassifier(languageClassifier))
-  ) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  void Promise.race([
+    Promise.resolve(value).then(() => undefined, () => undefined),
+    timeout
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+function invokeResourceCleanup(operation: () => unknown): void {
+  try {
+    containCleanupPromise(operation(), RESOURCE_ROLLBACK_TIMEOUT_MS);
+  } catch {
+    // Construction rollback is intentionally content-free.
   }
-  if (
-    (security.mode === 'azure-table' || generationReadiness.provider === 'litellm') &&
-    !isDurableSecurityRuntime(security.runtime)
-  ) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
-  }
+}
+
+export function createRelayHost(config: RelayHostConfig): RelayHost {
+  const acquiredCloseables: Array<() => unknown> = [];
+  let acquiredMetricSink: ReturnType<typeof validateMetricSink> | undefined;
+  let partialMetricCleanup: (() => unknown) | undefined;
+  try {
+    const validatedConfig = snapshotRelayHostConfig(config);
+    const environment = validatedConfig.environment;
+    const origin = assertCanonicalWssOrigin(validatedConfig.origin);
+    const browserOriginPolicy = normalizeBrowserOriginPolicy(validatedConfig.browserOriginPolicy);
+    const port = normalizePort(validatedConfig.port);
+    const bindHost = parseBindHost(validatedConfig.bindHost);
+    const gatePolicyVersion = validatedConfig.gatePolicyVersion;
+    const clock = validatedConfig.clock ?? systemClock();
+    const ids = validatedConfig.ids ?? systemIds();
+    const beforeServerMessageDelivery = validatedConfig.beforeServerMessageDelivery;
+    const audience: RelayUpgradeAudience = Object.freeze({
+      origin,
+      path: STREAM_PATH,
+      protocol: WEBSOCKET_SUBPROTOCOL
+    });
+    const configuredSecurity = validatedConfig.security === undefined
+      ? undefined
+      : validateSecurityCompositionShape(validatedConfig.security, validatedConfig.securityMode);
+    if (configuredSecurity !== undefined && validatedConfig.securityFactory !== undefined) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const securityMode = validatedConfig.securityMode ?? configuredSecurity?.mode ?? 'local-mock';
+    if (securityMode === 'azure-table' &&
+      configuredSecurity === undefined && validatedConfig.securityFactory === undefined) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (securityMode === 'local-mock' && validatedConfig.securityFactory !== undefined) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const localComposition = securityMode === 'local-mock';
+    const loopbackComposition = bindHost === '127.0.0.1' && new URL(origin).hostname === '127.0.0.1';
+    const explicitFixtureHarness = configuredSecurity !== undefined &&
+      validatedConfig.languageBoundaryMode === 'fixture' &&
+      validatedConfig.transcriptionProvider === undefined;
+
+    if (localComposition && (environment !== 'local-mock' || !loopbackComposition)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const configuredMetricSink = validatedConfig.metricSink;
+    const telemetryMechanisms = Number(configuredMetricSink !== undefined) +
+      Number(validatedConfig.metricSinkFactory !== undefined);
+    if (
+      (localComposition &&
+        (validatedConfig.metricSinkFactory !== undefined ||
+          (configuredMetricSink !== undefined &&
+            configuredMetricSink !== DISABLED_RELAY_METRIC_SINK))) ||
+      (!localComposition &&
+        (telemetryMechanisms !== 1 || isDisabledRelayMetricSink(configuredMetricSink)))
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    const configuredAdapters = validatedConfig.transcriptionAdapters === undefined
+      ? undefined
+      : validateTranscriptionAdapterMap(validatedConfig.transcriptionAdapters);
+    const configuredAdaptersAreTargetSpecificMocks = configuredAdapters !== undefined &&
+      configuredAdapters.es instanceof DeterministicMockTranscriptionAdapter &&
+      configuredAdapters.tr instanceof DeterministicMockTranscriptionAdapter &&
+      configuredAdapters.es.configuration.fixtureTargetLanguage === 'es' &&
+      configuredAdapters.tr.configuration.fixtureTargetLanguage === 'tr';
+    const configuredAdaptersAreAzureShared = configuredAdapters !== undefined &&
+      configuredAdapters.es instanceof AzureRealtimeTranscriptionAdapter &&
+      configuredAdapters.es === configuredAdapters.tr;
+    const inferredTranscriptionProvider = validatedConfig.transcriptionProvider ??
+      (configuredAdaptersAreAzureShared ? 'azure-realtime' : 'mock');
+    const hasTokenFactory = validatedConfig.azureTokenSourceFactory !== undefined;
+    const hasAdapterFactory = validatedConfig.azureTranscriptionAdapterFactory !== undefined;
+    if (hasTokenFactory !== hasAdapterFactory) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    if (inferredTranscriptionProvider === 'azure-realtime') {
+      if (
+        configuredAdapters !== undefined ||
+        validatedConfig.managedIdentityClientId === undefined ||
+        validatedConfig.azureTranscriptionEndpoint === undefined ||
+        validatedConfig.azureTranscriptionDeployment === undefined
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    } else if (
+      validatedConfig.azureTranscriptionEndpoint !== undefined ||
+      validatedConfig.azureTranscriptionDeployment !== undefined ||
+      hasTokenFactory ||
+      hasAdapterFactory
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    const generationService = validatedConfig.generationService ??
+      defaultGenerationService(localComposition ? 'fixture' : 'deny-all');
+    const generationReadiness = validatedConfig.generationReadiness === undefined
+      ? defaultGenerationReadiness(generationService)
+      : validateGenerationReadiness(validatedConfig.generationReadiness, generationService);
+    if (
+      !explicitFixtureHarness &&
+      ((generationReadiness.provider === 'mock' &&
+        !generationService.provider.id.startsWith('deterministic-mock')) ||
+        (generationReadiness.provider === 'litellm' &&
+          generationService.provider.id !== 'litellm-chat'))
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const requestedBoundary = validatedConfig.languageBoundaryMode;
+    const adaptersWillBeTargetSpecificMocks = configuredAdapters === undefined
+      ? inferredTranscriptionProvider === 'mock'
+      : configuredAdaptersAreTargetSpecificMocks;
+    const boundary: RelayLanguageBoundaryMode = requestedBoundary ??
+      (localComposition &&
+        environment === 'local-mock' &&
+        loopbackComposition &&
+        inferredTranscriptionProvider === 'mock' &&
+        generationReadiness.provider === 'mock' &&
+        isControlledFixtureTextLanguageClassifier(
+          validatedConfig.languageClassifier ?? createControlledFixtureTextLanguageClassifier()
+        ) &&
+        BUILT_IN_FIXTURE_GENERATION_SERVICES.has(generationService) &&
+        adaptersWillBeTargetSpecificMocks
+        ? 'fixture'
+        : 'deny-all');
+
+    const languageClassifier = validatedConfig.languageClassifier ??
+      (boundary === 'fixture'
+        ? createControlledFixtureTextLanguageClassifier()
+        : boundary === 'deny-all'
+          ? createFailClosedDeployedTextLanguageClassifier()
+          : undefined);
+    if (languageClassifier === undefined) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const productionApprovedGenerationValidator =
+      validatedConfig.productionApprovedGenerationValidator;
+
+    if (boundary === 'fixture') {
+      if (
+        !localComposition ||
+        environment !== 'local-mock' ||
+        !loopbackComposition ||
+        inferredTranscriptionProvider !== 'mock' ||
+        generationReadiness.provider !== 'mock' ||
+        (!BUILT_IN_FIXTURE_GENERATION_SERVICES.has(generationService) &&
+          !(explicitFixtureHarness && generationService.validator.id === 'deterministic-language-fixture')) ||
+        (!adaptersWillBeTargetSpecificMocks && !explicitFixtureHarness) ||
+        (!isControlledFixtureTextLanguageClassifier(languageClassifier) && !explicitFixtureHarness) ||
+        productionApprovedGenerationValidator !== undefined ||
+        generationService.validator.id !== 'deterministic-language-fixture'
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    } else if (boundary === 'deny-all') {
+      if (
+        localComposition ||
+        !isFailClosedDeployedTextLanguageClassifier(languageClassifier) ||
+        productionApprovedGenerationValidator !== undefined ||
+        generationService.validator.id !== 'fail-closed-generated-language'
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    } else if (
+      localComposition ||
+      productionApprovedGenerationValidator === undefined ||
+      isControlledFixtureTextLanguageClassifier(languageClassifier) ||
+      isFailClosedDeployedTextLanguageClassifier(languageClassifier) ||
+      (productionApprovedGenerationValidator !== undefined &&
+        (isDeterministicFixtureLanguageValidator(productionApprovedGenerationValidator) ||
+          isFailClosedGeneratedLanguageValidator(productionApprovedGenerationValidator) ||
+          generationService.validator.id !== productionApprovedGenerationValidator.id ||
+          generationService.validator.version !== productionApprovedGenerationValidator.version)) ||
+      generationService.validator.id === 'deterministic-language-fixture' ||
+      generationService.validator.id === 'fail-closed-generated-language'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    if (
+      inferredTranscriptionProvider === 'mock' &&
+      !adaptersWillBeTargetSpecificMocks &&
+      !explicitFixtureHarness
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (
+      boundary === 'fixture' &&
+      explicitFixtureHarness &&
+      !adaptersWillBeTargetSpecificMocks &&
+      (validatedConfig.languageClassifier === undefined ||
+        isControlledFixtureTextLanguageClassifier(validatedConfig.languageClassifier))
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    let metricSink: ReturnType<typeof validateMetricSink>;
+    if (localComposition) {
+      metricSink = validateMetricSink(DISABLED_RELAY_METRIC_SINK);
+    } else if (configuredMetricSink !== undefined) {
+      metricSink = validateMetricSink(configuredMetricSink);
+      acquiredMetricSink = metricSink;
+    } else {
+      let metricSinkCandidate: unknown;
+      try {
+        metricSinkCandidate = (validatedConfig.metricSinkFactory as () => RelayMetricSink)();
+        if (isDisabledRelayMetricSink(metricSinkCandidate)) {
+          throw new TypeError(RELAY_CONFIGURATION_ERROR);
+        }
+        metricSink = validateMetricSink(metricSinkCandidate);
+        acquiredMetricSink = metricSink;
+      } catch {
+        if (!isDisabledRelayMetricSink(metricSinkCandidate)) {
+          const partialShutdown = optionalDataProperty(metricSinkCandidate, 'shutdown');
+          if (typeof partialShutdown === 'function') {
+            partialMetricCleanup = () => partialShutdown.call(metricSinkCandidate);
+          }
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    }
+
+    const security = configuredSecurity ??
+      (validatedConfig.securityFactory === undefined
+        ? validateSecurityCompositionShape(
+            createLocalMockSecurityComposition({ audience }),
+            'local-mock'
+          )
+        : validateSecurityCompositionShape(
+            validatedConfig.securityFactory(),
+            securityMode
+          ));
+    if (!localComposition && !isDurableSecurityRuntime(security.runtime)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
+    let transcriptionAdapters: Readonly<Record<TargetLanguage, TranscriptionAdapter>>;
+    if (configuredAdapters !== undefined) {
+      transcriptionAdapters = configuredAdapters;
+    } else if (inferredTranscriptionProvider === 'azure-realtime') {
+      const clientId = validatedConfig.managedIdentityClientId as string;
+      const endpoint = validatedConfig.azureTranscriptionEndpoint as string;
+      const deployment = validatedConfig.azureTranscriptionDeployment as string;
+      const tokenSourceFactory = validatedConfig.azureTokenSourceFactory ??
+        ((options: Readonly<{ readonly clientId: string }>) =>
+          createAzureManagedIdentityTokenSource(options));
+      const tokenSource = tokenSourceFactory({ clientId });
+      const tokenProvider = optionalDataProperty(tokenSource, 'tokenProvider');
+      const closeTokenSource = optionalDataProperty(tokenSource, 'close');
+      if (typeof tokenProvider !== 'function' || typeof closeTokenSource !== 'function') {
+        if (typeof closeTokenSource === 'function') {
+          invokeResourceCleanup(() => closeTokenSource.call(tokenSource));
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      acquiredCloseables.push(() => closeTokenSource.call(tokenSource));
+      const adapterFactory = validatedConfig.azureTranscriptionAdapterFactory ??
+        ((options: Parameters<RelayAzureTranscriptionAdapterFactory>[0]) =>
+          new AzureRealtimeTranscriptionAdapter(options));
+      let adapter: TranscriptionAdapter;
+      let adapterCandidate: unknown;
+      try {
+        adapterCandidate = adapterFactory({
+          endpoint,
+          deployment,
+          tokenProvider: tokenProvider as AzureTokenProvider
+        });
+        adapter = validateTranscriptionAdapter(adapterCandidate);
+      } catch {
+        const partialClose = optionalDataProperty(adapterCandidate, 'close');
+        if (typeof partialClose === 'function') {
+          invokeResourceCleanup(() => partialClose.call(adapterCandidate));
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      const closeAdapter = optionalDataProperty(adapter, 'close');
+      if (closeAdapter !== undefined) {
+        if (typeof closeAdapter !== 'function') throw new TypeError(RELAY_CONFIGURATION_ERROR);
+        acquiredCloseables.push(() => closeAdapter.call(adapter));
+      }
+      if (!(adapter instanceof AzureRealtimeTranscriptionAdapter)) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      transcriptionAdapters = Object.freeze({ es: adapter, tr: adapter });
+    } else {
+      transcriptionAdapters = defaultTranscriptionAdapters();
+    }
+
+    const adaptersAreTargetSpecificMocks =
+      transcriptionAdapters.es instanceof DeterministicMockTranscriptionAdapter &&
+      transcriptionAdapters.tr instanceof DeterministicMockTranscriptionAdapter &&
+      transcriptionAdapters.es.configuration.fixtureTargetLanguage === 'es' &&
+      transcriptionAdapters.tr.configuration.fixtureTargetLanguage === 'tr';
+    const adaptersAreAzureShared =
+      transcriptionAdapters.es instanceof AzureRealtimeTranscriptionAdapter &&
+      transcriptionAdapters.es === transcriptionAdapters.tr;
+    if ((inferredTranscriptionProvider === 'mock' &&
+        !adaptersAreTargetSpecificMocks && !explicitFixtureHarness) ||
+      (inferredTranscriptionProvider === 'azure-realtime' && !adaptersAreAzureShared)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+
   const securityRuntime = security.runtime;
   const securityMaintenance = security.maintenance;
   const connections = new Set<RelayConnection>();
@@ -1027,34 +2005,110 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const pendingUpgradesByInstallation = new Map<string, Set<PendingUpgrade>>();
   const revokedInstallations = new Set<string>();
   const minimumCredentialVersions = new Map<string, number>();
+  const hostAbortController = new AbortController();
+  const trackedWork = new Set<Promise<unknown>>();
+  let lifecycleState: RelayHostLifecycleState = 'created';
   let stopping = false;
+  let startPromise: Promise<{ readonly port: number }> | undefined;
   let stopPromise: Promise<void> | undefined;
 
-  const checkReadiness = async (): Promise<boolean> => {
+  let readinessInFlight: Promise<boolean> | undefined;
+  let readinessCache: { readonly ready: boolean; readonly expiresAt: number } | undefined;
+  let lastReadinessClock: number | undefined;
+
+  const trackWork = <T>(promise: Promise<T>): Promise<T> => {
+    trackedWork.add(promise);
+    void promise.then(
+      () => trackedWork.delete(promise),
+      () => trackedWork.delete(promise)
+    );
+    return promise;
+  };
+
+  const readReadinessClock = (): number | undefined => {
+    try {
+      const value = clock.nowMonotonicMs();
+      if (
+        !Number.isFinite(value) ||
+        (lastReadinessClock !== undefined && value <= lastReadinessClock)
+      ) {
+        readinessCache = undefined;
+        return undefined;
+      }
+      lastReadinessClock = value;
+      return value;
+    } catch {
+      readinessCache = undefined;
+      return undefined;
+    }
+  };
+
+  const computeReadiness = async (): Promise<boolean> => {
     const generationCheck = generationReadiness.provider === 'mock'
       ? () => Promise.resolve(true)
       : generationReadiness.check;
-    const [generationReady, transcriptionReady, classifierReady, securityReady] = await Promise.all([
-      boundedReadinessCheck(generationCheck),
-      boundedReadinessCheck(async () => {
+    const signal = hostAbortController.signal;
+    const checks = [
+      boundedReadinessCheck(signal, generationCheck),
+      boundedReadinessCheck(signal, async (componentSignal) => {
         const results = await Promise.all(
-          [...new Set([
-            transcriptionAdapterForTarget('es'),
-            transcriptionAdapterForTarget('tr')
-          ])].map((adapter) => adapter.checkReadiness())
+          [...new Set([transcriptionAdapters.es, transcriptionAdapters.tr])].map((adapter) =>
+            adapter.checkReadiness(componentSignal)
+          )
         );
         return results.every((result) => result.ready === true);
       }),
-      boundedReadinessCheck(async () => {
+      boundedReadinessCheck(signal, async () => {
         await languageClassifier.ready;
         return true;
       }),
-      boundedReadinessCheck(async () => {
-        await securityMaintenance.checkReadiness();
+      boundedReadinessCheck(signal, async (componentSignal) => {
+        await securityMaintenance.checkReadiness(componentSignal);
         return true;
-      })
-    ]);
-    return generationReady && transcriptionReady && classifierReady && securityReady;
+      }),
+      boundedReadinessCheck(signal, (componentSignal) =>
+        metricSink.checkReadiness(componentSignal))
+    ] as const;
+    const [generationReady, transcriptionReady, classifierReady, securityReady, telemetryReady] =
+      await Promise.all(checks);
+    return generationReady && transcriptionReady && classifierReady && securityReady && telemetryReady;
+  };
+
+  const checkReadiness = (): Promise<boolean> => {
+    if (lifecycleState !== 'running' || hostAbortController.signal.aborted) {
+      return Promise.resolve(false);
+    }
+    if (readinessInFlight !== undefined) return readinessInFlight;
+    const now = readReadinessClock();
+    if (now === undefined) return Promise.resolve(false);
+    if (readinessCache !== undefined && now < readinessCache.expiresAt) {
+      return Promise.resolve(readinessCache.ready);
+    }
+    readinessCache = undefined;
+    const computation = computeReadiness().then((ready) => {
+      if (lifecycleState !== 'running' || hostAbortController.signal.aborted) {
+        readinessCache = undefined;
+        return false;
+      }
+      const completedAt = readReadinessClock();
+      if (completedAt === undefined) return false;
+      readinessCache = {
+        ready,
+        expiresAt: completedAt + (ready ? READINESS_SUCCESS_CACHE_MS : READINESS_FAILURE_CACHE_MS)
+      };
+      return ready;
+    }, () => {
+      const completedAt = readReadinessClock();
+      readinessCache = completedAt === undefined || lifecycleState !== 'running'
+        ? undefined
+        : { ready: false, expiresAt: completedAt + READINESS_FAILURE_CACHE_MS };
+      return false;
+    });
+    const published = computation.finally(() => {
+      readinessInFlight = undefined;
+    });
+    readinessInFlight = trackWork(published);
+    return readinessInFlight;
   };
 
   const webSocketServer = new WebSocketServer({
@@ -1065,6 +2119,10 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   });
 
   const server = createServer((request, response) => {
+    if (stopping || hostAbortController.signal.aborted) {
+      writeSensitiveJson(response, 503, REQUEST_REJECTED_BODY);
+      return;
+    }
     const originDecision = evaluateRequestOrigin(browserOriginPolicy, request);
     if (originDecision.kind === 'rejected') {
       writeSensitiveJson(response, 403, REQUEST_REJECTED_BODY);
@@ -1124,9 +2182,9 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         writeSensitiveJson(response, 405, REQUEST_REJECTED_BODY, corsOrigin);
         return;
       }
-      void checkReadiness().then((ready) => {
+      void trackWork(checkReadiness().then((ready) => {
         writeActualJson(ready ? 200 : 503, { ready });
-      }).catch(() => writeActualJson(503, { ready: false }));
+      }).catch(() => writeActualJson(503, { ready: false })));
       return;
     }
     if (route !== undefined) {
@@ -1141,7 +2199,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
           writeSensitiveJson(response, 400, REQUEST_REJECTED_BODY, corsOrigin);
           return;
         }
-        void readJsonBody(request).then((body) => {
+        void trackWork(readJsonBody(request).then(async (body) => {
           if (body.status === 'too_large') {
             writeSensitiveJson(response, 413, REQUEST_REJECTED_BODY, corsOrigin);
             return;
@@ -1150,101 +2208,97 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
             writeSensitiveJson(response, 400, REQUEST_REJECTED_BODY, corsOrigin);
             return;
           }
-          void (async (): Promise<void> => {
-            try {
-              if (pathname === PAIRING_REDEMPTION_PATH) {
-                const input = assertRelayRequest(() => assertPairingRedemptionRequest(body.value));
-                const trustedSource = trustedSocketSource(request);
-                if (trustedSource === undefined) throw new SecurityStateError('invalid-input');
-                const redeemed = await securityRuntime.redeemPairing({
-                  pairingCode: input.pairingCode,
-                  trustedSource
-                });
-                const result = assertPairingRedemptionResponse({
-                  installationId: redeemed.installationId,
-                  credential: redeemed.credential,
-                  credentialVersion: redeemed.credentialVersion,
-                  idleExpiresAt: new Date(redeemed.idleExpiresAt).toISOString(),
-                  absoluteExpiresAt: new Date(redeemed.absoluteExpiresAt).toISOString()
-                });
-                writeSensitiveJson(response, 200, result, corsOrigin);
-                return;
-              }
-              if (pathname === SESSION_TICKET_PATH) {
-                assertRelayRequest(() => assertSessionTicketRequest(body.value));
-                const credential = bearerCredential(request);
-                if (credential === undefined) throw new SecurityStateError('invalid-credential');
-                const issued = await securityRuntime.issueSessionTicket({
-                  credential,
-                  environment,
-                  audience,
-                  intent: 'new'
-                });
-                const result = assertSessionTicketResponse({
-                  ticket: issued.ticket,
-                  wssOrigin: origin,
-                  wssPath: STREAM_PATH,
-                  protocolVersion: 1,
-                  expiresAt: new Date(issued.expiresAt).toISOString()
-                });
-                writeSensitiveJson(response, 200, result, corsOrigin);
-                return;
-              }
-              if (pathname === CREDENTIAL_ROTATION_PATH) {
-                assertRelayRequest(() => assertCredentialRotationRequest(body.value));
-                const credential = bearerCredential(request);
-                if (credential === undefined) throw new SecurityStateError('invalid-credential');
-                const pending = await securityRuntime.beginCredentialRotation({ credential });
-                const result = assertRotationBeginResponse({
-                  pendingCredential: pending.pendingCredential,
-                  pendingCredentialVersion: pending.pendingCredentialVersion,
-                  pendingCredentialExpiresAt: new Date(pending.pendingExpiresAt).toISOString()
-                });
-                writeSensitiveJson(response, 200, result, corsOrigin);
-                return;
-              }
-              assertRelayRequest(() => assertCredentialRotationConfirmationRequest(body.value));
-              const credential = bearerCredential(request);
-              if (credential === undefined) throw new SecurityStateError('invalid-credential');
-              const promoted = await securityRuntime.promoteCredential({
-                pendingCredential: credential
+          try {
+            if (pathname === PAIRING_REDEMPTION_PATH) {
+              const input = assertRelayRequest(() => assertPairingRedemptionRequest(body.value));
+              const trustedSource = trustedSocketSource(request);
+              if (trustedSource === undefined) throw new SecurityStateError('invalid-input');
+              const redeemed = await securityRuntime.redeemPairing({
+                pairingCode: input.pairingCode,
+                trustedSource
               });
-              await applyPromotionResult(promoted);
-              const result = assertRotationConfirmationResponse({
-                credentialVersion: promoted.credentialVersion,
-                promoted: true,
-                confirmedAt: new Date(promoted.confirmedAt).toISOString(),
-                expiresAt: new Date(promoted.absoluteExpiresAt).toISOString()
+              const result = assertPairingRedemptionResponse({
+                installationId: redeemed.installationId,
+                credential: redeemed.credential,
+                credentialVersion: redeemed.credentialVersion,
+                idleExpiresAt: new Date(redeemed.idleExpiresAt).toISOString(),
+                absoluteExpiresAt: new Date(redeemed.absoluteExpiresAt).toISOString()
               });
               writeSensitiveJson(response, 200, result, corsOrigin);
-            } catch (error) {
-              writeSensitiveJson(response, securityHttpStatus(error), REQUEST_REJECTED_BODY, corsOrigin);
+              return;
             }
-          })();
+            if (pathname === SESSION_TICKET_PATH) {
+              assertRelayRequest(() => assertSessionTicketRequest(body.value));
+              const credential = bearerCredential(request);
+              if (credential === undefined) throw new SecurityStateError('invalid-credential');
+              const issued = await securityRuntime.issueSessionTicket({
+                credential,
+                environment,
+                audience,
+                intent: 'new'
+              });
+              const result = assertSessionTicketResponse({
+                ticket: issued.ticket,
+                wssOrigin: origin,
+                wssPath: STREAM_PATH,
+                protocolVersion: 1,
+                expiresAt: new Date(issued.expiresAt).toISOString()
+              });
+              writeSensitiveJson(response, 200, result, corsOrigin);
+              return;
+            }
+            if (pathname === CREDENTIAL_ROTATION_PATH) {
+              assertRelayRequest(() => assertCredentialRotationRequest(body.value));
+              const credential = bearerCredential(request);
+              if (credential === undefined) throw new SecurityStateError('invalid-credential');
+              const pending = await securityRuntime.beginCredentialRotation({ credential });
+              const result = assertRotationBeginResponse({
+                pendingCredential: pending.pendingCredential,
+                pendingCredentialVersion: pending.pendingCredentialVersion,
+                pendingCredentialExpiresAt: new Date(pending.pendingExpiresAt).toISOString()
+              });
+              writeSensitiveJson(response, 200, result, corsOrigin);
+              return;
+            }
+            assertRelayRequest(() => assertCredentialRotationConfirmationRequest(body.value));
+            const credential = bearerCredential(request);
+            if (credential === undefined) throw new SecurityStateError('invalid-credential');
+            const promoted = await securityRuntime.promoteCredential({
+              pendingCredential: credential
+            });
+            await applyPromotionResult(promoted);
+            const result = assertRotationConfirmationResponse({
+              credentialVersion: promoted.credentialVersion,
+              promoted: true,
+              confirmedAt: new Date(promoted.confirmedAt).toISOString(),
+              expiresAt: new Date(promoted.absoluteExpiresAt).toISOString()
+            });
+            writeSensitiveJson(response, 200, result, corsOrigin);
+          } catch (error) {
+            writeSensitiveJson(response, securityHttpStatus(error), REQUEST_REJECTED_BODY, corsOrigin);
+          }
         }).catch(() => {
           writeSensitiveJson(response, 400, REQUEST_REJECTED_BODY, corsOrigin);
-        });
+        }));
         return;
       }
-      void readNoBody(request).then((empty) => {
+      void trackWork(readNoBody(request).then(async (empty) => {
         if (!empty) {
           writeSensitiveJson(response, 400, REQUEST_REJECTED_BODY, corsOrigin);
           return;
         }
-        void (async (): Promise<void> => {
-          try {
-            const credential = bearerCredential(request);
-            if (credential === undefined) throw new SecurityStateError('invalid-credential');
-            const revoked = await securityRuntime.revokeCurrentInstallation({ credential });
-            await applyRevocationResult(revoked);
-            writeNoContent(response, corsOrigin);
-          } catch (error) {
-            writeSensitiveJson(response, securityHttpStatus(error), REQUEST_REJECTED_BODY, corsOrigin);
-          }
-        })();
+        try {
+          const credential = bearerCredential(request);
+          if (credential === undefined) throw new SecurityStateError('invalid-credential');
+          const revoked = await securityRuntime.revokeCurrentInstallation({ credential });
+          await applyRevocationResult(revoked);
+          writeNoContent(response, corsOrigin);
+        } catch (error) {
+          writeSensitiveJson(response, securityHttpStatus(error), REQUEST_REJECTED_BODY, corsOrigin);
+        }
       }).catch(() => {
         writeSensitiveJson(response, 400, REQUEST_REJECTED_BODY, corsOrigin);
-      });
+      }));
       return;
     }
     writeActualJson(404, REQUEST_REJECTED_BODY);
@@ -1379,8 +2433,22 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
     }
   };
 
+  const endDurableSession = (connection: RelayConnection): Promise<void> => {
+    if (connection.endPromise !== undefined) return connection.endPromise;
+    connection.ended = true;
+    if (connection.heartbeat !== undefined) {
+      clearInterval(connection.heartbeat);
+      connection.heartbeat = undefined;
+    }
+    const ending = Promise.resolve()
+      .then(() => securityRuntime.endSession({ lease: connection.lease }))
+      .catch(() => undefined);
+    connection.endPromise = trackWork(ending);
+    return connection.endPromise;
+  };
+
   const enqueue = (connection: RelayConnection, work: () => Promise<void> | void): void => {
-    connection.queue = connection.queue.then(async () => {
+    connection.queue = trackWork(connection.queue.then(async () => {
       if (!connection.closed) {
         await work();
       }
@@ -1388,7 +2456,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       if (!connection.closed) {
         closeConnection(connection, 1011, 'server_error');
       }
-    });
+    }));
   };
 
   webSocketServer.on('connection', (socket) => {
@@ -1405,10 +2473,11 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       securityRuntime,
       clock,
       ids,
-      transcriptionAdapter,
-      transcriptionAdapterForTarget,
+      transcriptionAdapters,
       languageClassifier,
       generationService,
+      languageBoundaryMode: boundary,
+      metricSink,
       gatePolicyVersion,
       onAsyncEventsAvailable: () => requestDrain()
     });
@@ -1422,6 +2491,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       lease: sessionLease,
       activated: false,
       ended: false,
+      endPromise: undefined,
       heartbeat: undefined,
       audio: undefined,
       limits: undefined
@@ -1455,20 +2525,6 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       });
     };
     requestDrain = scheduleDrain;
-
-    const endDurableSession = async (): Promise<void> => {
-      if (connection.ended) return;
-      connection.ended = true;
-      if (connection.heartbeat !== undefined) {
-        clearInterval(connection.heartbeat);
-        connection.heartbeat = undefined;
-      }
-      try {
-        await securityRuntime.endSession({ lease: connection.lease });
-      } catch {
-        // Closing is already fail-closed; durable cleanup is idempotent/best effort.
-      }
-    };
 
     const failSecurity = async (error: unknown): Promise<void> => {
       const quota = error instanceof SecurityStateError &&
@@ -1613,7 +2669,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
             typeof parsed === 'object' && parsed !== null &&
             (parsed as { readonly type?: unknown }).type === 'session.end'
           ) {
-            await endDurableSession();
+            await endDurableSession(connection);
           }
         }
         await deliver(connection, result);
@@ -1625,7 +2681,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
     socket.on('close', () => {
       connection.closed = true;
       if (connection.heartbeat !== undefined) clearInterval(connection.heartbeat);
-      void endDurableSession();
+      void endDurableSession(connection);
       closeCoreOnce(connection);
       connections.delete(connection);
       const installationConnections = connectionsByInstallation.get(connection.lease.installationId);
@@ -1672,7 +2728,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       cancelled: false
     };
     pendingUpgrades.add(pendingUpgrade);
-    pendingUpgrade.decision = prepareStreamUpgrade({
+    pendingUpgrade.decision = trackWork(prepareStreamUpgrade({
       offeredSubprotocols: offeredSubprotocols(request),
       audience,
       environment,
@@ -1717,54 +2773,61 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         return;
       }
       writeRejectedUpgrade(socket, 503);
-    }).finally(() => removePendingUpgrade(pendingUpgrade));
+    }).finally(() => removePendingUpgrade(pendingUpgrade)));
   });
 
-  const start = (): Promise<{ readonly port: number }> => new Promise((resolve, reject) => {
-    if (server.listening) {
-      const address = server.address();
-      if (address !== null && typeof address !== 'string') {
-        resolve({ port: address.port });
-        return;
-      }
+  const closeServer = (): Promise<void> => new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    try {
+      server.close(() => finish());
+      server.closeIdleConnections?.();
+      if (!server.listening && lifecycleState !== 'starting') finish();
+    } catch {
+      finish();
     }
-    const onError = (): void => {
-      server.removeListener('listening', onListening);
-      reject(new Error('relay_start_failed'));
-    };
-    const onListening = (): void => {
-      server.removeListener('error', onError);
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('relay_start_failed'));
-        return;
-      }
-      resolve({ port: address.port });
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port, bindHost);
   });
 
-  const closeServer = (): Promise<void> => new Promise((resolve, reject) => {
-    if (!server.listening) {
-      resolve();
-      return;
-    }
-    server.close((error) => {
-      if (error !== undefined && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
-        reject(error);
-        return;
-      }
-      resolve();
+  const settleWithin = async (
+    operation: () => Promise<unknown>,
+    timeoutMs: number
+  ): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const operationPromise = Promise.resolve().then(operation).catch(() => undefined);
+    const timeoutPromise = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
     });
-  });
+    try {
+      await Promise.race([operationPromise, timeoutPromise]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  const drainTrackedWork = async (): Promise<void> => {
+    while (trackedWork.size > 0) {
+      const snapshot = [...trackedWork];
+      await Promise.allSettled(snapshot);
+    }
+  };
 
   const stop = (): Promise<void> => {
     if (stopPromise !== undefined) {
       return stopPromise;
     }
+    let settleStop: (() => void) | undefined;
+    stopPromise = new Promise<void>((resolve) => {
+      settleStop = resolve;
+    });
+    lifecycleState = 'stopping';
     stopping = true;
+    readinessCache = undefined;
+    hostAbortController.abort();
+    const serverClosed = closeServer();
     for (const pendingUpgrade of [...pendingUpgrades]) {
       pendingUpgrade.cancelled = true;
       try {
@@ -1774,26 +2837,157 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       }
       removePendingUpgrade(pendingUpgrade);
     }
-    stopPromise = Promise.all([
-      closeServer(),
-      Promise.all(Array.from(connections, (connection) => new Promise<void>((resolve) => {
-        if (connection.socket.readyState === WebSocket.CLOSED) {
-          resolve();
-          return;
+    void (async (): Promise<void> => {
+      const connectionSnapshot = [...connections];
+      const durableEndings = connectionSnapshot.map((connection) => endDurableSession(connection));
+      const closingConnections = connectionSnapshot.map((connection) =>
+        new Promise<void>((resolve) => {
+          if (connection.socket.readyState === WebSocket.CLOSED) {
+            resolve();
+            return;
+          }
+          connection.socket.once('close', () => resolve());
+          closeCoreOnce(connection);
+          closeConnection(connection, 1001, 'server_shutdown');
+        })
+      );
+      await settleWithin(async () => {
+        await Promise.allSettled(connectionSnapshot.map((connection) => connection.queue));
+      }, CONNECTION_WORK_DRAIN_TIMEOUT_MS);
+      await settleWithin(async () => {
+        await Promise.allSettled(closingConnections);
+      }, SOCKET_CLOSE_WAIT_MS);
+      for (const connection of connectionSnapshot) {
+        if (connection.socket.readyState !== WebSocket.CLOSED) {
+          try {
+            connection.socket.terminate();
+          } catch {
+            // Shutdown is best effort and remains content-free.
+          }
         }
-        connection.socket.once('close', () => resolve());
-        closeConnection(connection, 1001, 'server_shutdown');
-      })))
-    ]).then(() => {
+      }
+      try {
+        server.closeAllConnections?.();
+      } catch {
+        // HTTP connection cleanup is best effort.
+      }
+      await settleWithin(async () => {
+        await serverClosed;
+      }, SOCKET_CLOSE_WAIT_MS);
+      await settleWithin(async () => {
+        await Promise.allSettled(durableEndings);
+      }, DURABLE_CLEANUP_TIMEOUT_MS);
+      await settleWithin(drainTrackedWork, REQUEST_WORK_DRAIN_TIMEOUT_MS);
+      for (const closeable of [...acquiredCloseables].reverse()) {
+        await settleWithin(async () => {
+          await closeable();
+        }, RESOURCE_ROLLBACK_TIMEOUT_MS);
+      }
+      acquiredCloseables.length = 0;
+      await settleWithin(() => metricSink.shutdown(), SHUTDOWN_TELEMETRY_TIMEOUT_MS);
+      acquiredMetricSink = undefined;
       connections.clear();
       pendingUpgrades.clear();
       pendingUpgradesByInstallation.clear();
       connectionsByInstallation.clear();
       revokedInstallations.clear();
       minimumCredentialVersions.clear();
+      readinessCache = undefined;
+    })().catch(() => undefined).finally(() => {
+      lifecycleState = 'stopped';
+      stopping = true;
+      settleStop?.();
     });
     return stopPromise;
   };
 
-  return { server, securityRuntime, securityMaintenance, start, stop };
+  const start = (): Promise<{ readonly port: number }> => {
+    if (lifecycleState === 'starting' && startPromise !== undefined) return startPromise;
+    if (lifecycleState === 'running') {
+      const address = server.address();
+      return address !== null && typeof address !== 'string'
+        ? Promise.resolve({ port: address.port })
+        : Promise.reject(new Error('relay_start_failed'));
+    }
+    if (lifecycleState === 'stopping' || lifecycleState === 'stopped') {
+      return Promise.reject(new Error('relay_start_rejected'));
+    }
+    lifecycleState = 'starting';
+    startPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        server.removeListener('error', onError);
+        server.removeListener('listening', onListening);
+        try {
+          hostAbortController.signal.removeEventListener('abort', onAbort);
+        } catch {
+          // Lifecycle listener cleanup is best effort.
+        }
+      };
+      const rejectAfterStop = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        void stop().then(
+          () => reject(new Error('relay_start_failed')),
+          () => reject(new Error('relay_start_failed'))
+        );
+      };
+      const onError = (): void => rejectAfterStop();
+      const onAbort = (): void => rejectAfterStop();
+      const onListening = (): void => {
+        if (lifecycleState !== 'starting' || hostAbortController.signal.aborted) {
+          rejectAfterStop();
+          return;
+        }
+        const address = server.address();
+        if (address === null || typeof address === 'string') {
+          rejectAfterStop();
+          return;
+        }
+        settled = true;
+        cleanup();
+        lifecycleState = 'running';
+        resolve({ port: address.port });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      try {
+        hostAbortController.signal.addEventListener('abort', onAbort, { once: true });
+        if (hostAbortController.signal.aborted) {
+          rejectAfterStop();
+          return;
+        }
+        server.listen(port, bindHost);
+      } catch {
+        rejectAfterStop();
+      }
+    });
+    return startPromise;
+  };
+
+    return {
+      server,
+      securityRuntime,
+      securityMaintenance,
+      get lifecycleState(): RelayHostLifecycleState {
+        return lifecycleState;
+      },
+      start,
+      stop
+    };
+  } catch {
+    for (const closeable of [...acquiredCloseables].reverse()) {
+      invokeResourceCleanup(closeable);
+    }
+    acquiredCloseables.length = 0;
+    if (acquiredMetricSink !== undefined) {
+      invokeResourceCleanup(() => acquiredMetricSink?.shutdown());
+      acquiredMetricSink = undefined;
+    } else if (partialMetricCleanup !== undefined) {
+      invokeResourceCleanup(partialMetricCleanup);
+      partialMetricCleanup = undefined;
+    }
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
 }

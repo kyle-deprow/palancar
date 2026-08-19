@@ -3,6 +3,7 @@ import { createServer as createHttpServer, type Server as HttpServer } from 'nod
 import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
+import { ManagedIdentityCredential } from '@azure/identity';
 import {
   DEFAULT_NEGOTIATED_LIMITS,
   WEBSOCKET_SUBPROTOCOL,
@@ -16,12 +17,17 @@ import {
   type TextLanguageClassifier
 } from '@palancar/language-registry';
 import {
+  DeterministicFixtureLanguageValidator,
   DeterministicMockProvider,
+  FailClosedGeneratedLanguageValidator,
   GenerationService,
+  type GeneratedLanguageValidationEvidence,
+  type GeneratedLanguageValidator,
   type GenerationProvider,
   type GenerationProviderCompletion,
 } from '@palancar/generation';
 import {
+  AzureRealtimeTranscriptionAdapter,
   DETERMINISTIC_MOCK_CAPABILITIES,
   DeterministicMockTranscriptionAdapter,
   type NormalizedTranscriptionEvent,
@@ -50,11 +56,13 @@ import {
   createTestHostSecurityComposition,
   createTestOptions,
   createRelayHost as createRelayHostProduction,
+  createFailClosedDeployedTextLanguageClassifier,
   parseRelayHostConfig,
   type RelayHost,
   type RelayHostConfig,
   type RelayUpgradeAudience
 } from '../src/index.js';
+import { createDisabledRelayMetricSink } from '../src/telemetry.js';
 
 const ORIGIN = 'wss://127.0.0.1';
 const ENVIRONMENT = 'relay-host-test';
@@ -66,10 +74,44 @@ const PENDING_CREDENTIAL = 'C'.repeat(42) + 'E';
 const RELAY_MAIN_PATH = fileURLToPath(new URL('../dist/main.js', import.meta.url));
 
 function createRelayHost(config: RelayHostConfig): RelayHost {
+  if (config.languageBoundaryMode === 'deny-all' || config.generationReadiness?.provider === 'litellm') {
+    const {
+      securityFactory,
+      metricSinkFactory,
+      ...directConfig
+    } = config;
+    void securityFactory;
+    void metricSinkFactory;
+    return createRelayHostProduction({
+      ...directConfig,
+      security: {
+        ...createTestHostSecurityComposition(),
+        mode: 'azure-table'
+      },
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: async () => true,
+        shutdown: async () => undefined
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+  }
   return createRelayHostProduction({
     ...config,
-    security: createTestHostSecurityComposition()
+    environment: 'local-mock',
+    languageBoundaryMode: 'fixture',
+    security: {
+      ...createTestHostSecurityComposition(),
+      mode: 'local-mock'
+    }
   });
+}
+
+function productionTestMetricSink(): NonNullable<RelayHostConfig['metricSink']> {
+  return {
+    record: () => undefined,
+    checkReadiness: async () => true,
+    shutdown: async () => undefined
+  } as NonNullable<RelayHostConfig['metricSink']>;
 }
 
 function testSecurityWith(input: {
@@ -126,7 +168,7 @@ function lifecycleSecurityWith() {
     }
   });
   return {
-    ...security,
+    composition: security,
     spies: { beginCredentialRotation, promoteCredential, revokeCurrentInstallation }
   };
 }
@@ -283,6 +325,44 @@ function runRelayMain(env: NodeJS.ProcessEnv): Promise<{
   return new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+  });
+}
+
+function runRelayMainAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<{
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}> {
+  const child = spawn(process.execPath, [RELAY_MAIN_PATH], {
+    env: { ...process.env, ...mockEnvironment({ PORT: '0' }) },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let stdout = '';
+  let stderr = '';
+  let signalled = false;
+  child.stdout.on('data', (chunk: Buffer | string) => {
+    stdout += chunk.toString();
+    if (!signalled && stdout.includes('relay listening on ')) {
+      signalled = true;
+      child.kill(signal);
+    }
+  });
+  child.stderr.on('data', (chunk: Buffer | string) => {
+    stderr += chunk.toString();
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('relay main did not drain after signal'));
+    }, 10_000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
   });
 }
 
@@ -784,18 +864,14 @@ async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Pro
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(4000, '127.0.0.1', () => {
       server.removeListener('error', reject);
       resolve();
     });
   });
-  const address = server.address();
-  expect(address).not.toBeNull();
-  expect(typeof address).toBe('object');
-  const port = (address as { readonly port: number }).port;
   return {
     server,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: 'http://127.0.0.1:4000',
     getCatalogAuthorization: () => catalogAuthorization,
     getCatalogRedirectAuthorization: () => catalogRedirectAuthorization,
     getCatalogRedirectRequests: () => catalogRedirectRequests,
@@ -821,15 +897,24 @@ function mockEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     PALANCAR_SECURITY_MODE: 'azure-table',
+    PALANCAR_RELAY_BIND_HOST: '0.0.0.0',
+    PALANCAR_RELAY_ORIGIN: 'wss://relay.example',
     PALANCAR_RELAY_ENVIRONMENT: ENVIRONMENT,
     PALANCAR_WORKLOAD_TABLE_ENDPOINT: 'https://palancartest.table.core.windows.net',
     PALANCAR_SECURITY_STATE_TABLE: 'SecurityState',
     PALANCAR_RATE_STATE_TABLE: 'RateState',
     AZURE_CLIENT_ID: '11111111-1111-4111-8111-111111111111',
     PALANCAR_GENERATION_PROVIDER: 'litellm',
+    PALANCAR_TRANSCRIPTION_PROVIDER: 'mock',
     PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000',
     PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY,
     PALANCAR_LITELLM_MODEL: LITELLM_MODEL,
+    PALANCAR_DEPLOYMENT_SLOT: 'dev',
+    APPLICATIONINSIGHTS_CONNECTION_STRING:
+      'InstrumentationKey=11111111-1111-4111-8111-111111111111;' +
+      'IngestionEndpoint=https://westus-0.in.applicationinsights.azure.com',
+    APPLICATIONINSIGHTS_STATSBEAT_DISABLED: 'true',
+    APPLICATION_INSIGHTS_NO_STATSBEAT: 'true',
     ...overrides
   };
 }
@@ -863,6 +948,56 @@ async function expectFailedLiteLLMReadiness(host: RelayHost): Promise<void> {
 }
 
 describe('relay host configuration and readiness', () => {
+  it('selects fixture only for the exact local composition and deny-all for deployment', () => {
+    const local = parseRelayHostConfig(mockEnvironment());
+    const deployed = parseRelayHostConfig(litellmEnvironment());
+
+    expect(local.languageBoundaryMode).toBe('fixture');
+    expect(local.generationService?.validator).toEqual({
+      id: 'deterministic-language-fixture',
+      version: '1.0.0'
+    });
+    expect(deployed.languageBoundaryMode).toBe('deny-all');
+    expect(deployed.generationService?.validator).toEqual({
+      id: 'fail-closed-generated-language',
+      version: '1.0.0'
+    });
+  });
+
+  it('does not perform fetch or managed-identity token work while parsing', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const tokenSpy = vi.spyOn(ManagedIdentityCredential.prototype, 'getToken');
+    try {
+      expect(() => parseRelayHostConfig(litellmEnvironment())).not.toThrow();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(tokenSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      tokenSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ['boundary selector', { PALANCAR_LANGUAGE_BOUNDARY_MODE: 'production-approved' }],
+    ['OTLP exporter', { OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:4317' }],
+    ['Azure API key', { AZURE_OPENAI_API_KEY: 'secret' }]
+  ])('rejects local environment contamination: %s', (_label, override) => {
+    expect(() => parseRelayHostConfig(mockEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it.each([
+    ['missing Statsbeat prerequisite', { APPLICATION_INSIGHTS_NO_STATSBEAT: undefined }],
+    ['wrong Statsbeat prerequisite', { APPLICATIONINSIGHTS_STATSBEAT_DISABLED: 'false' }],
+    ['raw OTLP exporter', { PALANCAR_OTLP_ENDPOINT: 'http://127.0.0.1:4317' }],
+    ['Azure transcription API key', { PALANCAR_AZURE_TRANSCRIPTION_API_KEY: 'secret' }]
+  ])('rejects deployed environment contamination: %s', (_label, override) => {
+    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
   it('parses an explicit mock generation provider', () => {
     const config = parseRelayHostConfig(mockEnvironment());
 
@@ -875,6 +1010,87 @@ describe('relay host configuration and readiness', () => {
       providerId: 'deterministic-mock-generation',
       model: 'mock'
     });
+  });
+
+  it('rejects fixture and fail-closed identities from future production-approved injection', () => {
+    const base = parseRelayHostConfig(litellmEnvironment());
+    const fixture = parseRelayHostConfig(mockEnvironment());
+    const classifier = createFailClosedDeployedTextLanguageClassifier();
+    const fixtureGenerationService = fixture.generationService;
+    if (fixtureGenerationService === undefined) {
+      throw new Error('fixture generation service is required');
+    }
+    const failClosedGenerationService = new GenerationService({
+      provider: new DeterministicMockProvider({
+        id: 'future-production-provider',
+        version: '1.0.0',
+        complete: {
+          result: {
+            englishTranslation: 'A phrase translated to English.',
+            suggestions: [
+              { englishText: 'Yes.', selectedTargetText: 'Sí.' },
+              { englishText: 'No.', selectedTargetText: 'No.' }
+            ]
+          }
+        }
+      }),
+      validator: new FailClosedGeneratedLanguageValidator()
+    });
+    const disguisedFixtureValidator = new DeterministicFixtureLanguageValidator({
+      id: 'approved-generated-language'
+    });
+    const disguisedFixtureService = new GenerationService({
+      provider: new DeterministicMockProvider({
+        id: 'future-production-provider',
+        complete: {
+          result: {
+            englishTranslation: 'unused',
+            suggestions: [
+              { englishText: 'one', selectedTargetText: 'uno' },
+              { englishText: 'two', selectedTargetText: 'dos' }
+            ]
+          }
+        }
+      }),
+      validator: disguisedFixtureValidator
+    });
+
+    expect(() => createRelayHostProduction({
+      ...base,
+      languageBoundaryMode: 'production-approved',
+      languageClassifier: classifier,
+      generationService: fixtureGenerationService
+    })).toThrow('Invalid relay host configuration.');
+    expect(() => createRelayHostProduction({
+      ...base,
+      languageBoundaryMode: 'production-approved',
+      languageClassifier: createTestOptions().languageClassifier
+    })).toThrow('Invalid relay host configuration.');
+    expect(() => createRelayHostProduction({
+      ...base,
+      languageBoundaryMode: 'production-approved',
+      languageClassifier: {
+        ready: Promise.resolve(),
+        classify: async () => ({
+          status: 'unavailable' as const,
+          detectorVersion: 'future-calibrated-classifier'
+        })
+      },
+      generationService: failClosedGenerationService
+    })).toThrow('Invalid relay host configuration.');
+    expect(() => createRelayHostProduction({
+      ...base,
+      languageBoundaryMode: 'production-approved',
+      languageClassifier: {
+        ready: Promise.resolve(),
+        classify: async () => ({
+          status: 'unavailable' as const,
+          detectorVersion: 'future-calibrated-classifier'
+        })
+      },
+      generationService: disguisedFixtureService,
+      productionApprovedGenerationValidator: disguisedFixtureValidator
+    })).toThrow('Invalid relay host configuration.');
   });
 
   it('parses and freezes the browser origin policy, including fail-closed defaults', () => {
@@ -946,7 +1162,8 @@ describe('relay host configuration and readiness', () => {
     const localHost = createRelayHostProduction(builtInConfig);
     await localHost.stop();
 
-    const customService = new GenerationService(new DeterministicMockProvider({
+    const customService = new GenerationService({
+      provider: new DeterministicMockProvider({
       id: 'custom-deterministic-provider',
       complete: {
         result: {
@@ -957,7 +1174,9 @@ describe('relay host configuration and readiness', () => {
           ]
         }
       }
-    }));
+      }),
+      validator: new DeterministicFixtureLanguageValidator()
+    });
     expect(() => createRelayHostProduction({
       ...builtInConfig,
       generationService: customService,
@@ -1008,11 +1227,53 @@ describe('relay host configuration and readiness', () => {
     ['missing API key', { PALANCAR_LITELLM_API_KEY: undefined }],
     ['missing model', { PALANCAR_LITELLM_MODEL: undefined }],
     ['malformed base URL', { PALANCAR_LITELLM_BASE_URL: 'not-a-url' }],
+    ['localhost alias', { PALANCAR_LITELLM_BASE_URL: 'http://localhost:4000' }],
+    ['HTTPS', { PALANCAR_LITELLM_BASE_URL: 'https://127.0.0.1:4000' }],
+    ['path', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000/v1' }],
+    ['trailing slash', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000/' }],
+    ['wrong port', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4001' }],
+    ['wrong host', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.2:4000' }],
+    ['wrong model', { PALANCAR_LITELLM_MODEL: 'other-generation' }],
     ['malformed timeout', { PALANCAR_LITELLM_TIMEOUT_MS: 'not-a-number' }]
   ])('rejects %s with a generic config error', (_name, override) => {
     expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
       'Invalid relay host configuration.'
     );
+  });
+
+  it('rejects noncanonical programmatic LiteLLM readiness before acquisition', () => {
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const metricSinkFactory = vi.fn(() => productionTestMetricSink());
+    const generationService = new GenerationService({
+      provider: {
+        id: 'litellm-chat',
+        version: '1.0.0',
+        complete: async () => {
+          throw new Error('unused');
+        }
+      },
+      validator: new FailClosedGeneratedLanguageValidator()
+    });
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      securityMode: 'azure-table',
+      securityFactory,
+      languageBoundaryMode: 'deny-all',
+      generationService,
+      generationReadiness: {
+        provider: 'litellm',
+        providerId: 'litellm-chat',
+        baseUrl: 'http://localhost:4000' as 'http://127.0.0.1:4000',
+        model: 'palancar-generation',
+        check: async () => true
+      },
+      metricSinkFactory
+    })).toThrow('Invalid relay host configuration.');
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(metricSinkFactory).not.toHaveBeenCalled();
   });
 
   it('keeps health process-only while LiteLLM readiness is failing', async () => {
@@ -1148,6 +1409,7 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: productionTestMetricSink(),
       security
     });
     try {
@@ -1177,7 +1439,10 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createReadinessAdapter(check),
+      transcriptionAdapters: {
+        es: createReadinessAdapter(check),
+        tr: createReadinessAdapter(check)
+      },
       languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
@@ -1199,12 +1464,17 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createReadinessAdapter(
-        () => {
-          readinessStarted.resolve();
-          return new Promise(() => undefined);
-        }
-      ),
+      transcriptionAdapters: {
+        es: createReadinessAdapter(
+          () => {
+            readinessStarted.resolve();
+            return new Promise(() => undefined);
+          }
+        ),
+        tr: createReadinessAdapter(
+          () => new Promise(() => undefined)
+        )
+      },
       languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
@@ -1212,7 +1482,7 @@ describe('relay host configuration and readiness', () => {
     try {
       const readyRequest = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
       await readinessStarted.promise;
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(6_000);
       const ready = await readyRequest;
       expect(ready.status).toBe(503);
       expect(await responseJson(ready)).toEqual({ ready: false });
@@ -1241,7 +1511,7 @@ describe('relay host configuration and readiness', () => {
         })
       };
       const host = createRelayHost({
-        environment: ENVIRONMENT,
+        environment: 'local-mock',
         origin: ORIGIN,
         port: 0,
         gatePolicyVersion: GATE_POLICY_VERSION,
@@ -1258,7 +1528,7 @@ describe('relay host configuration and readiness', () => {
         await host.stop();
       }
     },
-    5_000
+    10_000
   );
 
   it('requires an explicit classifier for non-default transcription adapters', () => {
@@ -1267,7 +1537,10 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createAsyncCallbackAdapter()
+      transcriptionAdapters: {
+        es: createAsyncCallbackAdapter(),
+        tr: createAsyncCallbackAdapter()
+      }
     })).toThrow('Invalid relay host configuration.');
   });
 
@@ -1277,7 +1550,10 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createAsyncCallbackAdapter(),
+      transcriptionAdapters: {
+        es: createAsyncCallbackAdapter(),
+        tr: createAsyncCallbackAdapter()
+      },
       languageClassifier: createTestOptions().languageClassifier
     })).toThrow('Invalid relay host configuration.');
   });
@@ -1288,12 +1564,812 @@ describe('relay host configuration and readiness', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: new DeterministicMockTranscriptionAdapter({
-        evidenceCategory: 'selected-target'
-      }),
+      transcriptionAdapters: {
+        es: new DeterministicMockTranscriptionAdapter({
+          evidenceCategory: 'selected-target',
+          fixtureTargetLanguage: 'es'
+        }),
+        tr: new DeterministicMockTranscriptionAdapter({
+          evidenceCategory: 'selected-target',
+          fixtureTargetLanguage: 'tr'
+        })
+      },
       languageClassifier: createTestOptions().languageClassifier
     });
     await host.stop();
+  });
+
+  it('serializes start and stop lifecycle transitions and permanently rejects restart', async () => {
+    const host = createRelayHostProduction(parseRelayHostConfig(mockEnvironment({ PORT: '0' })));
+    expect(host.lifecycleState).toBe('created');
+
+    const firstStart = host.start();
+    const secondStart = host.start();
+    expect(secondStart).toBe(firstStart);
+    await expect(firstStart).resolves.toEqual({ port: expect.any(Number) });
+    expect(host.lifecycleState).toBe('running');
+
+    const firstStop = host.stop();
+    const secondStop = host.stop();
+    expect(secondStop).toBe(firstStop);
+    expect(host.lifecycleState).toBe('stopping');
+    await firstStop;
+    expect(host.lifecycleState).toBe('stopped');
+    expect(host.server.listening).toBe(false);
+    await expect(host.start()).rejects.toThrow('relay_start_rejected');
+  });
+
+  it('settles start/stop and stop/start races without leaving a listening handle', async () => {
+    const startingHost = createRelayHostProduction(parseRelayHostConfig(mockEnvironment({ PORT: '0' })));
+    const starting = startingHost.start();
+    const stopping = startingHost.stop();
+    await expect(starting).rejects.toThrow('relay_start_failed');
+    await expect(stopping).resolves.toBeUndefined();
+    expect(startingHost.lifecycleState).toBe('stopped');
+    expect(startingHost.server.listening).toBe(false);
+
+    const neverStartedHost = createRelayHostProduction(
+      parseRelayHostConfig(mockEnvironment({ PORT: '0' }))
+    );
+    const stopped = neverStartedHost.stop();
+    await expect(neverStartedHost.start()).rejects.toThrow('relay_start_rejected');
+    await stopped;
+    expect(neverStartedHost.lifecycleState).toBe('stopped');
+    expect(neverStartedHost.server.listening).toBe(false);
+  });
+
+  it('rolls a listen failure back to terminal stopped state without an open handle', async () => {
+    const blocker = createHttpServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = blocker.address();
+    if (address === null || typeof address === 'string') throw new Error('missing blocker port');
+    const host = createRelayHostProduction(parseRelayHostConfig(mockEnvironment({
+      PORT: String(address.port),
+      PALANCAR_RELAY_ORIGIN: `wss://127.0.0.1:${address.port}`
+    })));
+    try {
+      await expect(host.start()).rejects.toThrow('relay_start_failed');
+      expect(host.lifecycleState).toBe('stopped');
+      expect(host.server.listening).toBe(false);
+      await expect(host.stop()).resolves.toBeUndefined();
+      await expect(host.start()).rejects.toThrow('relay_start_rejected');
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it('rejects hostile discriminants before invoking any composition factory', () => {
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const metricFactory = vi.fn(() => productionTestMetricSink());
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      securityMode: 'azure-table',
+      securityFactory,
+      languageBoundaryMode: 'unknown' as NonNullable<RelayHostConfig['languageBoundaryMode']>,
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: tokenFactory,
+      azureTranscriptionAdapterFactory: adapterFactory,
+      metricSinkFactory: metricFactory
+    })).toThrow('Invalid relay host configuration.');
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(metricFactory).not.toHaveBeenCalled();
+  });
+
+  it('enforces exact telemetry composition without touching rejected sinks', () => {
+    const localShutdown = vi.fn(async () => undefined);
+    const localSink = {
+      record: () => undefined,
+      checkReadiness: async () => true,
+      shutdown: localShutdown
+    } as NonNullable<RelayHostConfig['metricSink']>;
+    expect(() => createRelayHostProduction({
+      ...parseRelayHostConfig(mockEnvironment()),
+      metricSink: localSink
+    })).toThrow('Invalid relay host configuration.');
+    expect(localShutdown).not.toHaveBeenCalled();
+
+    const production = {
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith()
+    } satisfies RelayHostConfig;
+    expect(() => createRelayHostProduction(production)).toThrow(
+      'Invalid relay host configuration.'
+    );
+    expect(() => createRelayHostProduction({
+      ...production,
+      metricSink: productionTestMetricSink(),
+      metricSinkFactory: () => productionTestMetricSink()
+    })).toThrow('Invalid relay host configuration.');
+  });
+
+  it('allows only the exact disabled telemetry singleton for local composition', async () => {
+    const inheritedDisabledSink = Object.create(
+      createDisabledRelayMetricSink()
+    ) as NonNullable<RelayHostConfig['metricSink']>;
+    expect(() => createRelayHostProduction({
+      ...parseRelayHostConfig(mockEnvironment()),
+      metricSink: inheritedDisabledSink
+    })).toThrow('Invalid relay host configuration.');
+
+    const host = createRelayHostProduction({
+      ...parseRelayHostConfig(mockEnvironment({ PORT: '0' })),
+      metricSink: createDisabledRelayMetricSink()
+    });
+    await host.start();
+    try {
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      expect(ready.status).toBe(200);
+    } finally {
+      await host.stop();
+    }
+  });
+
+  it('rejects a direct disabled sink before any deployed resource or readiness can start', () => {
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const provider = new DeterministicMockProvider();
+    let host: RelayHost | undefined;
+
+    expect(() => {
+      host = createRelayHostProduction({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        securityMode: 'azure-table',
+        securityFactory,
+        languageBoundaryMode: 'deny-all',
+        generationService: new GenerationService({
+          provider,
+          validator: new FailClosedGeneratedLanguageValidator()
+        }),
+        transcriptionProvider: 'azure-realtime',
+        managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+        azureTranscriptionEndpoint:
+          'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+        azureTranscriptionDeployment: 'palancar-transcription',
+        azureTokenSourceFactory: tokenFactory,
+        azureTranscriptionAdapterFactory: adapterFactory,
+        metricSink: createDisabledRelayMetricSink()
+      });
+    }).toThrow('Invalid relay host configuration.');
+
+    expect(host).toBeUndefined();
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(provider.completeCalls).toBe(0);
+  });
+
+  it('rejects an inherited disabled sink during pure deployed validation', () => {
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const provider = new DeterministicMockProvider();
+    const inheritedDisabledSink = Object.create(
+      createDisabledRelayMetricSink()
+    ) as NonNullable<RelayHostConfig['metricSink']>;
+
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      securityMode: 'azure-table',
+      securityFactory,
+      languageBoundaryMode: 'deny-all',
+      generationService: new GenerationService({
+        provider,
+        validator: new FailClosedGeneratedLanguageValidator()
+      }),
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: tokenFactory,
+      azureTranscriptionAdapterFactory: adapterFactory,
+      metricSink: inheritedDisabledSink
+    })).toThrow('Invalid relay host configuration.');
+
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(provider.completeCalls).toBe(0);
+  });
+
+  it('evaluates a disabled telemetry factory before every deployed resource factory', () => {
+    const metricFactory = vi.fn(() => createDisabledRelayMetricSink());
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const provider = new DeterministicMockProvider();
+    let host: RelayHost | undefined;
+
+    expect(() => {
+      host = createRelayHostProduction({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        securityMode: 'azure-table',
+        securityFactory,
+        languageBoundaryMode: 'deny-all',
+        generationService: new GenerationService({
+          provider,
+          validator: new FailClosedGeneratedLanguageValidator()
+        }),
+        transcriptionProvider: 'azure-realtime',
+        managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+        azureTranscriptionEndpoint:
+          'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+        azureTranscriptionDeployment: 'palancar-transcription',
+        azureTokenSourceFactory: tokenFactory,
+        azureTranscriptionAdapterFactory: adapterFactory,
+        metricSinkFactory: metricFactory
+      });
+    }).toThrow('Invalid relay host configuration.');
+
+    expect(host).toBeUndefined();
+    expect(metricFactory).toHaveBeenCalledTimes(1);
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(provider.completeCalls).toBe(0);
+  });
+
+  it('rejects a deeply inherited disabled factory result before downstream acquisition', () => {
+    const inheritedDisabledSink = Object.create(Object.create(
+      createDisabledRelayMetricSink()
+    )) as NonNullable<RelayHostConfig['metricSink']>;
+    const metricFactory = vi.fn(() => inheritedDisabledSink);
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const provider = new DeterministicMockProvider();
+
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      securityMode: 'azure-table',
+      securityFactory,
+      languageBoundaryMode: 'deny-all',
+      generationService: new GenerationService({
+        provider,
+        validator: new FailClosedGeneratedLanguageValidator()
+      }),
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: tokenFactory,
+      azureTranscriptionAdapterFactory: adapterFactory,
+      metricSinkFactory: metricFactory
+    })).toThrow('Invalid relay host configuration.');
+
+    expect(metricFactory).toHaveBeenCalledTimes(1);
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(provider.completeCalls).toBe(0);
+  });
+
+  it('contains an early telemetry factory throw without acquiring other resources', () => {
+    const metricFactory = vi.fn(() => {
+      throw new Error('secret telemetry factory failure');
+    });
+    const securityFactory = vi.fn(() => testSecurityWith());
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+      close: vi.fn()
+    }));
+    const adapterFactory = vi.fn(() => {
+      throw new Error('must not run');
+    });
+
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      securityMode: 'azure-table',
+      securityFactory,
+      languageBoundaryMode: 'deny-all',
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: tokenFactory,
+      azureTranscriptionAdapterFactory: adapterFactory,
+      metricSinkFactory: metricFactory
+    })).toThrow('Invalid relay host configuration.');
+
+    expect(metricFactory).toHaveBeenCalledTimes(1);
+    expect(securityFactory).not.toHaveBeenCalled();
+    expect(tokenFactory).not.toHaveBeenCalled();
+    expect(adapterFactory).not.toHaveBeenCalled();
+  });
+
+  it('rolls back early telemetry and later token/adapter acquisition in safe order', async () => {
+    const firstOrder: string[] = [];
+    const firstTokenClose = vi.fn(() => firstOrder.push('token'));
+    const firstMetricShutdown = vi.fn(async () => {
+      firstOrder.push('telemetry');
+    });
+    const metricFactory = vi.fn(() => ({
+      ...productionTestMetricSink(),
+      shutdown: firstMetricShutdown
+    }));
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      languageBoundaryMode: 'deny-all',
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: () => ({
+        tokenProvider: async () => ({ token: 'unused', expiresOnTimestamp: Date.now() + 600_000 }),
+        close: firstTokenClose
+      }),
+      azureTranscriptionAdapterFactory: () => {
+        throw new Error('adapter acquisition failed');
+      },
+      metricSinkFactory: metricFactory
+    })).toThrow('Invalid relay host configuration.');
+    expect(firstTokenClose).toHaveBeenCalledTimes(1);
+    expect(metricFactory).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(firstMetricShutdown).toHaveBeenCalledTimes(1));
+    expect(firstOrder).toEqual(['token', 'telemetry']);
+
+    const order: string[] = [];
+    const tokenProvider = async () => ({
+      token: 'unused',
+      expiresOnTimestamp: Date.now() + 600_000
+    });
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      deployment: 'palancar-transcription',
+      tokenProvider
+    });
+    Object.defineProperty(adapter, 'close', {
+      value: () => order.push('adapter'),
+      enumerable: true
+    });
+    const partialTelemetryShutdown = vi.fn(async () => {
+      order.push('telemetry');
+    });
+    expect(() => createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      languageBoundaryMode: 'deny-all',
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: () => ({
+        tokenProvider,
+        close: () => order.push('token')
+      }),
+      azureTranscriptionAdapterFactory: () => adapter,
+      metricSinkFactory: () => ({
+        record: () => undefined,
+        shutdown: partialTelemetryShutdown
+      } as unknown as NonNullable<RelayHostConfig['metricSink']>)
+    })).toThrow('Invalid relay host configuration.');
+    await vi.waitFor(() => expect(partialTelemetryShutdown).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(['telemetry']);
+  });
+
+  it('composes real Azure factories once, deduplicates shared readiness, and shuts telemetry last', async () => {
+    const order: string[] = [];
+    const tokenProvider = async () => ({
+      token: 'unused',
+      expiresOnTimestamp: Date.now() + 600_000
+    });
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      deployment: 'palancar-transcription',
+      tokenProvider
+    });
+    const adapterReadiness = vi.spyOn(adapter, 'checkReadiness').mockImplementation(async () => {
+      order.push('transcription-ready');
+      return { ready: true, provider: 'azure-realtime', model: 'palancar-transcription' };
+    });
+    Object.defineProperty(adapter, 'close', {
+      value: () => order.push('adapter-close'),
+      enumerable: true
+    });
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider,
+      close: () => order.push('token-close')
+    }));
+    const adapterFactory = vi.fn(() => adapter);
+    const metricFactory = vi.fn(() => ({
+      record: () => undefined,
+      checkReadiness: async () => {
+        order.push('telemetry-ready');
+        return true;
+      },
+      shutdown: async () => {
+        order.push('telemetry-shutdown');
+      }
+    }));
+    const host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      languageBoundaryMode: 'deny-all',
+      transcriptionProvider: 'azure-realtime',
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTranscriptionEndpoint:
+        'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+      azureTranscriptionDeployment: 'palancar-transcription',
+      azureTokenSourceFactory: tokenFactory,
+      azureTranscriptionAdapterFactory: adapterFactory,
+      metricSinkFactory: metricFactory
+    });
+    await host.start();
+    const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+    expect(ready.status).toBe(200);
+    expect(tokenFactory).toHaveBeenCalledTimes(1);
+    expect(adapterFactory).toHaveBeenCalledTimes(1);
+    expect(metricFactory).toHaveBeenCalledTimes(1);
+    expect(adapterReadiness).toHaveBeenCalledTimes(1);
+    await host.stop();
+    expect(order.slice(-3)).toEqual(['adapter-close', 'token-close', 'telemetry-shutdown']);
+  });
+
+  it('invokes all five readiness dependencies concurrently and single-flights callers', async () => {
+    const started: string[] = [];
+    const generationReady = createValueDeferred<boolean>();
+    const spanishReady = createValueDeferred<ReturnType<TranscriptionAdapter['checkReadiness']> extends Promise<infer T> ? T : never>();
+    const turkishReady = createValueDeferred<ReturnType<TranscriptionAdapter['checkReadiness']> extends Promise<infer T> ? T : never>();
+    const classifierReady = createDeferred();
+    const securityReady = createDeferred();
+    const telemetryReady = createValueDeferred<boolean>();
+    const spanish = new DeterministicMockTranscriptionAdapter({
+      evidenceCategory: 'selected-target',
+      fixtureTargetLanguage: 'es'
+    });
+    const turkish = new DeterministicMockTranscriptionAdapter({
+      evidenceCategory: 'selected-target',
+      fixtureTargetLanguage: 'tr'
+    });
+    vi.spyOn(spanish, 'checkReadiness').mockImplementation(() => {
+      started.push('transcription-es');
+      return spanishReady.promise;
+    });
+    vi.spyOn(turkish, 'checkReadiness').mockImplementation(() => {
+      started.push('transcription-tr');
+      return turkishReady.promise;
+    });
+    const validator: GeneratedLanguageValidator = {
+      id: 'approved-generated-language',
+      version: '1.0.0',
+      validate: async (input) => ({
+        checks: input.checks.map((check) => ({
+          slot: check.slot,
+          expectedLanguage: check.expectedLanguage,
+          detectedLanguage: check.expectedLanguage,
+          verdict: 'match' as const,
+          confidenceBasisPoints: 10_000
+        })) as unknown as GeneratedLanguageValidationEvidence['checks']
+      })
+    };
+    const generationService = new GenerationService({
+      provider: {
+        id: 'litellm-chat',
+        version: '1.0.0',
+        complete: async () => {
+          throw new Error('generation must not run during readiness');
+        }
+      },
+      validator
+    });
+    const classifierThenable = {
+      then(resolve: () => void, reject: (error: unknown) => void): Promise<void> {
+        started.push('classifier');
+        return classifierReady.promise.then(resolve, reject);
+      }
+    } as unknown as Promise<void>;
+    const security = testSecurityWith({
+      maintenance: {
+        checkReadiness: async () => {
+          started.push('security');
+          await securityReady.promise;
+        }
+      }
+    });
+    const host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security,
+      languageBoundaryMode: 'production-approved',
+      transcriptionAdapters: { es: spanish, tr: turkish },
+      languageClassifier: {
+        ready: classifierThenable,
+        classify: async () => ({ status: 'unavailable', detectorVersion: 'approved-future' })
+      },
+      generationService,
+      productionApprovedGenerationValidator: validator,
+      generationReadiness: {
+        provider: 'litellm',
+        providerId: 'litellm-chat',
+        baseUrl: 'http://127.0.0.1:4000',
+        model: 'palancar-generation',
+        check: async () => {
+          started.push('generation');
+          return generationReady.promise;
+        }
+      },
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: async () => {
+          started.push('telemetry');
+          return telemetryReady.promise;
+        },
+        shutdown: async () => undefined
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+    await host.start();
+    const first = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+    const second = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+    await vi.waitFor(() => expect(new Set(started)).toEqual(new Set([
+      'generation',
+      'transcription-es',
+      'transcription-tr',
+      'classifier',
+      'security',
+      'telemetry'
+    ])));
+    expect(started).toHaveLength(6);
+    generationReady.resolve(true);
+    spanishReady.resolve({ ready: true, provider: 'deterministic-mock', model: 'mock' });
+    turkishReady.resolve({ ready: true, provider: 'deterministic-mock', model: 'mock' });
+    classifierReady.resolve();
+    securityReady.resolve();
+    telemetryReady.resolve(true);
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
+    expect(started).toHaveLength(6);
+    await host.stop();
+  });
+
+  it('uses exact 30s success and 2s failure readiness caches with a valid clock', async () => {
+    const run = async (ready: boolean, expiry: number): Promise<void> => {
+      let now = 0;
+      const spanish = new DeterministicMockTranscriptionAdapter({
+        evidenceCategory: 'selected-target',
+        fixtureTargetLanguage: 'es'
+      });
+      const turkish = new DeterministicMockTranscriptionAdapter({
+        evidenceCategory: 'selected-target',
+        fixtureTargetLanguage: 'tr'
+      });
+      const spanishCheck = vi.spyOn(spanish, 'checkReadiness').mockResolvedValue({
+        ready,
+        provider: 'deterministic-mock',
+        model: 'mock'
+      });
+      const turkishCheck = vi.spyOn(turkish, 'checkReadiness').mockResolvedValue({
+        ready,
+        provider: 'deterministic-mock',
+        model: 'mock'
+      });
+      const host = createRelayHostProduction({
+        environment: 'local-mock',
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        security: {
+          ...createTestHostSecurityComposition(),
+          mode: 'local-mock'
+        },
+        languageBoundaryMode: 'fixture',
+        transcriptionAdapters: { es: spanish, tr: turkish },
+        clock: {
+          nowIso: () => '2026-08-10T12:00:00.000Z',
+          nowMonotonicMs: () => {
+            now += 1;
+            return now;
+          }
+        }
+      });
+      await host.start();
+      const url = `http://127.0.0.1:${hostPort(host)}/readyz`;
+      expect((await fetch(url)).status).toBe(ready ? 200 : 503);
+      expect((await fetch(url)).status).toBe(ready ? 200 : 503);
+      expect(spanishCheck).toHaveBeenCalledTimes(1);
+      expect(turkishCheck).toHaveBeenCalledTimes(1);
+      now = expiry + 1;
+      expect((await fetch(url)).status).toBe(ready ? 200 : 503);
+      expect(spanishCheck).toHaveBeenCalledTimes(2);
+      expect(turkishCheck).toHaveBeenCalledTimes(2);
+      await host.stop();
+    };
+    await run(true, 30_000);
+    await run(false, 2_000);
+  });
+
+  it.each([
+    ['frozen', (): number => 1],
+    ['throwing', (): number => { throw new Error('clock failure'); }],
+    ['nonfinite', (): number => Number.NaN],
+    ['backward', ((): (() => number) => {
+      const values = [2, 1];
+      return () => values.shift() ?? 1;
+    })()]
+  ] as const)('fails readiness closed for a %s monotonic clock', async (_name, nowMonotonicMs) => {
+    const host = createRelayHostProduction({
+      ...parseRelayHostConfig(mockEnvironment({ PORT: '0' })),
+      clock: {
+        nowIso: () => '2026-08-10T12:00:00.000Z',
+        nowMonotonicMs
+      }
+    });
+    await host.start();
+    expect((await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`)).status).toBe(503);
+    await host.stop();
+  });
+
+  it('aborts active readiness on stop and never serves a cached success while stopping', async () => {
+    const started = createDeferred();
+    let observedSignal: AbortSignal | undefined;
+    const spanish = new DeterministicMockTranscriptionAdapter({
+      evidenceCategory: 'selected-target',
+      fixtureTargetLanguage: 'es'
+    });
+    vi.spyOn(spanish, 'checkReadiness').mockImplementation((signal) => {
+      observedSignal = signal;
+      started.resolve();
+      return new Promise((resolve) => {
+        signal?.addEventListener('abort', () => resolve({
+          ready: false,
+          provider: 'deterministic-mock',
+          model: 'mock'
+        }), { once: true });
+      });
+    });
+    const host = createRelayHostProduction({
+      environment: 'local-mock',
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: {
+        ...createTestHostSecurityComposition(),
+        mode: 'local-mock'
+      },
+      languageBoundaryMode: 'fixture',
+      transcriptionAdapters: {
+        es: spanish,
+        tr: new DeterministicMockTranscriptionAdapter({
+          evidenceCategory: 'selected-target',
+          fixtureTargetLanguage: 'tr'
+        })
+      }
+    });
+    await host.start();
+    const ready = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+    await started.promise;
+    const stopping = host.stop();
+    expect(observedSignal?.aborted).toBe(true);
+    await expect(ready).resolves.toMatchObject({ status: 503 });
+    await stopping;
+    expect(host.lifecycleState).toBe('stopped');
+  });
+
+  it('fails readiness independently when telemetry is unavailable', async () => {
+    const telemetryCheck = vi.fn(async () => false);
+    const host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: telemetryCheck,
+        shutdown: async () => undefined
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+    await host.start();
+    expect((await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`)).status).toBe(503);
+    expect(telemetryCheck).toHaveBeenCalledTimes(1);
+    await host.stop();
+  });
+
+  it('hard-bounds telemetry shutdown to exactly five seconds', async () => {
+    const shutdown = vi.fn(() => new Promise<void>(() => undefined));
+    const host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: async () => true,
+        shutdown
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+    await host.start();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let settled = false;
+      const stopping = host.stop().then(() => {
+        settled = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(shutdown).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await stopping;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      await host.stop();
+    }
   });
 });
 
@@ -1337,6 +2413,7 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: Object.freeze(['https://app.example']),
         allowNullOrigin: true
       }),
+      metricSink: productionTestMetricSink(),
       security: testSecurityWith({ maintenance: { checkReadiness } })
     });
     await host.start();
@@ -1387,7 +2464,8 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: Object.freeze(['https://app.example']),
         allowNullOrigin: false
       }),
-      security
+      metricSink: productionTestMetricSink(),
+      security: security.composition
     });
     await host.start();
 
@@ -1486,7 +2564,8 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: Object.freeze(['https://app.example']),
         allowNullOrigin: false
       }),
-      security
+      metricSink: productionTestMetricSink(),
+      security: security.composition
     });
     await host.start();
     const baseUrl = `http://127.0.0.1:${hostPort(host)}`;
@@ -1527,6 +2606,7 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: Object.freeze(['https://app.example']),
         allowNullOrigin: false
       }),
+      metricSink: productionTestMetricSink(),
       security: createTestHostSecurityComposition()
     });
     await host.start();
@@ -1590,6 +2670,7 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: ['https://app.example'],
         allowNullOrigin: false
       },
+      metricSink: productionTestMetricSink(),
       security
     });
     await host.start();
@@ -1711,6 +2792,7 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: productionTestMetricSink(),
       security: testSecurityWith({ runtime: { revokeCurrentInstallation } })
     });
     await host.start();
@@ -1771,6 +2853,7 @@ describe('relay HTTP/WebSocket host', () => {
         allowedOrigins: ['https://app.example'],
         allowNullOrigin: true
       },
+      metricSink: productionTestMetricSink(),
       security: testSecurityWith({ runtime: stateSpies })
     });
     await host.start();
@@ -1933,16 +3016,26 @@ describe('relay HTTP/WebSocket host', () => {
         )
       };
       host = createRelayHostProduction({
-        environment: ENVIRONMENT,
+        environment: 'local-mock',
         origin: ORIGIN,
         port: 0,
         gatePolicyVersion: GATE_POLICY_VERSION,
-        security: testSecurityWith({
-          runtime: { consumeSessionTicket, promoteCredential }
-        }),
-        transcriptionAdapter: createSynchronousFinalEventAdapter(),
+        security: {
+          ...testSecurityWith({
+            runtime: { consumeSessionTicket, promoteCredential }
+          }),
+          mode: 'local-mock'
+        },
+        languageBoundaryMode: 'fixture',
+        transcriptionAdapters: {
+          es: createSynchronousFinalEventAdapter(),
+          tr: createSynchronousFinalEventAdapter()
+        },
         languageClassifier: observingControlledClassifier(() => undefined),
-        generationService: new GenerationService(provider)
+        generationService: new GenerationService({
+          provider,
+          validator: new DeterministicFixtureLanguageValidator()
+        })
       });
       await host.start();
 
@@ -2058,6 +3151,7 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: productionTestMetricSink(),
       security: testSecurityWith({
         runtime: { consumeSessionTicket, revokeCurrentInstallation }
       })
@@ -2137,6 +3231,7 @@ describe('relay HTTP/WebSocket host', () => {
         origin: ORIGIN,
         port: 0,
         gatePolicyVersion: GATE_POLICY_VERSION,
+        metricSink: productionTestMetricSink(),
         security: testSecurityWith({
           runtime: {
             consumeSessionTicket,
@@ -2278,6 +3373,17 @@ describe('relay HTTP/WebSocket host', () => {
     expect(result.stderr).not.toContain(CONFIG_CANARY);
   });
 
+  it.each(['SIGTERM', 'SIGINT'] as const)(
+    'awaits successful %s shutdown without truncating process cleanup',
+    async (signal) => {
+      const result = await runRelayMainAndSignal(signal);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toMatch(/^relay listening on \d+\n$/);
+      expect(result.stderr).toBe('');
+    },
+    15_000
+  );
+
   it('consumes development tickets once and burns expired or mismatched tickets', async () => {
     let now = 1_000;
     const store = new DevelopmentTicketStore({ clock: () => now, ticketLifetimeMs: 10 });
@@ -2388,7 +3494,10 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      generationService: new GenerationService(provider)
+      generationService: new GenerationService({
+        provider,
+        validator: new DeterministicFixtureLanguageValidator()
+      })
     });
     await host.start();
 
@@ -2499,9 +3608,12 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      generationService: new GenerationService(new DeterministicMockProvider({
+      generationService: new GenerationService({
+        provider: new DeterministicMockProvider({
         complete: { failure: new Error(CANARY) }
-      }))
+        }),
+        validator: new DeterministicFixtureLanguageValidator()
+      })
     });
     await host.start();
     const issued = await issueTicket(host);
@@ -2535,19 +3647,21 @@ describe('relay HTTP/WebSocket host', () => {
     await closed;
   });
 
-  it('classifies and suppresses an asynchronous partial without another inbound message', async () => {
+  it('suppresses an asynchronous partial without classification or another inbound message', async () => {
     await host.stop();
-    const classified = createDeferred();
+    const classified = vi.fn();
     const receivedTypes: string[] = [];
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createAsyncCallbackAdapter(),
+      transcriptionAdapters: {
+        es: createAsyncCallbackAdapter(),
+        tr: createAsyncCallbackAdapter()
+      },
       languageClassifier: observingControlledClassifier((text) => {
-        expect(text).toBe('es-selected-target-partial-1');
-        classified.resolve();
+        classified(text);
       })
     });
     await host.start();
@@ -2570,7 +3684,8 @@ describe('relay HTTP/WebSocket host', () => {
       sessionEpoch: Number(ready.sessionEpoch),
       utteranceId: UTTERANCE_ID
     }));
-    await classified.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(classified).not.toHaveBeenCalled();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(receivedTypes).not.toContain('transcript.partial');
     const closed = waitForClose(socket);
@@ -2579,20 +3694,21 @@ describe('relay HTTP/WebSocket host', () => {
   });
 
   it.each(['microtask', 'immediate'] as const)(
-    'classifies a %s partial arriving while an async drain is already scheduled',
+    'suppresses a %s partial arriving while an async drain is already scheduled',
     async (mode) => {
     await host.stop();
     const classifiedTexts: string[] = [];
-    const secondClassified = createDeferred();
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createTwoAsyncEventAdapter(mode),
+      transcriptionAdapters: {
+        es: createTwoAsyncEventAdapter(mode),
+        tr: createTwoAsyncEventAdapter(mode)
+      },
       languageClassifier: observingControlledClassifier((text) => {
         classifiedTexts.push(text);
-        if (text === 'es-selected-target-partial-2') secondClassified.resolve();
       })
     });
     await host.start();
@@ -2608,8 +3724,8 @@ describe('relay HTTP/WebSocket host', () => {
       utteranceId: UTTERANCE_ID
     }));
 
-    await secondClassified.promise;
-    expect(classifiedTexts).toContain('es-selected-target-partial-2');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(classifiedTexts).toEqual([]);
     socket.close(1000, 'test_done');
     await waitForClose(socket);
     }
@@ -2622,7 +3738,10 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createSynchronousFailureAdapter(),
+      transcriptionAdapters: {
+        es: createSynchronousFailureAdapter(),
+        tr: createSynchronousFailureAdapter()
+      },
       languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
@@ -2660,7 +3779,10 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: createSynchronousFinalEventAdapter(),
+      transcriptionAdapters: {
+        es: createSynchronousFinalEventAdapter(),
+        tr: createSynchronousFinalEventAdapter()
+      },
       languageClassifier: observingControlledClassifier(() => undefined)
     });
     await host.start();
@@ -2731,27 +3853,21 @@ describe('relay HTTP/WebSocket host', () => {
     }
   });
 
-  it('reschedules a partial enqueued while the first async classification is blocked', async () => {
+  it('suppresses queued partials without classification', async () => {
     await host.stop();
     const fixture = createBlockedDeliveryAdapter();
-    const classificationReleased = createDeferred();
-    const firstClassificationStarted = createDeferred();
-    const secondClassificationFinished = createDeferred();
     const classifiedTexts: string[] = [];
     host = createRelayHost({
       environment: ENVIRONMENT,
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
-      transcriptionAdapter: fixture.adapter,
-      languageClassifier: observingControlledClassifier(async (text) => {
+      transcriptionAdapters: {
+        es: fixture.adapter,
+        tr: fixture.adapter
+      },
+      languageClassifier: observingControlledClassifier((text) => {
         classifiedTexts.push(text);
-        if (text === 'es-selected-target-partial-1') {
-          firstClassificationStarted.resolve();
-          await classificationReleased.promise;
-        } else if (text === 'es-selected-target-partial-2') {
-          secondClassificationFinished.resolve();
-        }
       })
     });
     await host.start();
@@ -2770,14 +3886,9 @@ describe('relay HTTP/WebSocket host', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     fixture.emitFirstEvent();
 
-    await firstClassificationStarted.promise;
     fixture.emitSecondEvent();
-    classificationReleased.resolve();
-    await secondClassificationFinished.promise;
-    expect(classifiedTexts).toEqual([
-      'es-selected-target-partial-1',
-      'es-selected-target-partial-2'
-    ]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(classifiedTexts).toEqual([]);
     socket.close(1000, 'test_done');
     await waitForClose(socket);
   });
@@ -2789,6 +3900,110 @@ describe('relay HTTP/WebSocket host', () => {
     await host.stop();
     await expect(closed).resolves.toBe(1001);
     expect(host.server.listening).toBe(false);
+  });
+
+  it('awaits tracked durable endSession cleanup before telemetry shutdown', async () => {
+    await host.stop();
+    const ending = createDeferred();
+    const order: string[] = [];
+    const endSession = vi.fn(async () => {
+      await ending.promise;
+      order.push('end-session');
+    });
+    const telemetryShutdown = vi.fn(async () => {
+      order.push('telemetry');
+    });
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith({ runtime: { endSession } }),
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: async () => true,
+        shutdown: telemetryShutdown
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const ready = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    await ready;
+
+    const stopping = host.stop();
+    await vi.waitFor(() => expect(endSession).toHaveBeenCalledTimes(1));
+    expect(telemetryShutdown).not.toHaveBeenCalled();
+    ending.resolve();
+    await stopping;
+    expect(order).toEqual(['end-session', 'telemetry']);
+  });
+
+  it('keeps deployed deny-all WSS transcript and generation content isolated', async () => {
+    await host.stop();
+    const provider = new DeterministicMockProvider({
+      id: 'deterministic-mock-deployed-deny',
+      complete: {
+        result: {
+          englishTranslation: 'must never be exposed',
+          suggestions: [
+            { englishText: 'never', selectedTargetText: 'nunca' },
+            { englishText: 'never', selectedTargetText: 'asla' }
+          ]
+        }
+      }
+    });
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      metricSink: productionTestMetricSink(),
+      languageBoundaryMode: 'deny-all',
+      generationService: new GenerationService({
+        provider,
+        validator: new FailClosedGeneratedLanguageValidator()
+      })
+    });
+    await host.start();
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const seen: string[] = [];
+    socket.on('message', (data) => {
+      try {
+        const message = asObject(JSON.parse(data.toString()) as unknown);
+        if (typeof message.type === 'string') seen.push(message.type);
+      } catch {
+        // Only protocol JSON is relevant to this assertion.
+      }
+    });
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const decision = nextMessage(socket, (message) => message.type === 'language.decision');
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+    socket.send(JSON.stringify({
+      type: 'utterance.commit',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 0
+    }));
+    await expect(decision).resolves.toMatchObject({ decision: 'uncertain' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).not.toContain('transcript.final');
+    expect(seen).not.toContain('translation.ready');
+    expect(seen).not.toContain('suggestions.ready');
+    expect(provider.completeCalls).toBe(0);
+    socket.close(1000, 'test_done');
+    await waitForClose(socket);
   });
 
   it.each([
@@ -2843,6 +4058,7 @@ describe('relay HTTP/WebSocket host', () => {
       origin: ORIGIN,
       port: 0,
       gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: productionTestMetricSink(),
       security
     });
     await host.start();
