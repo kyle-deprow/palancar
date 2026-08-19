@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  DeterministicFixtureLanguageValidator,
   DeterministicMockProvider,
   GenerationError,
   GenerationService,
   MetadataOnlyEvidenceCollector,
   createGenerationEvidenceRecord,
   createAcceptedTargetTurn,
+  isDeterministicFixtureLanguageValidator,
   isAcceptedTargetTurn
 } from '../src/index.js';
 import type {
@@ -14,6 +16,10 @@ import type {
   GenerationProvider,
   GenerationProviderCompletion,
   GenerationProviderCompletionInput,
+  GeneratedLanguageValidationEvidence,
+  GeneratedLanguageValidationInput,
+  GeneratedLanguageValidator,
+  MetadataOnlyEvidenceCollectorLike,
   SuggestionPhrasePair
 } from '../src/index.js';
 
@@ -61,6 +67,39 @@ function validCompletionInput(): GenerationProviderCompletionInput {
     gatePolicyVersion: '1.0.0',
     targetTranscript: 'source text'
   };
+}
+
+function serviceWithValidator(
+  provider: GenerationProvider,
+  evidenceCollector?: MetadataOnlyEvidenceCollectorLike
+): GenerationService {
+  return new GenerationService(
+    provider,
+    new DeterministicFixtureLanguageValidator(),
+    evidenceCollector
+  );
+}
+
+function validLanguageEvidence(
+  input: GeneratedLanguageValidationInput,
+  invalidIndex?: number
+): GeneratedLanguageValidationEvidence {
+  return {
+    checks: input.checks.map((item, index) => ({
+      slot: item.slot,
+      expectedLanguage: item.expectedLanguage,
+      detectedLanguage: index === invalidIndex ? 'other' : item.expectedLanguage,
+      verdict: index === invalidIndex ? 'mismatch' : 'match',
+      confidenceBasisPoints: 10_000
+    })) as unknown as GeneratedLanguageValidationEvidence['checks']
+  };
+}
+
+function languageValidator(
+  validate: GeneratedLanguageValidator['validate'],
+  id = 'test-language-validator'
+): GeneratedLanguageValidator {
+  return { id, version: '1.0.0', validate };
 }
 
 describe('accepted target boundary', () => {
@@ -130,7 +169,7 @@ describe('one-call completion', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion('Where is the station?', suggestions(2)) }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const result = await service.complete(turn('es'));
 
     expect(result).toEqual({
@@ -164,7 +203,7 @@ describe('one-call completion', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion('Where is the station?', suggestions(count)) }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const result = await service.complete(turn('tr'));
 
     expect(result.suggestions).toHaveLength(count);
@@ -187,7 +226,7 @@ describe('one-call completion', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion() }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const accepted = turn();
     const forgedTurn = { ...accepted } as AcceptedTargetTurn;
 
@@ -208,7 +247,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
         { result: completion('Recovered English') }
       ]
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const accepted = turn();
 
     try {
@@ -241,7 +280,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion('English', malformedSuggestions) }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
 
     await expect(service.complete(turn())).rejects.toMatchObject({
       category: 'invalid-provider-result'
@@ -260,7 +299,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
         ]) }
       ]
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const accepted = turn();
 
     await expect(service.complete(accepted)).rejects.toMatchObject({
@@ -279,7 +318,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
         { result: completion('x'.repeat(257)) }
       ]
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
 
     await expect(service.complete(turn())).resolves.toMatchObject({
       englishTranslation: 'x'.repeat(256)
@@ -306,7 +345,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
           { result: completion('English', [overlengthPair, suggestions(2)[1] as SuggestionPhrasePair]) }
         ]
       });
-      const service = new GenerationService(provider);
+      const service = serviceWithValidator(provider);
 
       const exactResult = await service.complete(turn());
       expect(exactResult.suggestions[0]?.[field]).toBe('x'.repeat(160));
@@ -320,7 +359,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion(), delayMs: 10 }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const first = turn('es');
     const second = turn('tr', 2);
 
@@ -340,7 +379,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion(), delayMs: 10 }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const accepted = turn();
 
     await service.complete(accepted);
@@ -364,7 +403,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
         { result: completion('English two') }
       ]
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const first = turn('es', 1, 'first transcript');
     const second = turn('es', 1, 'second transcript');
 
@@ -390,7 +429,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion(), delayMs: 50 }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const firstController = new AbortController();
     const secondController = new AbortController();
     const firstPromise = service.complete(turn(), { signal: firstController.signal });
@@ -419,7 +458,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
         }, { once: true });
       })
     };
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const controller = new AbortController();
     const addListener = vi.spyOn(controller.signal, 'addEventListener');
     const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
@@ -440,7 +479,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion() }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const controller = new AbortController();
     controller.abort();
 
@@ -488,6 +527,584 @@ describe('deterministic mock provider input validation', () => {
   });
 });
 
+describe('mandatory generated-language validation', () => {
+  it('requires a valid validator and never falls back to permissive validation', () => {
+    const provider = new DeterministicMockProvider({ complete: { result: completion() } });
+
+    expect(() => new GenerationService(provider, undefined as never)).toThrowError(
+      expect.objectContaining({ category: 'invalid-validator' })
+    );
+    expect(() => new GenerationService({ provider } as never)).toThrowError(
+      expect.objectContaining({ category: 'invalid-validator' })
+    );
+
+    const hostile = Object.create(null) as Record<string, unknown>;
+    let getterCalls = 0;
+    Object.defineProperties(hostile, {
+      id: {
+        get: () => {
+          getterCalls += 1;
+          throw new Error('validator canary must not leak');
+        }
+      },
+      version: { value: '1.0.0' },
+      validate: { value: async () => ({ checks: [] }) }
+    });
+    let error: unknown;
+    try {
+      new GenerationService(provider, hostile as unknown as GeneratedLanguageValidator);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ category: 'invalid-validator' });
+    expect(getterCalls).toBe(0);
+    expect(String(error) + JSON.stringify(error)).not.toContain('canary');
+  });
+
+  it('normalizes a revoked validator proxy as content-free invalid-validator', () => {
+    const provider = new DeterministicMockProvider({ complete: { result: completion() } });
+    const revoked = Proxy.revocable(languageValidator(async (input) =>
+      validLanguageEvidence(input)), {});
+    revoked.revoke();
+
+    let error: unknown;
+    try {
+      new GenerationService(provider, revoked.proxy);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      category: 'invalid-validator',
+      message: 'Invalid generated-language validator.'
+    });
+    expect((error as { readonly cause?: unknown }).cause).toBeUndefined();
+    expect(String(error) + JSON.stringify(error)).not.toContain('revoked');
+  });
+
+  it.each(['validator', 'languageValidationTimeoutMs'] as const)(
+    'rejects a throwing options %s accessor without invoking it',
+    (field) => {
+      const canary = `throwing-options-${field}-canary`;
+      let getterCalls = 0;
+      const options = {
+        provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator: new DeterministicFixtureLanguageValidator()
+      } as Record<string, unknown>;
+      Object.defineProperty(options, field, {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1;
+          throw new Error(canary);
+        }
+      });
+
+      let error: unknown;
+      try {
+        new GenerationService(options as never);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({ category: 'invalid-validator' });
+      expect(getterCalls).toBe(0);
+      expect((error as { readonly cause?: unknown }).cause).toBeUndefined();
+      expect(String(error) + JSON.stringify(error)).not.toContain(canary);
+    }
+  );
+
+  it('normalizes revoked options and timeout values as invalid-validator', () => {
+    const revokedOptions = Proxy.revocable({}, {});
+    revokedOptions.revoke();
+    expect(() => new GenerationService(revokedOptions.proxy as never)).toThrowError(
+      expect.objectContaining({ category: 'invalid-validator' })
+    );
+
+    const revokedTimeout = Proxy.revocable({}, {});
+    revokedTimeout.revoke();
+    let error: unknown;
+    try {
+      new GenerationService({
+        provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator: new DeterministicFixtureLanguageValidator(),
+        languageValidationTimeoutMs: revokedTimeout.proxy as never
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ category: 'invalid-validator' });
+    expect(String(error) + JSON.stringify(error)).not.toContain('revoked');
+  });
+
+  it.each([0, 10_001, 1.5, Number.NaN])(
+    'rejects invalid validator timeout %s',
+    (languageValidationTimeoutMs) => {
+      const provider = new DeterministicMockProvider({ complete: { result: completion() } });
+      expect(() => new GenerationService({
+        provider,
+        validator: new DeterministicFixtureLanguageValidator(),
+        languageValidationTimeoutMs
+      })).toThrowError(expect.objectContaining({ category: 'invalid-validator' }));
+    }
+  );
+
+  it.each([1, 10_000])('accepts timeout boundary %d', (languageValidationTimeoutMs) => {
+    expect(() => new GenerationService({
+      provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator: new DeterministicFixtureLanguageValidator(),
+      languageValidationTimeoutMs
+    })).not.toThrow();
+  });
+
+  it.each([
+    [2, 'es', 5],
+    [3, 'tr', 7]
+  ] as const)(
+    'supplies canonical frozen checks for %d suggestions in %s',
+    async (count, target, expectedCount) => {
+      const provider = new DeterministicMockProvider({
+        complete: { result: completion('Canonical English', suggestions(count)) }
+      });
+      let inspected = false;
+      const validator = languageValidator(async (input) => {
+        expect(input.checks.map(({ slot, text, expectedLanguage }) => ({
+          slot,
+          text,
+          expectedLanguage
+        }))).toEqual([
+          { slot: 'translation.english', text: 'Canonical English', expectedLanguage: 'en' },
+          {
+            slot: 'suggestion[0].english',
+            text: 'Where is the station?',
+            expectedLanguage: 'en'
+          },
+          {
+            slot: 'suggestion[0].target',
+            text: '¿Dónde está la estación?',
+            expectedLanguage: target
+          },
+          {
+            slot: 'suggestion[1].english',
+            text: 'Can you show me the way?',
+            expectedLanguage: 'en'
+          },
+          {
+            slot: 'suggestion[1].target',
+            text: '¿Puedes mostrarme el camino?',
+            expectedLanguage: target
+          },
+          ...(count === 3 ? [
+            { slot: 'suggestion[2].english', text: 'Thank you.', expectedLanguage: 'en' },
+            { slot: 'suggestion[2].target', text: 'Gracias.', expectedLanguage: target }
+          ] : [])
+        ]);
+        expect(Object.isFrozen(input)).toBe(true);
+        expect(Object.isFrozen(input.checks)).toBe(true);
+        expect(input.checks.every(Object.isFrozen)).toBe(true);
+        inspected = true;
+        return validLanguageEvidence(input);
+      }, 'canonical-test-validator');
+      const service = new GenerationService(provider, validator);
+
+      await service.complete(turn(target));
+
+      expect(inspected).toBe(true);
+      expect(service.evidence[0]).toMatchObject({
+        validatorId: 'canonical-test-validator',
+        validatorVersion: '1.0.0',
+        languageValidationStatus: 'accepted',
+        languageValidationCheckCount: expectedCount,
+        languageValidationNonmatchCount: 0
+      });
+    }
+  );
+
+  it('exposes an unforgeable local-fixture validator brand without retaining inputs', async () => {
+    const fixture = new DeterministicFixtureLanguageValidator();
+    const lookalike = {
+      id: fixture.id,
+      version: fixture.version,
+      validate: fixture.validate.bind(fixture)
+    };
+
+    expect(isDeterministicFixtureLanguageValidator(fixture)).toBe(true);
+    expect(isDeterministicFixtureLanguageValidator(lookalike)).toBe(false);
+    expect(isDeterministicFixtureLanguageValidator(null)).toBe(false);
+    expect(Object.keys(fixture)).not.toContain('inputs');
+    expect('inputs' in fixture).toBe(false);
+
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      fixture
+    );
+    await service.complete(turn());
+    expect(Object.keys(fixture)).not.toContain('inputs');
+    expect('inputs' in fixture).toBe(false);
+  });
+
+  it('runs structural validation before the validator', async () => {
+    const validate = vi.fn(async (input: GeneratedLanguageValidationInput) =>
+      validLanguageEvidence(input));
+    const provider = new DeterministicMockProvider({
+      complete: { result: completion('English', suggestions(2).slice(0, 1)) }
+    });
+    const service = new GenerationService(provider, languageValidator(validate));
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'invalid-provider-result'
+    });
+    expect(validate).not.toHaveBeenCalled();
+    expect(service.evidence[0]).toMatchObject({ languageValidationCheckCount: 0 });
+  });
+
+  it('does not construct a completion until validation succeeds', async () => {
+    let release: ((value: GeneratedLanguageValidationEvidence) => void) | undefined;
+    let capturedInput: GeneratedLanguageValidationInput | undefined;
+    const validator = languageValidator(async (input) => new Promise((resolve) => {
+      capturedInput = input;
+      release = resolve;
+    }));
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion('Validated English') } }),
+      validator
+    );
+    let settled = false;
+    const operation = service.complete(turn()).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(capturedInput).toBeDefined());
+
+    expect(settled).toBe(false);
+    expect(service.evidence).toEqual([]);
+    release?.(validLanguageEvidence(capturedInput as GeneratedLanguageValidationInput));
+    await expect(operation).resolves.toMatchObject({ englishTranslation: 'Validated English' });
+  });
+
+  it('rejects a definite wrong-language verdict without exposing generated text', async () => {
+    const canary = 'wrong-language-generated-canary';
+    const validator = languageValidator(async (input) => validLanguageEvidence(input, 2));
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion(canary) } }),
+      validator
+    );
+
+    let error: unknown;
+    try {
+      await service.complete(turn());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      category: 'invalid-generated-language',
+      message: 'Generated text failed language validation.'
+    });
+    expect(String(error) + JSON.stringify(error)).not.toContain(canary);
+    expect(service.evidence[0]).toMatchObject({
+      status: 'failure',
+      failureCategory: 'invalid-generated-language',
+      languageValidationStatus: 'rejected',
+      languageValidationCheckCount: 5,
+      languageValidationNonmatchCount: 1
+    });
+  });
+
+  it.each([
+    ['mismatch verdict', { verdict: 'mismatch' }],
+    ['indeterminate verdict', { verdict: 'indeterminate' }],
+    ['different detected language', { detectedLanguage: 'other' }],
+    ['undetermined detected language', { detectedLanguage: 'undetermined' }],
+    ['null confidence', { confidenceBasisPoints: null }]
+  ] as const)('rejects match-incomplete evidence with %s', async (_name, override) => {
+    const validator = languageValidator(async (input) => {
+      const evidence = validLanguageEvidence(input);
+      const checks = [...evidence.checks];
+      checks[0] = { ...checks[0] as GeneratedLanguageValidationEvidence['checks'][number], ...override };
+      return { checks } as unknown as GeneratedLanguageValidationEvidence;
+    });
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator
+    );
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'invalid-generated-language'
+    });
+    expect(service.evidence[0]).toMatchObject({
+      languageValidationStatus: 'rejected',
+      languageValidationNonmatchCount: 1
+    });
+  });
+
+  it('accepts exact confidence boundaries including zero', async () => {
+    const validator = languageValidator(async (input) => {
+      const evidence = validLanguageEvidence(input);
+      return {
+        checks: evidence.checks.map((item, index) => ({
+          ...item,
+          confidenceBasisPoints: index === 0 ? 0 : 10_000
+        }))
+      } as unknown as GeneratedLanguageValidationEvidence;
+    });
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator
+    );
+
+    await expect(service.complete(turn())).resolves.toBeDefined();
+  });
+
+  it.each([-1, 10_001, 1.5])(
+    'rejects malformed confidence evidence %s',
+    async (confidenceBasisPoints) => {
+      const validator = languageValidator(async (input) => {
+        const evidence = validLanguageEvidence(input);
+        const checks = [...evidence.checks];
+        checks[0] = {
+          ...checks[0] as GeneratedLanguageValidationEvidence['checks'][number],
+          confidenceBasisPoints
+        };
+        return { checks } as unknown as GeneratedLanguageValidationEvidence;
+      });
+      const service = new GenerationService(
+        new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator
+      );
+
+      await expect(service.complete(turn())).rejects.toMatchObject({
+        category: 'language-validation-failure'
+      });
+    }
+  );
+
+  it.each(['extra-key', 'reordered', 'short'] as const)(
+    'rejects %s validator evidence as a validation failure',
+    async (kind) => {
+      const validator = languageValidator(async (input) => {
+        const valid = validLanguageEvidence(input);
+        if (kind === 'extra-key') {
+          return { ...valid, content: 'evidence canary' } as unknown as GeneratedLanguageValidationEvidence;
+        }
+        const checks = [...valid.checks];
+        if (kind === 'reordered') {
+          [checks[0], checks[1]] = [checks[1] as typeof checks[number], checks[0] as typeof checks[number]];
+        } else {
+          checks.pop();
+        }
+        return { checks } as unknown as GeneratedLanguageValidationEvidence;
+      });
+      const service = new GenerationService(
+        new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator
+      );
+
+      await expect(service.complete(turn())).rejects.toMatchObject({
+        category: 'language-validation-failure',
+        message: 'Generated-language validation failed.'
+      });
+    }
+  );
+
+  it('normalizes a revoked checks proxy and records valid failed metadata', async () => {
+    const validator = languageValidator(async (input) => {
+      const revoked = Proxy.revocable(validLanguageEvidence(input).checks, {});
+      revoked.revoke();
+      return { checks: revoked.proxy } as GeneratedLanguageValidationEvidence;
+    });
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator
+    );
+
+    let error: unknown;
+    try {
+      await service.complete(turn());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      category: 'language-validation-failure',
+      message: 'Generated-language validation failed.'
+    });
+    expect((error as { readonly cause?: unknown }).cause).toBeUndefined();
+    expect(String(error) + JSON.stringify(error)).not.toContain('revoked');
+    expect(service.evidence).toMatchObject([{
+      status: 'failure',
+      failureCategory: 'language-validation-failure',
+      languageValidationStatus: 'failed',
+      languageValidationCheckCount: 5,
+      languageValidationNonmatchCount: 0
+    }]);
+    expect(() => createGenerationEvidenceRecord(service.evidence[0])).not.toThrow();
+  });
+
+  it('normalizes validator exceptions and canary-bearing hostile evidence', async () => {
+    const canary = 'validator-exception-canary';
+    const throwing = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      languageValidator(async () => {
+        throw new Error(canary);
+      })
+    );
+    let throwingError: unknown;
+    try {
+      await throwing.complete(turn());
+    } catch (caught) {
+      throwingError = caught;
+    }
+    expect(throwingError).toMatchObject({ category: 'language-validation-failure' });
+    expect(String(throwingError) + JSON.stringify(throwingError)).not.toContain(canary);
+
+    const hostileChecks = new Proxy([], {
+      ownKeys: () => {
+        throw new Error(canary);
+      }
+    });
+    const hostile = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      languageValidator(async () => ({ checks: hostileChecks } as unknown as GeneratedLanguageValidationEvidence))
+    );
+    let hostileError: unknown;
+    try {
+      await hostile.complete(turn());
+    } catch (caught) {
+      hostileError = caught;
+    }
+    expect(hostileError).toMatchObject({ category: 'language-validation-failure' });
+    expect(String(hostileError) + JSON.stringify(hostileError)).not.toContain(canary);
+  });
+
+  it('uses the 3000ms default and aborts a noncooperative validator on timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let validatorSignal: AbortSignal | undefined;
+      const validator = languageValidator(async (_input, context) => {
+        validatorSignal = context.signal;
+        return new Promise<GeneratedLanguageValidationEvidence>(() => undefined);
+      });
+      const service = new GenerationService({
+        provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator
+      });
+      const operation = service.complete(turn());
+      await vi.advanceTimersByTimeAsync(2_999);
+      let settled = false;
+      void operation.finally(() => {
+        settled = true;
+      }).catch(() => undefined);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(operation).rejects.toMatchObject({ category: 'language-validation-failure' });
+      expect(validatorSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps timeout classification when child abort synchronously aborts the caller', async () => {
+    vi.useFakeTimers();
+    try {
+      const caller = new AbortController();
+      let childSignal: AbortSignal | undefined;
+      const validator = languageValidator(async (_input, context) => {
+        childSignal = context.signal;
+        context.signal.addEventListener('abort', () => caller.abort(), { once: true });
+        return new Promise<GeneratedLanguageValidationEvidence>(() => undefined);
+      });
+      const service = new GenerationService({
+        provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+        validator,
+        languageValidationTimeoutMs: 1
+      });
+      const operation = service.complete(turn(), { signal: caller.signal });
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(operation).rejects.toMatchObject({
+        category: 'language-validation-failure',
+        message: 'Generated-language validation failed.'
+      });
+      expect(childSignal?.aborted).toBe(true);
+      expect(caller.signal.aborted).toBe(true);
+      expect(service.evidence).toMatchObject([{
+        status: 'failure',
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'failed',
+        languageValidationCheckCount: 5,
+        languageValidationNonmatchCount: 0
+      }]);
+      expect(() => createGenerationEvidenceRecord(service.evidence[0])).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles cancellation while a validator ignores its abort signal', async () => {
+    let validatorSignal: AbortSignal | undefined;
+    const validator = languageValidator(async (_input, context) => {
+      validatorSignal = context.signal;
+      return new Promise<GeneratedLanguageValidationEvidence>(() => undefined);
+    });
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator
+    );
+    const controller = new AbortController();
+    const operation = service.complete(turn(), { signal: controller.signal });
+    await vi.waitFor(() => expect(validatorSignal).toBeDefined());
+
+    controller.abort();
+    await expect(operation).rejects.toMatchObject({ category: 'provider-failure' });
+    expect(validatorSignal?.aborted).toBe(true);
+    expect(service.evidence).toMatchObject([{
+      status: 'cancelled',
+      languageValidationStatus: 'cancelled',
+      languageValidationCheckCount: 5,
+      languageValidationNonmatchCount: 0
+    }]);
+    expect(() => createGenerationEvidenceRecord(service.evidence[0])).not.toThrow();
+  });
+
+  it('ignores a late timed-out verdict and lets a retry complete independently', async () => {
+    vi.useFakeTimers();
+    try {
+      let firstInput: GeneratedLanguageValidationInput | undefined;
+      let resolveFirst: ((value: GeneratedLanguageValidationEvidence) => void) | undefined;
+      let calls = 0;
+      const validator = languageValidator(async (input) => {
+        calls += 1;
+        if (calls === 1) {
+          firstInput = input;
+          return new Promise((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        return validLanguageEvidence(input);
+      });
+      const service = new GenerationService({
+        provider: new DeterministicMockProvider({ complete: { result: completion('Retry English') } }),
+        validator,
+        languageValidationTimeoutMs: 1
+      });
+
+      const first = service.complete(turn());
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(first).rejects.toMatchObject({ category: 'language-validation-failure' });
+      await expect(service.complete(turn())).resolves.toMatchObject({
+        englishTranslation: 'Retry English'
+      });
+      resolveFirst?.(validLanguageEvidence(firstInput as GeneratedLanguageValidationInput));
+      await Promise.resolve();
+
+      expect(calls).toBe(2);
+      expect(service.evidence).toHaveLength(2);
+      expect(service.evidence.map((item) => item.status)).toEqual(['failure', 'success']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('provider snapshots and hostile values', () => {
   it('rejects provider identity accessors without exposing their messages', () => {
     const provider = Object.create(null) as Record<string, unknown>;
@@ -505,7 +1122,7 @@ describe('provider snapshots and hostile values', () => {
 
     let captured: unknown;
     try {
-      new GenerationService(provider as unknown as GenerationProvider);
+      serviceWithValidator(provider as unknown as GenerationProvider);
     } catch (error) {
       captured = error;
     }
@@ -517,7 +1134,7 @@ describe('provider snapshots and hostile values', () => {
 
   it('copies provider identity once for getters, evidence, and calls', async () => {
     const provider = new DeterministicMockProvider({ complete: { result: completion('English') } });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     (provider as { id: string }).id = 'changed-provider';
     (provider as { version: string }).version = '2.0.0';
 
@@ -555,7 +1172,7 @@ describe('provider snapshots and hostile values', () => {
       version: '1.0.0',
       complete: async () => completionResults.shift() as GenerationProviderCompletion
     };
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const errors: unknown[] = [];
     for (let index = 0; index < 2; index += 1) {
       try {
@@ -607,7 +1224,7 @@ describe('provider snapshots and hostile values', () => {
         suggestions: pairResults.shift() as GenerationProviderCompletion['suggestions']
       })
     };
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const errors: unknown[] = [];
     for (let index = 0; index < 2; index += 1) {
       try {
@@ -646,6 +1263,11 @@ describe('metadata-only evidence', () => {
       ...extra,
       providerId: 'test-provider',
       providerVersion: '1.0.0',
+      validatorId: 'test-validator',
+      validatorVersion: '1.0.0',
+      languageValidationStatus: status === 'success' ? 'accepted' : 'not-run',
+      languageValidationCheckCount: status === 'success' ? 5 : 0,
+      languageValidationNonmatchCount: 0,
       startMonotonicMs: 10,
       endMonotonicMs: 20,
       latencyMs: 10
@@ -661,7 +1283,7 @@ describe('metadata-only evidence', () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion('English suggestion text', suggestions(2)) }
     });
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     const accepted = turn('tr');
     await service.complete(accepted);
 
@@ -681,7 +1303,7 @@ describe('metadata-only evidence', () => {
 
   it('uses one validated configured collector without duplicate storage', async () => {
     const collector = new MetadataOnlyEvidenceCollector();
-    const service = new GenerationService(
+    const service = serviceWithValidator(
       new DeterministicMockProvider({ complete: { result: completion('English') } }),
       collector
     );
@@ -706,6 +1328,11 @@ describe('metadata-only evidence', () => {
       status: 'success',
       providerId: 'test-provider',
       providerVersion: '1.0.0',
+      validatorId: 'test-validator',
+      validatorVersion: '1.0.0',
+      languageValidationStatus: 'accepted',
+      languageValidationCheckCount: 5,
+      languageValidationNonmatchCount: 0,
       startMonotonicMs: 10,
       endMonotonicMs: 20,
       latencyMs: 10,
@@ -720,7 +1347,7 @@ describe('metadata-only evidence', () => {
         throw new Error('evidence collector secret');
       }
     };
-    const successService = new GenerationService(
+    const successService = serviceWithValidator(
       new DeterministicMockProvider({ complete: { result: completion('Recovered') } }),
       throwingCollector
     );
@@ -736,6 +1363,7 @@ describe('metadata-only evidence', () => {
           throw new Error('provider secret');
         }
       },
+      validator: new DeterministicFixtureLanguageValidator(),
       evidenceCollector: throwingCollector
     });
     await expect(failureService.complete(turn())).rejects.toMatchObject({
@@ -758,7 +1386,11 @@ describe('metadata-only evidence', () => {
         context.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
       })
     };
-    const service = new GenerationService({ provider, evidenceCollector: throwingCollector });
+    const service = new GenerationService({
+      provider,
+      validator: new DeterministicFixtureLanguageValidator(),
+      evidenceCollector: throwingCollector
+    });
     const controller = new AbortController();
     const operation = service.complete(turn(), { signal: controller.signal });
     await Promise.resolve();
@@ -781,6 +1413,11 @@ describe('metadata-only evidence', () => {
       failureCategory: 'invented-category',
       providerId: 'test-provider',
       providerVersion: '1.0.0',
+      validatorId: 'test-validator',
+      validatorVersion: '1.0.0',
+      languageValidationStatus: 'not-run',
+      languageValidationCheckCount: 0,
+      languageValidationNonmatchCount: 0,
       startMonotonicMs: 10,
       endMonotonicMs: 20,
       latencyMs: 10
@@ -812,7 +1449,7 @@ describe('provider-neutral contract', () => {
       version: '1.0.0',
       complete
     };
-    const service = new GenerationService(provider);
+    const service = serviceWithValidator(provider);
     await service.complete(turn());
 
     expect(complete).toHaveBeenCalledTimes(1);

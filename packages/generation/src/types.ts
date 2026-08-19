@@ -10,6 +10,10 @@ import type {
   Version
 } from '@palancar/contracts';
 import type { TargetLanguage } from '@palancar/language-registry';
+import type {
+  GeneratedLanguageValidationStatus,
+  GeneratedLanguageValidator
+} from './language-validation.js';
 
 export type GenerationOperation = 'complete' | 'translate' | 'suggest';
 
@@ -20,6 +24,9 @@ export type GenerationErrorCategory =
   | 'invalid-provider'
   | 'invalid-provider-result'
   | 'provider-failure'
+  | 'invalid-validator'
+  | 'invalid-generated-language'
+  | 'language-validation-failure'
   | 'invalid-evidence';
 
 export interface AcceptedTargetTurnInput {
@@ -98,6 +105,11 @@ export interface GenerationEvidenceRecord extends GenerationCorrelation {
   readonly failureCategory?: GenerationErrorCategory;
   readonly providerId: string;
   readonly providerVersion: string;
+  readonly validatorId: string;
+  readonly validatorVersion: string;
+  readonly languageValidationStatus: GeneratedLanguageValidationStatus;
+  readonly languageValidationCheckCount: 0 | 5 | 7;
+  readonly languageValidationNonmatchCount: number;
   readonly startMonotonicMs: number;
   readonly endMonotonicMs: number;
   readonly latencyMs: number;
@@ -105,6 +117,8 @@ export interface GenerationEvidenceRecord extends GenerationCorrelation {
 
 export interface GenerationServiceOptions {
   readonly provider: GenerationProvider;
+  readonly validator: GeneratedLanguageValidator;
+  readonly languageValidationTimeoutMs?: number;
   readonly evidenceCollector?: MetadataOnlyEvidenceCollectorLike;
   readonly evidence?: MetadataOnlyEvidenceCollectorLike;
 }

@@ -29,6 +29,11 @@ const ALLOWED_KEYS = new Set([
   'failureCategory',
   'providerId',
   'providerVersion',
+  'validatorId',
+  'validatorVersion',
+  'languageValidationStatus',
+  'languageValidationCheckCount',
+  'languageValidationNonmatchCount',
   'startMonotonicMs',
   'endMonotonicMs',
   'latencyMs'
@@ -41,6 +46,9 @@ const FAILURE_CATEGORIES: ReadonlySet<GenerationErrorCategory> = new Set([
   'invalid-provider',
   'invalid-provider-result',
   'provider-failure',
+  'invalid-validator',
+  'invalid-generated-language',
+  'language-validation-failure',
   'invalid-evidence'
 ]);
 
@@ -143,6 +151,22 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
     !PROVIDER_VALUE.test(snapshot.providerId) ||
     typeof snapshot.providerVersion !== 'string' ||
     !PROVIDER_VALUE.test(snapshot.providerVersion) ||
+    typeof snapshot.validatorId !== 'string' ||
+    !PROVIDER_VALUE.test(snapshot.validatorId) ||
+    typeof snapshot.validatorVersion !== 'string' ||
+    !PROVIDER_VALUE.test(snapshot.validatorVersion) ||
+    (snapshot.languageValidationStatus !== 'not-run' &&
+      snapshot.languageValidationStatus !== 'accepted' &&
+      snapshot.languageValidationStatus !== 'rejected' &&
+      snapshot.languageValidationStatus !== 'failed' &&
+      snapshot.languageValidationStatus !== 'cancelled') ||
+    (snapshot.languageValidationCheckCount !== 0 &&
+      snapshot.languageValidationCheckCount !== 5 &&
+      snapshot.languageValidationCheckCount !== 7) ||
+    typeof snapshot.languageValidationNonmatchCount !== 'number' ||
+    !Number.isSafeInteger(snapshot.languageValidationNonmatchCount) ||
+    snapshot.languageValidationNonmatchCount < 0 ||
+    snapshot.languageValidationNonmatchCount > snapshot.languageValidationCheckCount ||
     !isFiniteNonNegative(snapshot.startMonotonicMs) ||
     !isFiniteNonNegative(snapshot.endMonotonicMs) ||
     snapshot.endMonotonicMs < snapshot.startMonotonicMs ||
@@ -152,10 +176,41 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
     invalid();
   }
   if (
+    (snapshot.languageValidationStatus === 'not-run' &&
+      (snapshot.languageValidationCheckCount !== 0 || snapshot.languageValidationNonmatchCount !== 0)) ||
+    (snapshot.languageValidationStatus === 'accepted' &&
+      (snapshot.languageValidationCheckCount === 0 || snapshot.languageValidationNonmatchCount !== 0)) ||
+    (snapshot.languageValidationStatus === 'rejected' &&
+      (snapshot.languageValidationCheckCount === 0 || snapshot.languageValidationNonmatchCount === 0)) ||
+    ((snapshot.languageValidationStatus === 'failed' ||
+      snapshot.languageValidationStatus === 'cancelled') &&
+      snapshot.languageValidationCheckCount === 0)
+  ) {
+    invalid();
+  }
+  if (
     snapshot.status === 'failure' &&
     (typeof snapshot.failureCategory !== 'string' ||
       !MACHINE_VALUE.test(snapshot.failureCategory) ||
       !FAILURE_CATEGORIES.has(snapshot.failureCategory as GenerationErrorCategory))
+  ) {
+    invalid();
+  }
+  if (
+    (snapshot.status === 'success' && snapshot.languageValidationStatus !== 'accepted') ||
+    (snapshot.status === 'failure' &&
+      snapshot.failureCategory === 'invalid-generated-language' &&
+      snapshot.languageValidationStatus !== 'rejected') ||
+    (snapshot.status === 'failure' &&
+      snapshot.failureCategory === 'language-validation-failure' &&
+      snapshot.languageValidationStatus !== 'failed') ||
+    (snapshot.status === 'failure' &&
+      snapshot.failureCategory !== 'invalid-generated-language' &&
+      snapshot.failureCategory !== 'language-validation-failure' &&
+      snapshot.languageValidationStatus !== 'not-run') ||
+    (snapshot.status === 'cancelled' &&
+      snapshot.languageValidationStatus !== 'not-run' &&
+      snapshot.languageValidationStatus !== 'cancelled')
   ) {
     invalid();
   }
@@ -179,6 +234,11 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
     ...(snapshot.failureCategory === undefined ? {} : { failureCategory: snapshot.failureCategory }),
     providerId: snapshot.providerId,
     providerVersion: snapshot.providerVersion,
+    validatorId: snapshot.validatorId,
+    validatorVersion: snapshot.validatorVersion,
+    languageValidationStatus: snapshot.languageValidationStatus,
+    languageValidationCheckCount: snapshot.languageValidationCheckCount,
+    languageValidationNonmatchCount: snapshot.languageValidationNonmatchCount,
     startMonotonicMs: snapshot.startMonotonicMs,
     endMonotonicMs: snapshot.endMonotonicMs,
     latencyMs: snapshot.latencyMs

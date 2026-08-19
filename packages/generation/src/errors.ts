@@ -7,6 +7,9 @@ const PUBLIC_MESSAGES: Readonly<Record<GenerationErrorCategory, string>> = Objec
   'invalid-provider': 'Invalid generation provider.',
   'invalid-provider-result': 'Provider returned invalid generation data.',
   'provider-failure': 'Generation provider failed.',
+  'invalid-validator': 'Invalid generated-language validator.',
+  'invalid-generated-language': 'Generated text failed language validation.',
+  'language-validation-failure': 'Generated-language validation failed.',
   'invalid-evidence': 'Invalid generation evidence.'
 });
 

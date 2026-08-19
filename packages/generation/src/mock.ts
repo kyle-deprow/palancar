@@ -2,6 +2,11 @@ import { VERSION_PATTERN } from '@palancar/contracts';
 import { isTargetLanguage } from '@palancar/language-registry';
 
 import type {
+  GeneratedLanguageValidationEvidence,
+  GeneratedLanguageValidationInput,
+  GeneratedLanguageValidator
+} from './language-validation.js';
+import type {
   GenerationProvider,
   GenerationProviderCompletion,
   GenerationProviderCompletionInput,
@@ -28,6 +33,14 @@ export interface DeterministicMockProviderConfiguration {
 export interface DeterministicMockCallCounts {
   readonly complete: number;
 }
+
+export interface DeterministicFixtureLanguageValidatorConfiguration {
+  readonly id?: string;
+  readonly version?: string;
+  readonly delayMs?: number;
+}
+
+const DETERMINISTIC_FIXTURE_VALIDATORS = new WeakSet<object>();
 
 const PROVIDER_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const CANONICAL_V4_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -276,6 +289,64 @@ export class DeterministicMockProvider implements GenerationProvider {
     }
     return copyCompletion(step.result);
   }
+}
+
+/**
+ * Deterministic all-match validator for local/test fixtures only. Production
+ * composition must provide a real generated-language validator.
+ */
+export class DeterministicFixtureLanguageValidator implements GeneratedLanguageValidator {
+  readonly id: string;
+  readonly version: string;
+  readonly #delayMs: number | undefined;
+
+  constructor(configuration: DeterministicFixtureLanguageValidatorConfiguration = {}) {
+    if (!isRecord(configuration)) {
+      failConfiguration();
+    }
+    const id = configuration.id ?? 'deterministic-language-fixture';
+    const version = configuration.version ?? '1.0.0';
+    if (
+      typeof id !== 'string' ||
+      !PROVIDER_VALUE.test(id) ||
+      typeof version !== 'string' ||
+      !PROVIDER_VALUE.test(version) ||
+      (configuration.delayMs !== undefined &&
+        (typeof configuration.delayMs !== 'number' ||
+          !Number.isSafeInteger(configuration.delayMs) ||
+          configuration.delayMs < 0))
+    ) {
+      failConfiguration();
+    }
+    this.id = id;
+    this.version = version;
+    this.#delayMs = configuration.delayMs;
+    DETERMINISTIC_FIXTURE_VALIDATORS.add(this);
+  }
+
+  async validate(
+    input: GeneratedLanguageValidationInput,
+    context: { readonly signal: AbortSignal }
+  ): Promise<GeneratedLanguageValidationEvidence> {
+    await delay(this.#delayMs, context.signal);
+    return Object.freeze({
+      checks: Object.freeze(input.checks.map((item) => Object.freeze({
+        slot: item.slot,
+        expectedLanguage: item.expectedLanguage,
+        detectedLanguage: item.expectedLanguage,
+        verdict: 'match' as const,
+        confidenceBasisPoints: 10_000
+      }))) as GeneratedLanguageValidationEvidence['checks']
+    });
+  }
+}
+
+export function isDeterministicFixtureLanguageValidator(
+  value: unknown
+): value is DeterministicFixtureLanguageValidator {
+  return typeof value === 'object' &&
+    value !== null &&
+    DETERMINISTIC_FIXTURE_VALIDATORS.has(value);
 }
 
 export function createDeterministicMockProvider(
