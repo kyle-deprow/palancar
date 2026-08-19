@@ -28,6 +28,11 @@ output "runtime_principal_id" {
   value       = azurerm_user_assigned_identity.runtime.principal_id
 }
 
+output "runtime_application_insights_role_assignment_id" {
+  description = "Application Insights-scoped Monitoring Metrics Publisher assignment for the runtime identity."
+  value       = azurerm_role_assignment.runtime_application_insights.id
+}
+
 output "operator_security_table_role_assignment_id" {
   description = "SecurityState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
   value       = azurerm_role_assignment.operator_security_table.id
