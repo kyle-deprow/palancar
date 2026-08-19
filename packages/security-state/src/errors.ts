@@ -2,6 +2,7 @@ export const SECURITY_ERROR_MESSAGES = Object.freeze({
   'invalid-input': 'Security operation rejected.',
   'invalid-pairing': 'Pairing operation rejected.',
   'invalid-credential': 'Credential operation rejected.',
+  'credential-conflict': 'Credential operation conflicted.',
   'invalid-ticket': 'Ticket operation rejected.',
   'stale-lease': 'Lease operation rejected.',
   'session-rejected': 'Session operation rejected.',

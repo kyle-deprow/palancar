@@ -330,4 +330,59 @@ describe('Azure Table durable adapter against Azurite HTTPS/OAuth', () => {
       `session:${redeemed.value.installationId}`
     )).resolves.toBeUndefined();
   }, 60_000);
+
+  it('exercises durable promotion and credential-authenticated revocation replay paths', async () => {
+    const issued = await stores.operator.issuePairing({ operatorScope: 'operator-azurite-rotation' });
+    const redeemed = await stores.runtime.redeemPairing({
+      pairingCode: issued.pairingCode,
+      trustedSource: 'azurite-rotation-source' as HostTrustedOpaqueSource
+    });
+    const pending = await stores.runtime.beginCredentialRotation({ credential: redeemed.credential });
+    await expect(stores.runtime.beginCredentialRotation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    const promoted = await stores.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(promoted).toMatchObject({ status: 'promoted', credentialVersion: 2 });
+    const replayedPromotion = await stores.runtime.promoteCredential({
+      pendingCredential: pending.pendingCredential
+    });
+    expect(replayedPromotion).toMatchObject({ status: 'already-promoted', credentialVersion: 2 });
+
+    const revokePairing = await stores.operator.issuePairing({ operatorScope: 'operator-azurite-revocation' });
+    const revokeEnrollment = await stores.runtime.redeemPairing({
+      pairingCode: revokePairing.pairingCode,
+      trustedSource: 'azurite-revocation-source' as HostTrustedOpaqueSource
+    });
+    const ticket = await stores.runtime.issueSessionTicket({
+      credential: revokeEnrollment.credential,
+      environment: ENVIRONMENT,
+      audience: AUDIENCE,
+      intent: 'new'
+    });
+    const opening = await stores.runtime.consumeSessionTicket({
+      ticket: ticket.ticket,
+      environment: ENVIRONMENT,
+      audience: AUDIENCE,
+      intent: 'new'
+    });
+    const active = await stores.runtime.activateSession({
+      lease: opening,
+      message: { type: 'session.start', protocolVersion: 1 }
+    });
+    const revoked = await stores.runtime.revokeCurrentInstallation({ credential: revokeEnrollment.credential });
+    expect(revoked).toMatchObject({
+      status: 'revoked',
+      invalidatedSession: { sessionId: active.sessionId, sessionEpoch: active.sessionEpoch }
+    });
+    const replayedRevocation = await stores.runtime.revokeCurrentInstallation({
+      credential: revokeEnrollment.credential
+    });
+    expect(replayedRevocation).toMatchObject({
+      status: 'already-revoked',
+      revokedAt: revoked.revokedAt,
+      tombstoneVersion: revoked.tombstoneVersion,
+      invalidatedSession: revoked.invalidatedSession
+    });
+    await expect(stores.runtime.heartbeatSession({ lease: active }))
+      .rejects.toMatchObject({ category: 'stale-lease' });
+  }, 60_000);
 });

@@ -321,6 +321,7 @@ describe('deployment boundary and exact schemas', () => {
       () => store.beginCredentialRotation({ credential: redeemed.credential, ...extra } as never),
       () => store.promoteCredential({ pendingCredential: token(99), ...extra } as never),
       () => store.revokeInstallation({ installationId: redeemed.installationId, ...extra } as never),
+      () => store.revokeCurrentInstallation({ credential: redeemed.credential, ...extra } as never),
       () => store.issueSessionTicket({ ...ticketRequest(redeemed.credential), ...extra } as never),
       () => store.consumeSessionTicket({ ...ticketConsume(ticket.ticket), ...extra } as never),
       () => store.activateSession({
@@ -559,6 +560,20 @@ describe('credential rotation, tickets, and session leases', () => {
     await expect(absolute.store.authenticateCredential({ credential: absoluteEnrollment.redeemed.credential }))
       .rejects.toMatchObject({ category: 'invalid-credential' });
 
+    const capped = fixture();
+    const cappedEnrollment = await enroll(capped.store);
+    while (capped.fake.now() + CREDENTIAL_IDLE_TTL_MS < cappedEnrollment.redeemed.absoluteExpiresAt) {
+      const remaining = cappedEnrollment.redeemed.absoluteExpiresAt - capped.fake.now();
+      capped.fake.advance(Math.min(CREDENTIAL_IDLE_TTL_MS - 1, remaining - CREDENTIAL_IDLE_TTL_MS));
+      await capped.store.authenticateCredential({ credential: cappedEnrollment.redeemed.credential });
+    }
+    capped.fake.advance(cappedEnrollment.redeemed.absoluteExpiresAt - capped.fake.now() - 1);
+    await expect(capped.store.authenticateCredential({ credential: cappedEnrollment.redeemed.credential }))
+      .resolves.toMatchObject({ idleExpiresAt: cappedEnrollment.redeemed.absoluteExpiresAt });
+    capped.fake.advance(1);
+    await expect(capped.store.authenticateCredential({ credential: cappedEnrollment.redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+
     const revoked = fixture();
     const revokedEnrollment = await enroll(revoked.store);
     await revoked.store.revokeInstallation({ installationId: revokedEnrollment.redeemed.installationId });
@@ -591,6 +606,141 @@ describe('credential rotation, tickets, and session leases', () => {
       .rejects.toMatchObject({ category: 'invalid-credential' });
   });
 
+  it('reports pending rotation conflicts and returns frozen promotion replay metadata', async () => {
+    const { store, fake, redeemed, active } = await activeFixture();
+    const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+    await expect(store.beginCredentialRotation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    const promoted = await store.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(promoted).toMatchObject({
+      status: 'promoted',
+      confirmedAt: fake.now(),
+      idleExpiresAt: fake.now() + CREDENTIAL_IDLE_TTL_MS,
+      absoluteExpiresAt: redeemed.absoluteExpiresAt,
+      invalidatedSession: {
+        installationId: active.installationId,
+        sessionId: active.sessionId,
+        sessionEpoch: active.sessionEpoch
+      }
+    });
+    expect(Object.isFrozen(promoted)).toBe(true);
+    expect(Object.isFrozen(promoted.invalidatedSession)).toBe(true);
+    fake.advance(1);
+    const replay = await store.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(replay).toMatchObject({
+      status: 'already-promoted',
+      confirmedAt: fake.now(),
+      idleExpiresAt: fake.now() + CREDENTIAL_IDLE_TTL_MS,
+      absoluteExpiresAt: redeemed.absoluteExpiresAt
+    });
+    expect(replay.invalidatedSession).toBeUndefined();
+  });
+
+  it('detects a pending conflict before consuming candidate-token randomness', async () => {
+    let credentialCalls = 0;
+    const tokens: SecurityTokenFactory = Object.freeze({
+      pairingCode: () => pairing(1),
+      credential: () => {
+        credentialCalls += 1;
+        if (credentialCalls === 1) return token(1_000);
+        if (credentialCalls === 2) return token(1_001);
+        throw new Error('credential source failed');
+      },
+      ticket: () => token(2_000)
+    });
+    const fake = createFakeClock();
+    const store = createTestSecurityStateStore({
+      ...MOCK_PROVIDERS,
+      audience: AUDIENCE,
+      clock: fake.clock,
+      ids: deterministicIds(),
+      tokens
+    });
+    const { redeemed } = await enroll(store);
+    const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+    expect(pending.pendingCredential).toBe(token(1_001));
+    expect(credentialCalls).toBe(2);
+    await expect(store.beginCredentialRotation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    expect(credentialCalls).toBe(2);
+  });
+
+  it('replaces an expired pending credential exactly at its boundary', async () => {
+    const { store, fake } = fixture();
+    const { redeemed } = await enroll(store);
+    const first = await store.beginCredentialRotation({ credential: redeemed.credential });
+    fake.advance(PENDING_CREDENTIAL_TTL_MS - 1);
+    await expect(store.beginCredentialRotation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    expect(store.snapshot().credentials.filter((item) => item.status === 'pending')).toHaveLength(1);
+    fake.advance(1);
+    const second = await store.beginCredentialRotation({ credential: redeemed.credential });
+    expect(second.pendingCredentialVersion).toBe(first.pendingCredentialVersion);
+    expect(second.pendingExpiresAt).toBe(fake.now() + PENDING_CREDENTIAL_TTL_MS);
+    expect(store.snapshot().credentials).toEqual(expect.arrayContaining([
+      expect.objectContaining({ version: first.pendingCredentialVersion, status: 'expired' }),
+      expect.objectContaining({ version: second.pendingCredentialVersion, status: 'pending' })
+    ]));
+    expect(store.snapshot().credentials.filter((item) => item.status === 'pending')).toHaveLength(1);
+  });
+
+  it('revokes with the current credential and makes the former credential replay-safe', async () => {
+    const { store, fake, redeemed, active } = await activeFixture();
+    const first = await store.revokeCurrentInstallation({ credential: redeemed.credential });
+    expect(first).toMatchObject({
+      status: 'revoked',
+      revokedAt: fake.now(),
+      tombstoneVersion: 2,
+      invalidatedSession: {
+        installationId: active.installationId,
+        sessionId: active.sessionId,
+        sessionEpoch: active.sessionEpoch
+      }
+    });
+    const snapshot = store.snapshot();
+    const replay = await store.revokeCurrentInstallation({ credential: redeemed.credential });
+    expect(replay).toMatchObject({
+      ...first,
+      status: 'already-revoked'
+    });
+    expect(store.snapshot()).toEqual(snapshot);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first.invalidatedSession)).toBe(true);
+    await expect(store.revokeCurrentInstallation({ credential: token(999) }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it('serializes 100 rotation and credential-revocation contenders', async () => {
+    const rotation = fixture();
+    const { redeemed } = await enroll(rotation.store);
+    const beginnings = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      rotation.store.beginCredentialRotation({ credential: redeemed.credential })));
+    expect(beginnings.filter((item) => item.status === 'fulfilled')).toHaveLength(1);
+    expect(beginnings.filter((item) => item.status === 'rejected' &&
+      expectCategory(item.reason, 'credential-conflict'))).toHaveLength(99);
+    const winner = beginnings.find((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.store.beginCredentialRotation>>> =>
+      item.status === 'fulfilled');
+    if (winner === undefined) throw new Error('rotation winner missing');
+    const promotions = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      rotation.store.promoteCredential({ pendingCredential: winner.value.pendingCredential })));
+    expect(promotions.filter((item) => item.status === 'fulfilled')).toHaveLength(100);
+    expect(promotions.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.store.promoteCredential>>> =>
+      item.status === 'fulfilled' && item.value.status === 'promoted')).toHaveLength(1);
+    expect(promotions.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.store.promoteCredential>>> =>
+      item.status === 'fulfilled' && item.value.status === 'already-promoted')).toHaveLength(99);
+
+    const revocation = fixture();
+    const enrolled = await enroll(revocation.store);
+    const revocations = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      revocation.store.revokeCurrentInstallation({ credential: enrolled.redeemed.credential })));
+    expect(revocations.filter((item) => item.status === 'fulfilled')).toHaveLength(100);
+    expect(revocations.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof revocation.store.revokeCurrentInstallation>>> =>
+      item.status === 'fulfilled' && item.value.status === 'revoked')).toHaveLength(1);
+    expect(revocations.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof revocation.store.revokeCurrentInstallation>>> =>
+      item.status === 'fulfilled' && item.value.status === 'already-revoked')).toHaveLength(99);
+    expect(revocation.store.snapshot().installations[0]?.tombstoneVersion).toBe(2);
+  });
+
   it('promotion immediately ends prior-version sessions and invalidates their work', async () => {
     const { store, active, redeemed } = await activeFixture();
     await store.reserveAudio(audioRequest(active, 100));
@@ -612,6 +762,165 @@ describe('credential rotation, tickets, and session leases', () => {
       .rejects.toMatchObject({ category: 'generation-rejected' });
     await expect(store.providerStart({ claim: authorization.claim }))
       .rejects.toMatchObject({ category: 'generation-rejected' });
+  });
+
+  it.each([
+    { winner: 'promotion' as const },
+    { winner: 'revocation' as const }
+  ])('serializes promotion against credential-authenticated revocation when $winner wins', async ({ winner }) => {
+    const { store, redeemed } = await activeFixture();
+    const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+    const promotion = (): ReturnType<typeof store.promoteCredential> =>
+      store.promoteCredential({ pendingCredential: pending.pendingCredential });
+    const revocation = (): ReturnType<typeof store.revokeCurrentInstallation> =>
+      store.revokeCurrentInstallation({ credential: redeemed.credential });
+    const outcomes = await Promise.allSettled(winner === 'promotion'
+      ? [promotion(), revocation()]
+      : [revocation(), promotion()]);
+    expect(outcomes.filter((item) => item.status === 'fulfilled')).toHaveLength(1);
+    const fulfilled = outcomes.find((item) => item.status === 'fulfilled');
+    expect(fulfilled?.value).toMatchObject({ status: winner === 'promotion' ? 'promoted' : 'revoked' });
+    const installation = store.snapshot().installations[0];
+    expect(installation?.activeSessionId).toBeUndefined();
+    expect(installation?.status).toBe(winner === 'promotion' ? 'active' : 'revoked');
+    expect(store.snapshot().sessions.every((session) => !['opening', 'active'].includes(session.status))).toBe(true);
+    expect(outcomes.filter((item) => item.status === 'rejected').every((item) =>
+      (item.reason as SecurityStateError).category === 'invalid-credential'
+    )).toBe(true);
+  });
+
+  it.each([
+    { order: 'promotion-first' as const },
+    { order: 'revocation-first' as const }
+  ])('serializes promotion against ID-based revokeInstallation in $order order', async ({ order }) => {
+    const { store, redeemed } = await activeFixture();
+    const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+    const promotion = (): ReturnType<typeof store.promoteCredential> =>
+      store.promoteCredential({ pendingCredential: pending.pendingCredential });
+    const revocation = (): ReturnType<typeof store.revokeInstallation> =>
+      store.revokeInstallation({ installationId: redeemed.installationId });
+    const outcomes = await Promise.allSettled(order === 'promotion-first'
+      ? [promotion(), revocation()]
+      : [revocation(), promotion()]);
+    if (order === 'promotion-first') {
+      expect(outcomes[0]).toMatchObject({ status: 'fulfilled', value: { status: 'promoted' } });
+      expect(outcomes[1]?.status).toBe('fulfilled');
+    } else {
+      expect(outcomes[0]?.status).toBe('fulfilled');
+      expect(outcomes[1]).toMatchObject({
+        status: 'rejected',
+        reason: { category: 'invalid-credential' }
+      });
+    }
+    expect(store.snapshot().installations[0]).toMatchObject({
+      status: 'revoked',
+      tombstoneVersion: 2
+    });
+    expect(store.snapshot().installations[0]?.activeSessionId).toBeUndefined();
+    expect(store.snapshot().sessions.every((session) => !['opening', 'active'].includes(session.status))).toBe(true);
+  });
+
+  it('rejects malformed, unrelated, pending, retired, expired, and revoked credentials generically', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base.store);
+    const pending = await base.store.beginCredentialRotation({ credential: redeemed.credential });
+    await expect(base.store.promoteCredential({ pendingCredential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    await expect(base.store.revokeCurrentInstallation({ credential: pending.pendingCredential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    await expect(base.store.promoteCredential({ pendingCredential: 'not-a-credential' }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    await expect(base.store.promoteCredential({ pendingCredential: token(99_999) }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    const canary = 'CANARY-credential-value';
+    await base.store.promoteCredential({ pendingCredential: pending.pendingCredential });
+    await expect(base.store.revokeCurrentInstallation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+
+    const expired = fixture();
+    const expiredEnrollment = await enroll(expired.store);
+    const expiredPending = await expired.store.beginCredentialRotation({ credential: expiredEnrollment.redeemed.credential });
+    expired.fake.advance(PENDING_CREDENTIAL_TTL_MS);
+    await expect(expired.store.promoteCredential({ pendingCredential: expiredPending.pendingCredential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    try {
+      await expired.store.promoteCredential({ pendingCredential: canary });
+      expect.fail('expected expired credential rejection');
+    } catch (error) {
+      expect(error).toMatchObject({ category: 'invalid-credential' });
+      expect(String(error)).not.toContain(canary);
+      expect(error instanceof Error ? error.stack : '').not.toContain(canary);
+      expect(JSON.stringify(error)).not.toContain(canary);
+    }
+    expect(JSON.stringify(expired.store.snapshot())).not.toContain(canary);
+
+    const revoked = fixture();
+    const revokedEnrollment = await enroll(revoked.store);
+    await revoked.store.revokeCurrentInstallation({ credential: revokedEnrollment.redeemed.credential });
+    await expect(revoked.store.promoteCredential({ pendingCredential: revokedEnrollment.redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it.each([
+    {
+      name: 'malformed revocation',
+      exercise: async (): Promise<unknown> => {
+        const { store } = fixture();
+        return store.revokeCurrentInstallation({ credential: 'not-a-credential' });
+      }
+    },
+    {
+      name: 'expired-current revocation',
+      exercise: async (): Promise<unknown> => {
+        const { store, fake } = fixture();
+        const { redeemed } = await enroll(store);
+        fake.advance(CREDENTIAL_IDLE_TTL_MS);
+        return store.revokeCurrentInstallation({ credential: redeemed.credential });
+      }
+    },
+    {
+      name: 'retired promotion',
+      exercise: async (): Promise<unknown> => {
+        const { store } = fixture();
+        const { redeemed } = await enroll(store);
+        const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+        await store.promoteCredential({ pendingCredential: pending.pendingCredential });
+        expect(store.snapshot().credentials.find((item) => item.version === 1)?.status).toBe('retired');
+        return store.promoteCredential({ pendingCredential: redeemed.credential });
+      }
+    },
+    {
+      name: 'unrelated-revoked revocation',
+      exercise: async (): Promise<unknown> => {
+        const { store } = fixture();
+        const { redeemed } = await enroll(store);
+        const pending = await store.beginCredentialRotation({ credential: redeemed.credential });
+        await store.revokeCurrentInstallation({ credential: redeemed.credential });
+        expect(store.snapshot().credentials.find((item) =>
+          item.version === pending.pendingCredentialVersion)?.status).toBe('revoked');
+        expect(store.snapshot().installations[0]?.credentialVersion).not.toBe(pending.pendingCredentialVersion);
+        return store.revokeCurrentInstallation({ credential: pending.pendingCredential });
+      }
+    }
+  ])('rejects $name with invalid-credential', async ({ exercise }) => {
+    await expect(exercise()).rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it('keeps revocation credential canaries out of errors and state', async () => {
+    const { store } = fixture();
+    const before = store.snapshot();
+    const canary = 'CANARY-revocation-credential';
+    try {
+      await store.revokeCurrentInstallation({ credential: canary });
+      expect.fail('expected malformed revocation rejection');
+    } catch (error) {
+      expect(error).toMatchObject({ category: 'invalid-credential' });
+      expect(String(error)).not.toContain(canary);
+      expect(error instanceof Error ? error.stack : '').not.toContain(canary);
+      expect(JSON.stringify(error)).not.toContain(canary);
+    }
+    expect(store.snapshot()).toEqual(before);
+    expect(JSON.stringify(store.snapshot())).not.toContain(canary);
   });
 
   it('expires an unpromoted pending credential after exactly five minutes without retiring v1', async () => {

@@ -100,6 +100,7 @@ export interface AuthenticateCredentialInput { readonly credential: string; }
 export interface BeginCredentialRotationInput { readonly credential: string; }
 export interface PromoteCredentialInput { readonly pendingCredential: string; }
 export interface RevokeInstallationInput { readonly installationId: string; }
+export interface RevokeCurrentInstallationInput { readonly credential: string; }
 export interface TicketOperationInput extends TicketBinding { readonly credential: string; }
 export interface ConsumeTicketInput extends TicketBinding { readonly ticket: string; }
 export interface SessionStartMessage { readonly type: 'session.start'; readonly protocolVersion: 1; }
@@ -166,6 +167,18 @@ export interface InstallationMutationResult {
   readonly credentialVersion: number;
   readonly tombstoneVersion: number;
   readonly invalidatedSession?: InvalidatedSessionIdentity;
+}
+
+export interface CredentialPromotionResult extends InstallationMutationResult {
+  readonly status: 'promoted' | 'already-promoted';
+  readonly confirmedAt: number;
+  readonly idleExpiresAt: number;
+  readonly absoluteExpiresAt: number;
+}
+
+export interface InstallationRevocationResult extends InstallationMutationResult {
+  readonly status: 'revoked' | 'already-revoked';
+  readonly revokedAt: number;
 }
 
 export interface SessionTicketResult extends TicketBinding {
@@ -328,8 +341,11 @@ export interface SecurityRuntimeStore {
   readonly redeemPairing: (input: RedeemPairingInput) => Promise<PairingRedemptionResult>;
   readonly authenticateCredential: (input: AuthenticateCredentialInput) => Promise<CredentialAuthentication>;
   readonly beginCredentialRotation: (input: BeginCredentialRotationInput) => Promise<PendingCredentialResult>;
-  readonly promoteCredential: (input: PromoteCredentialInput) => Promise<InstallationMutationResult>;
+  readonly promoteCredential: (input: PromoteCredentialInput) => Promise<CredentialPromotionResult>;
   readonly revokeInstallation: (input: RevokeInstallationInput) => Promise<InstallationMutationResult>;
+  readonly revokeCurrentInstallation: (
+    input: RevokeCurrentInstallationInput,
+  ) => Promise<InstallationRevocationResult>;
   readonly issueSessionTicket: (input: TicketOperationInput) => Promise<SessionTicketResult>;
   readonly consumeSessionTicket: (input: ConsumeTicketInput) => Promise<SessionLease>;
   readonly activateSession: (input: ActivateSessionInput) => Promise<SessionLease>;

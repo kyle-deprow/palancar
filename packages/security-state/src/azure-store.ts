@@ -72,6 +72,7 @@ import {
   type CompleteGenerationInput,
   type ConsumeTicketInput,
   type CredentialAuthentication,
+  type CredentialPromotionResult,
   type DurableSecurityStateStore,
   type GenerationAuthorizationResult,
   type GenerationClaim,
@@ -79,6 +80,7 @@ import {
   type GenerationProviderStartResult,
   type HostTrustedOpaqueSource,
   type InstallationMutationResult,
+  type InstallationRevocationResult,
   type IssuePairingInput,
   type PairingIssueResult,
   type PairingOperatorStore,
@@ -88,6 +90,7 @@ import {
   type RedeemPairingInput,
   type ReserveAudioInput,
   type RevokeInstallationInput,
+  type RevokeCurrentInstallationInput,
   type RevokePairingInput,
   type SecurityAudience,
   type SecurityClock,
@@ -906,6 +909,26 @@ function sessionEntity(environment: string, row: Omit<SessionRow, 'entity'>): Az
     ...(row.activatedAt === undefined ? {} : { activatedAt: row.activatedAt }),
     ...(row.lastOperationId === undefined ? {} : { lastOperationId: row.lastOperationId })
   });
+}
+
+function sessionStateMatches(
+  row: SessionRow,
+  expected: Omit<SessionRow, 'entity'>
+): boolean {
+  return row.installationId === expected.installationId &&
+    row.status === expected.status &&
+    row.sessionId === expected.sessionId &&
+    row.sessionEpoch === expected.sessionEpoch &&
+    row.credentialVersion === expected.credentialVersion &&
+    row.tombstoneVersion === expected.tombstoneVersion &&
+    row.leaseVersion === expected.leaseVersion &&
+    row.leaseExpiresAt === expected.leaseExpiresAt &&
+    row.lastHeartbeatAt === expected.lastHeartbeatAt &&
+    row.lastActivityAt === expected.lastActivityAt &&
+    row.ticketHash === expected.ticketHash &&
+    row.ticketIssuedAt === expected.ticketIssuedAt &&
+    row.activatedAt === expected.activatedAt &&
+    row.lastOperationId === expected.lastOperationId;
 }
 
 function parseWindow(
@@ -1823,7 +1846,7 @@ class AzureSecurityStateCore {
         authentication.installation.pendingCredentialHash !== undefined &&
         authentication.installation.pendingExpiresAt !== undefined &&
         now < authentication.installation.pendingExpiresAt
-      ) fail('invalid-credential');
+      ) fail('credential-conflict');
       const pendingCredential = this.#candidate(this.#tokens.credential, assertCanonical256BitToken);
       const pendingHash = hashCredential(pendingCredential);
       const version = checkedIncrement(authentication.installation.currentCredentialVersion, 'invalid-credential');
@@ -1918,12 +1941,91 @@ class AzureSecurityStateCore {
     fail('state-unavailable');
   }
 
-  async promoteCredential(value: PromoteCredentialInput): Promise<InstallationMutationResult> {
+  async promoteCredential(value: PromoteCredentialInput): Promise<CredentialPromotionResult> {
     const input = exactDataObject(value, ['pendingCredential']);
+    try { hashCredential(input.pendingCredential); } catch { fail('invalid-credential'); }
+    const operation = operationId(this.#candidate(this.#ids.generationClaimId, assertCanonicalUuid));
     for (let attempt = 0; attempt < AZURE_CAS_ATTEMPTS; attempt += 1) {
       const now = this.#now();
       const authentication = await this.#readAuthentication(input.pendingCredential, now, true);
-      if (authentication === undefined || !authentication.pending) fail('invalid-credential');
+      if (authentication === undefined) fail('invalid-credential');
+      if (!authentication.pending) {
+        if (authentication.credential.version <= 1) fail('invalid-credential');
+        const idleExpiresAt = Math.min(
+          checkedAdd(now, CREDENTIAL_IDLE_TTL_MS, 'state-unavailable'),
+          authentication.installation.absoluteExpiresAt
+        );
+        if (
+          authentication.credential.lastUsedAt === now &&
+          authentication.credential.idleExpiresAt === idleExpiresAt &&
+          authentication.installation.lastActivityAt === now &&
+          authentication.installation.idleExpiresAt === idleExpiresAt
+        ) {
+          return freeze({
+            installationId: authentication.installation.installationId,
+            credentialVersion: authentication.credential.version,
+            tombstoneVersion: authentication.installation.tombstoneVersion,
+            status: 'already-promoted' as const,
+            confirmedAt: now,
+            idleExpiresAt,
+            absoluteExpiresAt: authentication.installation.absoluteExpiresAt
+          });
+        }
+        const credential: Omit<CredentialRow, 'entity'> = {
+          ...authentication.credential,
+          lastUsedAt: now,
+          idleExpiresAt
+        };
+        const installation = this.#touchInstallation(authentication.installation, now);
+        const mutations: readonly AzureTableMutation[] = [
+          {
+            type: 'replace',
+            entity: credentialEntity(this.environment, credential),
+            etag: authentication.credential.entity.etag
+          },
+          {
+            type: 'replace',
+            entity: installationEntity(this.environment, installation),
+            etag: authentication.installation.entity.etag
+          }
+        ];
+        try {
+          await this.#security.transaction(mutations);
+          return freeze({
+            installationId: installation.installationId,
+            credentialVersion: credential.version,
+            tombstoneVersion: installation.tombstoneVersion,
+            status: 'already-promoted' as const,
+            confirmedAt: now,
+            idleExpiresAt,
+            absoluteExpiresAt: installation.absoluteExpiresAt
+          });
+        } catch (error) {
+          if (isBoundary(error, 'conflict', 'precondition-failed')) continue;
+          if (isBoundary(error, 'ambiguous')) {
+            const reconciled = await this.#readAuthentication(input.pendingCredential, now, false);
+            if (
+              reconciled !== undefined && !reconciled.pending &&
+              reconciled.credential.version === credential.version &&
+              reconciled.credential.lastUsedAt === now &&
+              reconciled.credential.idleExpiresAt === idleExpiresAt &&
+              reconciled.installation.currentCredentialHash === credential.hash
+            ) {
+              return freeze({
+                installationId: reconciled.installation.installationId,
+                credentialVersion: reconciled.credential.version,
+                tombstoneVersion: reconciled.installation.tombstoneVersion,
+                status: 'already-promoted' as const,
+                confirmedAt: now,
+                idleExpiresAt,
+                absoluteExpiresAt: reconciled.installation.absoluteExpiresAt
+              });
+            }
+            continue;
+          }
+          mapBoundary(error);
+        }
+      }
       const currentEntity = await this.#point(
         this.#security,
         this.environment,
@@ -1948,14 +2050,15 @@ class AzureSecurityStateCore {
       if (current.status !== 'current' || !this.#credentialAudienceMatches(current)) fail('invalid-credential');
       const invalidates = (session.status === 'opening' || session.status === 'active') &&
         session.credentialVersion !== authentication.credential.version;
+      const idleExpiresAt = Math.min(
+        checkedAdd(now, CREDENTIAL_IDLE_TTL_MS, 'state-unavailable'),
+        authentication.installation.absoluteExpiresAt
+      );
       const pending: Omit<CredentialRow, 'entity'> = {
         ...authentication.credential,
         status: 'current',
         lastUsedAt: now,
-        idleExpiresAt: Math.min(
-          checkedAdd(now, CREDENTIAL_IDLE_TTL_MS, 'state-unavailable'),
-          authentication.installation.absoluteExpiresAt
-        ),
+        idleExpiresAt,
         pendingExpiresAt: undefined
       };
       const installation: Omit<InstallationRow, 'entity'> = {
@@ -1978,15 +2081,16 @@ class AzureSecurityStateCore {
             }
           : {})
       };
-      const nextSession: Omit<SessionRow, 'entity'> = invalidates
-        ? {
-            ...session,
-            status: 'ended',
-            leaseVersion: checkedIncrement(session.leaseVersion, 'state-unavailable'),
-            leaseExpiresAt: now,
-            lastActivityAt: now
-          }
-        : session;
+      const nextSession: Omit<SessionRow, 'entity'> = {
+        ...session,
+        lastOperationId: operation,
+        ...(invalidates ? {
+          status: 'ended' as const,
+          leaseVersion: checkedIncrement(session.leaseVersion, 'state-unavailable'),
+          leaseExpiresAt: now,
+          lastActivityAt: now
+        } : {})
+      };
       const mutations: readonly AzureTableMutation[] = [
         { type: 'replace', entity: credentialEntity(this.environment, { ...current, status: 'retired' }), etag: current.entity.etag },
         { type: 'replace', entity: credentialEntity(this.environment, pending), etag: authentication.credential.entity.etag },
@@ -1999,6 +2103,10 @@ class AzureSecurityStateCore {
           installationId: installation.installationId,
           credentialVersion: installation.currentCredentialVersion,
           tombstoneVersion: installation.tombstoneVersion,
+          status: 'promoted' as const,
+          confirmedAt: now,
+          idleExpiresAt,
+          absoluteExpiresAt: installation.absoluteExpiresAt,
           ...(invalidates && session.sessionId !== undefined ? {
             invalidatedSession: freeze({
               installationId: session.installationId,
@@ -2011,11 +2119,39 @@ class AzureSecurityStateCore {
         if (isBoundary(error, 'conflict', 'precondition-failed')) continue;
         if (isBoundary(error, 'ambiguous')) {
           const reconciled = await this.#readAuthentication(input.pendingCredential, now, false);
-          if (reconciled !== undefined && reconciled.credential.version === pending.version) {
+          const reconciledSessionEntity = await this.#point(
+            this.#security,
+            this.environment,
+            sessionKey(authentication.installation.installationId)
+          );
+          const reconciledSession = reconciledSessionEntity === undefined
+            ? undefined
+            : parseSession(
+                reconciledSessionEntity,
+                this.environment,
+                authentication.installation.installationId
+              );
+          if (
+            reconciled !== undefined && !reconciled.pending &&
+            reconciled.credential.version === pending.version &&
+            reconciled.credential.lastUsedAt === now &&
+            reconciled.credential.idleExpiresAt === idleExpiresAt &&
+            reconciled.installation.lastActivityAt === installation.lastActivityAt &&
+            reconciled.installation.idleExpiresAt === installation.idleExpiresAt &&
+            reconciled.installation.currentCredentialHash === pending.hash &&
+            reconciled.installation.currentCredentialVersion === pending.version &&
+            reconciled.installation.pendingCredentialHash === undefined &&
+            reconciledSession !== undefined &&
+            sessionStateMatches(reconciledSession, nextSession)
+          ) {
             return freeze({
               installationId: installation.installationId,
               credentialVersion: pending.version,
               tombstoneVersion: installation.tombstoneVersion,
+              status: 'promoted' as const,
+              confirmedAt: now,
+              idleExpiresAt,
+              absoluteExpiresAt: installation.absoluteExpiresAt,
               ...(invalidates && session.sessionId !== undefined ? {
                 invalidatedSession: freeze({
                   installationId: session.installationId,
@@ -2024,6 +2160,234 @@ class AzureSecurityStateCore {
                 })
               } : {})
             });
+          }
+          continue;
+        }
+        mapBoundary(error);
+      }
+    }
+    fail('state-unavailable');
+  }
+
+  async revokeCurrentInstallation(value: RevokeCurrentInstallationInput): Promise<InstallationRevocationResult> {
+    const input = exactDataObject(value, ['credential']);
+    let credentialHash: CanonicalSha256;
+    try { credentialHash = hashCredential(input.credential); } catch { fail('invalid-credential'); }
+    const operation = operationId(this.#candidate(this.#ids.generationClaimId, assertCanonicalUuid));
+    for (let attempt = 0; attempt < AZURE_CAS_ATTEMPTS; attempt += 1) {
+      const now = this.#now();
+      const credentialEntityValue = await this.#point(
+        this.#security,
+        this.environment,
+        credentialKey(credentialHash)
+      );
+      if (credentialEntityValue === undefined) fail('invalid-credential');
+      const credential = parseCredential(credentialEntityValue, this.environment, credentialHash);
+      const installationEntityValue = await this.#point(
+        this.#security,
+        this.environment,
+        installationKey(credential.installationId)
+      );
+      if (installationEntityValue === undefined) fail('invalid-credential');
+      const installation = parseInstallation(
+        installationEntityValue,
+        this.environment,
+        credential.installationId
+      );
+      if (
+        credential.status === 'revoked' && installation.status === 'revoked' &&
+        credential.hash === installation.currentCredentialHash &&
+        credential.version === installation.currentCredentialVersion &&
+        installation.revokedAt !== undefined &&
+        this.#credentialAudienceMatches(credential)
+      ) {
+        const sessionEntityValue = await this.#point(
+          this.#security,
+          this.environment,
+          sessionKey(installation.installationId)
+        );
+        const session = sessionEntityValue === undefined
+          ? undefined
+          : parseSession(sessionEntityValue, this.environment, installation.installationId);
+        const invalidatedSession = session?.status === 'revoked' && session.sessionId !== undefined
+          ? freeze({
+              installationId: installation.installationId,
+              sessionId: session.sessionId,
+              sessionEpoch: session.sessionEpoch
+            })
+          : undefined;
+        return freeze({
+          installationId: installation.installationId,
+          credentialVersion: installation.currentCredentialVersion,
+          tombstoneVersion: installation.tombstoneVersion,
+          status: 'already-revoked' as const,
+          revokedAt: installation.revokedAt,
+          ...(invalidatedSession === undefined ? {} : { invalidatedSession })
+        });
+      }
+      if (
+        credential.status !== 'current' ||
+        !this.#credentialValid(credential, installation, now, false)
+      ) fail('invalid-credential');
+      const pendingEntity = installation.pendingCredentialHash === undefined
+        ? undefined
+        : await this.#point(this.#security, this.environment, credentialKey(installation.pendingCredentialHash));
+      if (installation.pendingCredentialHash !== undefined && pendingEntity === undefined) fail('state-unavailable');
+      const sessionEntityValue = await this.#point(
+        this.#security,
+        this.environment,
+        sessionKey(installation.installationId)
+      );
+      if (sessionEntityValue === undefined) fail('state-unavailable');
+      const pending = pendingEntity === undefined || installation.pendingCredentialHash === undefined
+        ? undefined
+        : parseCredential(pendingEntity, this.environment, installation.pendingCredentialHash);
+      if (pending !== undefined && !this.#credentialAudienceMatches(pending)) fail('invalid-credential');
+      const session = parseSession(sessionEntityValue, this.environment, installation.installationId);
+      const invalidates = (session.status === 'opening' || session.status === 'active') &&
+        session.sessionId !== undefined;
+      const nextInstallation: Omit<InstallationRow, 'entity'> = {
+        ...installation,
+        status: 'revoked',
+        tombstoneVersion: checkedIncrement(installation.tombstoneVersion, 'state-unavailable'),
+        revokedAt: now,
+        lastActivityAt: now,
+        activeSessionId: undefined,
+        activeSessionEpoch: session.sessionEpoch,
+        activeSessionLockVersion: checkedIncrement(installation.activeSessionLockVersion, 'state-unavailable'),
+        activeSessionLeaseVersion: invalidates
+          ? checkedIncrement(session.leaseVersion, 'state-unavailable')
+          : session.leaseVersion,
+        activeSessionLeaseExpiresAt: now
+      };
+      const nextSession: Omit<SessionRow, 'entity'> = {
+        ...session,
+        lastOperationId: operation,
+        ...(invalidates ? {
+          status: 'revoked' as const,
+          leaseVersion: checkedIncrement(session.leaseVersion, 'state-unavailable'),
+          leaseExpiresAt: now,
+          lastActivityAt: now
+        } : {})
+      };
+      const mutations: AzureTableMutation[] = [
+        {
+          type: 'replace',
+          entity: installationEntity(this.environment, nextInstallation),
+          etag: installation.entity.etag
+        },
+        {
+          type: 'replace',
+          entity: credentialEntity(this.environment, { ...credential, status: 'revoked' }),
+          etag: credential.entity.etag
+        },
+        {
+          type: 'replace',
+          entity: sessionEntity(this.environment, nextSession),
+          etag: session.entity.etag
+        }
+      ];
+      if (pending !== undefined) {
+        mutations.push({
+          type: 'replace',
+          entity: credentialEntity(this.environment, { ...pending, status: 'revoked' }),
+          etag: pending.entity.etag
+        });
+      }
+      try {
+        await this.#security.transaction(mutations);
+        return freeze({
+          installationId: installation.installationId,
+          credentialVersion: installation.currentCredentialVersion,
+          tombstoneVersion: nextInstallation.tombstoneVersion,
+          status: 'revoked' as const,
+          revokedAt: now,
+          ...(invalidates && session.sessionId !== undefined ? {
+            invalidatedSession: freeze({
+              installationId: session.installationId,
+              sessionId: session.sessionId,
+              sessionEpoch: session.sessionEpoch
+            })
+          } : {})
+        });
+      } catch (error) {
+        if (isBoundary(error, 'conflict', 'precondition-failed')) continue;
+        if (isBoundary(error, 'ambiguous')) {
+          const reconciledEntity = await this.#point(
+            this.#security,
+            this.environment,
+            installationKey(installation.installationId)
+          );
+          const reconciledCredentialEntity = await this.#point(
+            this.#security,
+            this.environment,
+            credentialKey(credential.hash)
+          );
+          const reconciledSessionEntity = await this.#point(
+            this.#security,
+            this.environment,
+            sessionKey(installation.installationId)
+          );
+          if (
+            reconciledEntity !== undefined &&
+            reconciledCredentialEntity !== undefined &&
+            reconciledSessionEntity !== undefined
+          ) {
+            const reconciled = parseInstallation(
+              reconciledEntity,
+              this.environment,
+              installation.installationId
+            );
+            const reconciledCredential = parseCredential(
+              reconciledCredentialEntity,
+              this.environment,
+              credential.hash
+            );
+            const reconciledSession = parseSession(
+              reconciledSessionEntity,
+              this.environment,
+              installation.installationId
+            );
+            const reconciledPending = pending === undefined
+              ? undefined
+              : await this.#point(
+                  this.#security,
+                  this.environment,
+                  credentialKey(pending.hash)
+                );
+            if (
+              reconciled.status === 'revoked' &&
+              reconciled.tombstoneVersion === nextInstallation.tombstoneVersion &&
+              reconciled.revokedAt === now &&
+              reconciled.currentCredentialHash === credential.hash &&
+              reconciled.currentCredentialVersion === credential.version &&
+              reconciled.lastActivityAt === nextInstallation.lastActivityAt &&
+              reconciled.activeSessionId === undefined &&
+              reconciledCredential.status === 'revoked' &&
+              reconciledCredential.installationId === credential.installationId &&
+              reconciledCredential.version === credential.version &&
+              reconciledCredential.hash === credential.hash &&
+              (pending === undefined || (
+                reconciledPending !== undefined &&
+                parseCredential(reconciledPending, this.environment, pending.hash).status === 'revoked'
+              )) &&
+              sessionStateMatches(reconciledSession, nextSession)
+            ) {
+              return freeze({
+                installationId: reconciled.installationId,
+                credentialVersion: reconciled.currentCredentialVersion,
+                tombstoneVersion: reconciled.tombstoneVersion,
+                status: 'revoked' as const,
+                revokedAt: reconciled.revokedAt,
+                ...(invalidates && session.sessionId !== undefined ? {
+                  invalidatedSession: freeze({
+                    installationId: session.installationId,
+                    sessionId: session.sessionId,
+                    sessionEpoch: session.sessionEpoch
+                  })
+                } : {})
+              });
+            }
           }
           continue;
         }
@@ -3601,10 +3965,12 @@ class AzureRuntimeStore implements DurableSecurityStateStore, SecurityStateMaint
     this.#core.authenticateCredential(input);
   beginCredentialRotation = (input: BeginCredentialRotationInput): Promise<PendingCredentialResult> =>
     this.#core.beginCredentialRotation(input);
-  promoteCredential = (input: PromoteCredentialInput): Promise<InstallationMutationResult> =>
+  promoteCredential = (input: PromoteCredentialInput): Promise<CredentialPromotionResult> =>
     this.#core.promoteCredential(input);
   revokeInstallation = (input: RevokeInstallationInput): Promise<InstallationMutationResult> =>
     this.#core.revokeInstallation(input);
+  revokeCurrentInstallation = (input: RevokeCurrentInstallationInput): Promise<InstallationRevocationResult> =>
+    this.#core.revokeCurrentInstallation(input);
   issueSessionTicket = (input: TicketOperationInput): Promise<SessionTicketResult> => this.#core.issueSessionTicket(input);
   consumeSessionTicket = (input: ConsumeTicketInput): Promise<SessionLease> => this.#core.consumeSessionTicket(input);
   activateSession = (input: ActivateSessionInput): Promise<SessionLease> => this.#core.activateSession(input);

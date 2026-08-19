@@ -49,6 +49,7 @@ import {
   type CompleteGenerationInput,
   type ConsumeTicketInput,
   type CredentialAuthentication,
+  type CredentialPromotionResult,
   type CredentialStatus,
   type GenerationAuthorizationResult,
   type GenerationClaim,
@@ -56,6 +57,7 @@ import {
   type GenerationProviderStartResult,
   type GenerationStatus,
   type InstallationMutationResult,
+  type InstallationRevocationResult,
   type IssuePairingInput,
   type LocalMockSecurityStateStore,
   type LocalMockSecurityStateOptions,
@@ -67,6 +69,7 @@ import {
   type RedeemPairingInput,
   type ReserveAudioInput,
   type RevokeInstallationInput,
+  type RevokeCurrentInstallationInput,
   type RevokePairingInput,
   type SecurityAudience,
   type SecurityClock,
@@ -208,6 +211,11 @@ interface AuthenticationPlan {
   readonly installation: InstallationRow;
   readonly pending: boolean;
   readonly idleExpiresAt: number;
+}
+
+interface RevokedSessionIdentity {
+  readonly sessionId: CanonicalUuid;
+  readonly sessionEpoch: number;
 }
 
 class RollingWindow {
@@ -460,6 +468,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
   readonly #installations = new Map<CanonicalUuid, InstallationRow>();
   readonly #tickets = new Map<CanonicalSha256, TicketRow>();
   readonly #sessions = new Map<CanonicalUuid, SessionRow>();
+  readonly #revokedSessionIdentities = new Map<CanonicalUuid, RevokedSessionIdentity>();
   readonly #grants = new Map<CanonicalUuid, GrantRow>();
   readonly #generations = new Map<CanonicalSha256, GenerationRow>();
   readonly #generationClaims = new Map<CanonicalUuid, GenerationRow>();
@@ -885,6 +894,11 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     const before = this.#context();
     const preflight = this.#authenticatePlan(input.credential, before);
     if (preflight === undefined || preflight.pending) fail('invalid-credential');
+    if (
+      preflight.installation.pendingCredentialHash !== undefined &&
+      preflight.installation.pendingExpiresAt !== undefined &&
+      before < preflight.installation.pendingExpiresAt
+    ) fail('credential-conflict');
     const pendingCredential = this.#candidate(
       this.#tokens.credential,
       assertCanonical256BitToken,
@@ -899,7 +913,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       const existingPending = installation.pendingCredentialHash === undefined
         ? undefined : this.#credentials.get(installation.pendingCredentialHash);
       if (existingPending !== undefined && installation.pendingExpiresAt !== undefined && now < installation.pendingExpiresAt) {
-        return undefined;
+        fail('credential-conflict');
       }
       if (this.#credentials.has(pendingHash)) fail('state-unavailable');
       const version = checkedIncrement(installation.currentCredentialVersion, 'invalid-credential');
@@ -932,13 +946,27 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     return result;
   }
 
-  async promoteCredential(value: PromoteCredentialInput): Promise<InstallationMutationResult> {
+  async promoteCredential(value: PromoteCredentialInput): Promise<CredentialPromotionResult> {
     this.#entry();
     const input = exactDataObject(value, ['pendingCredential']);
     const now = this.#context();
     const result = this.#commit(now, () => {
       const plan = this.#authenticatePlan(input.pendingCredential, now);
-      if (plan === undefined || !plan.pending) return undefined;
+      if (plan === undefined) return undefined;
+      if (!plan.pending) {
+        if (plan.credential.version <= 1) return undefined;
+        plan.credential.lastUsedAt = now;
+        plan.credential.idleExpiresAt = plan.idleExpiresAt;
+        return freeze({
+          installationId: plan.installation.id,
+          credentialVersion: plan.credential.version,
+          tombstoneVersion: plan.installation.tombstoneVersion,
+          status: 'already-promoted' as const,
+          confirmedAt: now,
+          idleExpiresAt: plan.idleExpiresAt,
+          absoluteExpiresAt: plan.installation.absoluteExpiresAt
+        });
+      }
       const activeSession = plan.installation.activeSessionId === undefined
         ? undefined : this.#sessions.get(plan.installation.activeSessionId);
       const invalidatedSession = activeSession !== undefined &&
@@ -955,6 +983,83 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         installationId: authentication.installationId,
         credentialVersion: authentication.credentialVersion,
         tombstoneVersion: plan.installation.tombstoneVersion,
+        status: 'promoted' as const,
+        confirmedAt: now,
+        idleExpiresAt: authentication.idleExpiresAt,
+        absoluteExpiresAt: authentication.absoluteExpiresAt,
+        ...(invalidatedSession === undefined ? {} : { invalidatedSession })
+      });
+    });
+    if (result === undefined) fail('invalid-credential');
+    return result;
+  }
+
+  async revokeCurrentInstallation(value: RevokeCurrentInstallationInput): Promise<InstallationRevocationResult> {
+    this.#entry();
+    const input = exactDataObject(value, ['credential']);
+    const now = this.#context();
+    const result = this.#commit(now, () => {
+      let hash: CanonicalSha256;
+      try { hash = hashCredential(input.credential); } catch { return undefined; }
+      const credential = this.#credentials.get(hash);
+      const installation = credential === undefined ? undefined : this.#installations.get(credential.installationId);
+      if (
+        credential !== undefined && installation !== undefined &&
+        credential.status === 'revoked' && installation.status === 'revoked' &&
+        installation.currentCredentialHash === credential.hash &&
+        installation.currentCredentialVersion === credential.version &&
+        installation.revokedAt !== undefined
+      ) {
+        const revokedSession = this.#revokedSessionIdentities.get(installation.id);
+        const invalidatedSession = revokedSession === undefined
+          ? undefined
+          : freeze({
+              installationId: installation.id,
+              sessionId: revokedSession.sessionId,
+              sessionEpoch: revokedSession.sessionEpoch
+            });
+        return freeze({
+          installationId: installation.id,
+          credentialVersion: installation.currentCredentialVersion,
+          tombstoneVersion: installation.tombstoneVersion,
+          status: 'already-revoked' as const,
+          revokedAt: installation.revokedAt,
+          ...(invalidatedSession === undefined ? {} : { invalidatedSession })
+        });
+      }
+      const plan = this.#authenticatePlan(input.credential, now);
+      if (plan === undefined || plan.pending) return undefined;
+      const pending = plan.installation.pendingCredentialHash === undefined
+        ? undefined : this.#credentials.get(plan.installation.pendingCredentialHash);
+      const session = plan.installation.activeSessionId === undefined
+        ? undefined : this.#sessions.get(plan.installation.activeSessionId);
+      const nextTombstone = checkedIncrement(plan.installation.tombstoneVersion, 'state-unavailable');
+      const invalidatedSession = session !== undefined &&
+        (session.status === 'opening' || session.status === 'active')
+        ? freeze({ installationId: session.installationId, sessionId: session.id, sessionEpoch: session.epoch })
+        : undefined;
+      if (invalidatedSession !== undefined) {
+        this.#revokedSessionIdentities.set(plan.installation.id, {
+          sessionId: invalidatedSession.sessionId,
+          sessionEpoch: invalidatedSession.sessionEpoch
+        });
+      }
+      plan.installation.tombstoneVersion = nextTombstone;
+      plan.installation.status = 'revoked';
+      plan.installation.revokedAt = now;
+      plan.credential.status = 'revoked';
+      if (pending !== undefined) pending.status = 'revoked';
+      if (session !== undefined) {
+        session.status = 'revoked';
+        this.#deleteSessionGrants(session);
+      }
+      delete plan.installation.activeSessionId;
+      return freeze({
+        installationId: plan.installation.id,
+        credentialVersion: plan.installation.currentCredentialVersion,
+        tombstoneVersion: plan.installation.tombstoneVersion,
+        status: 'revoked' as const,
+        revokedAt: now,
         ...(invalidatedSession === undefined ? {} : { invalidatedSession })
       });
     });
@@ -978,6 +1083,12 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         (session.status === 'opening' || session.status === 'active')
         ? freeze({ installationId: session.installationId, sessionId: session.id, sessionEpoch: session.epoch })
         : undefined;
+      if (invalidatedSession !== undefined) {
+        this.#revokedSessionIdentities.set(row.id, {
+          sessionId: invalidatedSession.sessionId,
+          sessionEpoch: invalidatedSession.sessionEpoch
+        });
+      }
       row.tombstoneVersion = nextTombstone;
       row.status = 'revoked';
       row.revokedAt = now;
@@ -1643,6 +1754,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
             ? installation.revokedAt !== undefined && now - installation.revokedAt >= REVOCATION_TOMBSTONE_TTL_MS
             : installation.status === 'expired' && installation.expiredAt !== undefined &&
               now - installation.expiredAt >= REVOCATION_TOMBSTONE_TTL_MS;
+          if (removable) this.#revokedSessionIdentities.delete(installation.id);
         } else if (table === this.#sessions) {
           const session = row as SessionRow;
           if ((session.status === 'opening' || session.status === 'active') && now >= session.leaseExpiresAt) {

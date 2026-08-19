@@ -6,6 +6,7 @@ import {
   AUDIO_RESERVATION_WINDOW_MS,
   AZURE_SECURITY_SCHEMA_VERSION,
   CREDENTIAL_ABSOLUTE_TTL_MS,
+  CREDENTIAL_IDLE_TTL_MS,
   LOCAL_MOCK_ENVIRONMENT,
   MAX_AUDIO_GRANTS_PER_WINDOW,
   OPENING_LEASE_MS,
@@ -138,11 +139,51 @@ function cloneEntity(entity: AzureStoredEntity): AzureStoredEntity {
   });
 }
 
+function requiredRow(
+  rows: readonly AzureStoredEntity[],
+  kind: string,
+  status?: string
+): AzureStoredEntity {
+  const row = rows.find((item) => item.properties.kind === kind &&
+    (status === undefined || item.properties.status === status));
+  if (row === undefined) throw new Error(`missing ${status === undefined ? kind : `${status} ${kind}`} row`);
+  return row;
+}
+
+function expectExactReplacementTransaction(
+  mutations: readonly AzureTableMutation[],
+  beforeRows: readonly AzureStoredEntity[],
+  expectedRows: readonly AzureStoredEntity[]
+): void {
+  expect(mutations).toHaveLength(expectedRows.length);
+  expect(mutations.map((mutation) => mutation.entity.rowKey).sort())
+    .toEqual(expectedRows.map((row) => row.rowKey).sort());
+  for (const mutation of mutations) {
+    expect(mutation.type).toBe('replace');
+    expect(mutation.entity.partitionKey).toBe(ENVIRONMENT);
+    const before = beforeRows.find((row) => row.partitionKey === mutation.entity.partitionKey &&
+      row.rowKey === mutation.entity.rowKey);
+    if (before === undefined || mutation.type !== 'replace') throw new Error('unexpected transaction mutation');
+    expect(mutation.etag).toBe(before.etag);
+  }
+}
+
+function requiredReplacement(
+  mutations: readonly AzureTableMutation[],
+  rowKey: string
+): Extract<AzureTableMutation, { readonly type: 'replace' }> {
+  const mutation = mutations.find((item) => item.type === 'replace' && item.entity.rowKey === rowKey);
+  if (mutation === undefined || mutation.type !== 'replace') throw new Error(`missing replacement for ${rowKey}`);
+  return mutation;
+}
+
 function fakeTable() {
   let rows = new Map<string, AzureStoredEntity>();
   let version = 0;
   let failure: Failure | undefined;
   let afterTransaction: (() => Promise<void>) | undefined;
+  let beforeTransaction: (() => Promise<void>) | undefined;
+  const transactions: AzureTableMutation[][] = [];
   const key = (partitionKey: string, rowKey: string): string => `${partitionKey}\u0000${rowKey}`;
   const nextEtag = (): string => `"etag-${++version}"`;
   const takeFailure = (operation: Operation, after: boolean): void => {
@@ -193,6 +234,9 @@ function fakeTable() {
       takeFailure('delete', true);
     },
     transaction: async (mutations: readonly AzureTableMutation[]) => {
+      const beforeCallback = beforeTransaction;
+      beforeTransaction = undefined;
+      if (beforeCallback !== undefined) await beforeCallback();
       takeFailure('transaction', false);
       if (mutations.length === 0 || mutations.length > 100) throw new Error('transaction size');
       const partition = mutations[0]?.entity.partitionKey;
@@ -212,6 +256,7 @@ function fakeTable() {
         }
       }
       rows = next;
+      transactions.push([...mutations]);
       takeFailure('transaction', true);
       const callback = afterTransaction;
       afterTransaction = undefined;
@@ -234,9 +279,11 @@ function fakeTable() {
     failNext: (operation: Operation, kind: AzureBoundaryErrorKind, after = false): void => {
       failure = { operation, kind, after };
     },
+    beforeNextTransaction: (callback: () => Promise<void>): void => { beforeTransaction = callback; },
     afterNextTransaction: (callback: () => Promise<void>): void => { afterTransaction = callback; },
     insertRaw: (entity: AzureNewEntity): void => { rows.set(key(entity.partitionKey, entity.rowKey), store(entity)); },
-    snapshot: (): readonly AzureStoredEntity[] => Object.freeze([...rows.values()].map(cloneEntity))
+    snapshot: (): readonly AzureStoredEntity[] => Object.freeze([...rows.values()].map(cloneEntity)),
+    transactions: (): readonly (readonly AzureTableMutation[])[] => Object.freeze(transactions.map((item) => Object.freeze([...item])))
   });
 }
 
@@ -586,6 +633,381 @@ describe('Azure Table durable adapter', () => {
       .rejects.toMatchObject({ category: 'invalid-credential' });
   });
 
+  it('provides retry-safe promotion and credential-authenticated revocation semantics', async () => {
+    const base = await activeFixture();
+    const pending = await base.runtime.beginCredentialRotation({ credential: base.redeemed.credential });
+    await expect(base.runtime.beginCredentialRotation({ credential: base.redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    const promoted = await base.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(promoted).toMatchObject({
+      status: 'promoted',
+      confirmedAt: base.fake.now(),
+      idleExpiresAt: base.fake.now() + CREDENTIAL_IDLE_TTL_MS,
+      absoluteExpiresAt: base.redeemed.absoluteExpiresAt,
+      invalidatedSession: {
+        installationId: base.active.installationId,
+        sessionId: base.active.sessionId,
+        sessionEpoch: base.active.sessionEpoch
+      }
+    });
+    expect(Object.isFrozen(promoted)).toBe(true);
+    expect(Object.isFrozen(promoted.invalidatedSession)).toBe(true);
+    base.fake.advance(1);
+    const replay = await base.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(replay).toMatchObject({
+      status: 'already-promoted',
+      confirmedAt: base.fake.now(),
+      idleExpiresAt: base.fake.now() + CREDENTIAL_IDLE_TTL_MS,
+      absoluteExpiresAt: base.redeemed.absoluteExpiresAt
+    });
+    expect(replay.invalidatedSession).toBeUndefined();
+
+    const revokedBase = await activeFixture();
+    const firstRevocation = await revokedBase.runtime.revokeCurrentInstallation({
+      credential: revokedBase.redeemed.credential
+    });
+    expect(firstRevocation).toMatchObject({
+      status: 'revoked',
+      revokedAt: revokedBase.fake.now(),
+      tombstoneVersion: 2,
+      invalidatedSession: { sessionId: revokedBase.active.sessionId }
+    });
+    const replayRevocation = await revokedBase.runtime.revokeCurrentInstallation({
+      credential: revokedBase.redeemed.credential
+    });
+    expect(replayRevocation).toMatchObject({
+      status: 'already-revoked',
+      revokedAt: firstRevocation.revokedAt,
+      tombstoneVersion: firstRevocation.tombstoneVersion,
+      invalidatedSession: firstRevocation.invalidatedSession
+    });
+    const other = storesForAudience(revokedBase, OTHER_AUDIENCE);
+    await expect(other.runtime.revokeCurrentInstallation({ credential: revokedBase.redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+
+    const ambiguousPromotion = fixture();
+    const ambiguousEnrollment = await enroll(ambiguousPromotion);
+    const ambiguousPending = await ambiguousPromotion.runtime.beginCredentialRotation({
+      credential: ambiguousEnrollment.redeemed.credential
+    });
+    ambiguousPromotion.security.failNext('transaction', 'ambiguous', true);
+    await expect(ambiguousPromotion.runtime.promoteCredential({
+      pendingCredential: ambiguousPending.pendingCredential
+    })).resolves.toMatchObject({ status: 'promoted', credentialVersion: 2 });
+
+    const ambiguousRevocation = fixture();
+    const ambiguousRevocationEnrollment = await enroll(ambiguousRevocation);
+    ambiguousRevocation.security.failNext('transaction', 'ambiguous', true);
+    await expect(ambiguousRevocation.runtime.revokeCurrentInstallation({
+      credential: ambiguousRevocationEnrollment.redeemed.credential
+    })).resolves.toMatchObject({ status: 'revoked', tombstoneVersion: 2 });
+  });
+
+  it('replaces an expired pending credential at the exact fake-Azure boundary', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const first = await base.runtime.beginCredentialRotation({ credential: redeemed.credential });
+    base.fake.advance(first.pendingExpiresAt - base.fake.now() - 1);
+    await expect(base.runtime.beginCredentialRotation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'credential-conflict' });
+    expect(base.security.snapshot().filter((row) =>
+      row.properties.kind === 'credential' && row.properties.status === 'pending')).toHaveLength(1);
+    base.fake.advance(1);
+    const second = await base.runtime.beginCredentialRotation({ credential: redeemed.credential });
+    expect(second.pendingCredentialVersion).toBe(first.pendingCredentialVersion);
+    const credentials = base.security.snapshot().filter((row) => row.properties.kind === 'credential');
+    expect(credentials.filter((row) => row.properties.status === 'pending')).toHaveLength(1);
+    expect(credentials.some((row) => row.properties.status === 'expired')).toBe(true);
+    expect(credentials.filter((row) => row.properties.status === 'pending')[0]?.properties.pendingExpiresAt)
+      .toBe(second.pendingExpiresAt);
+  });
+
+  it('rejects invalid lifecycle credentials and keeps canaries out of public errors', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const pending = await base.runtime.beginCredentialRotation({ credential: redeemed.credential });
+    await expect(base.runtime.promoteCredential({ pendingCredential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    await expect(base.runtime.revokeCurrentInstallation({ credential: pending.pendingCredential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    await expect(base.runtime.promoteCredential({ pendingCredential: token(99_999) }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    try {
+      await base.runtime.promoteCredential({ pendingCredential: 'CANARY-credential-value' });
+      expect.fail('expected malformed credential rejection');
+    } catch (error) {
+      expect(error).toMatchObject({ category: 'invalid-credential' });
+      expect(String(error)).not.toContain('CANARY-credential-value');
+      expect(error instanceof Error ? error.stack : '').not.toContain('CANARY-credential-value');
+      expect(JSON.stringify(error)).not.toContain('CANARY-credential-value');
+    }
+    await base.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    await expect(base.runtime.revokeCurrentInstallation({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+
+    const expired = fixture();
+    const expiredEnrollment = await enroll(expired);
+    const expiredPending = await expired.runtime.beginCredentialRotation({ credential: expiredEnrollment.redeemed.credential });
+    expired.fake.advance(expiredPending.pendingExpiresAt - expired.fake.now());
+    await expect(expired.runtime.promoteCredential({ pendingCredential: expiredPending.pendingCredential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+
+    const revoked = fixture();
+    const revokedEnrollment = await enroll(revoked);
+    await revoked.runtime.revokeCurrentInstallation({ credential: revokedEnrollment.redeemed.credential });
+    await expect(revoked.runtime.promoteCredential({ pendingCredential: revokedEnrollment.redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+    expect(JSON.stringify(base.security.snapshot())).not.toContain('CANARY-credential-value');
+  });
+
+  it.each([
+    {
+      name: 'malformed revocation',
+      exercise: async (): Promise<unknown> => fixture().runtime.revokeCurrentInstallation({
+        credential: 'not-a-credential'
+      })
+    },
+    {
+      name: 'expired-current revocation',
+      exercise: async (): Promise<unknown> => {
+        const base = fixture();
+        const { redeemed } = await enroll(base);
+        base.fake.advance(CREDENTIAL_IDLE_TTL_MS);
+        return base.runtime.revokeCurrentInstallation({ credential: redeemed.credential });
+      }
+    },
+    {
+      name: 'retired promotion',
+      exercise: async (): Promise<unknown> => {
+        const base = fixture();
+        const { redeemed } = await enroll(base);
+        const pending = await base.runtime.beginCredentialRotation({ credential: redeemed.credential });
+        await base.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+        expect(base.security.snapshot().find((row) =>
+          row.properties.kind === 'credential' && row.properties.version === 1)?.properties.status).toBe('retired');
+        return base.runtime.promoteCredential({ pendingCredential: redeemed.credential });
+      }
+    },
+    {
+      name: 'unrelated-revoked revocation',
+      exercise: async (): Promise<unknown> => {
+        const base = fixture();
+        const { redeemed } = await enroll(base);
+        const pending = await base.runtime.beginCredentialRotation({ credential: redeemed.credential });
+        await base.runtime.revokeCurrentInstallation({ credential: redeemed.credential });
+        const rows = base.security.snapshot();
+        const revokedPending = rows.find((row) => row.properties.kind === 'credential' &&
+          row.properties.version === pending.pendingCredentialVersion);
+        expect(revokedPending?.properties.status).toBe('revoked');
+        expect(requiredRow(rows, 'installation').properties.currentCredentialHash)
+          .not.toBe(revokedPending?.properties.hash);
+        return base.runtime.revokeCurrentInstallation({ credential: pending.pendingCredential });
+      }
+    },
+    {
+      name: 'active wrong-audience revocation',
+      exercise: async (): Promise<unknown> => {
+        const base = fixture();
+        const { redeemed } = await enroll(base);
+        return storesForAudience(base, OTHER_AUDIENCE).runtime.revokeCurrentInstallation({
+          credential: redeemed.credential
+        }).finally(() => {
+          expect(requiredRow(base.security.snapshot(), 'installation').properties.status).toBe('active');
+        });
+      }
+    }
+  ])('rejects $name with invalid-credential', async ({ exercise }) => {
+    await expect(exercise()).rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it('keeps revocation credential canaries out of errors and fake-boundary diagnostics', async () => {
+    const base = fixture();
+    const beforeRows = base.security.snapshot();
+    const beforeTransactions = base.security.transactions();
+    const canary = 'CANARY-revocation-credential';
+    try {
+      await base.runtime.revokeCurrentInstallation({ credential: canary });
+      expect.fail('expected malformed revocation rejection');
+    } catch (error) {
+      expect(error).toMatchObject({ category: 'invalid-credential' });
+      expect(String(error)).not.toContain(canary);
+      expect(error instanceof Error ? error.stack : '').not.toContain(canary);
+      expect(JSON.stringify(error)).not.toContain(canary);
+    }
+    expect(base.security.snapshot()).toEqual(beforeRows);
+    expect(base.security.transactions()).toEqual(beforeTransactions);
+    expect(JSON.stringify([base.security.snapshot(), base.security.transactions()])).not.toContain(canary);
+  });
+
+  it('caps refreshed fake-Azure idle expiry at absolute expiry', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    while (base.fake.now() + CREDENTIAL_IDLE_TTL_MS < redeemed.absoluteExpiresAt) {
+      const remaining = redeemed.absoluteExpiresAt - base.fake.now();
+      base.fake.advance(Math.min(CREDENTIAL_IDLE_TTL_MS - 1, remaining - CREDENTIAL_IDLE_TTL_MS));
+      await base.runtime.authenticateCredential({ credential: redeemed.credential });
+    }
+    base.fake.advance(redeemed.absoluteExpiresAt - base.fake.now() - 1);
+    await expect(base.runtime.authenticateCredential({ credential: redeemed.credential }))
+      .resolves.toMatchObject({ idleExpiresAt: redeemed.absoluteExpiresAt });
+    base.fake.advance(1);
+    await expect(base.runtime.authenticateCredential({ credential: redeemed.credential }))
+      .rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it('uses the exact promotion mutation set and original ETags', async () => {
+    const promotion = await activeFixture();
+    const pending = await promotion.runtime.beginCredentialRotation({ credential: promotion.redeemed.credential });
+    const beforeRows = promotion.security.snapshot();
+    const installationRow = requiredRow(beforeRows, 'installation');
+    const currentRow = requiredRow(beforeRows, 'credential', 'current');
+    const pendingRow = requiredRow(beforeRows, 'credential', 'pending');
+    const sessionRow = requiredRow(beforeRows, 'session');
+    expect(installationRow.rowKey).toBe(`installation:${promotion.redeemed.installationId}`);
+    expect(sessionRow.rowKey).toBe(`session:${promotion.redeemed.installationId}`);
+    expect(currentRow.rowKey).toBe(`credential:${String(currentRow.properties.hash)}`);
+    expect(pendingRow.rowKey).toBe(`credential:${String(pendingRow.properties.hash)}`);
+    const beforeTransactionCount = promotion.security.transactions().length;
+    await promotion.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    const operationTransactions = promotion.security.transactions().slice(beforeTransactionCount);
+    expect(operationTransactions).toHaveLength(1);
+    const mutations = operationTransactions[0];
+    if (mutations === undefined) throw new Error('promotion transaction missing');
+    expectExactReplacementTransaction(
+      mutations,
+      beforeRows,
+      [installationRow, currentRow, pendingRow, sessionRow]
+    );
+    const promotionOperation = hashCorrelationKey(uuid(6_004));
+    expect(requiredReplacement(mutations, currentRow.rowKey).entity.properties.status).toBe('retired');
+    expect(requiredReplacement(mutations, pendingRow.rowKey).entity.properties.status).toBe('current');
+    expect(requiredReplacement(mutations, installationRow.rowKey).entity.properties).toMatchObject({
+      status: 'active',
+      currentCredentialHash: pendingRow.properties.hash,
+      currentCredentialVersion: pendingRow.properties.version
+    });
+    expect(requiredReplacement(mutations, installationRow.rowKey).entity.properties)
+      .not.toHaveProperty('pendingCredentialHash');
+    expect(requiredReplacement(mutations, sessionRow.rowKey).entity.properties)
+      .toMatchObject({ lastOperationId: promotionOperation });
+  });
+
+  it('uses the exact revocation mutation set and original ETags without a pending credential', async () => {
+    const revocation = await activeFixture();
+    const beforeRows = revocation.security.snapshot();
+    const installationRow = requiredRow(beforeRows, 'installation');
+    const currentRow = requiredRow(beforeRows, 'credential', 'current');
+    const sessionRow = requiredRow(beforeRows, 'session');
+    expect(installationRow.rowKey).toBe(`installation:${revocation.redeemed.installationId}`);
+    expect(sessionRow.rowKey).toBe(`session:${revocation.redeemed.installationId}`);
+    expect(currentRow.rowKey).toBe(`credential:${String(currentRow.properties.hash)}`);
+    const beforeTransactionCount = revocation.security.transactions().length;
+    await revocation.runtime.revokeCurrentInstallation({ credential: revocation.redeemed.credential });
+    const operationTransactions = revocation.security.transactions().slice(beforeTransactionCount);
+    expect(operationTransactions).toHaveLength(1);
+    const mutations = operationTransactions[0];
+    if (mutations === undefined) throw new Error('revocation transaction missing');
+    expectExactReplacementTransaction(mutations, beforeRows, [installationRow, currentRow, sessionRow]);
+    const revocationOperation = hashCorrelationKey(uuid(6_004));
+    expect(requiredReplacement(mutations, installationRow.rowKey).entity.properties).toMatchObject({
+      status: 'revoked',
+      currentCredentialHash: currentRow.properties.hash
+    });
+    expect(requiredReplacement(mutations, currentRow.rowKey).entity.properties.status).toBe('revoked');
+    expect(requiredReplacement(mutations, sessionRow.rowKey).entity.properties)
+      .toMatchObject({ status: 'revoked', lastOperationId: revocationOperation });
+  });
+
+  it('uses the exact revocation mutation set and original ETags with a pending credential', async () => {
+    const revocation = await activeFixture();
+    await revocation.runtime.beginCredentialRotation({ credential: revocation.redeemed.credential });
+    const beforeRows = revocation.security.snapshot();
+    const installationRow = requiredRow(beforeRows, 'installation');
+    const currentRow = requiredRow(beforeRows, 'credential', 'current');
+    const pendingRow = requiredRow(beforeRows, 'credential', 'pending');
+    const sessionRow = requiredRow(beforeRows, 'session');
+    expect(installationRow.rowKey).toBe(`installation:${revocation.redeemed.installationId}`);
+    expect(sessionRow.rowKey).toBe(`session:${revocation.redeemed.installationId}`);
+    expect(currentRow.rowKey).toBe(`credential:${String(currentRow.properties.hash)}`);
+    expect(pendingRow.rowKey).toBe(`credential:${String(pendingRow.properties.hash)}`);
+    const beforeTransactionCount = revocation.security.transactions().length;
+    await revocation.runtime.revokeCurrentInstallation({ credential: revocation.redeemed.credential });
+    const operationTransactions = revocation.security.transactions().slice(beforeTransactionCount);
+    expect(operationTransactions).toHaveLength(1);
+    const mutations = operationTransactions[0];
+    if (mutations === undefined) throw new Error('pending revocation transaction missing');
+    expectExactReplacementTransaction(
+      mutations,
+      beforeRows,
+      [installationRow, currentRow, pendingRow, sessionRow]
+    );
+    const revocationOperation = hashCorrelationKey(uuid(6_004));
+    expect(requiredReplacement(mutations, installationRow.rowKey).entity.properties.status).toBe('revoked');
+    expect(requiredReplacement(mutations, currentRow.rowKey).entity.properties.status).toBe('revoked');
+    expect(requiredReplacement(mutations, pendingRow.rowKey).entity.properties.status).toBe('revoked');
+    expect(requiredReplacement(mutations, sessionRow.rowKey).entity.properties)
+      .toMatchObject({ status: 'revoked', lastOperationId: revocationOperation });
+  });
+
+  it('returns replay status when contention commits before the tested transaction is ambiguous', async () => {
+    const promotion = await activeFixture();
+    const pending = await promotion.runtime.beginCredentialRotation({ credential: promotion.redeemed.credential });
+    let competingPromotion: Awaited<ReturnType<typeof promotion.runtime.promoteCredential>> | undefined;
+    promotion.security.beforeNextTransaction(async () => {
+      competingPromotion = await promotion.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+      promotion.security.failNext('transaction', 'ambiguous');
+    });
+    const testedPromotion = await promotion.runtime.promoteCredential({ pendingCredential: pending.pendingCredential });
+    expect(competingPromotion).toMatchObject({ status: 'promoted' });
+    expect(testedPromotion).toMatchObject({ status: 'already-promoted' });
+
+    const revocation = await activeFixture();
+    let competingRevocation: Awaited<ReturnType<typeof revocation.runtime.revokeCurrentInstallation>> | undefined;
+    revocation.security.beforeNextTransaction(async () => {
+      competingRevocation = await revocation.runtime.revokeCurrentInstallation({
+        credential: revocation.redeemed.credential
+      });
+      revocation.security.failNext('transaction', 'ambiguous');
+    });
+    const testedRevocation = await revocation.runtime.revokeCurrentInstallation({
+      credential: revocation.redeemed.credential
+    });
+    expect(competingRevocation).toMatchObject({ status: 'revoked' });
+    expect(testedRevocation).toMatchObject({ status: 'already-revoked' });
+  });
+
+  it('serializes 100 fake-Azure rotation and credential-revocation contenders', async () => {
+    const rotation = fixture();
+    const { redeemed } = await enroll(rotation);
+    const beginnings = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      rotation.runtime.beginCredentialRotation({ credential: redeemed.credential })));
+    expect(beginnings.filter((item) => item.status === 'fulfilled')).toHaveLength(1);
+    expect(beginnings.filter((item) => item.status === 'rejected' &&
+      (item.reason as SecurityStateError).category === 'credential-conflict')).toHaveLength(99);
+    const winner = beginnings.find((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.runtime.beginCredentialRotation>>> =>
+      item.status === 'fulfilled');
+    if (winner === undefined) throw new Error('fake-Azure rotation winner missing');
+    const promotions = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      rotation.runtime.promoteCredential({ pendingCredential: winner.value.pendingCredential })));
+    expect(promotions.filter((item) => item.status === 'fulfilled')).toHaveLength(100);
+    expect(promotions.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.runtime.promoteCredential>>> =>
+      item.status === 'fulfilled' && item.value.status === 'promoted')).toHaveLength(1);
+    expect(promotions.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof rotation.runtime.promoteCredential>>> =>
+      item.status === 'fulfilled' && item.value.status === 'already-promoted')).toHaveLength(99);
+
+    const revocation = fixture();
+    const enrolled = await enroll(revocation);
+    const revocations = await Promise.allSettled(Array.from({ length: 100 }, () =>
+      revocation.runtime.revokeCurrentInstallation({ credential: enrolled.redeemed.credential })));
+    expect(revocations.filter((item) => item.status === 'fulfilled')).toHaveLength(100);
+    expect(revocations.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof revocation.runtime.revokeCurrentInstallation>>> =>
+      item.status === 'fulfilled' && item.value.status === 'revoked')).toHaveLength(1);
+    expect(revocations.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof revocation.runtime.revokeCurrentInstallation>>> =>
+      item.status === 'fulfilled' && item.value.status === 'already-revoked')).toHaveLength(99);
+    expect(revocation.security.snapshot().find((row) => row.properties.kind === 'installation')?.properties.tombstoneVersion)
+      .toBe(2);
+  });
+
   it('serializes promotion and revocation races without a partially active old session', async () => {
     const base = await activeFixture();
     const pending = await base.runtime.beginCredentialRotation({ credential: base.redeemed.credential });
@@ -596,6 +1018,40 @@ describe('Azure Table durable adapter', () => {
     expect(raced.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     await expect(base.runtime.heartbeatSession({ lease: base.active }))
       .rejects.toMatchObject({ category: 'stale-lease' });
+  });
+
+  it.each([
+    { winner: 'promotion' as const },
+    { winner: 'revocation' as const }
+  ])('serializes the fake-Azure promotion/revocation race when $winner commits first', async ({ winner }) => {
+    const base = await activeFixture();
+    const pending = await base.runtime.beginCredentialRotation({ credential: base.redeemed.credential });
+    let winningStatus: 'promoted' | 'revoked' | undefined;
+    if (winner === 'promotion') {
+      base.security.beforeNextTransaction(async () => {
+        winningStatus = (await base.runtime.promoteCredential({
+          pendingCredential: pending.pendingCredential
+        })).status as 'promoted';
+      });
+      await expect(base.runtime.revokeCurrentInstallation({ credential: base.redeemed.credential }))
+        .rejects.toMatchObject({ category: 'invalid-credential' });
+    } else {
+      base.security.beforeNextTransaction(async () => {
+        winningStatus = (await base.runtime.revokeCurrentInstallation({
+          credential: base.redeemed.credential
+        })).status as 'revoked';
+      });
+      await expect(base.runtime.promoteCredential({ pendingCredential: pending.pendingCredential }))
+        .rejects.toMatchObject({ category: 'invalid-credential' });
+    }
+    expect(winningStatus).toBe(winner === 'promotion' ? 'promoted' : 'revoked');
+    expect(base.security.snapshot().find((row) => row.properties.kind === 'installation')?.properties.activeSessionId)
+      .toBeUndefined();
+    expect(base.security.snapshot().find((row) => row.properties.kind === 'installation')?.properties.status)
+      .toBe(winner === 'promotion' ? 'active' : 'revoked');
+    expect(base.security.snapshot()
+      .filter((row) => row.properties.kind === 'session')
+      .every((row) => !['opening', 'active'].includes(String(row.properties.status)))).toBe(true);
   });
 
   it('enforces reconnect quotas across session epochs', async () => {
