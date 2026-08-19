@@ -4,6 +4,8 @@ import {
   AudioFrameError,
   ClientControlMessageSchema,
   ControlMessageSchema,
+  CredentialRotationConfirmationRequestSchema,
+  CredentialRotationRequestSchema,
   DEFAULT_NEGOTIATED_LIMITS,
   ErrorEnvelopeSchema,
   InstallationCredentialResponseSchema,
@@ -14,6 +16,8 @@ import {
   UuidSchema,
   assertClientControlMessage,
   assertControlMessage,
+  assertCredentialRotationConfirmationRequest,
+  assertCredentialRotationRequest,
   assertErrorEnvelope,
   assertServerControlMessage,
   assertSessionTicketRequest,
@@ -26,6 +30,8 @@ import {
   isCanonicalWssOrigin,
   isClientControlMessage,
   isControlMessage,
+  isCredentialRotationConfirmationRequest,
+  isCredentialRotationRequest,
   isErrorEnvelope,
   isNegotiatedLimits,
   isServerControlMessage,
@@ -197,6 +203,55 @@ describe('semantic aggregate validation', () => {
 });
 
 describe('canonical auth values', () => {
+  it('accepts only exact empty credential rotation request objects', () => {
+    const canary = 'ROTATION-CREDENTIAL-CANARY';
+    const contracts = [
+      {
+        schema: CredentialRotationRequestSchema,
+        isValid: isCredentialRotationRequest,
+        assertValid: assertCredentialRotationRequest
+      },
+      {
+        schema: CredentialRotationConfirmationRequestSchema,
+        isValid: isCredentialRotationConfirmationRequest,
+        assertValid: assertCredentialRotationConfirmationRequest
+      }
+    ] as const;
+
+    for (const { schema, isValid, assertValid } of contracts) {
+      const valid = {};
+      expect(Value.Check(schema, valid)).toBe(true);
+      expect(isValid(valid)).toBe(true);
+      expect(assertValid(valid)).toBe(valid);
+
+      for (const invalid of [
+        null,
+        [],
+        'rotation request',
+        1,
+        Symbol('rotation request'),
+        { credential: canary },
+        { secret: canary },
+        { password: canary },
+        { credentialVersion: 1 }
+      ] as unknown[]) {
+        expect(Value.Check(schema, invalid)).toBe(false);
+        expect(isValid(invalid)).toBe(false);
+        expect(() => assertValid(invalid)).toThrow();
+      }
+
+      for (const invalid of [
+        { credential: canary },
+        { secret: canary },
+        { password: canary }
+      ]) {
+        const error = capturedError(() => assertValid(invalid));
+        expect(JSON.stringify(error) ?? '').not.toContain(canary);
+        expect(error.stack ?? '').not.toContain(canary);
+      }
+    }
+  });
+
   it('rejects terminal base64url aliases that decode to the same bytes', () => {
     const canonical = 'A'.repeat(43);
     for (const aliasTerminal of ['B', 'C', 'D']) {
@@ -373,6 +428,12 @@ describe('safe validation errors', () => {
       capturedError(() => assertControlMessage({
         ...sessionStart,
         payloadCanary: canaries[0]
+      })),
+      capturedError(() => assertCredentialRotationRequest({
+        credential: canaries[3]
+      })),
+      capturedError(() => assertCredentialRotationConfirmationRequest({
+        secret: canaries[4]
       }))
     ];
 
@@ -382,6 +443,7 @@ describe('safe validation errors', () => {
         .join('|');
       for (const canary of canaries) {
         expect(exposed).not.toContain(canary);
+        expect(error.stack ?? '').not.toContain(canary);
       }
       if (error instanceof AudioFrameError) {
         expect(error.reason).not.toContain('CANARY');

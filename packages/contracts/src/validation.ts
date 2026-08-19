@@ -44,6 +44,8 @@ import {
   type UtcTimestamp
 } from './schemas.js';
 import {
+  CredentialRotationConfirmationRequestSchema,
+  CredentialRotationRequestSchema,
   HttpErrorResponseSchema,
   InstallationCredentialResponseSchema,
   PairingRedemptionRequestSchema,
@@ -54,6 +56,8 @@ import {
   isBase64UrlSecret,
   isCanonicalPairingCode,
   isCanonicalWssOrigin,
+  type CredentialRotationConfirmationRequest,
+  type CredentialRotationRequest,
   type HttpErrorResponse,
   type InstallationCredentialResponse,
   type PairingRedemptionRequest,
@@ -443,6 +447,36 @@ export function assertInstallationCredentialResponse(
 
 export const isPairingRedemptionResponse = isInstallationCredentialResponse;
 export const assertPairingRedemptionResponse = assertInstallationCredentialResponse;
+
+export function isCredentialRotationRequest(
+  value: unknown
+): value is CredentialRotationRequest {
+  return isSchema(CredentialRotationRequestSchema, value);
+}
+
+export function assertCredentialRotationRequest(value: unknown): CredentialRotationRequest {
+  return assertSchema(
+    CredentialRotationRequestSchema,
+    value,
+    'credential rotation request'
+  );
+}
+
+export function isCredentialRotationConfirmationRequest(
+  value: unknown
+): value is CredentialRotationConfirmationRequest {
+  return isSchema(CredentialRotationConfirmationRequestSchema, value);
+}
+
+export function assertCredentialRotationConfirmationRequest(
+  value: unknown
+): CredentialRotationConfirmationRequest {
+  return assertSchema(
+    CredentialRotationConfirmationRequestSchema,
+    value,
+    'credential rotation confirmation request'
+  );
+}
 
 export function isSessionTicketRequest(value: unknown): value is SessionTicketRequest {
   return isSchema(SessionTicketRequestSchema, value);

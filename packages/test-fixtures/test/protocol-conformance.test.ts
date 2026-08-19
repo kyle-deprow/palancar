@@ -9,6 +9,8 @@ import {
   BINARY_MAGIC,
   ClientControlMessageSchema,
   ControlMessageSchema,
+  CredentialRotationConfirmationRequestSchema,
+  CredentialRotationRequestSchema,
   DEFAULT_NEGOTIATED_LIMITS,
   ErrorEnvelopeSchema,
   HttpErrorResponseSchema,
@@ -39,6 +41,8 @@ import {
   WEBSOCKET_SUBPROTOCOL,
   assertClientControlMessage,
   assertControlMessage,
+  assertCredentialRotationConfirmationRequest,
+  assertCredentialRotationRequest,
   assertInstallationCredentialResponse,
   assertRotationConfirmationResponse,
   assertServerControlMessage,
@@ -53,6 +57,8 @@ import {
   isCanonicalPairingCode,
   isClientControlMessage,
   isControlMessage,
+  isCredentialRotationConfirmationRequest,
+  isCredentialRotationRequest,
   isErrorEnvelope,
   isInstallationCredentialResponse,
   isRotationBeginResponse,
@@ -72,6 +78,8 @@ import {
   CONTROLLED_INSTALLATION_CREDENTIAL,
   CONTROLLED_PAIRING_CODE,
   CONTROLLED_SESSION_TICKET,
+  CREDENTIAL_ROTATION_CONFIRMATION_REQUEST,
+  CREDENTIAL_ROTATION_REQUEST,
   ERROR_CODES,
   ERROR_ENVELOPE_FIXTURES,
   GOLDEN_MINIMUM_AUDIO_FRAME_HEX,
@@ -342,6 +350,63 @@ describe('strict schema and semantic boundaries', () => {
 });
 
 describe('authentication and semantic timestamps', () => {
+  it('accepts only the symmetric deeply frozen empty credential rotation fixtures', () => {
+    const canary = 'ROTATION-CREDENTIAL-CANARY';
+    const contracts = [
+      {
+        fixture: CREDENTIAL_ROTATION_REQUEST,
+        schema: CredentialRotationRequestSchema,
+        isValid: isCredentialRotationRequest,
+        assertValid: assertCredentialRotationRequest
+      },
+      {
+        fixture: CREDENTIAL_ROTATION_CONFIRMATION_REQUEST,
+        schema: CredentialRotationConfirmationRequestSchema,
+        isValid: isCredentialRotationConfirmationRequest,
+        assertValid: assertCredentialRotationConfirmationRequest
+      }
+    ] as const;
+
+    for (const { fixture, schema, isValid, assertValid } of contracts) {
+      expect(fixture).toEqual({});
+      expect(Object.keys(fixture)).toEqual([]);
+      expect(Object.isFrozen(fixture)).toBe(true);
+      expect(Value.Check(schema, fixture)).toBe(true);
+      expect(isValid(fixture)).toBe(true);
+      expect(assertValid(fixture)).toBe(fixture);
+
+      for (const invalid of [
+        null,
+        [],
+        'rotation request',
+        1,
+        Symbol('rotation request'),
+        { credential: canary },
+        { secret: canary },
+        { password: canary },
+        { credentialVersion: 1 }
+      ] as unknown[]) {
+        expect(Value.Check(schema, invalid)).toBe(false);
+        expect(isValid(invalid)).toBe(false);
+        expect(() => assertValid(invalid)).toThrow();
+      }
+
+      for (const invalid of [{ credential: canary }, { secret: canary }]) {
+        let captured: unknown;
+        try {
+          assertValid(invalid);
+        } catch (error) {
+          captured = error;
+        }
+        expect(captured).toBeInstanceOf(Error);
+        if (captured instanceof Error) {
+          expect(JSON.stringify(captured) ?? '').not.toContain(canary);
+          expect(captured.stack ?? '').not.toContain(canary);
+        }
+      }
+    }
+  });
+
   it('accepts every controlled auth fixture with its intended runtime validator', () => {
     expect(Value.Check(PairingRedemptionRequestSchema, PAIRING_REDEMPTION_REQUEST)).toBe(true);
     expect(Value.Check(InstallationCredentialResponseSchema, INSTALLATION_CREDENTIAL_RESPONSE)).toBe(
@@ -526,6 +591,8 @@ describe('deeply immutable controlled fixtures', () => {
       UTTERANCE_ABORTED_FIXTURES,
       ERROR_ENVELOPE_FIXTURES,
       LANGUAGE_DECISION_FIXTURES,
+      CREDENTIAL_ROTATION_REQUEST,
+      CREDENTIAL_ROTATION_CONFIRMATION_REQUEST,
       SPANISH_PROTOCOL_JOURNEY,
       SPANISH_PROTOCOL_JOURNEY.suggestionsReady.suggestions,
       SPANISH_PROTOCOL_JOURNEY.suggestionsReady.suggestions[0]

@@ -40,6 +40,20 @@ export const PairingRedemptionRequestSchema = Type.Object(
 );
 export type PairingRedemptionRequest = Static<typeof PairingRedemptionRequestSchema>;
 
+export const CredentialRotationRequestSchema = Type.Object(
+  {},
+  { additionalProperties: false }
+);
+export type CredentialRotationRequest = Static<typeof CredentialRotationRequestSchema>;
+
+export const CredentialRotationConfirmationRequestSchema = Type.Object(
+  {},
+  { additionalProperties: false }
+);
+export type CredentialRotationConfirmationRequest = Static<
+  typeof CredentialRotationConfirmationRequestSchema
+>;
+
 export const InstallationCredentialResponseSchema = Type.Object(
   {
     installationId: UuidSchema,

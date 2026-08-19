@@ -4,6 +4,8 @@ import {
   type AudioAck,
   type AudioFrameInput,
   type ClientControlMessage,
+  type CredentialRotationConfirmationRequest,
+  type CredentialRotationRequest,
   type ErrorCode,
   type ErrorEnvelope,
   type HttpErrorResponse,
@@ -120,6 +122,9 @@ export const NEW_SESSION_READY: SessionReady = deepFreeze({
 export const PAIRING_REDEMPTION_REQUEST: PairingRedemptionRequest = deepFreeze({
   pairingCode: CONTROLLED_PAIRING_CODE
 });
+export const CREDENTIAL_ROTATION_REQUEST: CredentialRotationRequest = deepFreeze({});
+export const CREDENTIAL_ROTATION_CONFIRMATION_REQUEST: CredentialRotationConfirmationRequest =
+  deepFreeze({});
 export const INSTALLATION_CREDENTIAL_RESPONSE: InstallationCredentialResponse = deepFreeze({
   installationId: FIXTURE_ERROR_ID,
   credential: CONTROLLED_INSTALLATION_CREDENTIAL,
