@@ -598,6 +598,91 @@ function validateKnownFields(descriptors: ReadonlyMap<string, PropertyDescriptor
   }
 }
 
+const EXPORT_PROVIDER_VERSIONS = new Map<string, string>([
+  ['deterministic-mock', '1.0.0'],
+  ['deterministic-mock-generation', '1.0.0'],
+  ['azure-realtime', 'ga-transcription-websocket'],
+  ['litellm-chat', '1.0.0']
+]);
+
+const EXPORT_ERROR_IDS = new Map<TelemetryErrorCategory, string>([
+  [ERROR_CATEGORIES.UNKNOWN, 'unknown_failure'],
+  [ERROR_CATEGORIES.PROVIDER, 'provider_failure'],
+  [ERROR_CATEGORIES.STATE_STORE, 'state_store_failure'],
+  [ERROR_CATEGORIES.TRANSPORT, 'transport_failure'],
+  [ERROR_CATEGORIES.VALIDATION, 'validation_failure'],
+  [ERROR_CATEGORIES.CONFIGURATION, 'configuration_failure'],
+  [ERROR_CATEGORIES.TIMEOUT, 'timeout_failure'],
+  [ERROR_CATEGORIES.AUTHORIZATION, 'authorization_failure'],
+  [ERROR_CATEGORIES.STORAGE, 'storage_failure'],
+  [ERROR_CATEGORIES.LANGUAGE, 'language_failure']
+]);
+
+const LATENCY_METRIC_NAMES = new Set<TelemetryMetricName>([
+  TELEMETRY_METRIC_NAMES.TRANSCRIPTION_FIRST_PARTIAL_LATENCY,
+  TELEMETRY_METRIC_NAMES.TRANSCRIPTION_FINAL_LATENCY,
+  TELEMETRY_METRIC_NAMES.TRANSLATION_LATENCY,
+  TELEMETRY_METRIC_NAMES.SUGGESTION_LATENCY
+]);
+
+const AUDIO_SAMPLE_METRIC_NAMES = new Set<TelemetryMetricName>([
+  TELEMETRY_METRIC_NAMES.AUDIO_ACCEPTED_SAMPLES,
+  TELEMETRY_METRIC_NAMES.AUDIO_DUPLICATE_SAMPLES,
+  TELEMETRY_METRIC_NAMES.AUDIO_REJECTED_SAMPLES
+]);
+
+function validateExportMetricFields(
+  descriptors: ReadonlyMap<string, PropertyDescriptor>
+): void {
+  const name = descriptorValue(descriptors, 'name') as TelemetryMetricName;
+  const hasDuration = descriptorValue(descriptors, 'durationMs') !== undefined;
+  const hasSamples = descriptorValue(descriptors, 'sampleCount') !== undefined;
+  const hasCount = descriptorValue(descriptors, 'count') !== undefined;
+
+  if (LATENCY_METRIC_NAMES.has(name)) {
+    if (!hasDuration || hasSamples || hasCount) {
+      fail('invalid-field');
+    }
+    return;
+  }
+
+  if (AUDIO_SAMPLE_METRIC_NAMES.has(name)) {
+    const sampleCount = descriptorValue(descriptors, 'sampleCount');
+    if (!hasSamples || hasDuration || hasCount || sampleCount === 0) {
+      fail('invalid-field');
+    }
+    return;
+  }
+
+  const count = descriptorValue(descriptors, 'count');
+  if (hasDuration || hasSamples || (hasCount && count === 0)) {
+    fail('invalid-field');
+  }
+}
+
+function validateExportPairs(descriptors: ReadonlyMap<string, PropertyDescriptor>): void {
+  const providerId = descriptorValue(descriptors, 'providerId');
+  const providerVersion = descriptorValue(descriptors, 'providerVersion');
+  if ((providerId === undefined) !== (providerVersion === undefined)) {
+    fail('invalid-field');
+  }
+  if (
+    typeof providerId === 'string' &&
+    EXPORT_PROVIDER_VERSIONS.get(providerId) !== providerVersion
+  ) {
+    fail('invalid-field');
+  }
+
+  const errorCategory = descriptorValue(descriptors, 'errorCategory');
+  const errorId = descriptorValue(descriptors, 'errorId');
+  if (
+    typeof errorCategory === 'string' &&
+    EXPORT_ERROR_IDS.get(errorCategory as TelemetryErrorCategory) !== errorId
+  ) {
+    fail('invalid-error');
+  }
+}
+
 function copyAllowedFields(
   descriptors: ReadonlyMap<string, PropertyDescriptor>
 ): SanitizedTelemetryRecord {
@@ -644,6 +729,48 @@ export function sanitizeTelemetry(input: unknown): SanitizedTelemetryRecord {
     fail('invalid-field');
   }
   validateKnownFields(descriptors);
+  return copyAllowedFields(descriptors);
+}
+
+/**
+ * Strict exporter boundary. The complete graph is inspected before the exact
+ * root shape and metric-specific contract are evaluated.
+ */
+export function sanitizeTelemetryForExport(
+  input: unknown,
+  deploymentSlot: DeploymentSlot
+): SanitizedTelemetryRecord {
+  const descriptors = inspectInputGraph(
+    input,
+    {
+      ancestors: new Set<object>(),
+      visited: new Set<object>(),
+      objectCount: 0,
+      propertyCount: 0
+    },
+    0
+  );
+  if (descriptors === undefined) {
+    fail('input-shape');
+  }
+  for (const [key, descriptor] of descriptors) {
+    if (!OUTPUT_KEYS.has(key) || descriptor.value === undefined) {
+      fail('invalid-field');
+    }
+  }
+  if (!hasKey(descriptors, 'name') || !hasKey(descriptors, 'timestamp')) {
+    fail('invalid-field');
+  }
+  validateKnownFields(descriptors);
+  const timestamp = descriptorValue(descriptors, 'timestamp');
+  if (typeof timestamp !== 'string' || Number(timestamp.slice(0, 4)) < 1970) {
+    fail('invalid-timestamp');
+  }
+  if (descriptorValue(descriptors, 'deploymentSlot') !== deploymentSlot) {
+    fail('invalid-field');
+  }
+  validateExportMetricFields(descriptors);
+  validateExportPairs(descriptors);
   return copyAllowedFields(descriptors);
 }
 
@@ -851,3 +978,5 @@ export function createTelemetrySink(
 ): InMemoryTelemetrySink {
   return new InMemoryTelemetrySink(options);
 }
+
+export * from './otlp-json-exporter.js';
