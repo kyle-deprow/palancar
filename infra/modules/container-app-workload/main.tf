@@ -117,6 +117,22 @@ resource "azapi_resource" "this" {
                     value = var.runtime_identity_client_id
                   },
                   {
+                    name  = "PALANCAR_DEPLOYMENT_SLOT"
+                    value = var.deployment_slot
+                  },
+                  {
+                    name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+                    value = local.relay_application_insights_connection_string
+                  },
+                  {
+                    name  = "APPLICATIONINSIGHTS_STATSBEAT_DISABLED"
+                    value = "true"
+                  },
+                  {
+                    name  = "APPLICATION_INSIGHTS_NO_STATSBEAT"
+                    value = "true"
+                  },
+                  {
                     name  = "PALANCAR_SECURITY_MODE"
                     value = var.security_mode
                   },
@@ -136,6 +152,18 @@ resource "azapi_resource" "this" {
                     name  = "PALANCAR_TRANSCRIPTION_PROVIDER"
                     value = var.transcription_provider
                   },
+                ],
+                var.transcription_provider == "azure-realtime" ? [
+                  {
+                    name  = "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT"
+                    value = var.azure_transcription_endpoint
+                  },
+                  {
+                    name  = "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT"
+                    value = var.azure_transcription_deployment
+                  }
+                ] : [],
+                [
                   {
                     name  = "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON"
                     value = jsonencode(var.browser_allowed_origins)
@@ -164,8 +192,7 @@ resource "azapi_resource" "this" {
               probes = [
                 {
                   type = "Liveness"
-                  httpGet = {
-                    path = "/healthz"
+                  tcpSocket = {
                     port = 8787
                   }
                   initialDelaySeconds = 10
@@ -180,8 +207,8 @@ resource "azapi_resource" "this" {
                     port = 8787
                   }
                   initialDelaySeconds = 5
-                  periodSeconds       = 5
-                  timeoutSeconds      = 3
+                  periodSeconds       = 10
+                  timeoutSeconds      = 7
                   failureThreshold    = 3
                 }
               ]
@@ -219,8 +246,7 @@ resource "azapi_resource" "this" {
               probes = [
                 {
                   type = "Liveness"
-                  httpGet = {
-                    path = "/health/liveliness"
+                  tcpSocket = {
                     port = 4000
                   }
                   initialDelaySeconds = 10
@@ -235,7 +261,7 @@ resource "azapi_resource" "this" {
                     port = 4000
                   }
                   periodSeconds    = 10
-                  timeoutSeconds   = 3
+                  timeoutSeconds   = 7
                   failureThreshold = 3
                 },
                 {
@@ -274,6 +300,16 @@ resource "azapi_resource" "this" {
     }
 
     precondition {
+      condition     = trimspace(var.runtime_openai_user_role_assignment_id) != ""
+      error_message = "runtime_openai_user_role_assignment_id must be nonempty."
+    }
+
+    precondition {
+      condition     = trimspace(var.runtime_monitoring_metrics_publisher_role_assignment_id) != ""
+      error_message = "runtime_monitoring_metrics_publisher_role_assignment_id must be nonempty."
+    }
+
+    precondition {
       condition     = lower(var.image_pull_identity_id) != lower(var.runtime_identity_id)
       error_message = "image-pull and runtime identities must be distinct."
     }
@@ -289,37 +325,40 @@ resource "azapi_resource" "this" {
     }
 
     precondition {
-      condition = (
+      condition = anytrue([
         var.transcription_provider == "mock" &&
-        trimspace(var.azure_transcription_endpoint) == "" &&
-        trimspace(var.azure_transcription_deployment) == ""
-      )
-      error_message = "transcription_provider must be mock and Azure transcription fields must be empty."
+        var.azure_transcription_endpoint == "" &&
+        var.azure_transcription_deployment == "",
+        var.transcription_provider == "azure-realtime" &&
+        var.azure_transcription_endpoint != "" &&
+        var.azure_transcription_deployment == "gpt-4o-mini-transcribe",
+      ])
+      error_message = "transcription_provider must be mock with empty Azure fields or azure-realtime with the canonical endpoint and gpt-4o-mini-transcribe deployment."
     }
 
     precondition {
       condition = !var.enable_litellm_sidecar || (
         var.litellm_backend == "openrouter" &&
-        trimspace(var.litellm_image_digest) != "" &&
+        var.litellm_image_digest != "" &&
         startswith(var.litellm_image_digest, "${var.acr_login_server}/") &&
         startswith(var.litellm_upstream_model, "openrouter/") &&
-        trimspace(var.litellm_master_key_secret_url) != "" &&
-        trimspace(var.openrouter_api_key_secret_url) != "" &&
-        trimspace(var.azure_api_base) == "" &&
-        trimspace(var.azure_api_version) == ""
+        var.litellm_master_key_secret_url != "" &&
+        var.openrouter_api_key_secret_url != "" &&
+        var.azure_api_base == "" &&
+        var.azure_api_version == ""
       )
       error_message = "enabled LiteLLM requires the complete OpenRouter configuration, an immutable image in acr_login_server, and empty Azure fields."
     }
 
     precondition {
       condition = var.enable_litellm_sidecar || (
-        trimspace(var.litellm_backend) == "" &&
-        trimspace(var.litellm_image_digest) == "" &&
-        trimspace(var.litellm_upstream_model) == "" &&
-        trimspace(var.litellm_master_key_secret_url) == "" &&
-        trimspace(var.openrouter_api_key_secret_url) == "" &&
-        trimspace(var.azure_api_base) == "" &&
-        trimspace(var.azure_api_version) == ""
+        var.litellm_backend == "" &&
+        var.litellm_image_digest == "" &&
+        var.litellm_upstream_model == "" &&
+        var.litellm_master_key_secret_url == "" &&
+        var.openrouter_api_key_secret_url == "" &&
+        var.azure_api_base == "" &&
+        var.azure_api_version == ""
       )
       error_message = "all LiteLLM and provider values must be empty when the sidecar is disabled."
     }
