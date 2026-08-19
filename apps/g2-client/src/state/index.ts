@@ -13,6 +13,10 @@ export const MAX_UINT32 = 4_294_967_295;
 
 type StateName =
   | "Starting"
+  | "EnrollmentChecking"
+  | "EnrollmentRequired"
+  | "Enrolling"
+  | "StorageError"
   | "TargetSelection"
   | "Ready"
   | "Listening"
@@ -21,22 +25,66 @@ type StateName =
   | "Results"
   | "Error";
 
+export type EnrollmentReason =
+  | "missing"
+  | "absolute-expired"
+  | "credential-rejected"
+  | "pairing-failed"
+  | "pairing-uncertain"
+  | "revoked"
+  | "revocation-unconfirmed";
+
+export type PairingFailureReason = "pairing-failed" | "pairing-uncertain";
+
+export interface EnrollmentCheckingState {
+  readonly state: "EnrollmentChecking";
+  readonly type: "EnrollmentChecking";
+  readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
+  readonly phase: "checking" | "revoking";
+}
+
+export interface EnrollmentRequiredState {
+  readonly state: "EnrollmentRequired";
+  readonly type: "EnrollmentRequired";
+  readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
+  readonly reason: EnrollmentReason;
+}
+
+export interface EnrollingState {
+  readonly state: "Enrolling";
+  readonly type: "Enrolling";
+  readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
+}
+
+export interface StorageErrorState {
+  readonly state: "StorageError";
+  readonly type: "StorageError";
+  readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
+}
+
 export interface StartingState {
   readonly state: "Starting";
   readonly type: "Starting";
   readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
 }
 
 export interface TargetSelectionState {
   readonly state: "TargetSelection";
   readonly type: "TargetSelection";
   readonly highlightedTarget: TargetLanguage;
+  readonly authAttempt: number;
 }
 
 interface ReadyStateBase {
   readonly state: "Ready";
   readonly type: "Ready";
   readonly targetLanguage: TargetLanguage;
+  readonly authAttempt: number;
   readonly turn: number;
   readonly message?: string;
 }
@@ -54,6 +102,11 @@ export interface RecoveryReadyState extends ReadyStateBase {
   readonly message: string;
 }
 
+export interface AuthenticationReadyState extends ReadyStateBase {
+  readonly sessionReady: false;
+  readonly pending: "authentication";
+}
+
 export interface EstablishedReadyState extends ReadyStateBase {
   readonly sessionReady: true;
   readonly pending: false;
@@ -61,11 +114,15 @@ export interface EstablishedReadyState extends ReadyStateBase {
   readonly sessionEpoch: number;
 }
 
-export type PendingReadyState = InitialReadyState | RecoveryReadyState;
+export type PendingReadyState =
+  | InitialReadyState
+  | RecoveryReadyState
+  | AuthenticationReadyState;
 export type ReadyState = PendingReadyState | EstablishedReadyState;
 
 interface ActiveTurnState {
   readonly targetLanguage: TargetLanguage;
+  readonly authAttempt: number;
   readonly sessionId: string;
   readonly sessionEpoch: number;
   readonly utteranceId: string;
@@ -128,6 +185,10 @@ export interface ErrorState {
 
 export type ClientState =
   | StartingState
+  | EnrollmentCheckingState
+  | EnrollmentRequiredState
+  | EnrollingState
+  | StorageErrorState
   | TargetSelectionState
   | ReadyState
   | ListeningState
@@ -142,6 +203,74 @@ export interface StartupReadyEvent {
 
 export interface StartupFailedEvent {
   readonly type: "startup.failed";
+}
+
+export interface EnrollmentReadyEvent {
+  readonly type: "enrollment.ready";
+}
+
+export interface EnrollmentRequiredEvent {
+  readonly type: "enrollment.required";
+  readonly reason: EnrollmentReason;
+}
+
+export interface EnrollmentStartedEvent {
+  readonly type: "enrollment.started";
+}
+
+export interface EnrollmentFailedEvent {
+  readonly type: "enrollment.failed";
+  readonly reason: PairingFailureReason;
+}
+
+export interface EnrollmentStorageErrorEvent {
+  readonly type: "enrollment.storage-error";
+}
+
+export interface EnrollmentRetryEvent {
+  readonly type: "enrollment.retry";
+}
+
+export interface EnrollmentResetEvent {
+  readonly type: "enrollment.reset";
+}
+
+export interface SessionAuthenticatedEvent {
+  readonly type: "session.authenticated";
+  readonly authAttempt: number;
+}
+
+export interface SessionAuthRequiredEvent {
+  readonly type: "session.auth-required";
+  readonly authAttempt: number;
+  readonly reason: EnrollmentReason;
+}
+
+export interface SessionAuthStorageErrorEvent {
+  readonly type: "session.auth-storage-error";
+  readonly authAttempt: number;
+}
+
+export interface SessionAuthUnavailableEvent {
+  readonly type: "session.auth-unavailable";
+  readonly authAttempt: number;
+}
+
+export interface CredentialRejectedEvent {
+  readonly type: "credential.rejected";
+}
+
+export interface CredentialStorageErrorEvent {
+  readonly type: "credential.storage-error";
+}
+
+export interface RevocationStartedEvent {
+  readonly type: "revocation.started";
+}
+
+export interface RevocationCompletedEvent {
+  readonly type: "revocation.completed";
+  readonly reason: "revoked" | "revocation-unconfirmed";
 }
 
 export interface SwipeNextEvent {
@@ -260,6 +389,21 @@ export interface ShutdownEvent {
 export type LocalClientEvent =
   | StartupReadyEvent
   | StartupFailedEvent
+  | EnrollmentReadyEvent
+  | EnrollmentRequiredEvent
+  | EnrollmentStartedEvent
+  | EnrollmentFailedEvent
+  | EnrollmentStorageErrorEvent
+  | EnrollmentRetryEvent
+  | EnrollmentResetEvent
+  | SessionAuthenticatedEvent
+  | SessionAuthRequiredEvent
+  | SessionAuthStorageErrorEvent
+  | SessionAuthUnavailableEvent
+  | CredentialRejectedEvent
+  | CredentialStorageErrorEvent
+  | RevocationStartedEvent
+  | RevocationCompletedEvent
   | SwipeNextEvent
   | SwipePreviousEvent
   | PressEvent
@@ -282,6 +426,24 @@ export type ClientEvent = LocalClientEvent | ServerClientEvent;
 export interface PersistTargetEffect {
   readonly type: "persist-target";
   readonly targetLanguage: TargetLanguage;
+}
+
+export interface CheckEnrollmentEffect {
+  readonly type: "check-enrollment";
+}
+
+export interface ResetEnrollmentEffect {
+  readonly type: "reset-enrollment";
+}
+
+export interface PrepareSessionAuthEffect {
+  readonly type: "prepare-session-auth";
+  readonly targetLanguage: TargetLanguage;
+  readonly authAttempt: number;
+}
+
+export interface CancelSessionBoundaryEffect {
+  readonly type: "cancel-session-boundary";
 }
 
 export interface StartSessionEffect {
@@ -330,6 +492,10 @@ export interface RequestSuggestionsEffect extends SessionEffect {
 }
 
 export type ClientEffect =
+  | CheckEnrollmentEffect
+  | ResetEnrollmentEffect
+  | PrepareSessionAuthEffect
+  | CancelSessionBoundaryEffect
   | PersistTargetEffect
   | StartSessionEffect
   | StartFreshSessionEffect
@@ -351,6 +517,7 @@ interface SessionIdentity {
 
 interface ActiveTurnData extends SessionIdentity {
   readonly targetLanguage: TargetLanguage;
+  readonly authAttempt: number;
   readonly utteranceId: string;
   readonly turn: number;
   readonly transcript: string;
@@ -376,10 +543,26 @@ const SAFE_MESSAGES = Object.freeze({
   malformedResults: "Response results were invalid; ready for a new turn.",
   transcriptOverflow: "The transcript exceeded the safe display limit; ready for a new turn.",
   sessionMismatch: "The session target did not match the confirmed target.",
+  authUnavailable: "Session authentication unavailable; press to retry.",
 } as const);
 const KNOWN_CLIENT_EVENT_TYPES = Object.freeze({
   "startup.ready": true,
   "startup.failed": true,
+  "enrollment.ready": true,
+  "enrollment.required": true,
+  "enrollment.started": true,
+  "enrollment.failed": true,
+  "enrollment.storage-error": true,
+  "enrollment.retry": true,
+  "enrollment.reset": true,
+  "session.authenticated": true,
+  "session.auth-required": true,
+  "session.auth-storage-error": true,
+  "session.auth-unavailable": true,
+  "credential.rejected": true,
+  "credential.storage-error": true,
+  "revocation.started": true,
+  "revocation.completed": true,
   "swipe.next": true,
   "swipe.previous": true,
   press: true,
@@ -453,9 +636,119 @@ function noChange(state: ClientState): ClientStateReduction {
 
 function isKnownClientEvent(value: unknown): value is ClientEvent {
   if (value === null || typeof value !== "object") return false;
-  const type = (value as { readonly type?: unknown }).type;
-  return typeof type === "string" &&
-    Object.prototype.hasOwnProperty.call(KNOWN_CLIENT_EVENT_TYPES, type);
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype || Array.isArray(value)) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(value);
+    const stringKeys = keys.filter((key): key is string => typeof key === "string");
+    if (stringKeys.length !== keys.length) return false;
+    for (const key of stringKeys) {
+      const descriptor = descriptors[key];
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+        return false;
+      }
+    }
+    const typeDescriptor = descriptors.type;
+    if (typeDescriptor === undefined || !Object.prototype.hasOwnProperty.call(typeDescriptor, "value")) {
+      return false;
+    }
+    const type = typeDescriptor.value;
+    if (typeof type !== "string" ||
+      !Object.prototype.hasOwnProperty.call(KNOWN_CLIENT_EVENT_TYPES, type)) return false;
+
+    const hasExactKeys = (...allowed: readonly string[][]): boolean => allowed.some((expected) =>
+      expected.length === stringKeys.length && expected.every((key) => stringKeys.includes(key)));
+    const hasOnlyKeys = (allowed: readonly string[]): boolean =>
+      stringKeys.every((key) => allowed.includes(key));
+    const record = value as Record<string, unknown>;
+    switch (type) {
+      case "startup.ready":
+      case "startup.failed":
+      case "enrollment.ready":
+      case "enrollment.started":
+      case "enrollment.storage-error":
+      case "enrollment.retry":
+      case "enrollment.reset":
+      case "credential.rejected":
+      case "credential.storage-error":
+      case "revocation.started":
+      case "swipe.next":
+      case "swipe.previous":
+      case "fatal":
+      case "shutdown":
+        return hasExactKeys(["type"]);
+      case "session.authenticated":
+      case "session.auth-storage-error":
+      case "session.auth-unavailable":
+        return hasExactKeys(["type", "authAttempt"]) &&
+          validAuthAttempt(record.authAttempt);
+      case "session.auth-required":
+        return hasExactKeys(["type", "authAttempt", "reason"]) &&
+          validAuthAttempt(record.authAttempt) && isEnrollmentReason(record.reason);
+      case "enrollment.required":
+        return hasExactKeys(["type", "reason"]) && isEnrollmentReason(record.reason);
+      case "enrollment.failed":
+        return hasExactKeys(["type", "reason"]) && isPairingFailureReason(record.reason);
+      case "revocation.completed":
+        return hasExactKeys(["type", "reason"]) && isRevocationReason(record.reason);
+      case "press":
+        return hasExactKeys(["type"], ["type", "utteranceId"]) &&
+          (!Object.prototype.hasOwnProperty.call(record, "utteranceId") ||
+            typeof record.utteranceId === "string");
+      case "session.ready":
+        return hasOnlyKeys(["type", "sessionId", "sessionEpoch", "targetLanguage", "result"]);
+      case "transcript.partial":
+      case "transcript.final":
+        return hasOnlyKeys([
+          "type",
+          "sessionId",
+          "sessionEpoch",
+          "utteranceId",
+          "segmentId",
+          "revision",
+          "text",
+        ]);
+      case "language.decision":
+        return hasOnlyKeys([
+          "type",
+          "sessionId",
+          "sessionEpoch",
+          "utteranceId",
+          "segmentId",
+          "revision",
+          "decision",
+          "selectedTargetLanguage",
+        ]);
+      case "translation.ready":
+        return hasOnlyKeys([
+          "type",
+          "sessionId",
+          "sessionEpoch",
+          "utteranceId",
+          "segmentId",
+          "acceptedFinalRevision",
+          "englishTranslation",
+        ]);
+      case "suggestions.ready":
+        return hasOnlyKeys([
+          "type",
+          "sessionId",
+          "sessionEpoch",
+          "utteranceId",
+          "segmentId",
+          "acceptedFinalRevision",
+          "suggestions",
+        ]);
+      case "transport.lost":
+      case "recovery.failed":
+        return hasOnlyKeys(["type", "sessionId", "sessionEpoch"]);
+      case "utterance.aborted":
+        return hasOnlyKeys(["type", "sessionId", "sessionEpoch", "utteranceId", "category"]);
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function assertNeverClientEvent(event: never): never {
@@ -472,12 +765,42 @@ function validPositiveUint32(value: unknown): value is number {
     value <= MAX_UINT32;
 }
 
+function validAuthGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) &&
+    value >= 0 && value <= MAX_UINT32;
+}
+
+function validAuthAttempt(value: unknown): value is number {
+  return validAuthGeneration(value) && value > 0;
+}
+
+function nextAuthAttempt(value: number): number | undefined {
+  return validAuthGeneration(value) && value < MAX_UINT32 ? value + 1 : undefined;
+}
+
 function validText(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
 }
 
 function validSegmentId(value: unknown): value is string {
   return typeof value === "string" && SEGMENT_ID_PATTERN.test(value);
+}
+
+function isEnrollmentReason(value: unknown): value is EnrollmentReason {
+  return value === "missing" || value === "absolute-expired" ||
+    value === "credential-rejected" || value === "pairing-failed" ||
+    value === "pairing-uncertain" || value === "revoked" ||
+    value === "revocation-unconfirmed";
+}
+
+function isPairingFailureReason(value: unknown): value is PairingFailureReason {
+  return value === "pairing-failed" || value === "pairing-uncertain";
+}
+
+function isRevocationReason(
+  value: unknown,
+): value is "revoked" | "revocation-unconfirmed" {
+  return value === "revoked" || value === "revocation-unconfirmed";
 }
 
 function defaultTarget(): TargetLanguage {
@@ -496,12 +819,17 @@ export function createInitialState(restoredTargetValue?: unknown): ClientState {
   return makeState({
     state: "Starting" as const,
     highlightedTarget: restoredTarget(restoredTargetValue),
+    authAttempt: 0,
   }) as StartingState;
 }
 
 function stateTarget(state: ClientState): TargetLanguage | undefined {
   switch (state.state) {
     case "Starting":
+    case "EnrollmentChecking":
+    case "EnrollmentRequired":
+    case "Enrolling":
+    case "StorageError":
     case "TargetSelection":
       return state.highlightedTarget;
     case "Ready":
@@ -538,6 +866,10 @@ function stateSession(state: ClientState): SessionIdentity | undefined {
         ? { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch }
         : undefined;
     case "Starting":
+    case "EnrollmentChecking":
+    case "EnrollmentRequired":
+    case "Enrolling":
+    case "StorageError":
     case "TargetSelection":
       return undefined;
   }
@@ -572,18 +904,21 @@ function readyState(
   targetLanguage: TargetLanguage,
   session: undefined,
   turn: number,
+  authAttempt: number,
   message?: string,
 ): PendingReadyState;
 function readyState(
   targetLanguage: TargetLanguage,
   session: SessionIdentity,
   turn: number,
+  authAttempt: number,
   message?: string,
 ): EstablishedReadyState;
 function readyState(
   targetLanguage: TargetLanguage,
   session: SessionIdentity | undefined,
   turn: number,
+  authAttempt: number,
   message?: string,
 ): ReadyState {
   if (session === undefined) {
@@ -593,6 +928,7 @@ function readyState(
       sessionReady: false as const,
       pending: "initial" as const,
       turn,
+      authAttempt,
       ...(message === undefined ? {} : { message }),
     }) as InitialReadyState;
   }
@@ -603,14 +939,74 @@ function readyState(
     pending: false as const,
     ...session,
     turn,
+    authAttempt,
     ...(message === undefined ? {} : { message }),
   }) as ReadyState;
+}
+
+function authenticationReadyState(
+  targetLanguage: TargetLanguage,
+  authAttempt: number,
+  message?: string,
+): AuthenticationReadyState {
+  return makeState({
+    state: "Ready" as const,
+    targetLanguage,
+    sessionReady: false as const,
+    pending: "authentication" as const,
+    authAttempt,
+    turn: 0,
+    ...(message === undefined ? {} : { message }),
+  }) as AuthenticationReadyState;
+}
+
+function enrollmentCheckingState(
+  highlightedTarget: TargetLanguage,
+  phase: "checking" | "revoking",
+  authAttempt: number,
+): EnrollmentCheckingState {
+  return makeState({
+    state: "EnrollmentChecking" as const,
+    highlightedTarget,
+    authAttempt,
+    phase,
+  });
+}
+
+function enrollmentRequiredState(
+  highlightedTarget: TargetLanguage,
+  reason: EnrollmentReason,
+  authAttempt: number,
+): EnrollmentRequiredState {
+  return makeState({
+    state: "EnrollmentRequired" as const,
+    highlightedTarget,
+    authAttempt,
+    reason,
+  });
+}
+
+function enrollingState(highlightedTarget: TargetLanguage, authAttempt: number): EnrollingState {
+  return makeState({
+    state: "Enrolling" as const,
+    highlightedTarget,
+    authAttempt,
+  });
+}
+
+function storageErrorState(highlightedTarget: TargetLanguage, authAttempt: number): StorageErrorState {
+  return makeState({
+    state: "StorageError" as const,
+    highlightedTarget,
+    authAttempt,
+  });
 }
 
 function recoveryReadyState(
   targetLanguage: TargetLanguage,
   previousSession: SessionIdentity,
   turn: number,
+  authAttempt: number,
 ): RecoveryReadyState {
   return makeState({
     state: "Ready" as const,
@@ -620,6 +1016,7 @@ function recoveryReadyState(
     previousSessionId: previousSession.sessionId,
     previousSessionEpoch: previousSession.sessionEpoch,
     turn,
+    authAttempt,
     message: SAFE_MESSAGES.transportLost,
   }) as RecoveryReadyState;
 }
@@ -627,6 +1024,7 @@ function recoveryReadyState(
 function activeData(state: ActiveTurnClientState): ActiveTurnData {
   return {
     targetLanguage: state.targetLanguage,
+    authAttempt: state.authAttempt,
     sessionId: state.sessionId,
     sessionEpoch: state.sessionEpoch,
     utteranceId: state.utteranceId,
@@ -704,11 +1102,25 @@ function isActiveTurnState(state: ClientState): state is ActiveTurnClientState {
     state.state === "Translating" || state.state === "Results";
 }
 
-function startSessionEffects(targetLanguage: TargetLanguage): readonly ClientEffect[] {
+function prepareSessionAuthEffect(
+  targetLanguage: TargetLanguage,
+  authAttempt: number,
+): PrepareSessionAuthEffect {
+  return { type: "prepare-session-auth", targetLanguage, authAttempt };
+}
+
+function startSessionEffects(
+  targetLanguage: TargetLanguage,
+  authAttempt: number,
+): readonly ClientEffect[] {
   return [
     { type: "persist-target", targetLanguage },
-    { type: "start-session", targetLanguage },
+    prepareSessionAuthEffect(targetLanguage, authAttempt),
   ];
+}
+
+function cancelSessionBoundaryEffect(): CancelSessionBoundaryEffect {
+  return { type: "cancel-session-boundary" };
 }
 
 function startFreshSessionEffect(
@@ -747,6 +1159,83 @@ function cleanupEffects(state: ClientState): ClientEffect[] {
   const session = stateSession(state);
   if (session !== undefined) effects.push(endSessionEffect(session));
   return effects;
+}
+
+function boundaryCleanupEffects(state: ClientState): ClientEffect[] {
+  return [cancelSessionBoundaryEffect(), ...cleanupEffects(state)];
+}
+
+function isAuthenticatedSessionState(state: ClientState): boolean {
+  if (state.state === "Ready") {
+    return state.pending === "authentication" || state.pending === "initial" ||
+      state.pending === "recovery" || state.pending === false;
+  }
+  return isActiveTurnState(state);
+}
+
+function stateAuthGeneration(state: ClientState): number | undefined {
+  return state.state !== "Error" && validAuthGeneration(state.authAttempt)
+    ? state.authAttempt
+    : undefined;
+}
+
+function matchesAuthAttempt(
+  state: ClientState,
+  event: { readonly authAttempt: number },
+): state is AuthenticationReadyState {
+  return state.state === "Ready" && state.pending === "authentication" &&
+    state.message === undefined && validAuthAttempt(state.authAttempt) &&
+    state.authAttempt === event.authAttempt;
+}
+
+function credentialRejected(state: ClientState): ClientStateReduction {
+  if (!isAuthenticatedSessionState(state)) return noChange(state);
+  const target = stateTarget(state);
+  const authAttempt = stateAuthGeneration(state);
+  return target === undefined || authAttempt === undefined
+    ? noChange(state)
+    : reduction(
+        enrollmentRequiredState(target, "credential-rejected", authAttempt),
+        boundaryCleanupEffects(state),
+      );
+}
+
+function credentialStorageError(state: ClientState): ClientStateReduction {
+  if (!isAuthenticatedSessionState(state)) return noChange(state);
+  const target = stateTarget(state);
+  const authAttempt = stateAuthGeneration(state);
+  return target === undefined || authAttempt === undefined
+    ? noChange(state)
+    : reduction(storageErrorState(target, authAttempt), boundaryCleanupEffects(state));
+}
+
+function isRevocableSessionState(state: ClientState): boolean {
+  if (state.state === "TargetSelection") return true;
+  if (state.state === "Ready") {
+    return state.pending === "authentication" || state.pending === "initial" ||
+      state.pending === "recovery" || state.pending === false;
+  }
+  return isActiveTurnState(state);
+}
+
+function revocationStarted(state: ClientState): ClientStateReduction {
+  if (!isRevocableSessionState(state)) return noChange(state);
+  const target = stateTarget(state);
+  const authAttempt = stateAuthGeneration(state);
+  return target === undefined || authAttempt === undefined
+    ? noChange(state)
+    : reduction(
+        enrollmentCheckingState(target, "revoking", authAttempt),
+        boundaryCleanupEffects(state),
+      );
+}
+
+function enrollmentStorageError(state: ClientState): ClientStateReduction {
+  if (state.state !== "EnrollmentChecking" && state.state !== "EnrollmentRequired" &&
+    state.state !== "Enrolling") return noChange(state);
+  return validAuthGeneration(state.authAttempt)
+    ? reduction(storageErrorState(state.highlightedTarget, state.authAttempt))
+    : noChange(state);
 }
 
 function sessionReadyMismatch(state: ReadyState, event: SessionReadyEvent): ClientStateReduction {
@@ -823,6 +1312,7 @@ function segmentUpdate(
 
   const data: ActiveTurnData = {
     targetLanguage: state.targetLanguage,
+    authAttempt: state.authAttempt,
     sessionId: state.sessionId,
     sessionEpoch: state.sessionEpoch,
     utteranceId: state.utteranceId,
@@ -885,6 +1375,7 @@ function languageDecision(state: FinalizingState, event: LanguageDecisionEvent):
       state.targetLanguage,
       { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch },
       state.turn,
+      state.authAttempt,
       decisionMessage(event.decision, state.targetLanguage),
     ));
   }
@@ -982,6 +1473,7 @@ function clearAfterAbort(
     state.targetLanguage,
     session,
     state.turn,
+    state.authAttempt,
     SAFE_MESSAGES.utteranceAborted,
   ), effects);
 }
@@ -1011,9 +1503,21 @@ function swipeResult(state: ResultsState, direction: 1 | -1): ClientStateReducti
 
 function pressReduction(state: ClientState, event: PressEvent): ClientStateReduction {
   if (state.state === "TargetSelection") {
+    const authAttempt = nextAuthAttempt(state.authAttempt);
+    if (authAttempt === undefined) return noChange(state);
     return reduction(
-      readyState(state.highlightedTarget, undefined, 0),
-      startSessionEffects(state.highlightedTarget),
+      authenticationReadyState(state.highlightedTarget, authAttempt),
+      startSessionEffects(state.highlightedTarget, authAttempt),
+    );
+  }
+
+  if (state.state === "Ready" && state.pending === "authentication") {
+    if (state.message !== SAFE_MESSAGES.authUnavailable) return noChange(state);
+    const authAttempt = nextAuthAttempt(state.authAttempt);
+    if (authAttempt === undefined) return noChange(state);
+    return reduction(
+      authenticationReadyState(state.targetLanguage, authAttempt),
+      [prepareSessionAuthEffect(state.targetLanguage, authAttempt)],
     );
   }
 
@@ -1023,6 +1527,7 @@ function pressReduction(state: ClientState, event: PressEvent): ClientStateReduc
     const data: ActiveTurnData = {
       ...session,
       targetLanguage: state.targetLanguage,
+      authAttempt: state.authAttempt,
       utteranceId: event.utteranceId,
       turn: state.turn + 1,
       transcript: "",
@@ -1031,8 +1536,8 @@ function pressReduction(state: ClientState, event: PressEvent): ClientStateReduc
       finalSegments: {},
     };
     return reduction(listeningState(data), [
-      { type: "start-audio", ...session, utteranceId: event.utteranceId },
       { type: "start-utterance", ...session, utteranceId: event.utteranceId },
+      { type: "start-audio", ...session, utteranceId: event.utteranceId },
     ]);
   }
 
@@ -1054,11 +1559,28 @@ function pressReduction(state: ClientState, event: PressEvent): ClientStateReduc
   }
 
   if (state.state === "Results") {
-    return reduction(readyState(
-      state.targetLanguage,
-      { sessionId: state.sessionId, sessionEpoch: state.sessionEpoch },
-      state.turn,
-    ));
+    const session = stateSession(state);
+    if (session === undefined || !validUuidV4(event.utteranceId) ||
+      event.utteranceId === state.utteranceId || !validPositiveUint32(state.turn) ||
+      state.turn >= MAX_UINT32) {
+      return noChange(state);
+    }
+
+    const data: ActiveTurnData = {
+      ...session,
+      targetLanguage: state.targetLanguage,
+      authAttempt: state.authAttempt,
+      utteranceId: event.utteranceId,
+      turn: state.turn + 1,
+      transcript: "",
+      segmentTexts: {},
+      segmentRevisions: {},
+      finalSegments: {},
+    };
+    return reduction(listeningState(data), [
+      { type: "start-utterance", ...session, utteranceId: event.utteranceId },
+      { type: "start-audio", ...session, utteranceId: event.utteranceId },
+    ]);
   }
 
   return noChange(state);
@@ -1074,7 +1596,7 @@ function handleTransportLost(
     const session = stateSession(state);
     if (session === undefined) return noChange(state);
     return reduction(
-      recoveryReadyState(state.targetLanguage, session, state.turn),
+      recoveryReadyState(state.targetLanguage, session, state.turn, state.authAttempt),
       [startFreshSessionEffect(state.targetLanguage, session)],
     );
   }
@@ -1086,19 +1608,34 @@ function handleTransportLost(
   const stopAudio = stopAudioForActiveTurn(state);
   if (stopAudio !== undefined) effects.push(stopAudio);
   effects.push(startFreshSessionEffect(state.targetLanguage, session));
-  return reduction(recoveryReadyState(state.targetLanguage, session, state.turn), effects);
+  return reduction(
+    recoveryReadyState(state.targetLanguage, session, state.turn, state.authAttempt),
+    effects,
+  );
 }
 
 export function reduceClientState(inputState: ClientState, inputEvent: ClientEvent): ClientStateReduction {
   const state = normalizeInput(inputState);
-  const eventValue: unknown = normalizeInput(inputEvent as unknown);
+  let eventValue: unknown;
+  try {
+    if (!isKnownClientEvent(inputEvent as unknown)) return noChange(state);
+    eventValue = normalizeInput(inputEvent as unknown);
+  } catch {
+    return noChange(state);
+  }
   if (!isKnownClientEvent(eventValue)) return noChange(state);
   const event = eventValue;
 
   switch (event.type) {
     case "startup.ready":
       return state.state === "Starting"
-        ? reduction(makeState({ state: "TargetSelection" as const, highlightedTarget: state.highlightedTarget }) as TargetSelectionState)
+        ? reduction(enrollmentCheckingState(
+            state.highlightedTarget,
+            "checking",
+            state.authAttempt,
+          ), [
+            { type: "check-enrollment" },
+          ])
         : noChange(state);
 
     case "startup.failed":
@@ -1106,15 +1643,141 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
         ? reduction(errorState(SAFE_MESSAGES.startup, true, state.highlightedTarget))
         : noChange(state);
 
+    case "enrollment.ready":
+      return state.state === "EnrollmentChecking" && state.phase === "checking"
+        ? reduction(makeState({
+            state: "TargetSelection" as const,
+            highlightedTarget: state.highlightedTarget,
+            authAttempt: state.authAttempt,
+          }) as TargetSelectionState)
+        : state.state === "Enrolling"
+          ? reduction(makeState({
+              state: "TargetSelection" as const,
+              highlightedTarget: state.highlightedTarget,
+              authAttempt: state.authAttempt,
+            }) as TargetSelectionState)
+          : noChange(state);
+
+    case "enrollment.required":
+      return state.state === "EnrollmentChecking" && state.phase === "checking"
+        ? reduction(enrollmentRequiredState(
+            state.highlightedTarget,
+            event.reason,
+            state.authAttempt,
+          ))
+        : noChange(state);
+
+    case "enrollment.started":
+      return state.state === "EnrollmentRequired"
+        ? reduction(enrollingState(state.highlightedTarget, state.authAttempt))
+        : noChange(state);
+
+    case "enrollment.failed":
+      return state.state === "Enrolling"
+        ? reduction(enrollmentRequiredState(
+            state.highlightedTarget,
+            event.reason,
+            state.authAttempt,
+          ))
+        : noChange(state);
+
+    case "enrollment.storage-error":
+      return enrollmentStorageError(state);
+
+    case "enrollment.retry":
+      return state.state === "StorageError"
+        ? reduction(enrollmentCheckingState(
+            state.highlightedTarget,
+            "checking",
+            state.authAttempt,
+          ), [
+            { type: "check-enrollment" },
+          ])
+        : noChange(state);
+
+    case "enrollment.reset":
+      return state.state === "StorageError"
+        ? reduction(enrollmentCheckingState(
+            state.highlightedTarget,
+            "checking",
+            state.authAttempt,
+          ), [
+            { type: "reset-enrollment" },
+          ])
+        : noChange(state);
+
+    case "session.authenticated":
+      return matchesAuthAttempt(state, event)
+        ? reduction(readyState(
+            state.targetLanguage,
+            undefined,
+            0,
+            state.authAttempt,
+          ), [
+            { type: "start-session", targetLanguage: state.targetLanguage },
+          ])
+        : noChange(state);
+
+    case "session.auth-required":
+      return matchesAuthAttempt(state, event)
+          ? reduction(
+            enrollmentRequiredState(state.targetLanguage, event.reason, state.authAttempt),
+            [cancelSessionBoundaryEffect()],
+          )
+        : noChange(state);
+
+    case "session.auth-storage-error":
+      return matchesAuthAttempt(state, event)
+        ? reduction(
+            storageErrorState(state.targetLanguage, state.authAttempt),
+            [cancelSessionBoundaryEffect()],
+          )
+        : noChange(state);
+
+    case "session.auth-unavailable":
+      return matchesAuthAttempt(state, event)
+        ? reduction(authenticationReadyState(
+            state.targetLanguage,
+            state.authAttempt,
+            SAFE_MESSAGES.authUnavailable,
+          ))
+        : noChange(state);
+
+    case "credential.rejected":
+      return credentialRejected(state);
+
+    case "credential.storage-error":
+      return credentialStorageError(state);
+
+    case "revocation.started":
+      return revocationStarted(state);
+
+    case "revocation.completed":
+      return state.state === "EnrollmentChecking" && state.phase === "revoking"
+        ? reduction(enrollmentRequiredState(
+            state.highlightedTarget,
+            event.reason,
+            state.authAttempt,
+          ))
+        : noChange(state);
+
     case "swipe.next":
       if (state.state === "TargetSelection") {
-        return reduction(makeState({ state: "TargetSelection" as const, highlightedTarget: nextTarget(state.highlightedTarget, 1) }) as TargetSelectionState);
+        return reduction(makeState({
+          state: "TargetSelection" as const,
+          highlightedTarget: nextTarget(state.highlightedTarget, 1),
+          authAttempt: state.authAttempt,
+        }) as TargetSelectionState);
       }
       return state.state === "Results" ? swipeResult(state, 1) : noChange(state);
 
     case "swipe.previous":
       if (state.state === "TargetSelection") {
-        return reduction(makeState({ state: "TargetSelection" as const, highlightedTarget: nextTarget(state.highlightedTarget, -1) }) as TargetSelectionState);
+        return reduction(makeState({
+          state: "TargetSelection" as const,
+          highlightedTarget: nextTarget(state.highlightedTarget, -1),
+          authAttempt: state.authAttempt,
+        }) as TargetSelectionState);
       }
       return state.state === "Results" ? swipeResult(state, -1) : noChange(state);
 
@@ -1123,6 +1786,7 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
 
     case "session.ready": {
       if (state.state !== "Ready") return noChange(state);
+      if (state.pending === "authentication") return noChange(state);
       const target = eventTarget(event);
       const session = eventSession(event);
       if (state.pending === "recovery") {
@@ -1134,7 +1798,13 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
           session.sessionEpoch <= previousSession.sessionEpoch) {
           return invalidRecoveryReady(state, event);
         }
-        return reduction(readyState(target, session, state.turn, state.message));
+        return reduction(readyState(
+          target,
+          session,
+          state.turn,
+          state.authAttempt,
+          state.message,
+        ));
       }
       if (target === undefined || session === undefined || event.result !== "new") return noChange(state);
       const confirmedTarget = stateTarget(state);
@@ -1144,7 +1814,13 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
       if (state.sessionReady) {
         return sameSession(state, event) ? noChange(state) : sessionReadyMismatch(state, event);
       }
-      return reduction(readyState(target, session, state.turn, state.message));
+      return reduction(readyState(
+        target,
+        session,
+        state.turn,
+        state.authAttempt,
+        state.message,
+      ));
     }
 
     case "transcript.partial":

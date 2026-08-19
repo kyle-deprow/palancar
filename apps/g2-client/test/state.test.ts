@@ -26,7 +26,9 @@ const UTTERANCE_ID = "22222222-2222-4222-8222-222222222222";
 const UTTERANCE_ID_WRONG_VERSION = "22222222-2222-5222-8222-222222222222";
 const UTTERANCE_ID_WRONG_VARIANT = "22222222-2222-4222-7222-222222222222";
 const OTHER_UTTERANCE_ID = "44444444-4444-4444-8444-444444444444";
+const NEXT_UTTERANCE_ID = "55555555-5555-4555-8555-555555555555";
 const SEGMENT_ID = "segment-1";
+const FIRST_AUTH_ATTEMPT = 1;
 
 const sessionReady = (targetLanguage: "es" | "tr"): ClientEvent => ({
   type: "session.ready",
@@ -41,16 +43,31 @@ const reduce = (state: ClientState, event: ClientEvent): ClientState =>
 const asClientEvent = (event: unknown): ClientEvent => event as ClientEvent;
 
 const highlightedTarget = (state: ClientState): "es" | "tr" => {
-  if (state.state !== "Starting" && state.state !== "TargetSelection") {
+  if (state.state !== "Starting" && state.state !== "EnrollmentChecking" &&
+    state.state !== "EnrollmentRequired" && state.state !== "Enrolling" &&
+    state.state !== "StorageError" && state.state !== "TargetSelection") {
     throw new Error(`Expected a selection state, received ${state.state}`);
   }
   return state.highlightedTarget;
 };
 
-const toSessionReady = (targetLanguage: "es" | "tr" = "es"): ClientState => {
+const toTargetSelection = (targetLanguage: "es" | "tr" = "es"): ClientState => {
   let state = createInitialState(targetLanguage);
   state = reduce(state, { type: "startup.ready" });
-  state = reduce(state, { type: "press" });
+  return reduce(state, { type: "enrollment.ready" });
+};
+
+const toAuthenticationPending = (targetLanguage: "es" | "tr" = "es"): ClientState =>
+  reduce(toTargetSelection(targetLanguage), { type: "press" });
+
+const toInitialPending = (targetLanguage: "es" | "tr" = "es"): ClientState =>
+  reduce(toAuthenticationPending(targetLanguage), {
+    type: "session.authenticated",
+    authAttempt: FIRST_AUTH_ATTEMPT,
+  });
+
+const toSessionReady = (targetLanguage: "es" | "tr" = "es"): ClientState => {
+  const state = toInitialPending(targetLanguage);
   return reduce(state, sessionReady(targetLanguage));
 };
 
@@ -76,6 +93,13 @@ const toFinalizing = (targetLanguage: "es" | "tr" = "es"): ClientState => {
     revision: 2,
     text: "hola mundo",
   });
+};
+
+const toResults = (targetLanguage: "es" | "tr" = "es"): ClientState => {
+  const finalizing = toFinalizing(targetLanguage);
+  const translating = reduce(finalizing, languageDecision("target", targetLanguage));
+  const translated = reduce(translating, targetTranslation());
+  return reduce(translated, suggestionsReady());
 };
 
 const languageDecision = (
@@ -139,7 +163,14 @@ describe("G2 client interaction state", () => {
     expect(highlightedTarget(invalidRestoredState)).toBe("es");
     expect(Object.isFrozen(defaultState)).toBe(true);
 
-    const selected = reduceClientState(defaultState, { type: "startup.ready" });
+    const checking = reduceClientState(defaultState, { type: "startup.ready" });
+    expect(checking.state.state).toBe("EnrollmentChecking");
+    expect(checking.state.type).toBe("EnrollmentChecking");
+    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+    if (checking.state.state !== "EnrollmentChecking") return;
+    expect(checking.state.phase).toBe("checking");
+
+    const selected = reduceClientState(checking.state, { type: "enrollment.ready" });
     expect(selected.state.state).toBe("TargetSelection");
     expect(highlightedTarget(selected.state)).toBe("es");
     expect(Object.isFrozen(selected.state)).toBe(true);
@@ -155,22 +186,39 @@ describe("G2 client interaction state", () => {
     const initial = createInitialState("tr");
     expect(reduceClientState(initial, { type: "press" }).effects).toHaveLength(0);
 
-    const selection = reduce(initial, { type: "startup.ready" });
+    const checking = reduceClientState(initial, { type: "startup.ready" });
+    expect(checking.state.state).toBe("EnrollmentChecking");
+    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+    const selection = reduce(checking.state, { type: "enrollment.ready" });
     const confirmed = reduceClientState(selection, { type: "press" });
     expect(confirmed.state.state).toBe("Ready");
     if (confirmed.state.state !== "Ready") return;
     expect(confirmed.state.sessionReady).toBe(false);
-    expect(confirmed.state.pending).toBe("initial");
+    expect(confirmed.state.pending).toBe("authentication");
+    if (confirmed.state.pending !== "authentication") return;
+    expect(confirmed.state.authAttempt).toBe(FIRST_AUTH_ATTEMPT);
     expect(confirmed.effects.map((effect) => effect.type)).toEqual([
       "persist-target",
-      "start-session",
+      "prepare-session-auth",
     ]);
+    expect(confirmed.effects).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "start-session" }),
+    ]));
     expect(confirmed.effects).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "start-audio" }),
     ]));
 
-    expect(reduceClientState(confirmed.state, { type: "press" }).effects).toHaveLength(0);
-    const ready = reduceClientState(confirmed.state, sessionReady("tr"));
+    const authenticated = reduceClientState(confirmed.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(authenticated.state.state).toBe("Ready");
+    if (authenticated.state.state !== "Ready") return;
+    expect(authenticated.state.pending).toBe("initial");
+    expect(authenticated.effects).toEqual([{ type: "start-session", targetLanguage: "tr" }]);
+
+    expect(reduceClientState(authenticated.state, { type: "press" }).effects).toHaveLength(0);
+    const ready = reduceClientState(authenticated.state, sessionReady("tr"));
     expect(ready.state.state).toBe("Ready");
     if (ready.state.state !== "Ready") return;
     expect(ready.state.sessionReady).toBe(true);
@@ -179,11 +227,555 @@ describe("G2 client interaction state", () => {
     expect(ready.effects).toHaveLength(0);
   });
 
-  it("requires canonical session fields and v4 identities", () => {
-    const pending = reduce(
-      reduce(createInitialState("es"), { type: "startup.ready" }),
-      { type: "press" },
+  it("runs the redacted enrollment transition table for every reason and recovery action", () => {
+    const initial = createInitialState("tr");
+    const checking = reduceClientState(initial, { type: "startup.ready" });
+    expect(checking.state).toMatchObject({
+      state: "EnrollmentChecking",
+      type: "EnrollmentChecking",
+      highlightedTarget: "tr",
+      authAttempt: 0,
+      phase: "checking",
+    });
+    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+
+    const reasons = [
+      "missing",
+      "absolute-expired",
+      "credential-rejected",
+      "pairing-failed",
+      "pairing-uncertain",
+      "revoked",
+      "revocation-unconfirmed",
+    ] as const;
+    for (const reason of reasons) {
+      const required = reduceClientState(checking.state, {
+        type: "enrollment.required",
+        reason,
+      });
+      expect(required.state).toMatchObject({
+        state: "EnrollmentRequired",
+        type: "EnrollmentRequired",
+        highlightedTarget: "tr",
+        authAttempt: 0,
+        reason,
+      });
+      expect(required.effects).toHaveLength(0);
+      expect(Object.keys(required.state).sort()).toEqual([
+        "authAttempt",
+        "highlightedTarget",
+        "reason",
+        "state",
+        "type",
+      ]);
+
+      const enrolling = reduceClientState(required.state, { type: "enrollment.started" });
+      expect(enrolling.state).toEqual({
+        state: "Enrolling",
+        type: "Enrolling",
+        highlightedTarget: "tr",
+        authAttempt: 0,
+      });
+      expect(enrolling.effects).toHaveLength(0);
+
+      const ready = reduceClientState(enrolling.state, { type: "enrollment.ready" });
+      expect(ready.state).toEqual({
+        state: "TargetSelection",
+        type: "TargetSelection",
+        highlightedTarget: "tr",
+        authAttempt: 0,
+      });
+      expect(ready.effects).toHaveLength(0);
+
+      for (const pairingReason of ["pairing-failed", "pairing-uncertain"] as const) {
+        const failed = reduceClientState(enrolling.state, {
+          type: "enrollment.failed",
+          reason: pairingReason,
+        });
+        expect(failed.state).toEqual({
+          state: "EnrollmentRequired",
+          type: "EnrollmentRequired",
+          highlightedTarget: "tr",
+          authAttempt: 0,
+          reason: pairingReason,
+        });
+        expect(failed.effects).toHaveLength(0);
+      }
+    }
+
+    for (const source of [
+      checking.state,
+      reduceClientState(checking.state, {
+        type: "enrollment.required",
+        reason: "missing",
+      }).state,
+      reduceClientState(
+        reduceClientState(checking.state, {
+          type: "enrollment.required",
+          reason: "missing",
+        }).state,
+        { type: "enrollment.started" },
+      ).state,
+    ]) {
+      const failed = reduceClientState(source, { type: "enrollment.storage-error" });
+      expect(failed.state).toEqual({
+        state: "StorageError",
+        type: "StorageError",
+        highlightedTarget: "tr",
+        authAttempt: 0,
+      });
+      expect(failed.effects).toHaveLength(0);
+      const retried = reduceClientState(failed.state, { type: "enrollment.retry" });
+      expect(retried.state).toEqual({
+        state: "EnrollmentChecking",
+        type: "EnrollmentChecking",
+        highlightedTarget: "tr",
+        authAttempt: 0,
+        phase: "checking",
+      });
+      expect(retried.effects).toEqual([{ type: "check-enrollment" }]);
+      const reset = reduceClientState(failed.state, { type: "enrollment.reset" });
+      expect(reset.state).toEqual(retried.state);
+      expect(reset.effects).toEqual([{ type: "reset-enrollment" }]);
+    }
+
+    const malformed = reduceClientState(checking.state, asClientEvent({
+      type: "enrollment.required",
+      reason: "unknown",
+      credential: "CREDENTIAL-CANARY",
+    }));
+    expect(malformed.state).toEqual(checking.state);
+    expect(malformed.effects).toHaveLength(0);
+    expect(JSON.stringify(malformed)).not.toContain("CREDENTIAL-CANARY");
+  });
+
+  it("keeps enrollment and storage states target-only and ignores gestures", () => {
+    const checking = reduceClientState(
+      createInitialState("es"),
+      { type: "startup.ready" },
+    ).state;
+    const required = reduceClientState(checking, {
+      type: "enrollment.required",
+      reason: "missing",
+    }).state;
+    const enrolling = reduceClientState(required, { type: "enrollment.started" }).state;
+    const storageError = reduceClientState(enrolling, { type: "enrollment.storage-error" }).state;
+    const states = [checking, required, enrolling, storageError];
+
+    for (const state of states) {
+      expect(Object.keys(state).every((key) => [
+        "state",
+        "type",
+        "highlightedTarget",
+        "authAttempt",
+        "phase",
+        "reason",
+      ].includes(key))).toBe(true);
+      expect(Object.isFrozen(state)).toBe(true);
+      for (const event of [
+        { type: "press" },
+        { type: "swipe.next" },
+        { type: "swipe.previous" },
+      ] as const) {
+        const unchanged = reduceClientState(state, event);
+        expect(unchanged.state).toEqual(state);
+        expect(unchanged.effects).toHaveLength(0);
+      }
+    }
+  });
+
+  it("requires authentication before starting a session and supports a redacted retry", () => {
+    const selection = toTargetSelection("es");
+    const authPending = reduceClientState(selection, { type: "press" });
+    expect(authPending.state).toEqual({
+      state: "Ready",
+      type: "Ready",
+      targetLanguage: "es",
+      sessionReady: false,
+      pending: "authentication",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      turn: 0,
+    });
+    expect(authPending.effects).toEqual([
+      { type: "persist-target", targetLanguage: "es" },
+      {
+        type: "prepare-session-auth",
+        targetLanguage: "es",
+        authAttempt: FIRST_AUTH_ATTEMPT,
+      },
+    ]);
+
+    const bypass = reduceClientState(authPending.state, sessionReady("es"));
+    expect(bypass.state).toEqual(authPending.state);
+    expect(bypass.effects).toHaveLength(0);
+
+    const duplicatePress = reduceClientState(authPending.state, { type: "press" });
+    expect(duplicatePress.state).toEqual(authPending.state);
+    expect(duplicatePress.effects).toHaveLength(0);
+
+    for (const staleEvent of [
+      { type: "session.authenticated", authAttempt: 2 },
+      { type: "session.auth-required", authAttempt: 2, reason: "absolute-expired" },
+      { type: "session.auth-storage-error", authAttempt: 2 },
+      { type: "session.auth-unavailable", authAttempt: 2 },
+    ] as const) {
+      const stale = reduceClientState(authPending.state, staleEvent);
+      expect(stale.state).toEqual(authPending.state);
+      expect(stale.effects).toHaveLength(0);
+    }
+
+    for (const malformedEvent of [
+      { type: "session.authenticated", authAttempt: FIRST_AUTH_ATTEMPT, extra: true },
+      { type: "session.auth-required", authAttempt: FIRST_AUTH_ATTEMPT },
+      { type: "session.auth-storage-error", authAttempt: 0 },
+      { type: "session.authenticated", authAttempt: MAX_UINT32 + 1 },
+      { type: "session.auth-unavailable" },
+    ]) {
+      const malformed = reduceClientState(authPending.state, asClientEvent(malformedEvent));
+      expect(malformed.state).toEqual(authPending.state);
+      expect(malformed.effects).toHaveLength(0);
+    }
+
+    const authenticated = reduceClientState(authPending.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(authenticated.state).toMatchObject({
+      state: "Ready",
+      type: "Ready",
+      targetLanguage: "es",
+      sessionReady: false,
+      pending: "initial",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      turn: 0,
+    });
+    expect(authenticated.effects).toEqual([{ type: "start-session", targetLanguage: "es" }]);
+
+    const required = reduceClientState(authPending.state, {
+      type: "session.auth-required",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      reason: "absolute-expired",
+    });
+    expect(required.state).toEqual({
+      state: "EnrollmentRequired",
+      type: "EnrollmentRequired",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      reason: "absolute-expired",
+    });
+    expect(required.effects).toEqual([{ type: "cancel-session-boundary" }]);
+
+    const storageError = reduceClientState(authPending.state, {
+      type: "session.auth-storage-error",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(storageError.state).toEqual({
+      state: "StorageError",
+      type: "StorageError",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(storageError.effects).toEqual([{ type: "cancel-session-boundary" }]);
+
+    const unavailable = reduceClientState(authPending.state, {
+      type: "session.auth-unavailable",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(unavailable.state.state).toBe("Ready");
+    if (unavailable.state.state !== "Ready") return;
+    expect(unavailable.state.pending).toBe("authentication");
+    if (unavailable.state.pending !== "authentication") return;
+    expect(unavailable.state.authAttempt).toBe(FIRST_AUTH_ATTEMPT);
+    expect(unavailable.state.message).toBe("Session authentication unavailable; press to retry.");
+    expect(JSON.stringify(unavailable.state)).not.toContain("CREDENTIAL-CANARY");
+    expect(unavailable.effects).toHaveLength(0);
+
+    const lateCompletion = reduceClientState(unavailable.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(lateCompletion.state).toEqual(unavailable.state);
+    expect(lateCompletion.effects).toHaveLength(0);
+
+    const retry = reduceClientState(unavailable.state, { type: "press" });
+    expect(retry.state).toEqual({
+      state: "Ready",
+      type: "Ready",
+      targetLanguage: "es",
+      sessionReady: false,
+      pending: "authentication",
+      authAttempt: 2,
+      turn: 0,
+    });
+    expect(retry.effects).toEqual([{
+      type: "prepare-session-auth",
+      targetLanguage: "es",
+      authAttempt: 2,
+    }]);
+
+    const staleRetryCompletion = reduceClientState(retry.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(staleRetryCompletion.state).toEqual(retry.state);
+    expect(staleRetryCompletion.effects).toHaveLength(0);
+
+    const retryAuthenticated = reduceClientState(retry.state, {
+      type: "session.authenticated",
+      authAttempt: 2,
+    });
+    expect(retryAuthenticated.state).toMatchObject({ pending: "initial" });
+    expect(retryAuthenticated.effects).toEqual([{ type: "start-session", targetLanguage: "es" }]);
+
+    const exhausted = {
+      ...unavailable.state,
+      authAttempt: MAX_UINT32,
+    } as ClientState;
+    const exhaustedRetry = reduceClientState(exhausted, { type: "press" });
+    expect(exhaustedRetry.state).toEqual(exhausted);
+    expect(exhaustedRetry.effects).toHaveLength(0);
+
+    const exhaustedSelection = {
+      ...selection,
+      authAttempt: MAX_UINT32,
+    } as ClientState;
+    const exhaustedStart = reduceClientState(exhaustedSelection, { type: "press" });
+    expect(exhaustedStart.state).toEqual(exhaustedSelection);
+    expect(exhaustedStart.effects).toHaveLength(0);
+  });
+
+  it("routes credential rejection and storage failures through exact authenticated cleanup", () => {
+    const authPending = toAuthenticationPending();
+    const pendingRejected = reduceClientState(authPending, { type: "credential.rejected" });
+    expect(pendingRejected.state).toEqual({
+      state: "EnrollmentRequired",
+      type: "EnrollmentRequired",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      reason: "credential-rejected",
+    });
+    expect(pendingRejected.effects).toEqual([{ type: "cancel-session-boundary" }]);
+
+    const pendingStorage = reduceClientState(authPending, { type: "credential.storage-error" });
+    expect(pendingStorage.state).toEqual({
+      state: "StorageError",
+      type: "StorageError",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(pendingStorage.effects).toEqual([{ type: "cancel-session-boundary" }]);
+
+    const authenticatedStates = [
+      toInitialPending(),
+      toSessionReady(),
+      toListening(),
+      toFinalizing(),
+      reduce(toFinalizing(), languageDecision("target")),
+      toResults(),
+    ];
+    for (const state of authenticatedStates) {
+      const expectedCleanup = state.state === "Listening"
+        ? ["cancel-session-boundary", "stop-audio", "end-session"]
+        : state.state === "Ready" && state.pending === "initial"
+          ? ["cancel-session-boundary"]
+          : ["cancel-session-boundary", "end-session"];
+      const rejected = reduceClientState(state, { type: "credential.rejected" });
+      expect(rejected.state).toEqual({
+        state: "EnrollmentRequired",
+        type: "EnrollmentRequired",
+        highlightedTarget: "es",
+        authAttempt: FIRST_AUTH_ATTEMPT,
+        reason: "credential-rejected",
+      });
+      expect(rejected.effects.map((effect) => effect.type)).toEqual(expectedCleanup);
+
+      const stored = reduceClientState(state, { type: "credential.storage-error" });
+      expect(stored.state).toEqual({
+        state: "StorageError",
+        type: "StorageError",
+        highlightedTarget: "es",
+        authAttempt: FIRST_AUTH_ATTEMPT,
+      });
+      expect(stored.effects.map((effect) => effect.type)).toEqual(expectedCleanup);
+    }
+
+    const enrollment = reduceClientState(
+      reduceClientState(
+        reduceClientState(createInitialState(), { type: "startup.ready" }).state,
+        { type: "enrollment.required", reason: "missing" },
+      ).state,
+      { type: "credential.rejected" },
     );
+    expect(enrollment.state.state).toBe("EnrollmentRequired");
+    if (enrollment.state.state === "EnrollmentRequired") {
+      expect(enrollment.state.reason).toBe("missing");
+    }
+    expect(enrollment.effects).toHaveLength(0);
+  });
+
+  it("never reuses an authentication generation after revocation and re-enrollment", () => {
+    const first = reduceClientState(toTargetSelection(), { type: "press" });
+    expect(first.state).toMatchObject({
+      state: "Ready",
+      pending: "authentication",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+
+    const revoking = reduceClientState(first.state, { type: "revocation.started" });
+    expect(revoking.effects[0]).toEqual({ type: "cancel-session-boundary" });
+    expect(revoking.state).toEqual({
+      state: "EnrollmentChecking",
+      type: "EnrollmentChecking",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      phase: "revoking",
+    });
+
+    const required = reduce(revoking.state, {
+      type: "revocation.completed",
+      reason: "revoked",
+    });
+    const enrolling = reduce(required, { type: "enrollment.started" });
+    const reselection = reduce(enrolling, { type: "enrollment.ready" });
+    expect(reselection).toEqual({
+      state: "TargetSelection",
+      type: "TargetSelection",
+      highlightedTarget: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+
+    const second = reduceClientState(reselection, { type: "press" });
+    expect(second.state).toMatchObject({
+      state: "Ready",
+      pending: "authentication",
+      authAttempt: FIRST_AUTH_ATTEMPT + 1,
+    });
+    expect(second.effects).toContainEqual({
+      type: "prepare-session-auth",
+      targetLanguage: "es",
+      authAttempt: FIRST_AUTH_ATTEMPT + 1,
+    });
+
+    const delayedFirst = reduceClientState(second.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(delayedFirst.state).toEqual(second.state);
+    expect(delayedFirst.effects).toHaveLength(0);
+
+    const current = reduceClientState(second.state, {
+      type: "session.authenticated",
+      authAttempt: FIRST_AUTH_ATTEMPT + 1,
+    });
+    expect(current.state).toMatchObject({
+      state: "Ready",
+      pending: "initial",
+      authAttempt: FIRST_AUTH_ATTEMPT + 1,
+    });
+    expect(current.effects).toEqual([{ type: "start-session", targetLanguage: "es" }]);
+  });
+
+  it("revokes every pending or active authenticated state without retaining session data", () => {
+    const recoveryPending = reduce(toSessionReady(), transportLost());
+    const revocableStates = [
+      toTargetSelection(),
+      toAuthenticationPending(),
+      toInitialPending(),
+      recoveryPending,
+      toSessionReady(),
+      toListening(),
+      toFinalizing(),
+      reduce(toFinalizing(), languageDecision("target")),
+      toResults(),
+    ];
+    for (const state of revocableStates) {
+      const started = reduceClientState(state, { type: "revocation.started" });
+      if (state.state === "Error") throw new Error("Expected a revocable state");
+      expect(started.state).toEqual({
+        state: "EnrollmentChecking",
+        type: "EnrollmentChecking",
+        highlightedTarget: "es",
+        authAttempt: state.authAttempt,
+        phase: "revoking",
+      });
+      const expectedCleanup = state.state === "Listening"
+        ? ["cancel-session-boundary", "stop-audio", "end-session"]
+        : state.state === "TargetSelection"
+          ? ["cancel-session-boundary"]
+        : state.state === "Ready" &&
+            (state.pending === "authentication" || state.pending === "initial")
+          ? ["cancel-session-boundary"]
+          : ["cancel-session-boundary", "end-session"];
+      expect(started.effects.map((effect) => effect.type)).toEqual(expectedCleanup);
+      for (const reason of ["revoked", "revocation-unconfirmed"] as const) {
+        const completed = reduceClientState(started.state, {
+          type: "revocation.completed",
+          reason,
+        });
+        expect(completed.state).toEqual({
+          state: "EnrollmentRequired",
+          type: "EnrollmentRequired",
+          highlightedTarget: "es",
+          authAttempt: state.authAttempt,
+          reason,
+        });
+        expect(completed.effects).toHaveLength(0);
+      }
+    }
+
+    const checking = reduceClientState(createInitialState(), { type: "startup.ready" });
+    const completedBeforeRevocation = reduceClientState(checking.state, {
+      type: "revocation.completed",
+      reason: "revoked",
+    });
+    expect(completedBeforeRevocation.state).toEqual(checking.state);
+    expect(completedBeforeRevocation.effects).toHaveLength(0);
+  });
+
+  it("rejects malformed, secret-bearing, accessor, and proxy events without throwing", () => {
+    const state = toTargetSelection();
+    const canary = "PAIRING-CODE-CREDENTIAL-CANARY";
+    const malformedEvents: unknown[] = [
+      { type: "enrollment.ready", credential: canary },
+      { type: "enrollment.required", reason: "invalid", secret: canary },
+      { type: "enrollment.failed", reason: "missing", pairingCode: canary },
+      { type: "revocation.completed", reason: "invalid", credential: canary },
+      { type: "session.authenticated", credential: canary },
+      { type: "press", utteranceId: UTTERANCE_ID, secret: canary },
+      { type: "unknown.event", credential: canary },
+    ];
+    for (const event of malformedEvents) {
+      const outcome = reduceClientState(state, asClientEvent(event));
+      expect(outcome.state).toEqual(state);
+      expect(outcome.effects).toHaveLength(0);
+      expect(JSON.stringify(outcome)).not.toContain(canary);
+    }
+
+    const getter = { type: "enrollment.ready" } as Record<string, unknown>;
+    Object.defineProperty(getter, "credential", {
+      enumerable: true,
+      get: () => {
+        throw new Error(canary);
+      },
+    });
+    expect(() => reduceClientState(state, asClientEvent(getter))).not.toThrow();
+    const getterOutcome = reduceClientState(state, asClientEvent(getter));
+    expect(getterOutcome.state).toEqual(state);
+    expect(JSON.stringify(getterOutcome)).not.toContain(canary);
+
+    const proxy = new Proxy({ type: "enrollment.ready" }, {
+      ownKeys: () => {
+        throw new Error(canary);
+      },
+    });
+    expect(() => reduceClientState(state, asClientEvent(proxy))).not.toThrow();
+    const proxyOutcome = reduceClientState(state, asClientEvent(proxy));
+    expect(proxyOutcome.state).toEqual(state);
+    expect(JSON.stringify(proxyOutcome)).not.toContain(canary);
+  });
+
+  it("requires canonical session fields and v4 identities", () => {
+    const pending = toInitialPending("es");
     const epochAliasReady = reduceClientState(pending, asClientEvent({
       type: "session.ready",
       sessionId: SESSION.sessionId,
@@ -255,10 +847,7 @@ describe("G2 client interaction state", () => {
   });
 
   it("bounds initial and recovery epochs to positive uint32 values", () => {
-    const initialPending = reduce(
-      reduce(createInitialState("es"), { type: "startup.ready" }),
-      { type: "press" },
-    );
+    const initialPending = toInitialPending("es");
     const maximumInitial = reduceClientState(initialPending, {
       type: "session.ready",
       sessionId: SESSION.sessionId,
@@ -347,8 +936,8 @@ describe("G2 client interaction state", () => {
     let transition = reduceClientState(state, { type: "press", utteranceId: UTTERANCE_ID });
     expect(transition.state.state).toBe("Listening");
     expect(transition.effects.map((effect) => effect.type)).toEqual([
-      "start-audio",
       "start-utterance",
+      "start-audio",
     ]);
     state = transition.state;
 
@@ -446,14 +1035,112 @@ describe("G2 client interaction state", () => {
     state = reduce(state, { type: "swipe.previous" });
     if (state.state !== "Results") return;
     expect(state.suggestionIndex).toBe(0);
-    state = reduce(state, { type: "press" });
-    expect(state.state).toBe("Ready");
-    if (state.state !== "Ready") return;
-    expect(state.sessionReady).toBe(true);
-    expect("transcript" in state).toBe(false);
-    expect("suggestions" in state).toBe(false);
-    expect("suggestionIndex" in state).toBe(false);
-    expect("englishTranslation" in state).toBe(false);
+    const next = reduceClientState(state, {
+      type: "press",
+      utteranceId: NEXT_UTTERANCE_ID,
+    });
+    expect(next.state.state).toBe("Listening");
+    expect(next.effects.map((effect) => effect.type)).toEqual([
+      "start-utterance",
+      "start-audio",
+    ]);
+  });
+
+  it.each(["es", "tr"] as const)(
+    "starts the next %s utterance directly from Results with exact effects",
+    (targetLanguage) => {
+      const results = toResults(targetLanguage);
+      expect(results.state).toBe("Results");
+      if (results.state !== "Results") return;
+
+      const transition = reduceClientState(results, {
+        type: "press",
+        utteranceId: NEXT_UTTERANCE_ID,
+      });
+      expect(transition.state.state).toBe("Listening");
+      if (transition.state.state !== "Listening") return;
+      expect(transition.state.targetLanguage).toBe(targetLanguage);
+      expect(transition.state.sessionId).toBe(SESSION.sessionId);
+      expect(transition.state.sessionEpoch).toBe(SESSION.sessionEpoch);
+      expect(transition.state.utteranceId).toBe(NEXT_UTTERANCE_ID);
+      expect(transition.state.utteranceId).not.toBe(results.utteranceId);
+      expect(transition.state.turn).toBe(results.turn + 1);
+      expect(transition.state.transcript).toBe("");
+      expect(transition.state.segmentTexts).toEqual({});
+      expect(transition.state.segmentRevisions).toEqual({});
+      expect(transition.state.finalSegments).toEqual({});
+      expect(transition.effects).toEqual([
+        {
+          type: "start-utterance",
+          sessionId: SESSION.sessionId,
+          sessionEpoch: SESSION.sessionEpoch,
+          utteranceId: NEXT_UTTERANCE_ID,
+        },
+        {
+          type: "start-audio",
+          sessionId: SESSION.sessionId,
+          sessionEpoch: SESSION.sessionEpoch,
+          utteranceId: NEXT_UTTERANCE_ID,
+        },
+      ]);
+      expect(Object.isFrozen(transition.state)).toBe(true);
+      expect(Object.isFrozen(transition.effects)).toBe(true);
+    },
+  );
+
+  it("clears all completed result content and active-turn final fields", () => {
+    const results = toResults("es");
+    expect(results.state).toBe("Results");
+    if (results.state !== "Results") return;
+    expect(results.finalTranscript).toBe("hola mundo");
+    expect(results.finalSegmentId).toBe(SEGMENT_ID);
+    expect(results.finalRevision).toBe(2);
+    expect(results.englishTranslation).toBe("hello world");
+    expect(results.suggestions).toEqual(targetSuggestions);
+
+    const next = reduceClientState(results, {
+      type: "press",
+      utteranceId: NEXT_UTTERANCE_ID,
+    });
+    expect(next.state.state).toBe("Listening");
+    if (next.state.state !== "Listening") return;
+    for (const clearedField of [
+      "finalTranscript",
+      "finalSegmentId",
+      "finalRevision",
+      "englishTranslation",
+      "suggestions",
+      "suggestionIndex",
+    ]) {
+      expect(clearedField in next.state).toBe(false);
+    }
+  });
+
+  it("no-ops from Results for absent, malformed, or reused utterance IDs", () => {
+    const results = toResults();
+    for (const event of [
+      { type: "press" },
+      { type: "press", utteranceId: "not-a-uuid" },
+      { type: "press", utteranceId: UTTERANCE_ID_WRONG_VERSION },
+      { type: "press", utteranceId: UTTERANCE_ID_WRONG_VARIANT },
+      { type: "press", utteranceId: UTTERANCE_ID },
+    ] as const) {
+      const unchanged = reduceClientState(results, asClientEvent(event));
+      expect(unchanged.state).toEqual(results);
+      expect(unchanged.effects).toHaveLength(0);
+      expect(Object.isFrozen(unchanged.state)).toBe(true);
+    }
+  });
+
+  it("no-ops from Results when incrementing turn would exceed uint32", () => {
+    const results = toResults();
+    const maximumTurnResults = { ...results, turn: MAX_UINT32 } as ClientState;
+    const overflow = reduceClientState(maximumTurnResults, {
+      type: "press",
+      utteranceId: NEXT_UTTERANCE_ID,
+    });
+    expect(overflow.state).toEqual(maximumTurnResults);
+    expect(overflow.effects).toHaveLength(0);
   });
 
   it("bounds transcript and accepted-result revisions to positive uint32 values", () => {
@@ -586,8 +1273,8 @@ describe("G2 client interaction state", () => {
       acceptedFinalRevision: 2,
       english: "must not be accepted",
     }));
-    expect(englishAliasTranslation.state.state).toBe("Error");
-    expect(englishAliasTranslation.effects.map((effect) => effect.type)).toEqual(["end-session"]);
+    expect(englishAliasTranslation.state).toEqual(translating);
+    expect(englishAliasTranslation.effects).toHaveLength(0);
     expect(JSON.stringify(englishAliasTranslation.state)).not.toContain("must not be accepted");
 
     const englishTextAliasTranslation = reduceClientState(translating, asClientEvent({
@@ -598,8 +1285,8 @@ describe("G2 client interaction state", () => {
       acceptedFinalRevision: 2,
       englishText: "must not be accepted",
     }));
-    expect(englishTextAliasTranslation.state.state).toBe("Error");
-    expect(englishTextAliasTranslation.effects.map((effect) => effect.type)).toEqual(["end-session"]);
+    expect(englishTextAliasTranslation.state).toEqual(translating);
+    expect(englishTextAliasTranslation.effects).toHaveLength(0);
     expect(JSON.stringify(englishTextAliasTranslation.state)).not.toContain("must not be accepted");
 
     const beforeTranslation = reduceClientState(translating, suggestionsReady({
@@ -827,7 +1514,6 @@ describe("G2 client interaction state", () => {
     const failed = reduceClientState(lost.state, asClientEvent({
       type: "recovery.failed",
       ...SESSION,
-      message: { secret: "must not be displayed" },
     }));
     expect(failed.state.state).toBe("Error");
     if (failed.state.state !== "Error") return;
@@ -1011,7 +1697,6 @@ describe("G2 client interaction state", () => {
   it("bounds safe startup messages and performs fatal/shutdown cleanup once", () => {
     const failed = reduceClientState(createInitialState(), asClientEvent({
       type: "startup.failed",
-      message: "x".repeat(1_000),
     }));
     expect(failed.state.state).toBe("Error");
     if (failed.state.state !== "Error") return;
@@ -1022,7 +1707,6 @@ describe("G2 client interaction state", () => {
     const active = toListening();
     const fatal = reduceClientState(active, asClientEvent({
       type: "fatal",
-      message: { arbitrary: "object" },
     }));
     expect(fatal.state.state).toBe("Error");
     expect(fatal.effects.map((effect) => effect.type)).toEqual(["stop-audio", "end-session"]);
