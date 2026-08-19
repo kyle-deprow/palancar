@@ -32,7 +32,10 @@ export type EnrollmentReason =
   | "pairing-failed"
   | "pairing-uncertain"
   | "revoked"
-  | "revocation-unconfirmed";
+  | "revocation-unconfirmed"
+  | "relay-unavailable";
+
+type ReportedEnrollmentReason = Exclude<EnrollmentReason, "relay-unavailable">;
 
 export type PairingFailureReason = "pairing-failed" | "pairing-uncertain";
 
@@ -211,7 +214,7 @@ export interface EnrollmentReadyEvent {
 
 export interface EnrollmentRequiredEvent {
   readonly type: "enrollment.required";
-  readonly reason: EnrollmentReason;
+  readonly reason: ReportedEnrollmentReason;
 }
 
 export interface EnrollmentStartedEvent {
@@ -221,6 +224,10 @@ export interface EnrollmentStartedEvent {
 export interface EnrollmentFailedEvent {
   readonly type: "enrollment.failed";
   readonly reason: PairingFailureReason;
+}
+
+export interface EnrollmentUnavailableEvent {
+  readonly type: "enrollment.unavailable";
 }
 
 export interface EnrollmentStorageErrorEvent {
@@ -243,7 +250,7 @@ export interface SessionAuthenticatedEvent {
 export interface SessionAuthRequiredEvent {
   readonly type: "session.auth-required";
   readonly authAttempt: number;
-  readonly reason: EnrollmentReason;
+  readonly reason: ReportedEnrollmentReason;
 }
 
 export interface SessionAuthStorageErrorEvent {
@@ -393,6 +400,7 @@ export type LocalClientEvent =
   | EnrollmentRequiredEvent
   | EnrollmentStartedEvent
   | EnrollmentFailedEvent
+  | EnrollmentUnavailableEvent
   | EnrollmentStorageErrorEvent
   | EnrollmentRetryEvent
   | EnrollmentResetEvent
@@ -430,6 +438,7 @@ export interface PersistTargetEffect {
 
 export interface CheckEnrollmentEffect {
   readonly type: "check-enrollment";
+  readonly mode: "initialize" | "retry-persistence";
 }
 
 export interface ResetEnrollmentEffect {
@@ -552,6 +561,7 @@ const KNOWN_CLIENT_EVENT_TYPES = Object.freeze({
   "enrollment.required": true,
   "enrollment.started": true,
   "enrollment.failed": true,
+  "enrollment.unavailable": true,
   "enrollment.storage-error": true,
   "enrollment.retry": true,
   "enrollment.reset": true,
@@ -666,6 +676,7 @@ function isKnownClientEvent(value: unknown): value is ClientEvent {
       case "startup.failed":
       case "enrollment.ready":
       case "enrollment.started":
+      case "enrollment.unavailable":
       case "enrollment.storage-error":
       case "enrollment.retry":
       case "enrollment.reset":
@@ -786,7 +797,7 @@ function validSegmentId(value: unknown): value is string {
   return typeof value === "string" && SEGMENT_ID_PATTERN.test(value);
 }
 
-function isEnrollmentReason(value: unknown): value is EnrollmentReason {
+function isEnrollmentReason(value: unknown): value is ReportedEnrollmentReason {
   return value === "missing" || value === "absolute-expired" ||
     value === "credential-rejected" || value === "pairing-failed" ||
     value === "pairing-uncertain" || value === "revoked" ||
@@ -1634,7 +1645,7 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
             "checking",
             state.authAttempt,
           ), [
-            { type: "check-enrollment" },
+            { type: "check-enrollment", mode: "initialize" },
           ])
         : noChange(state);
 
@@ -1681,6 +1692,15 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
           ))
         : noChange(state);
 
+    case "enrollment.unavailable":
+      return state.state === "Enrolling"
+        ? reduction(enrollmentRequiredState(
+            state.highlightedTarget,
+            "relay-unavailable",
+            state.authAttempt,
+          ))
+        : noChange(state);
+
     case "enrollment.storage-error":
       return enrollmentStorageError(state);
 
@@ -1691,7 +1711,7 @@ export function reduceClientState(inputState: ClientState, inputEvent: ClientEve
             "checking",
             state.authAttempt,
           ), [
-            { type: "check-enrollment" },
+            { type: "check-enrollment", mode: "retry-persistence" },
           ])
         : noChange(state);
 

@@ -166,7 +166,7 @@ describe("G2 client interaction state", () => {
     const checking = reduceClientState(defaultState, { type: "startup.ready" });
     expect(checking.state.state).toBe("EnrollmentChecking");
     expect(checking.state.type).toBe("EnrollmentChecking");
-    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+    expect(checking.effects).toEqual([{ type: "check-enrollment", mode: "initialize" }]);
     if (checking.state.state !== "EnrollmentChecking") return;
     expect(checking.state.phase).toBe("checking");
 
@@ -188,7 +188,7 @@ describe("G2 client interaction state", () => {
 
     const checking = reduceClientState(initial, { type: "startup.ready" });
     expect(checking.state.state).toBe("EnrollmentChecking");
-    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+    expect(checking.effects).toEqual([{ type: "check-enrollment", mode: "initialize" }]);
     const selection = reduce(checking.state, { type: "enrollment.ready" });
     const confirmed = reduceClientState(selection, { type: "press" });
     expect(confirmed.state.state).toBe("Ready");
@@ -237,7 +237,7 @@ describe("G2 client interaction state", () => {
       authAttempt: 0,
       phase: "checking",
     });
-    expect(checking.effects).toEqual([{ type: "check-enrollment" }]);
+    expect(checking.effects).toEqual([{ type: "check-enrollment", mode: "initialize" }]);
 
     const reasons = [
       "missing",
@@ -333,7 +333,10 @@ describe("G2 client interaction state", () => {
         authAttempt: 0,
         phase: "checking",
       });
-      expect(retried.effects).toEqual([{ type: "check-enrollment" }]);
+      expect(retried.effects).toEqual([{
+        type: "check-enrollment",
+        mode: "retry-persistence",
+      }]);
       const reset = reduceClientState(failed.state, { type: "enrollment.reset" });
       expect(reset.state).toEqual(retried.state);
       expect(reset.effects).toEqual([{ type: "reset-enrollment" }]);
@@ -382,6 +385,79 @@ describe("G2 client interaction state", () => {
         expect(unchanged.effects).toHaveLength(0);
       }
     }
+  });
+
+  it("maps a redacted post-prewarm relay failure to enrollment required", () => {
+    const checking = reduceClientState(
+      createInitialState("tr"),
+      { type: "startup.ready" },
+    ).state;
+    const required = reduce(checking, {
+      type: "enrollment.required",
+      reason: "missing",
+    });
+    const enrolling = reduce(required, { type: "enrollment.started" });
+
+    const unavailable = reduceClientState(enrolling, { type: "enrollment.unavailable" });
+    expect(unavailable.state).toEqual({
+      state: "EnrollmentRequired",
+      type: "EnrollmentRequired",
+      highlightedTarget: "tr",
+      authAttempt: 0,
+      reason: "relay-unavailable",
+    });
+    expect(unavailable.effects).toHaveLength(0);
+
+    const canary = "RELAY-DIAGNOSTIC-CANARY";
+    for (const event of [
+      { type: "enrollment.unavailable", message: canary },
+      { type: "enrollment.unavailable", status: 503 },
+      { type: "enrollment.required", reason: "relay-unavailable" },
+    ]) {
+      const malformed = reduceClientState(enrolling, asClientEvent(event));
+      expect(malformed.state).toEqual(enrolling);
+      expect(malformed.effects).toHaveLength(0);
+      expect(JSON.stringify(malformed)).not.toContain(canary);
+    }
+
+    const outOfPhase = reduceClientState(toTargetSelection("tr"), {
+      type: "enrollment.unavailable",
+    });
+    expect(outOfPhase.state).toEqual(toTargetSelection("tr"));
+    expect(outOfPhase.effects).toHaveLength(0);
+  });
+
+  it("retries persistence without resetting the authentication generation", () => {
+    const pending = toAuthenticationPending("tr");
+    const storageError = reduceClientState(pending, { type: "credential.storage-error" });
+    expect(storageError.state).toEqual({
+      state: "StorageError",
+      type: "StorageError",
+      highlightedTarget: "tr",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+
+    const retried = reduceClientState(storageError.state, { type: "enrollment.retry" });
+    expect(retried.state).toEqual({
+      state: "EnrollmentChecking",
+      type: "EnrollmentChecking",
+      highlightedTarget: "tr",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+      phase: "checking",
+    });
+    expect(retried.effects).toEqual([{
+      type: "check-enrollment",
+      mode: "retry-persistence",
+    }]);
+
+    const selected = reduceClientState(retried.state, { type: "enrollment.ready" });
+    expect(selected.state).toEqual({
+      state: "TargetSelection",
+      type: "TargetSelection",
+      highlightedTarget: "tr",
+      authAttempt: FIRST_AUTH_ATTEMPT,
+    });
+    expect(selected.effects).toHaveLength(0);
   });
 
   it("requires authentication before starting a session and supports a redacted retry", () => {
