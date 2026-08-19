@@ -426,7 +426,8 @@ function parseProductionOptions(value: unknown): AzureTableRuntimeStoreOptions {
   try {
     const endpoint = new URL(input.endpoint);
     if (
-      endpoint.protocol !== 'https:' || endpoint.origin !== input.endpoint ||
+      endpoint.protocol !== 'https:' ||
+      (endpoint.origin !== input.endpoint && `${endpoint.origin}/` !== input.endpoint) ||
       endpoint.username !== '' || endpoint.password !== '' || endpoint.port !== '' ||
       endpoint.pathname !== '/' || endpoint.search !== '' || endpoint.hash !== '' ||
       !/^[a-z0-9]{3,24}\.table\.core\.windows\.net$/.test(endpoint.hostname)
@@ -444,7 +445,7 @@ function parseProductionOptions(value: unknown): AzureTableRuntimeStoreOptions {
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.managedIdentityClientId)
   ) fail('invalid-input');
   return freeze({
-    endpoint: input.endpoint,
+    endpoint: new URL(input.endpoint).origin,
     securityTableName: input.securityTableName as string,
     rateTableName: input.rateTableName as string,
     environment: parseEnvironment(input.environment),

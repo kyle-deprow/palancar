@@ -84,10 +84,37 @@ run "enabled_openrouter_contract" {
   }
 
   assert {
+    condition     = azapi_resource.this.body.properties.managedEnvironmentId == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.App/managedEnvironments/cae-palancar-dev"
+    error_message = "managedEnvironmentId must be the canonical Container Apps environment in the fixture boundary"
+  }
+
+  assert {
+    condition = jsonencode(azapi_resource.this.body.properties.configuration.identitySettings) == jsonencode([
+      {
+        identity  = replace(var.image_pull_identity_id, "resourceGroups", "resourcegroups")
+        lifecycle = "None"
+      },
+      {
+        identity  = replace(var.runtime_identity_id, "resourceGroups", "resourcegroups")
+        lifecycle = "Main"
+      },
+    ])
+    error_message = "identitySettings must only lowercase the resourceGroups path segment"
+  }
+
+  assert {
+    condition = azapi_resource.this.body.properties.template.containers[0].env[9] == {
+      name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
+      value = "https://palancardev.table.core.windows.net"
+    }
+    error_message = "the relay workload table endpoint must be slash-free"
+  }
+
+  assert {
     condition = jsonencode(azapi_resource.this.body.properties.configuration.ingress) == jsonencode({
       external      = true
       targetPort    = 8787
-      transport     = "http"
+      transport     = "Http"
       allowInsecure = false
       traffic       = [{ latestRevision = true, weight = 100 }]
     })
@@ -119,19 +146,12 @@ run "enabled_openrouter_contract" {
   assert {
     condition = jsonencode(azapi_resource.this.body.properties.template.containers[1].probes) == jsonencode([
       {
-        type                = "Startup"
+        type                = "Liveness"
         httpGet             = { path = "/health/liveliness", port = 4000 }
         initialDelaySeconds = 10
-        periodSeconds       = 10
+        periodSeconds       = 30
         timeoutSeconds      = 3
-        failureThreshold    = 10
-      },
-      {
-        type             = "Liveness"
-        httpGet          = { path = "/health/liveliness", port = 4000 }
-        periodSeconds    = 30
-        timeoutSeconds   = 3
-        failureThreshold = 3
+        failureThreshold    = 3
       },
       {
         type             = "Readiness"
@@ -139,6 +159,13 @@ run "enabled_openrouter_contract" {
         periodSeconds    = 10
         timeoutSeconds   = 3
         failureThreshold = 3
+      },
+      {
+        type             = "Startup"
+        httpGet          = { path = "/health/liveliness", port = 4000 }
+        periodSeconds    = 10
+        timeoutSeconds   = 3
+        failureThreshold = 10
       },
     ])
     error_message = "LiteLLM probes must match the exact HTTP contract"
@@ -293,4 +320,14 @@ run "reject_non_acr_litellm_image" {
   }
 
   expect_failures = [var.litellm_image_digest]
+}
+
+run "reject_case_only_duplicate_identities" {
+  command = plan
+
+  variables {
+    runtime_identity_id = "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG-PALANCAR-DEV/PROVIDERS/MICROSOFT.MANAGEDIDENTITY/USERASSIGNEDIDENTITIES/ID-PALANCAR-DEV-IMAGE-PULL"
+  }
+
+  expect_failures = [azapi_resource.this]
 }

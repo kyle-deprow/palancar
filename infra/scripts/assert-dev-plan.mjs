@@ -441,6 +441,39 @@ function isUserAssignedIdentity(value) {
   );
 }
 
+function isCanonicalUserAssignedIdentity(value) {
+  return (
+    typeof value === "string" &&
+    /^\/subscriptions\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/resourceGroups\/[^/]+\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/]+$/.test(value)
+  );
+}
+
+function sameIdentityCaseInsensitive(left, right) {
+  return (
+    typeof left === "string" &&
+    typeof right === "string" &&
+    left.toLowerCase() === right.toLowerCase()
+  );
+}
+
+function hasExactManagedEnvironmentId(value, identity) {
+  const identityMatch =
+    typeof identity === "string"
+      ? /^\/subscriptions\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/resourceGroups\/([^/]+)\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/]+$/i.exec(identity)
+      : null;
+  const environmentMatch =
+    typeof value === "string"
+      ? /^\/subscriptions\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/resourceGroups\/([^/]+)\/providers\/Microsoft\.App\/managedEnvironments\/[^/]+$/.exec(value)
+      : null;
+
+  return (
+    identityMatch !== null &&
+    environmentMatch !== null &&
+    environmentMatch[1] === identityMatch[1].toLowerCase() &&
+    environmentMatch[2].toLowerCase() === identityMatch[2].toLowerCase()
+  );
+}
+
 function containsHelperTopology(value) {
   if (value === 4001 || value === "4001") {
     return true;
@@ -499,7 +532,7 @@ function hasExactIngress(ingress) {
     ]) ||
     ingress.external !== true ||
     ingress.targetPort !== 8787 ||
-    ingress.transport !== "http" ||
+    ingress.transport !== "Http" ||
     ingress.allowInsecure !== false ||
     !Array.isArray(ingress.traffic) ||
     ingress.traffic.length !== 1
@@ -566,52 +599,82 @@ function hasExactRuntimeContainerApp(change) {
   const configuration = properties?.configuration;
   const template = properties?.template;
   const identities = after?.identity;
+  const registries = configuration?.registries;
+  const registry = Array.isArray(registries) ? registries[0] : undefined;
+  const imagePullIdentity = registry?.identity;
+  const secrets = valuesByName(configuration?.secrets);
+  const masterSecret = secrets?.get("litellm-master-key");
+  const openRouterSecret = secrets?.get("openrouter-api-key");
+  const runtimeIdentity = masterSecret?.identity;
+  const identityIds = identities?.[0]?.identity_ids;
 
   if (
     !isObject(body) ||
     !isObject(properties) ||
     !isObject(configuration) ||
     !isObject(template) ||
+    !hasExactKeys(body, ["properties"]) ||
+    !hasExactKeys(properties, [
+      "managedEnvironmentId",
+      "configuration",
+      "template",
+    ]) ||
+    !hasExactKeys(configuration, [
+      "activeRevisionsMode",
+      "ingress",
+      "registries",
+      "identitySettings",
+      "secrets",
+    ]) ||
+    !hasExactKeys(template, ["containers", "scale"]) ||
     configuration.activeRevisionsMode !== "Single" ||
     !hasExactIngress(configuration.ingress) ||
     !Array.isArray(identities) ||
     identities.length !== 1 ||
     identities[0]?.type !== "UserAssigned" ||
-    !Array.isArray(identities[0]?.identity_ids) ||
-    identities[0].identity_ids.length !== 2 ||
-    !identities[0].identity_ids.every(isUserAssignedIdentity) ||
-    identities[0].identity_ids[0] === identities[0].identity_ids[1] ||
+    !Array.isArray(identityIds) ||
+    identityIds.length !== 2 ||
+    !identityIds.every(isUserAssignedIdentity) ||
+    !isCanonicalUserAssignedIdentity(imagePullIdentity) ||
+    !isCanonicalUserAssignedIdentity(runtimeIdentity) ||
+    !sameIdentityCaseInsensitive(masterSecret?.identity, openRouterSecret?.identity) ||
+    sameIdentityCaseInsensitive(imagePullIdentity, runtimeIdentity) ||
+    !identityIds.some((identity) =>
+      sameIdentityCaseInsensitive(identity, imagePullIdentity),
+    ) ||
+    !identityIds.some((identity) =>
+      sameIdentityCaseInsensitive(identity, runtimeIdentity),
+    ) ||
+    !hasExactManagedEnvironmentId(
+      properties.managedEnvironmentId,
+      imagePullIdentity,
+    ) ||
     (after.sensitive_body !== undefined && after.sensitive_body !== null) ||
     containsHelperTopology(body)
   ) {
     return false;
   }
 
-  const [imagePullIdentity, runtimeIdentity] = identities[0].identity_ids;
   const identitySettings = configuration.identitySettings;
-  const registries = configuration.registries;
   if (
     !Array.isArray(identitySettings) ||
     identitySettings.length !== 2 ||
     !hasExactKeys(identitySettings[0], ["identity", "lifecycle"]) ||
-    identitySettings[0].identity !== imagePullIdentity ||
+    identitySettings[0].identity !== imagePullIdentity.replace("/resourceGroups/", "/resourcegroups/") ||
     identitySettings[0].lifecycle !== "None" ||
     !hasExactKeys(identitySettings[1], ["identity", "lifecycle"]) ||
-    identitySettings[1].identity !== runtimeIdentity ||
+    identitySettings[1].identity !== runtimeIdentity.replace("/resourceGroups/", "/resourcegroups/") ||
     identitySettings[1].lifecycle !== "Main" ||
     !Array.isArray(registries) ||
     registries.length !== 1 ||
-    !hasExactKeys(registries[0], ["server", "identity"]) ||
-    registries[0].identity !== imagePullIdentity ||
-    typeof registries[0].server !== "string" ||
-    !/^[a-z0-9.-]+\.azurecr\.io$/.test(registries[0].server)
+    !hasExactKeys(registry, ["server", "identity"]) ||
+    registry.identity !== imagePullIdentity ||
+    typeof registry.server !== "string" ||
+    !/^[a-z0-9.-]+\.azurecr\.io$/.test(registry.server)
   ) {
     return false;
   }
 
-  const secrets = valuesByName(configuration.secrets);
-  const masterSecret = secrets?.get("litellm-master-key");
-  const openRouterSecret = secrets?.get("openrouter-api-key");
   if (
     !hasExactNamedEntries(secrets, ["litellm-master-key", "openrouter-api-key"]) ||
     !hasExactSecret(masterSecret, "litellm-master-key", runtimeIdentity, "/secrets/litellm-master-key") ||
@@ -629,9 +692,11 @@ function hasExactRuntimeContainerApp(change) {
     !hasOnlyKeys(relay, ["name", "image", "resources", "env", "probes"]) ||
     !hasOnlyKeys(litellm, ["name", "image", "resources", "env", "probes"]) ||
     !isImmutableAcrImage(relay?.image) ||
-    !relay.image.startsWith(`${registries[0].server}/`) ||
+    !relay.image.startsWith(`${registry.server}/`) ||
     !isImmutableAcrImage(litellm?.image) ||
-    !litellm.image.startsWith(`${registries[0].server}/`) ||
+    !litellm.image.startsWith(`${registry.server}/`) ||
+    !hasExactKeys(relay?.resources, ["cpu", "memory"]) ||
+    !hasExactKeys(litellm?.resources, ["cpu", "memory"]) ||
     relay?.resources?.cpu !== 0.25 ||
     relay?.resources?.memory !== "0.5Gi" ||
     litellm?.resources?.cpu !== 0.25 ||
@@ -658,18 +723,10 @@ function hasExactRuntimeContainerApp(change) {
     ]) ||
     !hasExactProbes(litellm?.probes, [
       {
-        type: "Startup",
-        path: "/health/liveliness",
-        port: 4000,
-        initialDelaySeconds: 10,
-        periodSeconds: 10,
-        timeoutSeconds: 3,
-        failureThreshold: 10,
-      },
-      {
         type: "Liveness",
         path: "/health/liveliness",
         port: 4000,
+        initialDelaySeconds: 10,
         periodSeconds: 30,
         timeoutSeconds: 3,
         failureThreshold: 3,
@@ -681,6 +738,14 @@ function hasExactRuntimeContainerApp(change) {
         periodSeconds: 10,
         timeoutSeconds: 3,
         failureThreshold: 3,
+      },
+      {
+        type: "Startup",
+        path: "/health/liveliness",
+        port: 4000,
+        periodSeconds: 10,
+        timeoutSeconds: 3,
+        failureThreshold: 10,
       },
     ])
   ) {
@@ -731,7 +796,7 @@ function hasExactRuntimeContainerApp(change) {
     !/^wss:\/\/[a-z0-9.-]+\.azurecontainerapps\.io$/.test(relayEnv.get("PALANCAR_RELAY_ORIGIN")?.value) ||
     !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(relayEnv.get("PALANCAR_GATE_POLICY_VERSION")?.value) ||
     typeof relayEnv.get("PALANCAR_WORKLOAD_TABLE_ENDPOINT")?.value !== "string" ||
-    !/^https:\/\/[a-z0-9]+\.table\.core\.windows\.net\/$/.test(relayEnv.get("PALANCAR_WORKLOAD_TABLE_ENDPOINT").value)
+    !/^https:\/\/[a-z0-9]+\.table\.core\.windows\.net$/.test(relayEnv.get("PALANCAR_WORKLOAD_TABLE_ENDPOINT").value)
   ) {
     return false;
   }

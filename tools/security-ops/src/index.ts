@@ -27,12 +27,15 @@ const execFile = promisify(execFileCallback);
 const SECURITY_TABLE = 'SecurityState';
 const RATE_TABLE = 'RateState';
 const STREAM_PATH = '/v1/stream';
+const READY_PATH = '/readyz';
 const GATE_POLICY_VERSION = '1.0.0';
 const AUDIO_SAMPLES_PER_FRAME = 1_600;
 const AUDIO_FRAME_COUNT = 18;
 const AUDIO_BYTES_PER_FRAME = AUDIO_SAMPLES_PER_FRAME * 2;
 const OPERATION_TIMEOUT_MS = 20_000;
 const GENERATION_TIMEOUT_MS = 120_000;
+const READY_ATTEMPT_TIMEOUT_MS = 30_000;
+const READY_RETRY_DELAY_MS = 1_000;
 const CLEANUP_PAGE_LIMIT = 100;
 const ALLOWED_ENV = new Set([
   'PALANCAR_OP_TABLE_ENDPOINT',
@@ -124,20 +127,23 @@ export function parseSecurityOpsConfig(env: NodeJS.ProcessEnv): SecurityOpsConfi
   for (const key of Object.keys(env)) {
     if (key.startsWith('PALANCAR_OP_') && !ALLOWED_ENV.has(key)) fail();
   }
-  const endpoint = required(env, 'PALANCAR_OP_TABLE_ENDPOINT', 255);
+  const endpointInput = required(env, 'PALANCAR_OP_TABLE_ENDPOINT', 255);
   const environment = required(env, 'PALANCAR_OP_ENVIRONMENT', 64);
   const relayOrigin = canonicalRelayOrigin(required(env, 'PALANCAR_OP_RELAY_ORIGIN', 255));
   const operatorScope = required(env, 'PALANCAR_OP_OPERATOR_SCOPE', 128);
   const subscriptionId = required(env, 'PALANCAR_OP_SUBSCRIPTION_ID', 36);
   const tenantId = required(env, 'PALANCAR_OP_TENANT_ID', 36);
   const principalId = required(env, 'PALANCAR_OP_PRINCIPAL_ID', 36);
+  let endpoint: string;
   try {
-    const url = new URL(endpoint);
+    const url = new URL(endpointInput);
     if (
-      url.protocol !== 'https:' || url.origin !== endpoint || url.pathname !== '/' ||
-      url.search !== '' || url.hash !== '' || url.port !== '' ||
+      !/^https:\/\/[a-z0-9]{3,24}\.table\.core\.windows\.net\/?$/.test(endpointInput) ||
+      url.protocol !== 'https:' || url.pathname !== '/' || url.search !== '' ||
+      url.hash !== '' || url.port !== '' || url.username !== '' || url.password !== '' ||
       !/^[a-z0-9]{3,24}\.table\.core\.windows\.net$/.test(url.hostname)
     ) fail();
+    endpoint = url.origin;
   } catch (error) {
     if (error instanceof SecurityOpsError) throw error;
     fail();
@@ -179,17 +185,24 @@ async function verifyAzureCliContext(config: SecurityOpsConfig): Promise<void> {
     const account = await execFile('az', [
       'account', 'show', '--query', '{subscription:id,tenant:tenantId}', '-o', 'json'
     ], { timeout: OPERATION_TIMEOUT_MS, maxBuffer: 4_096 });
-    const identity = await execFile('az', [
-      'ad', 'signed-in-user', 'show', '--query', 'id', '-o', 'tsv'
-    ], { timeout: OPERATION_TIMEOUT_MS, maxBuffer: 4_096 });
-    if (account.stdout.length > 4_096 || identity.stdout.length > 128) fail();
+    const tokenResult = await execFile('az', [
+      'account', 'get-access-token', '--resource', 'https://storage.azure.com/',
+      '--query', 'accessToken', '-o', 'tsv'
+    ], { timeout: OPERATION_TIMEOUT_MS, maxBuffer: 32_768 });
+    if (account.stdout.length > 4_096 || tokenResult.stdout.length > 32_768) fail();
     const parsed = JSON.parse(account.stdout) as unknown;
+    const token = tokenResult.stdout.trim();
+    const parts = token.split('.');
+    if (parts.length !== 3 || parts[1] === undefined) fail();
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as unknown;
     if (
       typeof parsed !== 'object' || parsed === null || Array.isArray(parsed) ||
       Object.keys(parsed).length !== 2 ||
       (parsed as { subscription?: unknown }).subscription !== config.subscriptionId ||
       (parsed as { tenant?: unknown }).tenant !== config.tenantId ||
-      identity.stdout.trim() !== config.principalId
+      typeof claims !== 'object' || claims === null || Array.isArray(claims) ||
+      (claims as { oid?: unknown }).oid !== config.principalId ||
+      (claims as { tid?: unknown }).tid !== config.tenantId
     ) fail();
   } catch (error) {
     if (error instanceof SecurityOpsError) throw error;
@@ -247,23 +260,6 @@ function withTimeout<T>(promise: Promise<T>, milliseconds = OPERATION_TIMEOUT_MS
   });
 }
 
-function waitForOpen(socket: SecurityOpsSocket): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      socket.off('open', onOpen);
-      socket.off('error', onFailure);
-      socket.off('unexpected-response', onFailure);
-    };
-    const onOpen = (): void => { cleanup(); resolve(); };
-    const onFailure = (): void => { cleanup(); reject(new SecurityOpsError()); };
-    const timer = setTimeout(onFailure, OPERATION_TIMEOUT_MS);
-    socket.once('open', onOpen);
-    socket.once('error', onFailure);
-    socket.once('unexpected-response', onFailure);
-  });
-}
-
 function rawText(data: RawData): string {
   if (typeof data === 'string') return data;
   if (Buffer.isBuffer(data)) return data.toString('utf8');
@@ -272,27 +268,134 @@ function rawText(data: RawData): string {
   fail();
 }
 
+interface SocketLifecycle {
+  readonly signal: AbortSignal;
+  readonly failure: Promise<never>;
+  race<T>(promise: Promise<T>): Promise<T>;
+  expectNormalClose(): void;
+  shutdown(): Promise<void>;
+}
+
+function monitorSocket(socket: SecurityOpsSocket): SocketLifecycle {
+  const controller = new AbortController();
+  let rejectFailure: (reason: SecurityOpsError) => void = () => undefined;
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+  void failure.catch(() => undefined);
+  let failed = false;
+  let shutdownStarted = false;
+  let normalCloseExpected = false;
+  let terminalSettled = false;
+  let resolveTerminal: () => void = () => undefined;
+  let terminalTimer: ReturnType<typeof setTimeout> | undefined;
+  let shutdownPromise: Promise<void> | undefined;
+  const settleTerminal = (): void => {
+    if (terminalSettled) return;
+    terminalSettled = true;
+    if (terminalTimer !== undefined) clearTimeout(terminalTimer);
+    resolveTerminal();
+  };
+  const failSocket = (): void => {
+    if (failed || shutdownStarted) return;
+    failed = true;
+    clearTimeout(deadline);
+    controller.abort();
+    rejectFailure(new SecurityOpsError());
+  };
+  const onError = (): void => {
+    if (!shutdownStarted) failSocket();
+  };
+  const onClose = (code: number): void => {
+    if (shutdownStarted) {
+      settleTerminal();
+      return;
+    }
+    if (!normalCloseExpected || code !== 1000) failSocket();
+  };
+  socket.on('error', onError);
+  socket.on('close', onClose);
+  const deadline = setTimeout(failSocket, GENERATION_TIMEOUT_MS);
+  return {
+    signal: controller.signal,
+    failure,
+    race<T>(promise: Promise<T>): Promise<T> {
+      return Promise.race([promise, failure]);
+    },
+    expectNormalClose(): void {
+      normalCloseExpected = true;
+    },
+    shutdown(): Promise<void> {
+      if (shutdownPromise !== undefined) return shutdownPromise;
+      shutdownStarted = true;
+      clearTimeout(deadline);
+      controller.abort();
+      shutdownPromise = new Promise<void>((resolve) => {
+        resolveTerminal = resolve;
+        terminalTimer = setTimeout(settleTerminal, OPERATION_TIMEOUT_MS);
+        if (socket.readyState === WebSocket.CLOSED) {
+          settleTerminal();
+          return;
+        }
+        try {
+          socket.terminate();
+        } catch {
+          settleTerminal();
+        }
+      }).then(() => {
+        socket.off('error', onError);
+        socket.off('close', onClose);
+      });
+      return shutdownPromise;
+    }
+  };
+}
+
+function waitForOpen(socket: SecurityOpsSocket, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.off('open', onOpen);
+      socket.off('unexpected-response', onFailure);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onFailure = (): void => { cleanup(); reject(new SecurityOpsError()); };
+    const onAbort = (): void => { onFailure(); };
+    const onOpen = (): void => { cleanup(); resolve(); };
+    const timer = setTimeout(onFailure, OPERATION_TIMEOUT_MS);
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
+    socket.once('open', onOpen);
+    socket.once('unexpected-response', onFailure);
+  });
+}
+
 function waitForMessage<T extends ServerControlMessage>(
   socket: SecurityOpsSocket,
   predicate: (message: ServerControlMessage) => message is T,
+  signal: AbortSignal,
   timeoutMs = OPERATION_TIMEOUT_MS
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    let settled = false;
     const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       socket.off('message', onMessage);
-      socket.off('error', onError);
-      socket.off('close', onClose);
+      signal.removeEventListener('abort', onAbort);
     };
-    const onError = (): void => { cleanup(); reject(new SecurityOpsError()); };
-    const onClose = (): void => { cleanup(); reject(new SecurityOpsError()); };
+    const onFailure = (): void => { cleanup(); reject(new SecurityOpsError()); };
+    const onAbort = (): void => { onFailure(); };
     const onMessage = (data: RawData, isBinary: boolean): void => {
       if (isBinary) return;
       try {
         const message = assertServerControlMessage(JSON.parse(rawText(data)) as unknown);
         if (message.type === 'error' || message.type === 'session.rejected' || message.type === 'utterance.aborted') {
-          cleanup();
-          reject(new SecurityOpsError());
+          onFailure();
           return;
         }
         if (predicate(message)) {
@@ -300,48 +403,53 @@ function waitForMessage<T extends ServerControlMessage>(
           resolve(message);
         }
       } catch {
-        cleanup();
-        reject(new SecurityOpsError());
+        onFailure();
       }
     };
+    const timer = setTimeout(onFailure, timeoutMs);
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
     socket.on('message', onMessage);
-    socket.once('error', onError);
-    socket.once('close', onClose);
-    const timer = setTimeout(onError, timeoutMs);
   });
 }
 
-async function closeSocket(socket: SecurityOpsSocket): Promise<void> {
+async function closeSocket(socket: SecurityOpsSocket, signal: AbortSignal): Promise<void> {
   if (socket.readyState === WebSocket.CLOSED) return;
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
     const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       socket.off('close', onClose);
       socket.off('error', onError);
+      signal.removeEventListener('abort', onAbort);
     };
     const onClose = (code: number): void => {
       cleanup();
       if (code === 1000) resolve(); else reject(new SecurityOpsError());
     };
     const onError = (): void => { cleanup(); reject(new SecurityOpsError()); };
+    const onAbort = (): void => {
+      cleanup();
+      reject(new SecurityOpsError());
+    };
     const timer = setTimeout(() => {
       cleanup();
-      socket.terminate();
       reject(new SecurityOpsError());
     }, OPERATION_TIMEOUT_MS);
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
     socket.once('close', onClose);
     socket.once('error', onError);
   });
 }
 
-async function issueCredential(
+async function redeemPairingCredential(
   config: SecurityOpsConfig,
   operations: Operations,
   dependencies: SecurityOpsDependencies
-): Promise<Readonly<{
-  credential: string;
-  ticket: string;
-}>> {
+): Promise<string> {
   const pairing = await operations.operator.issuePairing({ operatorScope: config.operatorScope });
   const origin = httpsOrigin(config.relayOrigin);
   const redemption = await dependencies.fetch(`${origin}/v1/pairing-redemptions`, {
@@ -352,19 +460,74 @@ async function issueCredential(
     signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS)
   });
   const credential = assertInstallationCredentialResponse(await responseJson(redemption));
+  return credential.credential;
+}
+
+async function issueSessionTicket(
+  config: SecurityOpsConfig,
+  credential: string,
+  dependencies: SecurityOpsDependencies
+): Promise<string> {
+  const origin = httpsOrigin(config.relayOrigin);
   const ticketResponse = await dependencies.fetch(`${origin}/v1/session-tickets`, {
     method: 'POST',
     redirect: 'error',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${credential.credential}`
+      authorization: `Bearer ${credential}`
     },
     body: JSON.stringify({ protocolVersion: 1, intent: 'new' }),
     signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS)
   });
   const ticket = assertSessionTicketResponse(await responseJson(ticketResponse));
   if (ticket.wssOrigin !== config.relayOrigin || ticket.wssPath !== STREAM_PATH) fail();
-  return Object.freeze({ credential: credential.credential, ticket: ticket.ticket });
+  return ticket.ticket;
+}
+
+function isRelayReady(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === 'ready' && (value as { ready?: unknown }).ready === true;
+}
+
+async function awaitRelayReady(
+  config: SecurityOpsConfig,
+  dependencies: SecurityOpsDependencies
+): Promise<void> {
+  const deadline = dependencies.now() + GENERATION_TIMEOUT_MS;
+  const url = `${httpsOrigin(config.relayOrigin)}${READY_PATH}`;
+  const retry = async (): Promise<void> => {
+    const remaining = deadline - dependencies.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) fail();
+    const delayMs = Math.max(1, Math.min(READY_RETRY_DELAY_MS, Math.floor(remaining)));
+    await withTimeout(dependencies.delay(delayMs), delayMs);
+    if (dependencies.now() >= deadline) fail();
+  };
+
+  while (true) {
+    const remaining = deadline - dependencies.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) fail();
+    const attemptTimeout = Math.max(1, Math.min(READY_ATTEMPT_TIMEOUT_MS, Math.floor(remaining)));
+    let response: Response;
+    try {
+      response = await withTimeout(dependencies.fetch(url, {
+        method: 'GET',
+        redirect: 'error',
+        signal: AbortSignal.timeout(attemptTimeout)
+      } as RequestInit), attemptTimeout);
+    } catch {
+      await retry();
+      continue;
+    }
+    if (response.status === 503) {
+      await retry();
+      continue;
+    }
+    if (response.status !== 200) fail();
+    if (!isRelayReady(await responseJson(response))) fail();
+    return;
+  }
 }
 
 function isSessionReady(message: ServerControlMessage): message is SessionReady {
@@ -376,32 +539,30 @@ type LanguageDecision = Extract<ServerControlMessage, { type: 'language.decision
 type TranslationReady = Extract<ServerControlMessage, { type: 'translation.ready' }>;
 type SuggestionsReady = Extract<ServerControlMessage, { type: 'suggestions.ready' }>;
 
-function targetTextLooksSelected(items: SuggestionsReady['suggestions'], target: TargetLanguage): boolean {
-  const text = items.map((item) => item.selectedTargetText).join(' ');
-  if (target === 'es') return /[áéíóúñ¿¡]/iu.test(text) && !/[ğışçİ]/u.test(text);
-  return /[çğıöşüİ]/u.test(text) && !/[ñ¿¡]/u.test(text);
-}
-
 function collectTurnResults(
   socket: SecurityOpsSocket,
   ready: SessionReady,
   utteranceId: string,
-  targetLanguage: TargetLanguage
+  targetLanguage: TargetLanguage,
+  signal: AbortSignal
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
+    let settled = false;
     let transcript: TranscriptFinal | undefined;
     let decision: LanguageDecision | undefined;
     let translation: TranslationReady | undefined;
     let suggestions: SuggestionsReady | undefined;
     let settling = false;
     const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(deadline);
       if (settleTimer !== undefined) clearTimeout(settleTimer);
       socket.off('message', onMessage);
-      socket.off('error', onFailure);
-      socket.off('close', onFailure);
+      signal.removeEventListener('abort', onAbort);
     };
     const onFailure = (): void => { cleanup(); reject(new SecurityOpsError()); };
+    const onAbort = (): void => { onFailure(); };
     const finish = (): void => {
       if (transcript === undefined || decision === undefined || translation === undefined || suggestions === undefined) return;
       if (
@@ -415,13 +576,14 @@ function collectTurnResults(
         suggestions.segmentId !== transcript.segmentId ||
         suggestions.acceptedFinalRevision !== transcript.revision ||
         decision.decision !== 'target' || decision.selectedTargetLanguage !== targetLanguage ||
-        decision.detectedLanguage !== targetLanguage || transcript.text.trim().length === 0 ||
+        decision.detectedLanguage !== targetLanguage || decision.gatePolicyVersion !== GATE_POLICY_VERSION ||
+        transcript.text.trim().length === 0 ||
         translation.englishTranslation.trim().length === 0 ||
         suggestions.suggestions.length < 2 || suggestions.suggestions.length > 3 ||
         suggestions.suggestions.some((item) =>
           item.englishText.trim().length === 0 || item.selectedTargetText.trim().length === 0 ||
           item.englishText === item.selectedTargetText
-        ) || !targetTextLooksSelected(suggestions.suggestions, targetLanguage)
+        )
       ) {
         onFailure();
         return;
@@ -463,28 +625,39 @@ function collectTurnResults(
     };
     const deadline = setTimeout(onFailure, GENERATION_TIMEOUT_MS);
     let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
     socket.on('message', onMessage);
-    socket.once('error', onFailure);
-    socket.once('close', onFailure);
   });
+}
+
+function effectiveLimitsDoNotExceed(
+  effective: SessionReady['effectiveLimits'],
+  requested: SessionReady['effectiveLimits']
+): boolean {
+  return (Object.keys(requested) as Array<keyof SessionReady['effectiveLimits']>).every((key) =>
+    effective[key] <= requested[key]
+  );
 }
 
 async function smokeTarget(
   config: SecurityOpsConfig,
   targetLanguage: TargetLanguage,
-  operations: Operations,
+  credential: string,
   dependencies: SecurityOpsDependencies
 ): Promise<number> {
   const started = dependencies.now();
-  const { ticket } = await issueCredential(config, operations, dependencies);
+  const ticket = await issueSessionTicket(config, credential, dependencies);
   const socket = dependencies.createSocket(
     socketUrl(config.relayOrigin),
     createWebSocketSubprotocols(ticket)
   );
+  const lifecycle = monitorSocket(socket);
   try {
-    await waitForOpen(socket);
+    await lifecycle.race(waitForOpen(socket, lifecycle.signal));
     if (socket.protocol !== WEBSOCKET_SUBPROTOCOL) fail();
-    const readyPromise = waitForMessage(socket, isSessionReady);
+    const requestedLimits = DEFAULT_NEGOTIATED_LIMITS;
+    const readyPromise = waitForMessage(socket, isSessionReady, lifecycle.signal);
     socket.send(JSON.stringify({
       type: 'session.start',
       protocolVersion: 1,
@@ -493,10 +666,15 @@ async function smokeTarget(
       languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
       gatePolicyVersion: GATE_POLICY_VERSION,
       clientBuild: 'security-ops-0.1.0',
-      requestedLimits: DEFAULT_NEGOTIATED_LIMITS
+      requestedLimits
     }));
-    const ready = await readyPromise;
-    if (ready.result !== 'new' || ready.targetLanguage !== targetLanguage) fail();
+    const ready = await lifecycle.race(readyPromise);
+    if (
+      ready.result !== 'new' || ready.targetLanguage !== targetLanguage ||
+      ready.languageRegistryVersion !== LANGUAGE_REGISTRY_VERSION ||
+      ready.gatePolicyVersion !== GATE_POLICY_VERSION ||
+      !effectiveLimitsDoNotExceed(ready.effectiveLimits, requestedLimits)
+    ) fail();
     const utteranceId = randomUUID();
     socket.send(JSON.stringify({
       type: 'utterance.start',
@@ -504,7 +682,6 @@ async function smokeTarget(
       sessionEpoch: ready.sessionEpoch,
       utteranceId
     }));
-    const audioStarted = dependencies.now();
     for (let sequence = 0; sequence < AUDIO_FRAME_COUNT; sequence += 1) {
       const expectedOffset = (sequence + 1) * AUDIO_SAMPLES_PER_FRAME;
       const ack = waitForMessage(
@@ -513,7 +690,8 @@ async function smokeTarget(
           message.type === 'audio.ack' && message.utteranceId === utteranceId &&
           message.sessionId === ready.sessionId && message.sessionEpoch === ready.sessionEpoch &&
           message.flowState === 'normal' &&
-          message.highestContiguousExclusiveOffset === expectedOffset
+          message.highestContiguousExclusiveOffset === expectedOffset,
+        lifecycle.signal
       );
       socket.send(encodeAudioFrame({
         utteranceId,
@@ -521,13 +699,12 @@ async function smokeTarget(
         offset: sequence * AUDIO_SAMPLES_PER_FRAME,
         payload: new Uint8Array(AUDIO_BYTES_PER_FRAME)
       }));
-      await ack;
+      await lifecycle.race(ack);
       if (sequence + 1 < AUDIO_FRAME_COUNT) {
-        const scheduledAt = audioStarted + ((sequence + 1) * 100);
-        await dependencies.delay(Math.max(0, scheduledAt - dependencies.now()));
+        await lifecycle.race(dependencies.delay(100));
       }
     }
-    const turnResults = collectTurnResults(socket, ready, utteranceId, targetLanguage);
+    const turnResults = collectTurnResults(socket, ready, utteranceId, targetLanguage, lifecycle.signal);
     socket.send(JSON.stringify({
       type: 'utterance.commit',
       sessionId: ready.sessionId,
@@ -535,20 +712,21 @@ async function smokeTarget(
       utteranceId,
       finalOriginalSampleOffset: AUDIO_FRAME_COUNT * AUDIO_SAMPLES_PER_FRAME
     }));
-    await turnResults;
-    const normalClose = closeSocket(socket);
+    await lifecycle.race(turnResults);
+    lifecycle.expectNormalClose();
+    const normalClose = closeSocket(socket, lifecycle.signal);
     socket.send(JSON.stringify(assertClientControlMessage({
       type: 'session.end',
       sessionId: ready.sessionId,
       sessionEpoch: ready.sessionEpoch,
       reason: 'user_requested'
     })));
-    await normalClose;
+    await lifecycle.race(normalClose);
     return Math.min(Math.max(0, Math.round(dependencies.now() - started)), GENERATION_TIMEOUT_MS);
   } catch {
     fail();
   } finally {
-    if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+    await lifecycle.shutdown();
   }
   fail();
 }
@@ -563,7 +741,13 @@ export async function runSecurityOps(
   const config = parseSecurityOpsConfig(env);
   if (command === 'issue-pairing' && (!io.stdinIsTty || !io.stdoutIsTty)) fail();
   await withTimeout(dependencies.verifyAzureContext(config));
-  const operations = dependencies.createOperations(config);
+  const operations = dependencies.createOperations({
+    endpoint: config.endpoint,
+    securityTableName: config.securityTableName,
+    rateTableName: config.rateTableName,
+    environment: config.environment,
+    audience: config.audience
+  });
   if (command === 'initialize') {
     await withTimeout(operations.bootstrap.initializeState(AbortSignal.timeout(OPERATION_TIMEOUT_MS)));
     await withTimeout(operations.maintenance.checkReadiness(AbortSignal.timeout(OPERATION_TIMEOUT_MS)));
@@ -585,14 +769,13 @@ export async function runSecurityOps(
     io.stdout(`security-ops cleanup: pass visited=${result.visited} removed=${result.removed}\n`);
     return;
   }
-  const spanishMs = await withTimeout(
-    smokeTarget(config, 'es', operations, dependencies),
+  await awaitRelayReady(config, dependencies);
+  const credential = await withTimeout(
+    redeemPairingCredential(config, operations, dependencies),
     GENERATION_TIMEOUT_MS
   );
-  const turkishMs = await withTimeout(
-    smokeTarget(config, 'tr', operations, dependencies),
-    GENERATION_TIMEOUT_MS
-  );
+  const spanishMs = await smokeTarget(config, 'es', credential, dependencies);
+  const turkishMs = await smokeTarget(config, 'tr', credential, dependencies);
   io.stdout(`security-ops smoke: pass targets=2 es_ms=${spanishMs} tr_ms=${turkishMs}\n`);
 }
 

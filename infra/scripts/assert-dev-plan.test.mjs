@@ -158,12 +158,14 @@ function runtimeContainerAppAfter(minReplicas = 0) {
     ],
     body: {
       properties: {
+        managedEnvironmentId:
+          "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.App/managedEnvironments/cae-palancar-dev",
         configuration: {
           activeRevisionsMode: "Single",
           ingress: {
             external: true,
             targetPort: 8787,
-            transport: "http",
+            transport: "Http",
             allowInsecure: false,
             traffic: [{ latestRevision: true, weight: 100 }],
           },
@@ -171,8 +173,14 @@ function runtimeContainerAppAfter(minReplicas = 0) {
             { server: "palancardev.azurecr.io", identity: imagePullIdentity },
           ],
           identitySettings: [
-            { identity: imagePullIdentity, lifecycle: "None" },
-            { identity: runtimeIdentity, lifecycle: "Main" },
+            {
+              identity: imagePullIdentity.replace("/resourceGroups/", "/resourcegroups/"),
+              lifecycle: "None",
+            },
+            {
+              identity: runtimeIdentity.replace("/resourceGroups/", "/resourcegroups/"),
+              lifecycle: "Main",
+            },
           ],
           secrets: [
             {
@@ -231,7 +239,7 @@ function runtimeContainerAppAfter(minReplicas = 0) {
                 envValue("PALANCAR_SECURITY_MODE", "azure-table"),
                 envValue(
                   "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
-                  "https://palancardev.table.core.windows.net/",
+                  "https://palancardev.table.core.windows.net",
                 ),
                 envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
                 envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
@@ -250,16 +258,9 @@ function runtimeContainerAppAfter(minReplicas = 0) {
               resources: { cpu: 0.25, memory: "0.5Gi" },
               probes: [
                 {
-                  type: "Startup",
-                  httpGet: { path: "/health/liveliness", port: 4000 },
-                  initialDelaySeconds: 10,
-                  periodSeconds: 10,
-                  timeoutSeconds: 3,
-                  failureThreshold: 10,
-                },
-                {
                   type: "Liveness",
                   httpGet: { path: "/health/liveliness", port: 4000 },
+                  initialDelaySeconds: 10,
                   periodSeconds: 30,
                   timeoutSeconds: 3,
                   failureThreshold: 3,
@@ -270,6 +271,13 @@ function runtimeContainerAppAfter(minReplicas = 0) {
                   periodSeconds: 10,
                   timeoutSeconds: 3,
                   failureThreshold: 3,
+                },
+                {
+                  type: "Startup",
+                  httpGet: { path: "/health/liveliness", port: 4000 },
+                  periodSeconds: 10,
+                  timeoutSeconds: 3,
+                  failureThreshold: 10,
                 },
               ],
               env: [
@@ -797,6 +805,13 @@ test("runtime-rollout accepts only the exact OpenRouter workload at min zero or 
     acceptsPlan(computedIdentityOutputs, "runtime-rollout"),
     true,
   );
+
+  const reversedIdentityOrder = runtimePlan();
+  reversedIdentityOrder.resource_changes.at(-1).change.after.identity[0].identity_ids = [
+    runtimeIdentity,
+    imagePullIdentity,
+  ];
+  assert.equal(acceptsPlan(reversedIdentityOrder, "runtime-rollout"), true);
 });
 
 test("runtime-rollout accepts a realistic refresh-free zero-map plan with only the Container App update", () => {
@@ -1263,14 +1278,44 @@ test("runtime-rollout rejects mutable images, identity drift, revision drift, an
     (after) => { after.body.properties.template.containers[1].image = `otherdev.azurecr.io/palancar-litellm-proxy@sha256:${"2".repeat(64)}`; },
     (after) => { after.body.properties.template.containers[1].image = `ghcr.io/palancar/litellm-proxy@sha256:${"2".repeat(64)}`; },
     (after) => { after.identity[0].identity_ids = [runtimeIdentity]; },
+    (after) => { after.identity[0].identity_ids = [imagePullIdentity, imagePullIdentity]; },
+    (after) => { after.identity[0].identity_ids = [imagePullIdentity, imagePullIdentity.toUpperCase()]; },
+    (after) => { after.body.properties.configuration.identitySettings[0].identity = imagePullIdentity; },
+    (after) => { after.body.properties.configuration.identitySettings[1].identity = runtimeIdentity; },
+    (after) => { after.body.properties.configuration.identitySettings[0].identity = imagePullIdentity.toLowerCase(); },
+    (after) => { after.body.properties.configuration.identitySettings[1].identity = runtimeIdentity.toLowerCase(); },
     (after) => { after.body.properties.configuration.identitySettings[0].lifecycle = "Main"; },
     (after) => { after.body.properties.configuration.registries[0].identity = runtimeIdentity; },
+    (after) => { after.body.properties.configuration.secrets[0].identity = imagePullIdentity; },
     (after) => { after.body.properties.configuration.activeRevisionsMode = "Multiple"; },
     (after) => { after.body.properties.template.containers[0].resources.cpu = 0.5; },
     (after) => { after.body.properties.template.containers[1].resources.memory = "1Gi"; },
+    (after) => { after.body.properties.template.containers[0].resources.ephemeralStorage = "1Gi"; },
+    (after) => { after.body.properties.template.containers[1].resources.ephemeralStorage = "1Gi"; },
     (after) => { after.body.properties.template.scale.minReplicas = 2; },
     (after) => { after.body.properties.template.scale.maxReplicas = 2; },
     (after) => { after.body.properties.template.scale.rules = []; },
+  ];
+
+  for (const mutate of mutations) {
+    const after = runtimeContainerAppAfter();
+    mutate(after);
+    assert.equal(acceptsPlan(runtimePlan(after), "runtime-rollout"), false);
+  }
+});
+
+test("runtime-rollout requires exact body topology and managed environment boundary", () => {
+  const mutations = [
+    (after) => { after.body.extra = {}; },
+    (after) => { after.body.properties.extra = {}; },
+    (after) => { after.body.properties.configuration.dapr = {}; },
+    (after) => { after.body.properties.template.initContainers = []; },
+    (after) => { after.body.properties.template.volumes = []; },
+    (after) => { after.body.properties.template.serviceBinds = []; },
+    (after) => { after.body.properties.managedEnvironmentId = after.body.properties.managedEnvironmentId.replace("00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001"); },
+    (after) => { after.body.properties.managedEnvironmentId = after.body.properties.managedEnvironmentId.replace("rg-palancar-dev", "rg-other"); },
+    (after) => { after.body.properties.managedEnvironmentId = after.body.properties.managedEnvironmentId.replace("Microsoft.App", "microsoft.app"); },
+    (after) => { after.body.properties.managedEnvironmentId = after.body.properties.managedEnvironmentId.replace("managedEnvironments", "managedenvironments"); },
   ];
 
   for (const mutate of mutations) {
@@ -1285,6 +1330,7 @@ test("runtime-rollout requires the exact HTTP ingress and single-revision traffi
     (after) => { after.body.properties.configuration.ingress.external = false; },
     (after) => { after.body.properties.configuration.ingress.allowInsecure = true; },
     (after) => { after.body.properties.configuration.ingress.targetPort = 4000; },
+    (after) => { after.body.properties.configuration.ingress.transport = "http"; },
     (after) => { after.body.properties.configuration.ingress.transport = "tcp"; },
     (after) => { after.body.properties.configuration.ingress.exposedPort = 8787; },
     (after) => { after.body.properties.configuration.ingress.additionalPortMappings = []; },
@@ -1310,9 +1356,11 @@ test("runtime-rollout requires exact secret-free HTTP probes", () => {
     (after) => { after.body.properties.template.containers[0].probes[1].failureThreshold = 4; },
     (after) => { after.body.properties.template.containers[1].probes[0].type = "Readiness"; },
     (after) => { after.body.properties.template.containers[1].probes[0].failureThreshold = 9; },
-    (after) => { after.body.properties.template.containers[1].probes[1].periodSeconds = 10; },
-    (after) => { after.body.properties.template.containers[1].probes[2].httpGet.path = "/health/liveliness"; },
+    (after) => { after.body.properties.template.containers[1].probes[0].initialDelaySeconds = 11; },
+    (after) => { after.body.properties.template.containers[1].probes[1].periodSeconds = 11; },
+    (after) => { after.body.properties.template.containers[1].probes[2].httpGet.path = "/health/readiness"; },
     (after) => { after.body.properties.template.containers[1].probes[2].timeoutSeconds = 4; },
+    (after) => { after.body.properties.template.containers[1].probes[2].initialDelaySeconds = 10; },
     (after) => { after.body.properties.template.containers[0].probes[0].httpGet.scheme = "HTTPS"; },
     (after) => { after.body.properties.template.containers[0].probes[0].httpGet.httpHeaders = [{ name: "Authorization", value: "fixture-secret" }]; },
     (after) => {

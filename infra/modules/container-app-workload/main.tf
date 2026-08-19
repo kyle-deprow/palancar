@@ -28,7 +28,7 @@ resource "azapi_resource" "this" {
         ingress = {
           external      = true
           targetPort    = var.target_port
-          transport     = "http"
+          transport     = "Http"
           allowInsecure = false
           traffic = [
             {
@@ -47,11 +47,11 @@ resource "azapi_resource" "this" {
 
         identitySettings = [
           {
-            identity  = var.image_pull_identity_id
+            identity  = replace(var.image_pull_identity_id, "resourceGroups", "resourcegroups")
             lifecycle = "None"
           },
           {
-            identity  = var.runtime_identity_id
+            identity  = replace(var.runtime_identity_id, "resourceGroups", "resourcegroups")
             lifecycle = "Main"
           }
         ]
@@ -122,7 +122,7 @@ resource "azapi_resource" "this" {
                   },
                   {
                     name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
-                    value = var.workload_table_endpoint
+                    value = trimsuffix(var.workload_table_endpoint, "/")
                   },
                   {
                     name  = "PALANCAR_SECURITY_STATE_TABLE"
@@ -210,25 +210,15 @@ resource "azapi_resource" "this" {
 
               probes = [
                 {
-                  type = "Startup"
-                  httpGet = {
-                    path = "/health/liveliness"
-                    port = 4000
-                  }
-                  initialDelaySeconds = 10
-                  periodSeconds       = 10
-                  timeoutSeconds      = 3
-                  failureThreshold    = 10
-                },
-                {
                   type = "Liveness"
                   httpGet = {
                     path = "/health/liveliness"
                     port = 4000
                   }
-                  periodSeconds    = 30
-                  timeoutSeconds   = 3
-                  failureThreshold = 3
+                  initialDelaySeconds = 10
+                  periodSeconds       = 30
+                  timeoutSeconds      = 3
+                  failureThreshold    = 3
                 },
                 {
                   type = "Readiness"
@@ -239,6 +229,16 @@ resource "azapi_resource" "this" {
                   periodSeconds    = 10
                   timeoutSeconds   = 3
                   failureThreshold = 3
+                },
+                {
+                  type = "Startup"
+                  httpGet = {
+                    path = "/health/liveliness"
+                    port = 4000
+                  }
+                  periodSeconds    = 10
+                  timeoutSeconds   = 3
+                  failureThreshold = 10
                 }
               ]
             }
@@ -266,7 +266,7 @@ resource "azapi_resource" "this" {
     }
 
     precondition {
-      condition     = var.image_pull_identity_id != var.runtime_identity_id
+      condition     = lower(var.image_pull_identity_id) != lower(var.runtime_identity_id)
       error_message = "image-pull and runtime identities must be distinct."
     }
 

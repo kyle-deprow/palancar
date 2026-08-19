@@ -67,6 +67,13 @@ describe('Azure CLI operator capability boundary', () => {
     expect(Object.isFrozen(operations)).toBe(true);
   });
 
+  it('accepts and normalizes the standard Azure endpoint trailing slash', () => {
+    expect(() => createAzureCliTableOperations({
+      ...AZURE_CLI_OPTIONS,
+      endpoint: `${AZURE_CLI_OPTIONS.endpoint}/`
+    })).not.toThrow();
+  });
+
   it.each([
     {},
     { ...AZURE_CLI_OPTIONS, unexpected: true },
