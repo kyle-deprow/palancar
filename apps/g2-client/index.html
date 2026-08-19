@@ -3,9 +3,67 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; media-src 'none'; worker-src 'none'; connect-src https://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io wss://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io"
+    />
     <title>Palancar Translate</title>
+    <link rel="stylesheet" href="/src/phone-ui.css" />
   </head>
   <body>
+    <main id="palancar-phone-app" aria-labelledby="palancar-phone-heading">
+      <h1 id="palancar-phone-heading">Palancar Translate</h1>
+
+      <section aria-labelledby="palancar-status-heading">
+        <h2 id="palancar-status-heading">Authentication status</h2>
+        <p
+          id="palancar-auth-status"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >Starting authentication.</p>
+      </section>
+
+      <section aria-labelledby="palancar-pairing-heading">
+        <h2 id="palancar-pairing-heading">Pair this device</h2>
+        <form id="palancar-pairing-form" aria-labelledby="palancar-pairing-heading" hidden>
+          <label for="palancar-pairing-code">Pairing code</label>
+          <input
+            id="palancar-pairing-code"
+            type="password"
+            minlength="26"
+            maxlength="26"
+            pattern="^[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+          />
+          <button id="palancar-pairing-submit" type="submit">Pair device</button>
+        </form>
+      </section>
+
+      <section
+        id="palancar-storage-actions"
+        aria-labelledby="palancar-storage-heading"
+        hidden
+      >
+        <h2 id="palancar-storage-heading">Storage recovery</h2>
+        <button id="palancar-storage-retry" type="button">Retry storage</button>
+        <button id="palancar-storage-reset" type="button">Reset enrollment</button>
+      </section>
+
+      <section
+        id="palancar-enrolled-actions"
+        aria-labelledby="palancar-enrolled-heading"
+        hidden
+      >
+        <h2 id="palancar-enrolled-heading">Enrollment actions</h2>
+        <button id="palancar-revoke-start" type="button">Revoke enrollment</button>
+        <button id="palancar-revoke-confirm" type="button" hidden>Confirm revocation</button>
+        <button id="palancar-revoke-cancel" type="button" hidden>Cancel revocation</button>
+      </section>
+    </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

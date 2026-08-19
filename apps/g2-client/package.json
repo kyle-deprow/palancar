@@ -17,11 +17,12 @@
     "vitest": "4.1.10"
   },
   "scripts": {
+    "predev": "npm run check:relay-origin",
     "dev": "vite",
     "lint": "eslint .",
-    "pretypecheck": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
+    "pretypecheck": "npm run check:relay-origin && npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
     "typecheck": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json",
-    "pretest": "npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
+    "pretest": "npm run check:relay-origin && npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
     "test": "vitest run",
     "prebuild": "npm run check:relay-origin && npm run build --workspace @palancar/contracts && npm run build --workspace @palancar/audio && npm run build --workspace @palancar/language-registry",
     "build": "vite build && node ../../node_modules/typescript/bin/tsc -p tsconfig.pure.json",
