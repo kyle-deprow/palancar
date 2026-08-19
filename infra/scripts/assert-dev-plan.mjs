@@ -8,7 +8,12 @@ import path from "node:path";
 const MODEL_SPIKE_MODE = "model-spike";
 const FULL_DEPLOY_MODE = "full-deploy";
 const RUNTIME_ROLLOUT_MODE = "runtime-rollout";
+const SUPPORTED_PLAN_FORMAT_VERSION = "1.2";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
+const PINNED_MODEL_VERSION = "2025-12-15";
+const FOUNDRY_COGNITIVE_ACCOUNT_ID =
+  "/subscriptions/a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1/resourceGroups/rg-palancar-dev-aeeacd8c/providers/Microsoft.CognitiveServices/accounts/palancardevopenaiaeeacd8c";
+const AZURERM_PROVIDER_NAME = "registry.terraform.io/hashicorp/azurerm";
 const EXPECTED_BROWSER_ALLOWED_ORIGINS =
   "https://even-webview.synthetic.invalid";
 const MODEL_SPIKE_DEPLOYMENT =
@@ -307,6 +312,405 @@ function exactOperatorRoleAssignmentTableService(
     : undefined;
 }
 
+const CHECK_STATUSES = new Set(["pass", "fail", "error", "unknown"]);
+const CHECK_KINDS = new Set(["check", "output_value", "resource", "var"]);
+const MODEL_SPIKE_UNKNOWN_CHECK_KINDS = new Set(["resource", "var"]);
+const TERRAFORM_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const TERRAFORM_IDENTIFIER_PREFIX = /^[A-Za-z_][A-Za-z0-9_-]*/;
+const COGNITIVE_RESOURCE_TYPES = new Set([
+  "azurerm_cognitive_account",
+  "azurerm_cognitive_deployment",
+]);
+const MODEL_SPIKE_DIRECT_DEPENDENCY_MODULES = new Set([
+  "budget",
+  "foundry",
+  "observability",
+]);
+const MODEL_SPIKE_DIRECT_DEPENDENCY_PREFIXES = [
+  "azurerm_resource_group.foundation",
+  "module.budget",
+  "module.observability",
+  "module.workload_state",
+  "module.container_registry",
+  "module.container_app_environment",
+  "var.location",
+];
+
+function hasOnlyPairedUnicodeSurrogates(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = value.charCodeAt(index + 1);
+      if (!(nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function parseTerraformInstanceKey(value, offset) {
+  if (value[offset] !== "[") {
+    return { nextOffset: offset };
+  }
+
+  const keyOffset = offset + 1;
+  if (value[keyOffset] === '"') {
+    let quoteOffset = keyOffset + 1;
+    while (quoteOffset < value.length) {
+      if (value[quoteOffset] === "\\") {
+        quoteOffset += 2;
+        continue;
+      }
+      if (value[quoteOffset] === '"') {
+        break;
+      }
+      quoteOffset += 1;
+    }
+
+    if (quoteOffset >= value.length || value[quoteOffset + 1] !== "]") {
+      return undefined;
+    }
+
+    const literal = value.slice(keyOffset, quoteOffset + 1);
+    let key;
+    try {
+      key = JSON.parse(literal);
+    } catch {
+      return undefined;
+    }
+
+    if (
+      typeof key !== "string" ||
+      !hasOnlyPairedUnicodeSurrogates(key) ||
+      JSON.stringify(key) !== literal
+    ) {
+      return undefined;
+    }
+
+    return { key, nextOffset: quoteOffset + 2 };
+  }
+
+  const closingOffset = value.indexOf("]", keyOffset);
+  if (closingOffset === -1) {
+    return undefined;
+  }
+  const literal = value.slice(keyOffset, closingOffset);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(literal)) {
+    return undefined;
+  }
+  const key = Number(literal);
+  if (!Number.isSafeInteger(key)) {
+    return undefined;
+  }
+
+  return { key, nextOffset: closingOffset + 1 };
+}
+
+function parseTerraformModuleAddress(value) {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const segments = [];
+  let offset = 0;
+  while (offset < value.length) {
+    if (!value.startsWith("module.", offset)) {
+      return undefined;
+    }
+    offset += "module.".length;
+
+    const nameMatch = TERRAFORM_IDENTIFIER_PREFIX.exec(value.slice(offset));
+    if (nameMatch === null) {
+      return undefined;
+    }
+    const name = nameMatch[0];
+    offset += name.length;
+
+    const parsedKey = parseTerraformInstanceKey(value, offset);
+    if (parsedKey === undefined) {
+      return undefined;
+    }
+    offset = parsedKey.nextOffset;
+    segments.push(
+      parsedKey.key === undefined ? { name } : { name, key: parsedKey.key },
+    );
+
+    if (offset === value.length) {
+      return segments;
+    }
+    if (value[offset] !== ".") {
+      return undefined;
+    }
+    offset += 1;
+  }
+
+  return undefined;
+}
+
+function isTerraformModuleAddress(value) {
+  return parseTerraformModuleAddress(value) !== undefined;
+}
+
+function isModuleInstanceOf(staticModule, instanceModule) {
+  const staticSegments = parseTerraformModuleAddress(staticModule);
+  const instanceSegments = parseTerraformModuleAddress(instanceModule);
+  if (
+    staticSegments === undefined ||
+    instanceSegments === undefined ||
+    staticSegments.length !== instanceSegments.length
+  ) {
+    return false;
+  }
+
+  return staticSegments.every((staticSegment, index) => {
+    const instanceSegment = instanceSegments[index];
+    return (
+      staticSegment.name === instanceSegment.name &&
+      (!Object.hasOwn(staticSegment, "key") ||
+        (Object.hasOwn(instanceSegment, "key") &&
+          staticSegment.key === instanceSegment.key))
+    );
+  });
+}
+
+function checkAddressDisplay(address) {
+  const prefix = address.module === undefined ? "" : `${address.module}.`;
+
+  switch (address.kind) {
+    case "check":
+      return `${prefix}check.${address.name}`;
+    case "output_value":
+      return `${prefix}output.${address.name}`;
+    case "resource":
+      return `${prefix}${address.mode === "data" ? "data." : ""}${address.type}.${address.name}`;
+    case "var":
+      return `${prefix}var.${address.name}`;
+    default:
+      return undefined;
+  }
+}
+
+function hasValidCheckAddress(address) {
+  if (
+    !isObject(address) ||
+    typeof address.kind !== "string" ||
+    !CHECK_KINDS.has(address.kind) ||
+    typeof address.name !== "string" ||
+    !TERRAFORM_IDENTIFIER.test(address.name) ||
+    typeof address.to_display !== "string"
+  ) {
+    return false;
+  }
+
+  if (
+    Object.hasOwn(address, "module") &&
+    !isTerraformModuleAddress(address.module)
+  ) {
+    return false;
+  }
+
+  if (address.kind === "resource") {
+    if (
+      !hasExactKeys(address, [
+        "kind",
+        "to_display",
+        "mode",
+        "type",
+        "name",
+        ...(Object.hasOwn(address, "module") ? ["module"] : []),
+      ]) ||
+      !["managed", "data"].includes(address.mode) ||
+      typeof address.type !== "string" ||
+      !TERRAFORM_IDENTIFIER.test(address.type)
+    ) {
+      return false;
+    }
+  } else if (
+    !hasExactKeys(address, [
+      "kind",
+      "to_display",
+      "name",
+      ...(Object.hasOwn(address, "module") ? ["module"] : []),
+    ])
+  ) {
+    return false;
+  }
+
+  return address.to_display === checkAddressDisplay(address);
+}
+
+function hasValidCheckInstanceAddress(staticAddress, instanceAddress) {
+  if (!isObject(instanceAddress) || typeof instanceAddress.to_display !== "string") {
+    return false;
+  }
+
+  const hasModule = Object.hasOwn(instanceAddress, "module");
+  if (hasModule !== Object.hasOwn(staticAddress, "module")) {
+    return false;
+  }
+
+  if (
+    hasModule &&
+    !isModuleInstanceOf(staticAddress.module, instanceAddress.module)
+  ) {
+    return false;
+  }
+
+  const hasInstanceKey = Object.hasOwn(instanceAddress, "instance_key");
+  if (
+    hasInstanceKey &&
+    (staticAddress.kind !== "resource" ||
+      !(
+        (typeof instanceAddress.instance_key === "number" &&
+          Number.isSafeInteger(instanceAddress.instance_key) &&
+          instanceAddress.instance_key >= 0) ||
+        (typeof instanceAddress.instance_key === "string" &&
+          hasOnlyPairedUnicodeSurrogates(instanceAddress.instance_key))
+      ))
+  ) {
+    return false;
+  }
+
+  const expectedKeys = [
+    "to_display",
+    ...(hasModule ? ["module"] : []),
+    ...(hasInstanceKey ? ["instance_key"] : []),
+  ];
+  if (!hasExactKeys(instanceAddress, expectedKeys)) {
+    return false;
+  }
+
+  const addressForDisplay = {
+    ...staticAddress,
+    ...(hasModule ? { module: instanceAddress.module } : {}),
+  };
+  const instanceSuffix = hasInstanceKey
+    ? `[${JSON.stringify(instanceAddress.instance_key)}]`
+    : "";
+  return (
+    instanceAddress.to_display ===
+    `${checkAddressDisplay(addressForDisplay)}${instanceSuffix}`
+  );
+}
+
+function hasValidCheckInstance(staticAddress, instance) {
+  if (
+    !isObject(instance) ||
+    !hasExactKeys(instance, [
+      "address",
+      "status",
+      ...(Object.hasOwn(instance, "problems") ? ["problems"] : []),
+    ]) ||
+    !CHECK_STATUSES.has(instance.status) ||
+    !hasValidCheckInstanceAddress(staticAddress, instance.address)
+  ) {
+    return false;
+  }
+
+  if (Object.hasOwn(instance, "problems")) {
+    return (
+      ["fail", "error"].includes(instance.status) &&
+      Array.isArray(instance.problems) &&
+      instance.problems.every(
+        (problem) =>
+          hasExactKeys(problem, ["message"]) &&
+          typeof problem.message === "string",
+      )
+    );
+  }
+
+  return true;
+}
+
+function hasValidCheck(check) {
+  const hasInstances = isObject(check) && Object.hasOwn(check, "instances");
+  if (
+    !hasExactKeys(check, [
+      "address",
+      "status",
+      ...(hasInstances ? ["instances"] : []),
+    ]) ||
+    !hasValidCheckAddress(check.address) ||
+    !CHECK_STATUSES.has(check.status)
+  ) {
+    return false;
+  }
+
+  if (!hasInstances) {
+    return check.status === "unknown";
+  }
+
+  if (
+    !Array.isArray(check.instances) ||
+    check.instances.length === 0 ||
+    !check.instances.every((instance) =>
+      hasValidCheckInstance(check.address, instance),
+    )
+  ) {
+    return false;
+  }
+
+  const instanceDisplays = check.instances.map(
+    (instance) => instance.address.to_display,
+  );
+  if (new Set(instanceDisplays).size !== instanceDisplays.length) {
+    return false;
+  }
+
+  const instanceStatuses = check.instances.map((instance) => instance.status);
+  const aggregateStatus = instanceStatuses.includes("error")
+    ? "error"
+    : instanceStatuses.includes("fail")
+      ? "fail"
+      : instanceStatuses.includes("unknown")
+        ? "unknown"
+        : "pass";
+  return check.status === aggregateStatus;
+}
+
+function checkAddressIsModelRelevant(address) {
+  const moduleSegments = parseTerraformModuleAddress(address.module);
+  const moduleIsDirectDependency =
+    moduleSegments !== undefined &&
+    moduleSegments.some((segment) =>
+      MODEL_SPIKE_DIRECT_DEPENDENCY_MODULES.has(segment.name),
+    );
+  const isDirectModelDependency = MODEL_SPIKE_DIRECT_DEPENDENCY_PREFIXES.some(
+    (prefix) =>
+      address.to_display === prefix ||
+      address.to_display.startsWith(`${prefix}.`) ||
+      address.to_display.startsWith(`${prefix}[`),
+  );
+
+  return (
+    moduleIsDirectDependency ||
+    isDirectModelDependency ||
+    (address.kind === "var" &&
+      address.name === "foundry_deployments") ||
+    (address.kind === "resource" &&
+      COGNITIVE_RESOURCE_TYPES.has(address.type))
+  );
+}
+
+function checkIsModelRelevant(check) {
+  return (
+    checkAddressIsModelRelevant(check.address) ||
+    (check.instances ?? []).some((instance) =>
+      checkAddressIsModelRelevant({
+        ...check.address,
+        ...(Object.hasOwn(instance.address, "module")
+          ? { module: instance.address.module }
+          : {}),
+      }),
+    )
+  );
+}
+
 function hasNonPassingCheck(plan) {
   if (plan.checks === undefined) {
     return false;
@@ -317,12 +721,43 @@ function hasNonPassingCheck(plan) {
   }
 
   return plan.checks.some(
-    (check) => !isObject(check) || check.status !== "pass",
+    (check) =>
+      !hasValidCheck(check) ||
+      check.status !== "pass" ||
+      (check.instances ?? []).some((instance) => instance.status !== "pass"),
   );
 }
 
+function hasNonPassingModelSpikeCheck(plan) {
+  if (plan.checks === undefined) {
+    return false;
+  }
+
+  if (!Array.isArray(plan.checks)) {
+    return true;
+  }
+
+  return plan.checks.some((check) => {
+    if (!hasValidCheck(check)) {
+      return true;
+    }
+
+    if (check.status === "pass") {
+      return false;
+    }
+    if (check.status !== "unknown") {
+      return true;
+    }
+
+    return (
+      !MODEL_SPIKE_UNKNOWN_CHECK_KINDS.has(check.address.kind) ||
+      checkIsModelRelevant(check)
+    );
+  });
+}
+
 function hasResourceDrift(plan) {
-  if (plan.resource_drift === undefined) {
+  if (plan.resource_drift === undefined || plan.resource_drift === null) {
     return false;
   }
 
@@ -866,10 +1301,6 @@ function hasExactRuntimeContainerApp(change) {
   );
 }
 
-function hasObjectKeys(value, keys) {
-  return isObject(value) && keys.every((key) => Object.hasOwn(value, key));
-}
-
 function hasExactPinnedModelAfter(after) {
   if (!isObject(after)) {
     return false;
@@ -879,18 +1310,95 @@ function hasExactPinnedModelAfter(after) {
   const skus = after.sku;
 
   return (
+    hasExactKeys(after, [
+      "cognitive_account_id",
+      "dynamic_throttling_enabled",
+      "model",
+      "name",
+      "sku",
+      "timeouts",
+      "version_upgrade_option",
+    ]) &&
+    after.cognitive_account_id === FOUNDRY_COGNITIVE_ACCOUNT_ID &&
+    after.dynamic_throttling_enabled === null &&
+    after.name === PINNED_DEPLOYMENT_NAME &&
     Array.isArray(models) &&
     models.length === 1 &&
-    hasObjectKeys(models[0], ["format", "name", "version"]) &&
+    hasExactKeys(models[0], ["format", "name", "version"]) &&
     models[0].format === "OpenAI" &&
     models[0].name === PINNED_DEPLOYMENT_NAME &&
-    models[0].version === "2025-12-15" &&
+    models[0].version === PINNED_MODEL_VERSION &&
     Array.isArray(skus) &&
     skus.length === 1 &&
-    hasObjectKeys(skus[0], ["name", "capacity"]) &&
+    hasExactKeys(skus[0], ["capacity", "family", "name", "size", "tier"]) &&
     skus[0].name === "GlobalStandard" &&
     skus[0].capacity === 1 &&
+    skus[0].family === null &&
+    skus[0].size === null &&
+    skus[0].tier === null &&
+    after.timeouts === null &&
     after.version_upgrade_option === "NoAutoUpgrade"
+  );
+}
+
+function isExactEmptyObjectList(value) {
+  return (
+    Array.isArray(value) &&
+    value.length === 1 &&
+    hasExactKeys(value[0], [])
+  );
+}
+
+function hasExactPinnedModelCreateState(change) {
+  return (
+    hasExactKeys(change, [
+      "actions",
+      "before",
+      "after",
+      "after_unknown",
+      "before_sensitive",
+      "after_sensitive",
+    ]) &&
+    isCreate(change.actions) &&
+    change.before === null &&
+    change.before_sensitive === false &&
+    hasExactPinnedModelAfter(change.after) &&
+    hasExactKeys(change.after_unknown, [
+      "id",
+      "model",
+      "rai_policy_name",
+      "sku",
+    ]) &&
+    change.after_unknown.id === true &&
+    change.after_unknown.rai_policy_name === true &&
+    isExactEmptyObjectList(change.after_unknown.model) &&
+    isExactEmptyObjectList(change.after_unknown.sku) &&
+    hasExactKeys(change.after_sensitive, ["model", "sku"]) &&
+    isExactEmptyObjectList(change.after_sensitive.model) &&
+    isExactEmptyObjectList(change.after_sensitive.sku)
+  );
+}
+
+function hasExactPinnedModelCreateResourceChange(resourceChange) {
+  return (
+    hasExactKeys(resourceChange, [
+      "address",
+      "module_address",
+      "mode",
+      "type",
+      "name",
+      "index",
+      "provider_name",
+      "change",
+    ]) &&
+    resourceChange.address === MODEL_SPIKE_DEPLOYMENT &&
+    resourceChange.module_address === "module.foundry" &&
+    resourceChange.mode === "managed" &&
+    resourceChange.type === "azurerm_cognitive_deployment" &&
+    resourceChange.name === "this" &&
+    resourceChange.index === PINNED_DEPLOYMENT_NAME &&
+    resourceChange.provider_name === AZURERM_PROVIDER_NAME &&
+    hasExactPinnedModelCreateState(resourceChange.change)
   );
 }
 
@@ -1026,9 +1534,7 @@ function acceptsModelSpike(changes) {
     const actions = change.change.actions;
 
     if (
-      change.address === MODEL_SPIKE_DEPLOYMENT &&
-      isCreate(actions) &&
-      hasExactPinnedModelAfter(change.change.after)
+      hasExactPinnedModelCreateResourceChange(change)
     ) {
       targetCreates += 1;
       continue;
@@ -1075,7 +1581,9 @@ function acceptsFullDeploy(changes, requiredNoOpAddresses) {
     if (
       change.address === MODEL_SPIKE_DEPLOYMENT &&
       (isCreate(actions) || isNoOp(actions)) &&
-      hasExactPinnedModelAfter(change.change.after)
+      (isCreate(actions)
+        ? hasExactPinnedModelCreateResourceChange(change)
+        : hasExactPinnedModelAfter(change.change.after))
     ) {
       pinnedDeploymentEntries += 1;
       continue;
@@ -1170,12 +1678,17 @@ function acceptsRuntimeRollout(
 export function acceptsPlan(plan, mode) {
   if (
     !isObject(plan) ||
+    plan.format_version !== SUPPORTED_PLAN_FORMAT_VERSION ||
     ![MODEL_SPIKE_MODE, FULL_DEPLOY_MODE, RUNTIME_ROLLOUT_MODE].includes(mode)
   ) {
     return false;
   }
 
-  if (hasNonPassingCheck(plan) || hasResourceDrift(plan)) {
+  const hasInvalidChecks =
+    mode === MODEL_SPIKE_MODE
+      ? hasNonPassingModelSpikeCheck(plan)
+      : hasNonPassingCheck(plan);
+  if (hasInvalidChecks || hasResourceDrift(plan)) {
     return false;
   }
 

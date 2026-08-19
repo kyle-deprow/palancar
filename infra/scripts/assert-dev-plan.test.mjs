@@ -10,6 +10,9 @@ const cliPath = fileURLToPath(new URL("./assert-dev-plan.mjs", import.meta.url))
 
 const deploymentAddress =
   'module.foundry.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"]';
+const foundryCognitiveAccountId =
+  "/subscriptions/a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1/resourceGroups/rg-palancar-dev-aeeacd8c/providers/Microsoft.CognitiveServices/accounts/palancardevopenaiaeeacd8c";
+const azurermProviderName = "registry.terraform.io/hashicorp/azurerm";
 const containerAppAddress =
   "module.container_app_workload[0].azapi_resource.this";
 const operatorPrincipalId = "00000000-0000-0000-0000-000000000003";
@@ -26,6 +29,168 @@ const tableRoleDefinitionId =
   `/subscriptions/${fixtureSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
 const tableServiceId =
   `/subscriptions/${fixtureSubscriptionId}/resourceGroups/rg-palancar-dev/providers/Microsoft.Storage/storageAccounts/palancardev/tableServices/default`;
+
+const unrelatedCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  name: "example",
+  to_display: "terraform_data.example",
+  type: "terraform_data",
+};
+const rootFoundryVariableCheckAddress = {
+  kind: "var",
+  name: "foundry_deployments",
+  to_display: "var.foundry_deployments",
+};
+const moduleFoundryVariableCheckAddress = {
+  kind: "var",
+  module: "module.foundry",
+  name: "deployments",
+  to_display: "module.foundry.var.deployments",
+};
+const moduleFoundryResourceCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.foundry",
+  name: "this",
+  to_display: "module.foundry.azurerm_cognitive_account.this",
+  type: "azurerm_cognitive_account",
+};
+const cognitiveDeploymentCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.foundry",
+  name: "this",
+  to_display: "module.foundry.azurerm_cognitive_deployment.this",
+  type: "azurerm_cognitive_deployment",
+};
+const containerAppCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.container_app_workload[0]",
+  name: "this",
+  to_display: "module.container_app_workload[0].azapi_resource.this",
+  type: "azapi_resource",
+};
+const identityCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.identities_rbac",
+  name: "runtime",
+  to_display: "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  type: "azurerm_user_assigned_identity",
+};
+const keyVaultCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.workload_key_vault",
+  name: "this",
+  to_display: "module.workload_key_vault.azurerm_key_vault.this",
+  type: "azurerm_key_vault",
+};
+const unrelatedRootVariableCheckAddress = {
+  kind: "var",
+  name: "deploy_relay_workload",
+  to_display: "var.deploy_relay_workload",
+};
+const directDependencyCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.budget",
+  name: "this",
+  to_display:
+    "module.budget.azurerm_consumption_budget_resource_group.this",
+  type: "azurerm_consumption_budget_resource_group",
+};
+const unrelatedOutputCheckAddress = {
+  kind: "output_value",
+  name: "example",
+  to_display: "output.example",
+};
+const unrelatedCheckBlockAddress = {
+  kind: "check",
+  name: "example",
+  to_display: "check.example",
+};
+const nestedFoundryCheckBlockAddress = {
+  kind: "check",
+  module: "module.wrapper.module.foundry",
+  name: "example",
+  to_display: "module.wrapper.module.foundry.check.example",
+};
+const nestedFoundryVariableCheckAddress = {
+  kind: "var",
+  module: 'module.wrapper[0].module.foundry["primary"]',
+  name: "deployments",
+  to_display:
+    'module.wrapper[0].module.foundry["primary"].var.deployments',
+};
+const nestedBudgetVariableCheckAddress = {
+  kind: "var",
+  module: "module.wrapper.module.budget",
+  name: "amount",
+  to_display: "module.wrapper.module.budget.var.amount",
+};
+const nestedObservabilityResourceCheckAddress = {
+  kind: "resource",
+  mode: "managed",
+  module: "module.wrapper.module.observability",
+  name: "example",
+  to_display:
+    "module.wrapper.module.observability.terraform_data.example",
+  type: "terraform_data",
+};
+const instantiatedObservabilityResourceCheckAddress = {
+  ...nestedObservabilityResourceCheckAddress,
+  module: 'module.wrapper[0].module.observability["primary"]',
+  to_display:
+    'module.wrapper[0].module.observability["primary"].terraform_data.example',
+};
+const unrelatedDataCheckAddress = {
+  kind: "resource",
+  mode: "data",
+  name: "current",
+  to_display: "data.azurerm_client_config.current",
+  type: "azurerm_client_config",
+};
+const unrelatedModuleDataCheckAddress = {
+  ...unrelatedDataCheckAddress,
+  module: "module.unrelated",
+  to_display: "module.unrelated.data.azurerm_client_config.current",
+};
+
+function terraformCheck(address, status, instanceKey = undefined) {
+  const instanceAddress = {
+    ...(address.module === undefined ? {} : { module: address.module }),
+    to_display:
+      instanceKey === undefined
+        ? address.to_display
+        : `${address.to_display}[${JSON.stringify(instanceKey)}]`,
+    ...(instanceKey === undefined ? {} : { instance_key: instanceKey }),
+  };
+
+  return {
+    address: clone(address),
+    status,
+    instances: [{ address: instanceAddress, status }],
+  };
+}
+
+function terraformCheckWithInstanceStatuses(parentStatus, instanceStatuses) {
+  return {
+    address: clone(unrelatedCheckAddress),
+    status: parentStatus,
+    instances: instanceStatuses.map((status, instanceKey) => ({
+      address: {
+        instance_key: instanceKey,
+        to_display: `terraform_data.example[${instanceKey}]`,
+      },
+      status,
+    })),
+  };
+}
+
+const passCheck = terraformCheck(unrelatedCheckAddress, "pass");
 
 const foundationAddresses = [
   "azurerm_resource_group.foundation",
@@ -101,6 +266,8 @@ function operatorRoleAssignment(
 }
 
 const pinnedAfter = {
+  cognitive_account_id: foundryCognitiveAccountId,
+  dynamic_throttling_enabled: null,
   name: "gpt-4o-mini-transcribe",
   model: [
     {
@@ -109,11 +276,48 @@ const pinnedAfter = {
       version: "2025-12-15",
     },
   ],
-  sku: [{ name: "GlobalStandard", capacity: 1 }],
+  sku: [
+    {
+      capacity: 1,
+      family: null,
+      name: "GlobalStandard",
+      size: null,
+      tier: null,
+    },
+  ],
+  timeouts: null,
   version_upgrade_option: "NoAutoUpgrade",
 };
 
-const miniCreate = change(deploymentAddress, ["create"], pinnedAfter);
+function modelCreate(after) {
+  return {
+    address: deploymentAddress,
+    module_address: "module.foundry",
+    mode: "managed",
+    type: "azurerm_cognitive_deployment",
+    name: "this",
+    index: "gpt-4o-mini-transcribe",
+    provider_name: azurermProviderName,
+    change: {
+      actions: ["create"],
+      before: null,
+      after,
+      after_unknown: {
+        id: true,
+        model: [{}],
+        rai_policy_name: true,
+        sku: [{}],
+      },
+      before_sensitive: false,
+      after_sensitive: {
+        model: [{}],
+        sku: [{}],
+      },
+    },
+  };
+}
+
+const miniCreate = modelCreate(pinnedAfter);
 const miniNoOp = change(deploymentAddress, ["no-op"], pinnedAfter);
 
 function containerAppAfter(scale = { minReplicas: 0, maxReplicas: 1 }) {
@@ -429,7 +633,7 @@ function refreshFreeZeroMapRuntimePlan() {
         attribute: [],
       },
     ],
-    checks: [{ status: "pass" }],
+    checks: [passCheck],
   });
 }
 
@@ -446,6 +650,10 @@ function fullPlan(extraChanges = [], extras = {}) {
 
 test("model-spike accepts the exact pinned deployment create", () => {
   assert.equal(acceptsPlan(plan([miniCreate]), "model-spike"), true);
+  assert.equal(
+    acceptsPlan(plan([miniCreate], { resource_drift: null }), "model-spike"),
+    true,
+  );
   assert.equal(
     acceptsPlan(plan([miniCreate, appNoOp]), "model-spike"),
     true,
@@ -464,6 +672,9 @@ test("model-spike accepts the exact pinned deployment create", () => {
 
 test("model-spike rejects an imprecise pinned model payload", () => {
   const wrongPayloads = [
+    { ...clone(pinnedAfter), cognitive_account_id: `${foundryCognitiveAccountId}/other` },
+    { ...clone(pinnedAfter), dynamic_throttling_enabled: false },
+    { ...clone(pinnedAfter), timeouts: {} },
     { ...clone(pinnedAfter), model: { ...pinnedAfter.model[0] } },
     {
       ...clone(pinnedAfter),
@@ -477,16 +688,28 @@ test("model-spike rejects an imprecise pinned model payload", () => {
       ...clone(pinnedAfter),
       model: [{ ...pinnedAfter.model[0], version: "2024-01-01" }],
     },
+    {
+      ...clone(pinnedAfter),
+      model: [{ ...pinnedAfter.model[0], source: "caller-controlled" }],
+    },
     { ...clone(pinnedAfter), model: [...pinnedAfter.model, pinnedAfter.model[0]] },
     { ...clone(pinnedAfter), sku: [{ name: "Standard", capacity: 1 }] },
-    { ...clone(pinnedAfter), sku: [{ name: "GlobalStandard", capacity: 2 }] },
+    {
+      ...clone(pinnedAfter),
+      sku: [{ ...pinnedAfter.sku[0], capacity: 2 }],
+    },
+    {
+      ...clone(pinnedAfter),
+      sku: [{ ...pinnedAfter.sku[0], tier: "Standard" }],
+    },
     { ...clone(pinnedAfter), sku: { name: "GlobalStandard", capacity: 1 } },
     { ...clone(pinnedAfter), version_upgrade_option: "Once" },
+    { ...clone(pinnedAfter), caller_controlled: true },
   ];
 
   for (const after of wrongPayloads) {
     assert.equal(
-      acceptsPlan(plan([change(deploymentAddress, ["create"], after)]), "model-spike"),
+      acceptsPlan(plan([modelCreate(after)]), "model-spike"),
       false,
     );
   }
@@ -509,15 +732,144 @@ test("model-spike rejects an imprecise pinned model payload", () => {
     false,
   );
 
-  const afterWithoutRedundantName = clone(pinnedAfter);
-  delete afterWithoutRedundantName.name;
+  const missingName = clone(pinnedAfter);
+  delete missingName.name;
   assert.equal(
-    acceptsPlan(
-      plan([change(deploymentAddress, ["create"], afterWithoutRedundantName)]),
-      "model-spike",
-    ),
-    true,
+    acceptsPlan(plan([modelCreate(missingName)]), "model-spike"),
+    false,
   );
+
+  const wrongName = clone(pinnedAfter);
+  wrongName.name = "other";
+  assert.equal(
+    acceptsPlan(plan([modelCreate(wrongName)]), "model-spike"),
+    false,
+  );
+
+  for (const key of Object.keys(pinnedAfter)) {
+    const missingTopLevelField = clone(pinnedAfter);
+    delete missingTopLevelField[key];
+    assert.equal(
+      acceptsPlan(plan([modelCreate(missingTopLevelField)]), "model-spike"),
+      false,
+      `missing deployment after.${key} should reject`,
+    );
+  }
+
+  for (const key of Object.keys(pinnedAfter.model[0])) {
+    const missingModelField = clone(pinnedAfter);
+    delete missingModelField.model[0][key];
+    assert.equal(
+      acceptsPlan(plan([modelCreate(missingModelField)]), "model-spike"),
+      false,
+      `missing deployment model.${key} should reject`,
+    );
+  }
+
+  for (const key of Object.keys(pinnedAfter.sku[0])) {
+    const missingSkuField = clone(pinnedAfter);
+    delete missingSkuField.sku[0][key];
+    assert.equal(
+      acceptsPlan(plan([modelCreate(missingSkuField)]), "model-spike"),
+      false,
+      `missing deployment sku.${key} should reject`,
+    );
+  }
+});
+
+test("model-spike requires the exact target resource-change envelope", () => {
+  for (const key of Object.keys(miniCreate)) {
+    const missingEnvelopeField = clone(miniCreate);
+    delete missingEnvelopeField[key];
+    assert.equal(
+      acceptsPlan(plan([missingEnvelopeField]), "model-spike"),
+      false,
+      `missing resource change ${key} should reject`,
+    );
+  }
+
+  const envelopeMutations = [
+    (resourceChange) => { resourceChange.address += ".caller"; },
+    (resourceChange) => { resourceChange.module_address = "module.wrapper.module.foundry"; },
+    (resourceChange) => { resourceChange.mode = "data"; },
+    (resourceChange) => { resourceChange.type = "terraform_data"; },
+    (resourceChange) => { resourceChange.name = "other"; },
+    (resourceChange) => { resourceChange.index = "other"; },
+    (resourceChange) => { resourceChange.provider_name = "registry.terraform.io/caller/azurerm"; },
+    (resourceChange) => { resourceChange.extra = true; },
+  ];
+  for (const mutate of envelopeMutations) {
+    const resourceChange = clone(miniCreate);
+    mutate(resourceChange);
+    assert.equal(acceptsPlan(plan([resourceChange]), "model-spike"), false);
+  }
+
+  for (const key of Object.keys(miniCreate.change)) {
+    const missingChangeField = clone(miniCreate);
+    delete missingChangeField.change[key];
+    assert.equal(
+      acceptsPlan(plan([missingChangeField]), "model-spike"),
+      false,
+      `missing resource change.change.${key} should reject`,
+    );
+  }
+
+  const extraChangeField = clone(miniCreate);
+  extraChangeField.change.extra = true;
+  assert.equal(acceptsPlan(plan([extraChangeField]), "model-spike"), false);
+
+  const wrongActions = clone(miniCreate);
+  wrongActions.change.actions = ["no-op"];
+  assert.equal(acceptsPlan(plan([wrongActions]), "model-spike"), false);
+});
+
+test("all modes require the supported Terraform JSON plan format", () => {
+  const malformedVersions = [undefined, {}, "1.1", "1.3"];
+  const validPlans = [
+    [plan([miniCreate]), "model-spike"],
+    [fullPlan(), "full-deploy"],
+    [runtimePlan(), "runtime-rollout"],
+  ];
+
+  for (const [validPlan, mode] of validPlans) {
+    assert.equal(acceptsPlan(validPlan, mode), true);
+    for (const formatVersion of malformedVersions) {
+      const candidate = clone(validPlan);
+      if (formatVersion === undefined) {
+        delete candidate.format_version;
+      } else {
+        candidate.format_version = formatVersion;
+      }
+      assert.equal(acceptsPlan(candidate, mode), false);
+    }
+  }
+});
+
+test("model-spike rejects unknown or sensitive pinned deployment inputs", () => {
+  const mutations = [
+    (resourceChange) => { resourceChange.change.after_unknown.name = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.model = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.model[0].name = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.model[0].version = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.sku = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.sku[0].name = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.sku[0].capacity = true; },
+    (resourceChange) => { resourceChange.change.after_unknown.version_upgrade_option = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.name = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.model = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.model[0].name = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.model[0].version = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.sku = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.sku[0].name = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.sku[0].capacity = true; },
+    (resourceChange) => { resourceChange.change.after_sensitive.version_upgrade_option = true; },
+  ];
+
+  for (const mutate of mutations) {
+    const resourceChange = clone(miniCreate);
+    mutate(resourceChange);
+    assert.equal(acceptsPlan(plan([resourceChange]), "model-spike"), false);
+  }
 });
 
 test("model-spike rejects other mutations and replacements", () => {
@@ -542,6 +894,377 @@ test("model-spike rejects other mutations and replacements", () => {
     acceptsPlan(
       plan([change(containerAppAddress, ["no-op"]), miniCreate]),
       "model-spike",
+    ),
+    false,
+  );
+});
+
+test("model-spike allows only unrelated unknown Terraform checks", () => {
+  for (const address of [
+    unrelatedCheckAddress,
+    containerAppCheckAddress,
+    identityCheckAddress,
+    keyVaultCheckAddress,
+    unrelatedRootVariableCheckAddress,
+  ]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(address, "unknown")],
+        }),
+        "model-spike",
+      ),
+      true,
+    );
+  }
+  assert.equal(
+    acceptsPlan(
+      plan([miniCreate], {
+        checks: [
+          {
+            address: clone(unrelatedRootVariableCheckAddress),
+            status: "unknown",
+          },
+        ],
+      }),
+      "model-spike",
+    ),
+    true,
+  );
+
+  for (const address of [
+    rootFoundryVariableCheckAddress,
+    moduleFoundryVariableCheckAddress,
+    moduleFoundryResourceCheckAddress,
+    cognitiveDeploymentCheckAddress,
+    nestedFoundryVariableCheckAddress,
+  ]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(address, "unknown")],
+        }),
+        "model-spike",
+      ),
+      false,
+    );
+  }
+  assert.equal(
+    acceptsPlan(
+      plan([miniCreate], {
+        checks: [terraformCheck(cognitiveDeploymentCheckAddress, "unknown", "gpt-4o-mini-transcribe")],
+      }),
+      "model-spike",
+    ),
+    false,
+  );
+
+  for (const address of [
+    unrelatedOutputCheckAddress,
+    unrelatedCheckBlockAddress,
+    nestedFoundryCheckBlockAddress,
+  ]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(address, "unknown")],
+        }),
+        "model-spike",
+      ),
+      false,
+    );
+  }
+  assert.equal(
+    acceptsPlan(
+      plan([miniCreate], {
+        checks: [terraformCheck(directDependencyCheckAddress, "unknown")],
+      }),
+      "model-spike",
+    ),
+    false,
+  );
+  for (const address of [
+    nestedBudgetVariableCheckAddress,
+    nestedObservabilityResourceCheckAddress,
+    instantiatedObservabilityResourceCheckAddress,
+  ]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(address, "unknown")],
+        }),
+        "model-spike",
+      ),
+      false,
+    );
+  }
+
+  for (const status of ["fail", "error"]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(unrelatedCheckAddress, status)],
+        }),
+        "model-spike",
+      ),
+      false,
+    );
+  }
+
+  assert.equal(
+    acceptsPlan(
+      plan(
+        [miniCreate, change("module.unrelated.resource", ["update"])],
+        { checks: [terraformCheck(unrelatedCheckAddress, "unknown")] },
+      ),
+      "model-spike",
+    ),
+    false,
+  );
+});
+
+test("model-spike rejects malformed or lookalike Terraform check addresses", () => {
+  const moduleAddress = {
+    kind: "resource",
+    mode: "managed",
+    module: "module.unrelated",
+    name: "example",
+    to_display: "module.unrelated.terraform_data.example",
+    type: "terraform_data",
+  };
+  const invalidEscapeModule = String.raw`module.unrelated["\q"]`;
+  const noncanonicalEscapeModule = String.raw`module.unrelated["\u0061"]`;
+  const unpairedSurrogateModule = String.raw`module.unrelated["\ud800"]`;
+  const malformedChecks = [
+    undefined,
+    null,
+    {},
+    { status: "unknown" },
+    { address: "var.foundry_deployments", status: "unknown" },
+    {
+      address: { ...unrelatedCheckAddress, extra: true },
+      status: "unknown",
+    },
+    { address: clone(unrelatedCheckAddress), status: "UNKNOWN" },
+    {
+      address: clone(unrelatedCheckAddress),
+      status: "unknown",
+      instances: { status: "unknown" },
+    },
+    {
+      address: clone(unrelatedCheckAddress),
+      status: "unknown",
+      instances: [{ status: "unknown" }],
+    },
+    {
+      address: clone(unrelatedCheckAddress),
+      status: "unknown",
+      instances: [
+        {
+          address: { to_display: "module.foundry.var.deployments" },
+          status: "unknown",
+        },
+      ],
+    },
+    {
+      address: {
+        ...clone(unrelatedCheckAddress),
+        to_display: moduleFoundryResourceCheckAddress.to_display,
+      },
+      status: "unknown",
+    },
+    {
+      address: {
+        ...clone(rootFoundryVariableCheckAddress),
+        name: "other",
+      },
+      status: "unknown",
+    },
+    {
+      address: clone(moduleAddress),
+      status: "unknown",
+      instances: [
+        {
+          address: {
+            module: "module.unrelated[0].module.foundry",
+            to_display:
+              "module.unrelated[0].module.foundry.terraform_data.example",
+          },
+          status: "unknown",
+        },
+      ],
+    },
+    {
+      address: {
+        ...clone(moduleAddress),
+        module: invalidEscapeModule,
+        to_display: `${invalidEscapeModule}.terraform_data.example`,
+      },
+      status: "unknown",
+    },
+    {
+      address: {
+        ...clone(moduleAddress),
+        module: noncanonicalEscapeModule,
+        to_display: `${noncanonicalEscapeModule}.terraform_data.example`,
+      },
+      status: "unknown",
+    },
+    {
+      address: clone(moduleAddress),
+      status: "unknown",
+      instances: [
+        {
+          address: {
+            module: invalidEscapeModule,
+            to_display: `${invalidEscapeModule}.terraform_data.example`,
+          },
+          status: "unknown",
+        },
+      ],
+    },
+    {
+      address: {
+        ...clone(moduleAddress),
+        module: unpairedSurrogateModule,
+        to_display: `${unpairedSurrogateModule}.terraform_data.example`,
+      },
+      status: "unknown",
+    },
+    terraformCheck(unrelatedCheckAddress, "unknown", "\ud800"),
+  ];
+
+  for (const check of malformedChecks) {
+    assert.equal(
+      acceptsPlan(plan([miniCreate], { checks: [check] }), "model-spike"),
+      false,
+    );
+  }
+});
+
+test("Terraform data check displays are mode-aware and canonical", () => {
+  for (const address of [
+    unrelatedDataCheckAddress,
+    unrelatedModuleDataCheckAddress,
+  ]) {
+    assert.equal(
+      acceptsPlan(
+        plan([miniCreate], {
+          checks: [terraformCheck(address, "unknown")],
+        }),
+        "model-spike",
+      ),
+      true,
+    );
+  }
+
+  const missingDataPrefix = clone(unrelatedDataCheckAddress);
+  missingDataPrefix.to_display = "azurerm_client_config.current";
+  assert.equal(
+    acceptsPlan(
+      plan([miniCreate], {
+        checks: [terraformCheck(missingDataPrefix, "unknown")],
+      }),
+      "model-spike",
+    ),
+    false,
+  );
+
+  const spuriousDataPrefix = clone(unrelatedCheckAddress);
+  spuriousDataPrefix.to_display = "data.terraform_data.example";
+  assert.equal(
+    acceptsPlan(
+      plan([miniCreate], {
+        checks: [terraformCheck(spuriousDataPrefix, "unknown")],
+      }),
+      "model-spike",
+    ),
+    false,
+  );
+});
+
+test("Terraform check instances have fail-closed aggregate semantics", () => {
+  const acceptedChecks = [
+    terraformCheckWithInstanceStatuses("pass", ["pass"]),
+    terraformCheckWithInstanceStatuses("unknown", ["pass", "unknown"]),
+    {
+      address: clone(unrelatedCheckAddress),
+      status: "unknown",
+    },
+    {
+      address: {
+        kind: "resource",
+        mode: "managed",
+        module: "module.unrelated",
+        name: "example",
+        to_display: "module.unrelated.terraform_data.example",
+        type: "terraform_data",
+      },
+      status: "unknown",
+      instances: [
+        {
+          address: {
+            module: "module.unrelated[0]",
+            to_display: "module.unrelated[0].terraform_data.example",
+          },
+          status: "unknown",
+        },
+      ],
+    },
+  ];
+
+  for (const check of acceptedChecks) {
+    assert.equal(
+      acceptsPlan(plan([miniCreate], { checks: [check] }), "model-spike"),
+      true,
+    );
+  }
+
+  const rejectedChecks = [
+    { address: clone(unrelatedCheckAddress), status: "unknown", instances: null },
+    { address: clone(unrelatedCheckAddress), status: "pass", instances: [] },
+    { address: clone(unrelatedCheckAddress), status: "unknown", instances: [] },
+    terraformCheckWithInstanceStatuses("pass", ["unknown"]),
+    terraformCheckWithInstanceStatuses("pass", ["pass", "unknown"]),
+    terraformCheckWithInstanceStatuses("unknown", ["pass"]),
+    terraformCheckWithInstanceStatuses("unknown", ["fail"]),
+    terraformCheckWithInstanceStatuses("unknown", ["error"]),
+    terraformCheckWithInstanceStatuses("fail", ["error"]),
+    terraformCheckWithInstanceStatuses("error", ["fail"]),
+  ];
+
+  const duplicateInstances = terraformCheck(
+    unrelatedCheckAddress,
+    "unknown",
+    0,
+  );
+  duplicateInstances.instances.push(clone(duplicateInstances.instances[0]));
+  rejectedChecks.push(duplicateInstances);
+
+  for (const check of rejectedChecks) {
+    assert.equal(
+      acceptsPlan(plan([miniCreate], { checks: [check] }), "model-spike"),
+      false,
+    );
+  }
+});
+
+test("full-deploy and runtime-rollout keep all check statuses strict", () => {
+  assert.equal(
+    acceptsPlan(
+      fullPlan([], {
+        checks: [terraformCheck(unrelatedCheckAddress, "unknown")],
+      }),
+      "full-deploy",
+    ),
+    false,
+  );
+  assert.equal(
+    acceptsPlan(
+      runtimePlan(undefined, ["update"], {
+        checks: [terraformCheck(unrelatedCheckAddress, "unknown")],
+      }),
+      "runtime-rollout",
     ),
     false,
   );
@@ -603,7 +1326,7 @@ test("full-deploy accepts a realistic complete foundation plan", () => {
   assert.equal(acceptsPlan(fullPlan(), "full-deploy"), true);
   assert.equal(
     acceptsPlan(
-      fullPlan([appUpdate], { checks: [{ status: "pass" }] }),
+      fullPlan([appUpdate], { checks: [passCheck] }),
       "full-deploy",
     ),
     true,
@@ -615,7 +1338,7 @@ test("full-deploy accepts a complete no-op inventory after deployment", () => {
     ...foundationNoOps.map(clone),
     miniNoOp,
     appNoOp,
-  ], { checks: [{ status: "pass" }] });
+  ], { checks: [passCheck] });
 
   assert.equal(acceptsPlan(noOpPlan, "full-deploy"), true);
 });
@@ -843,7 +1566,7 @@ test("every supplied check must have status exactly pass", () => {
 
   assert.equal(acceptsPlan(fullPlan([], { checks: [] }), "full-deploy"), true);
   assert.equal(
-    acceptsPlan(fullPlan([], { checks: [{ status: "pass" }] }), "full-deploy"),
+    acceptsPlan(fullPlan([], { checks: [passCheck] }), "full-deploy"),
     true,
   );
 });
