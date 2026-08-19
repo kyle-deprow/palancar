@@ -1,0 +1,19 @@
+{
+  "name": "@palancar/expiry-cleanup",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@palancar/security-state": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run build && vitest run",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  }
+}
