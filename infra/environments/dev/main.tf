@@ -26,6 +26,79 @@ resource "azurerm_resource_group" "foundation" {
       )
       error_message = "LiteLLM must be a complete OpenRouter-only sidecar configuration when enabled and entirely empty when disabled."
     }
+
+    precondition {
+      condition = var.deploy_relay_workload ? (
+        trimspace(var.relay_image_digest) != "" &&
+        can(regex(
+          "^${local.names.acr}\\.azurecr\\.io/palancar-relay@sha256:[0-9a-f]{64}$",
+          var.relay_image_digest
+        )) &&
+        trimspace(var.expiry_cleanup_image_digest) != "" &&
+        can(regex(
+          "^${local.names.acr}\\.azurecr\\.io/palancar-expiry-cleanup@sha256:[0-9a-f]{64}$",
+          var.expiry_cleanup_image_digest
+        )) &&
+        var.enable_litellm_sidecar &&
+        var.litellm_backend == "openrouter" &&
+        trimspace(var.litellm_image_digest) != "" &&
+        can(regex(
+          "^${local.names.acr}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
+          var.litellm_image_digest
+        )) &&
+        startswith(var.litellm_upstream_model, "openrouter/") &&
+        trimspace(var.openrouter_api_key_secret_url) != "" &&
+        trimspace(var.litellm_master_key_secret_url) != "" &&
+        var.azure_api_base == "" &&
+        var.azure_api_version == ""
+        ) : (
+        var.relay_image_digest == "" &&
+        var.expiry_cleanup_image_digest == "" &&
+        !var.enable_litellm_sidecar &&
+        var.litellm_image_digest == "" &&
+        var.litellm_backend == "" &&
+        var.litellm_upstream_model == "" &&
+        var.openrouter_api_key_secret_url == "" &&
+        var.litellm_master_key_secret_url == "" &&
+        var.azure_api_base == "" &&
+        var.azure_api_version == ""
+      )
+      error_message = "A deployed relay requires same-ACR relay and cleanup digests plus the complete OpenRouter LiteLLM sidecar; disabled workloads require exact empty image/provider values."
+    }
+
+    precondition {
+      condition = !var.deploy_relay_workload || (
+        length(local.names.relay_container_app) >= 2 &&
+        length(local.names.relay_container_app) <= 32 &&
+        can(regex("^[a-z0-9]+(?:-[a-z0-9]+)*$", local.names.relay_container_app)) &&
+        !strcontains(local.names.relay_container_app, "--") &&
+        length(local.names.expiry_cleanup_job) >= 2 &&
+        length(local.names.expiry_cleanup_job) <= 32 &&
+        can(regex("^[a-z0-9]+(?:-[a-z0-9]+)*$", local.names.expiry_cleanup_job)) &&
+        !strcontains(local.names.expiry_cleanup_job, "--")
+      )
+      error_message = "Deployed relay Container App and cleanup Job names must be 2-32 lower-case alphanumeric characters with single internal hyphens only."
+    }
+
+    precondition {
+      condition = !var.deploy_relay_workload || (
+        var.foundry_deployments == local.required_foundry_deployments
+      )
+      error_message = "A deployed relay requires exactly the pinned gpt-4o-mini-transcribe Foundry deployment: version 2025-12-15, OpenAI, GlobalStandard, capacity 1, and NoAutoUpgrade."
+    }
+
+    precondition {
+      condition = var.deploy_relay_workload ? (
+        local.relay_transcription_provider == "azure-realtime" &&
+        local.relay_transcription_deployment == "gpt-4o-mini-transcribe" &&
+        local.relay_deployment_slot == "dev"
+        ) : (
+        local.relay_transcription_provider == "" &&
+        local.relay_transcription_deployment == "" &&
+        local.relay_deployment_slot == ""
+      )
+      error_message = "The relay transcription/provider fields must be the exact Azure realtime configuration when enabled and exact empty strings when disabled."
+    }
   }
 }
 
@@ -110,6 +183,7 @@ module "identities_rbac" {
   rate_state_table_id                       = module.workload_state.rate_state_id
   operator_principal_id                     = var.operator_principal_id
   cognitive_account_id                      = module.foundry.account_id
+  application_insights_id                   = module.observability.application_insights_id
   acr_pull_role_definition_id               = var.acr_pull_role_definition_id
   table_data_contributor_role_definition_id = var.table_data_contributor_role_definition_id
   openai_user_role_definition_id            = var.openai_user_role_definition_id
@@ -129,37 +203,67 @@ module "container_app_workload" {
   count  = var.deploy_relay_workload ? 1 : 0
   source = "../../modules/container-app-workload"
 
-  name                                    = local.names.relay_container_app
-  resource_group_id                       = azurerm_resource_group.foundation.id
-  resource_group_name                     = azurerm_resource_group.foundation.name
-  location                                = var.location
-  tags                                    = local.tags
-  container_app_environment_id            = module.container_app_environment.id
-  image_digest                            = var.relay_image_digest
-  acr_login_server                        = module.container_registry.login_server
-  image_pull_identity_id                  = module.identities_rbac.image_pull_identity_id
-  runtime_identity_id                     = module.identities_rbac.runtime_identity_id
-  runtime_identity_client_id              = module.identities_rbac.runtime_client_id
-  workload_table_endpoint                 = module.workload_state.table_endpoint
-  security_state_table_name               = module.workload_state.security_state_name
-  rate_state_table_name                   = module.workload_state.rate_state_name
-  environment                             = var.environment
-  relay_origin                            = local.relay_origin
-  min_replicas                            = var.relay_min_replicas
-  browser_allowed_origins                 = var.browser_allowed_origins
-  allow_null_browser_origin               = var.allow_null_browser_origin
-  security_mode                           = "azure-table"
-  transcription_provider                  = "mock"
-  azure_transcription_endpoint            = ""
-  azure_transcription_deployment          = ""
-  enable_litellm_sidecar                  = var.enable_litellm_sidecar
-  litellm_image_digest                    = var.litellm_image_digest
-  litellm_backend                         = var.litellm_backend
-  litellm_upstream_model                  = var.litellm_upstream_model
-  openrouter_api_key_secret_url           = var.openrouter_api_key_secret_url
-  litellm_master_key_secret_url           = var.litellm_master_key_secret_url
-  key_vault_uri                           = module.workload_key_vault.uri
-  azure_api_base                          = var.azure_api_base
-  azure_api_version                       = var.azure_api_version
-  runtime_secrets_user_role_assignment_id = module.workload_key_vault.runtime_secrets_user_role_assignment_id
+  name                                                    = local.names.relay_container_app
+  resource_group_id                                       = azurerm_resource_group.foundation.id
+  location                                                = var.location
+  tags                                                    = local.tags
+  container_app_environment_id                            = module.container_app_environment.id
+  image_digest                                            = var.relay_image_digest
+  acr_login_server                                        = module.container_registry.login_server
+  image_pull_identity_id                                  = module.identities_rbac.image_pull_identity_id
+  runtime_identity_id                                     = module.identities_rbac.runtime_identity_id
+  runtime_identity_client_id                              = module.identities_rbac.runtime_client_id
+  workload_table_endpoint                                 = module.workload_state.table_endpoint
+  security_state_table_name                               = module.workload_state.security_state_name
+  rate_state_table_name                                   = module.workload_state.rate_state_name
+  environment                                             = var.environment
+  relay_origin                                            = local.relay_origin
+  min_replicas                                            = var.relay_min_replicas
+  browser_allowed_origins                                 = var.browser_allowed_origins
+  allow_null_browser_origin                               = var.allow_null_browser_origin
+  security_mode                                           = "azure-table"
+  transcription_provider                                  = local.relay_transcription_provider
+  azure_transcription_endpoint                            = local.relay_transcription_endpoint
+  azure_transcription_deployment                          = local.relay_transcription_deployment
+  deployment_slot                                         = local.relay_deployment_slot
+  application_insights_connection_string                  = module.observability.application_insights_connection_string
+  enable_litellm_sidecar                                  = var.enable_litellm_sidecar
+  litellm_image_digest                                    = var.litellm_image_digest
+  litellm_backend                                         = var.litellm_backend
+  litellm_upstream_model                                  = var.litellm_upstream_model
+  openrouter_api_key_secret_url                           = var.openrouter_api_key_secret_url
+  litellm_master_key_secret_url                           = var.litellm_master_key_secret_url
+  key_vault_uri                                           = module.workload_key_vault.uri
+  azure_api_base                                          = var.azure_api_base
+  azure_api_version                                       = var.azure_api_version
+  runtime_secrets_user_role_assignment_id                 = module.workload_key_vault.runtime_secrets_user_role_assignment_id
+  runtime_openai_user_role_assignment_id                  = module.identities_rbac.runtime_openai_user_role_assignment_id
+  runtime_monitoring_metrics_publisher_role_assignment_id = module.identities_rbac.runtime_application_insights_role_assignment_id
+
+  depends_on = [module.identities_rbac, module.foundry, module.workload_key_vault]
+}
+
+module "expiry_cleanup_job" {
+  count  = var.deploy_relay_workload ? 1 : 0
+  source = "../../modules/expiry-cleanup-job"
+
+  name                         = local.names.expiry_cleanup_job
+  resource_group_id            = azurerm_resource_group.foundation.id
+  location                     = var.location
+  tags                         = local.tags
+  container_app_environment_id = module.container_app_environment.id
+  image_digest                 = var.expiry_cleanup_image_digest
+  acr_login_server             = module.container_registry.login_server
+  image_pull_identity_id       = module.identities_rbac.image_pull_identity_id
+  runtime_identity_id          = module.identities_rbac.runtime_identity_id
+  runtime_identity_client_id   = module.identities_rbac.runtime_client_id
+  workload_table_endpoint      = trimsuffix(module.workload_state.table_endpoint, "/")
+  security_state_table_name    = module.workload_state.security_state_name
+  rate_state_table_name        = module.workload_state.rate_state_name
+  environment                  = var.environment
+  relay_origin                 = local.relay_origin
+  cleanup_limit                = 1000
+  cleanup_timeout_ms           = 240000
+
+  depends_on = [module.identities_rbac]
 }

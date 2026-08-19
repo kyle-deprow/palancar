@@ -1,10 +1,14 @@
 variable "name" {
-  description = "Container Apps Job name."
+  description = "Canonical 2-32 character Container Apps Job name."
   type        = string
 
   validation {
-    condition     = can(regex("^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$", var.name))
-    error_message = "name must be a lower-case Container Apps Job name."
+    condition = (
+      length(var.name) >= 2 &&
+      length(var.name) <= 32 &&
+      can(regex("^[a-z0-9]+(?:-[a-z0-9]+)*$", var.name))
+    )
+    error_message = "name must contain 2-32 lower-case alphanumeric characters with single internal hyphens only."
   }
 }
 
@@ -50,15 +54,15 @@ variable "container_app_environment_id" {
 }
 
 variable "image_digest" {
-  description = "Immutable lower-case ACR image digest."
+  description = "Immutable palancar-expiry-cleanup image digest in a lower-case ACR."
   type        = string
 
   validation {
     condition = can(regex(
-      "^[a-z0-9]{5,50}\\.azurecr\\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$",
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-expiry-cleanup@sha256:[0-9a-f]{64}$",
       var.image_digest
     ))
-    error_message = "image_digest must use a 5-50 character lower-case alphanumeric ACR name, safe nonempty lower-case repository components, and an exact lower-case sha256 digest."
+    error_message = "image_digest must use a 5-50 character lower-case alphanumeric ACR name, the exact palancar-expiry-cleanup repository, and an exact lower-case sha256 digest."
   }
 }
 
@@ -112,15 +116,15 @@ variable "runtime_identity_client_id" {
 }
 
 variable "workload_table_endpoint" {
-  description = "Canonical HTTPS Azure Table endpoint with a trailing slash."
+  description = "Canonical HTTPS Azure Table account origin with no trailing slash."
   type        = string
 
   validation {
     condition = can(regex(
-      "^https://[a-z0-9]{3,24}\\.table\\.core\\.windows\\.net/$",
+      "^https://[a-z0-9]{3,24}\\.table\\.core\\.windows\\.net$",
       var.workload_table_endpoint
     ))
-    error_message = "workload_table_endpoint must be a canonical HTTPS Azure Table endpoint with a trailing slash."
+    error_message = "workload_table_endpoint must be a canonical HTTPS Azure Table account origin with no trailing slash."
   }
 }
 

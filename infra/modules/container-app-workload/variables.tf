@@ -1,10 +1,15 @@
 variable "name" {
-  description = "Container App name."
+  description = "Canonical 2-32 character Container App name."
   type        = string
 
   validation {
-    condition     = trimspace(var.name) != ""
-    error_message = "name must be nonempty."
+    condition = (
+      length(var.name) >= 2 &&
+      length(var.name) <= 32 &&
+      can(regex("^[a-z0-9]+(?:-[a-z0-9]+)*$", var.name)) &&
+      !strcontains(var.name, "--")
+    )
+    error_message = "name must contain 2-32 lower-case alphanumeric characters with single internal hyphens only."
   }
 }
 
@@ -50,26 +55,15 @@ variable "container_app_environment_id" {
 }
 
 variable "image_digest" {
-  description = "Immutable ACR image digest."
+  description = "Immutable palancar-relay image digest in an ACR."
   type        = string
 
   validation {
-    condition = try(
-      length(var.image_digest) <= 512 &&
-      can(regex(
-        "^[a-z0-9]{5,50}\\.azurecr\\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$",
-        var.image_digest
-      )) &&
-      alltrue([
-        for component in slice(
-          split("/", split("@", var.image_digest)[0]),
-          1,
-          length(split("/", split("@", var.image_digest)[0]))
-        ) : length(component) >= 1 && length(component) <= 128
-      ]),
-      false
-    )
-    error_message = "image_digest must be an immutable lower-case ACR sha256 digest with a 5-50 character registry and safe bounded repository components."
+    condition = can(regex(
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-relay@sha256:[0-9a-f]{64}$",
+      var.image_digest
+    ))
+    error_message = "image_digest must use a 5-50 character lower-case ACR name, the exact palancar-relay repository, and an exact lower-case sha256 digest."
   }
 }
 
@@ -398,27 +392,16 @@ variable "enable_litellm_sidecar" {
 }
 
 variable "litellm_image_digest" {
-  description = "Immutable LiteLLM sidecar image digest in acr_login_server."
+  description = "Immutable palancar-litellm-proxy sidecar image digest in acr_login_server."
   type        = string
   default     = ""
 
   validation {
-    condition = var.litellm_image_digest == "" || try(
-      length(var.litellm_image_digest) <= 512 &&
-      can(regex(
-        "^[a-z0-9]{5,50}\\.azurecr\\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$",
-        var.litellm_image_digest
-      )) &&
-      alltrue([
-        for component in slice(
-          split("/", split("@", var.litellm_image_digest)[0]),
-          1,
-          length(split("/", split("@", var.litellm_image_digest)[0]))
-        ) : length(component) >= 1 && length(component) <= 128
-      ]),
-      false
-    )
-    error_message = "litellm_image_digest must be empty or an immutable lower-case ACR sha256 digest with a 5-50 character registry and safe bounded repository components."
+    condition = var.litellm_image_digest == "" || can(regex(
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
+      var.litellm_image_digest
+    ))
+    error_message = "litellm_image_digest must be empty or use a 5-50 character lower-case ACR name, the exact palancar-litellm-proxy repository, and an exact lower-case sha256 digest."
   }
 }
 

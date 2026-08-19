@@ -1,7 +1,7 @@
 mock_provider "azapi" {}
 
 variables {
-  name                         = "caj-palancar-dev-expiry-cleanup"
+  name                         = "caj-palancardev-cleanup-a1b2c3d4"
   resource_group_id            = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev"
   location                     = "eastus2"
   tags                         = { test = "runtime-contract" }
@@ -11,11 +11,97 @@ variables {
   image_pull_identity_id       = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull"
   runtime_identity_id          = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-runtime"
   runtime_identity_client_id   = "00000000-0000-0000-0000-000000000001"
-  workload_table_endpoint      = "https://palancardev.table.core.windows.net/"
+  workload_table_endpoint      = "https://palancardev.table.core.windows.net"
   security_state_table_name    = "SecurityState"
   rate_state_table_name        = "RateState"
   environment                  = "dev"
   relay_origin                 = "wss://ca-palancar-dev-relay.example.azurecontainerapps.io"
+}
+
+run "accept_minimum_job_name" {
+  command = plan
+
+  variables {
+    name = "a1"
+  }
+
+  assert {
+    condition     = azapi_resource.this.name == "a1"
+    error_message = "a two-character lower-case Container Apps Job name must be accepted"
+  }
+}
+
+run "accept_current_root_job_name_at_maximum_boundary" {
+  command = plan
+
+  variables {
+    name = "caj-palancardev-cleanup-a1b2c3d4"
+  }
+
+  assert {
+    condition     = azapi_resource.this.name == "caj-palancardev-cleanup-a1b2c3d4" && length(azapi_resource.this.name) == 32
+    error_message = "the current root Job name structure must be accepted at the thirty-two-character boundary"
+  }
+}
+
+run "reject_one_character_job_name" {
+  command = plan
+
+  variables {
+    name = "a"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_overlong_job_name" {
+  command = plan
+
+  variables {
+    name = join("", [for index in range(33) : "a"])
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_uppercase_job_name" {
+  command = plan
+
+  variables {
+    name = "caj-Palancar-cleanup"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_leading_hyphen_job_name" {
+  command = plan
+
+  variables {
+    name = "-caj-cleanup"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_trailing_hyphen_job_name" {
+  command = plan
+
+  variables {
+    name = "caj-cleanup-"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_double_hyphen_job_name" {
+  command = plan
+
+  variables {
+    name = "caj--cleanup"
+  }
+
+  expect_failures = [var.name]
 }
 
 run "exact_job_contract" {
@@ -72,7 +158,7 @@ run "exact_job_contract" {
                 },
                 {
                   name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
-                  value = "https://palancardev.table.core.windows.net/"
+                  value = "https://palancardev.table.core.windows.net"
                 },
                 {
                   name  = "PALANCAR_SECURITY_STATE_TABLE"
@@ -209,7 +295,7 @@ run "exact_job_contract" {
   assert {
     condition = azapi_resource.this.body.properties.template.containers[0].env == [
       { name = "AZURE_CLIENT_ID", value = "00000000-0000-0000-0000-000000000001" },
-      { name = "PALANCAR_WORKLOAD_TABLE_ENDPOINT", value = "https://palancardev.table.core.windows.net/" },
+      { name = "PALANCAR_WORKLOAD_TABLE_ENDPOINT", value = "https://palancardev.table.core.windows.net" },
       { name = "PALANCAR_SECURITY_STATE_TABLE", value = "SecurityState" },
       { name = "PALANCAR_RATE_STATE_TABLE", value = "RateState" },
       { name = "PALANCAR_RELAY_ENVIRONMENT", value = "dev" },
@@ -319,14 +405,27 @@ run "reject_uppercase_client_id" {
   expect_failures = [var.runtime_identity_client_id]
 }
 
-run "reject_non_canonical_table_endpoint" {
+run "reject_trailing_slash_table_endpoint" {
+  command = plan
+
+  variables {
+    workload_table_endpoint = "https://palancardev.table.core.windows.net/"
+  }
+
+  expect_failures = [var.workload_table_endpoint]
+}
+
+run "accept_tool_canonical_table_endpoint_without_trailing_slash" {
   command = plan
 
   variables {
     workload_table_endpoint = "https://palancardev.table.core.windows.net"
   }
 
-  expect_failures = [var.workload_table_endpoint]
+  assert {
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[1] == { name = "PALANCAR_WORKLOAD_TABLE_ENDPOINT", value = "https://palancardev.table.core.windows.net" }
+    error_message = "the cleanup Job must emit the tool's canonical slash-free Table account origin unchanged"
+  }
 }
 
 run "reject_wrong_table_name" {
@@ -412,12 +511,12 @@ run "reject_fractional_cleanup_limit" {
   expect_failures = [var.cleanup_limit]
 }
 
-run "accept_minimum_acr_and_repository_boundaries" {
+run "accept_minimum_acr_boundary" {
   command = plan
 
   variables {
     acr_login_server = "abcde.azurecr.io"
-    image_digest     = "abcde.azurecr.io/a@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest     = "abcde.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   assert {
@@ -426,8 +525,8 @@ run "accept_minimum_acr_and_repository_boundaries" {
   }
 
   assert {
-    condition     = azapi_resource.this.body.properties.template.containers[0].image == "abcde.azurecr.io/a@sha256:1111111111111111111111111111111111111111111111111111111111111111"
-    error_message = "a one-character safe repository component must be accepted"
+    condition     = azapi_resource.this.body.properties.template.containers[0].image == "abcde.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    error_message = "the exact cleanup repository must be accepted at the minimum ACR-name boundary"
   }
 }
 
@@ -436,12 +535,12 @@ run "accept_maximum_acr_boundary" {
 
   variables {
     acr_login_server = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.azurecr.io"
-    image_digest     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.azurecr.io/palancar/expiry-cleanup_v1.2@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   assert {
     condition     = azapi_resource.this.body.properties.configuration.registries[0].server == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.azurecr.io"
-    error_message = "a fifty-character ACR name and safe multi-component repository must be accepted"
+    error_message = "a fifty-character ACR name with the exact cleanup repository must be accepted"
   }
 }
 
@@ -499,7 +598,7 @@ run "reject_image_with_one_character_acr_name" {
   command = plan
 
   variables {
-    image_digest = "a.azurecr.io/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest = "a.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   expect_failures = [var.image_digest]
@@ -509,7 +608,7 @@ run "reject_image_with_dotted_acr_name" {
   command = plan
 
   variables {
-    image_digest = "palan.car.azurecr.io/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest = "palan.car.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   expect_failures = [var.image_digest]
@@ -519,7 +618,7 @@ run "reject_image_with_hyphenated_acr_name" {
   command = plan
 
   variables {
-    image_digest = "palan-car.azurecr.io/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest = "palan-car.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   expect_failures = [var.image_digest]
@@ -529,7 +628,7 @@ run "reject_image_with_uppercase_acr_name" {
   command = plan
 
   variables {
-    image_digest = "Palancar.azurecr.io/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest = "Palancar.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   expect_failures = [var.image_digest]
@@ -539,10 +638,20 @@ run "reject_image_from_different_valid_acr" {
   command = plan
 
   variables {
-    image_digest = "otherregistry.azurecr.io/palancar/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_digest = "otherregistry.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
   expect_failures = [azapi_resource.this]
+}
+
+run "reject_wrong_cleanup_repository" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
 }
 
 run "reject_parent_repository_component" {
@@ -1065,11 +1174,11 @@ run "accept_minimum_table_account_boundary" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://abc.table.core.windows.net/"
+    workload_table_endpoint = "https://abc.table.core.windows.net"
   }
 
   assert {
-    condition     = azapi_resource.this.body.properties.template.containers[0].env[1].value == "https://abc.table.core.windows.net/"
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[1].value == "https://abc.table.core.windows.net"
     error_message = "a three-character lower-case Table account must be accepted"
   }
 }
@@ -1078,11 +1187,11 @@ run "accept_maximum_table_account_boundary" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://abcdefghijklmnopqrstuvwx.table.core.windows.net/"
+    workload_table_endpoint = "https://abcdefghijklmnopqrstuvwx.table.core.windows.net"
   }
 
   assert {
-    condition     = azapi_resource.this.body.properties.template.containers[0].env[1].value == "https://abcdefghijklmnopqrstuvwx.table.core.windows.net/"
+    condition     = azapi_resource.this.body.properties.template.containers[0].env[1].value == "https://abcdefghijklmnopqrstuvwx.table.core.windows.net"
     error_message = "a twenty-four-character lower-case Table account must be accepted"
   }
 }
@@ -1091,7 +1200,7 @@ run "reject_table_account_below_minimum" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://ab.table.core.windows.net/"
+    workload_table_endpoint = "https://ab.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1101,7 +1210,7 @@ run "reject_table_account_above_maximum" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://abcdefghijklmnopqrstuvwxy.table.core.windows.net/"
+    workload_table_endpoint = "https://abcdefghijklmnopqrstuvwxy.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1111,7 +1220,7 @@ run "reject_table_endpoint_http" {
   command = plan
 
   variables {
-    workload_table_endpoint = "http://palancardev.table.core.windows.net/"
+    workload_table_endpoint = "http://palancardev.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1121,7 +1230,7 @@ run "reject_table_endpoint_uppercase" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://PalancarDev.table.core.windows.net/"
+    workload_table_endpoint = "https://PalancarDev.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1131,7 +1240,7 @@ run "reject_table_endpoint_port" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://palancardev.table.core.windows.net:443/"
+    workload_table_endpoint = "https://palancardev.table.core.windows.net:443"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1151,7 +1260,7 @@ run "reject_table_endpoint_query" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://palancardev.table.core.windows.net/?query=x"
+    workload_table_endpoint = "https://palancardev.table.core.windows.net?query=x"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1161,7 +1270,7 @@ run "reject_table_endpoint_fragment" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://palancardev.table.core.windows.net/#fragment"
+    workload_table_endpoint = "https://palancardev.table.core.windows.net#fragment"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1171,7 +1280,7 @@ run "reject_table_endpoint_credentials" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://user:password@palancardev.table.core.windows.net/"
+    workload_table_endpoint = "https://user:password@palancardev.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1201,7 +1310,7 @@ run "reject_table_endpoint_whitespace" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://palancar dev.table.core.windows.net/"
+    workload_table_endpoint = "https://palancar dev.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]
@@ -1211,7 +1320,7 @@ run "reject_table_endpoint_control_character" {
   command = plan
 
   variables {
-    workload_table_endpoint = "https://palancar\ndev.table.core.windows.net/"
+    workload_table_endpoint = "https://palancar\ndev.table.core.windows.net"
   }
 
   expect_failures = [var.workload_table_endpoint]

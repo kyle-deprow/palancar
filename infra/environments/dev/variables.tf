@@ -205,10 +205,24 @@ variable "relay_image_digest" {
 
   validation {
     condition = var.relay_image_digest == "" || can(regex(
-      "^[a-z0-9.-]+\\.azurecr\\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$",
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-relay@sha256:[0-9a-f]{64}$",
       var.relay_image_digest
     ))
-    error_message = "relay_image_digest must be empty or an immutable lower-case ACR sha256 digest."
+    error_message = "relay_image_digest must be empty or the exact immutable <acr>.azurecr.io/palancar-relay@sha256 digest."
+  }
+}
+
+variable "expiry_cleanup_image_digest" {
+  description = "Optional immutable ACR digest for the expiry-cleanup Job; required with the relay workload."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.expiry_cleanup_image_digest == "" || can(regex(
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-expiry-cleanup@sha256:[0-9a-f]{64}$",
+      var.expiry_cleanup_image_digest
+    ))
+    error_message = "expiry_cleanup_image_digest must be empty or the exact immutable <acr>.azurecr.io/palancar-expiry-cleanup@sha256 digest."
   }
 }
 
@@ -219,13 +233,13 @@ variable "deploy_relay_workload" {
 }
 
 variable "relay_min_replicas" {
-  description = "Minimum relay replicas; development supports scale-to-zero or one warm replica."
+  description = "Minimum relay replicas; the development workload remains warm at exactly one replica."
   type        = number
-  default     = 0
+  default     = 1
 
   validation {
-    condition     = contains([0, 1], var.relay_min_replicas)
-    error_message = "relay_min_replicas must be exactly 0 or 1."
+    condition     = var.relay_min_replicas == 1
+    error_message = "relay_min_replicas must be exactly 1."
   }
 }
 
@@ -276,10 +290,10 @@ variable "litellm_image_digest" {
 
   validation {
     condition = var.litellm_image_digest == "" || can(regex(
-      "^[a-z0-9.-]+\\.azurecr\\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$",
+      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
       var.litellm_image_digest
     ))
-    error_message = "litellm_image_digest must be empty or an immutable lower-case ACR sha256 digest."
+    error_message = "litellm_image_digest must be empty or the exact immutable <acr>.azurecr.io/palancar-litellm-proxy@sha256 digest."
   }
 }
 
@@ -300,8 +314,14 @@ variable "litellm_upstream_model" {
   default     = ""
 
   validation {
-    condition     = trimspace(var.litellm_upstream_model) == "" || length(var.litellm_upstream_model) <= 128
-    error_message = "litellm_upstream_model must be empty or at most 128 characters."
+    condition = var.litellm_upstream_model == "" || (
+      length(var.litellm_upstream_model) <= 194 &&
+      can(regex(
+        "^openrouter/[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?/[a-z0-9](?:[a-z0-9._:-]{0,126}[a-z0-9])?$",
+        var.litellm_upstream_model
+      ))
+    )
+    error_message = "litellm_upstream_model must be empty or an exact bounded lower-case openrouter/owner/model identifier."
   }
 }
 

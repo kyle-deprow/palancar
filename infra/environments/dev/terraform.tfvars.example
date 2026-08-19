@@ -23,11 +23,13 @@ foundry_deployments = {}
 # Do not commit the live principal ID.
 operator_principal_id = "00000000-0000-0000-0000-000000000000"
 
-# Optional relay workload. Both images must be immutable sha256 references in
-# the same development ACR.
-deploy_relay_workload = false
-relay_image_digest    = ""
-relay_min_replicas    = 0
+# Optional relay workload. A deployed workload requires the exact single
+# transcription deployment shown below, three exact immutable images from the
+# same development ACR, and the complete OpenRouter sidecar configuration.
+deploy_relay_workload       = false
+relay_image_digest          = ""
+expiry_cleanup_image_digest = ""
+relay_min_replicas          = 1
 
 # Keep this synthetic origin until physical Even WebView evidence supplies a
 # reviewed exact origin. Null browser origins remain rejected by default.
@@ -45,13 +47,30 @@ litellm_master_key_secret_url = ""
 azure_api_base                 = ""
 azure_api_version              = ""
 
-# Example enabled OpenRouter values. The secret URLs are exact, versionless
-# references in the workload Key Vault so Container Apps can follow rotation.
+# Final enabled workload example. Keep the model map exactly as shown; the
+# relay's fixed internal generation alias is palancar-generation and LiteLLM's
+# provider-prefixed upstream model uses the openrouter/openai convention.
+# foundry_deployments = {
+#   "gpt-4o-mini-transcribe" = {
+#     model_name             = "gpt-4o-mini-transcribe"
+#     model_version          = "2025-12-15"
+#     model_format           = "OpenAI"
+#     sku_name               = "GlobalStandard"
+#     capacity               = 1
+#     version_upgrade_option = "NoAutoUpgrade"
+#   }
+# }
 # deploy_relay_workload = true
 # relay_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# expiry_cleanup_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+# relay_min_replicas = 1
 # enable_litellm_sidecar = true
 # litellm_image_digest = "palancardevacraeeacd8c.azurecr.io/palancar-litellm-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # litellm_backend = "openrouter"
 # litellm_upstream_model = "openrouter/openai/gpt-5.6-luna"
+# azure_api_base = ""
+# azure_api_version = ""
+# The secret URLs are exact, versionless Key Vault references; no live key is
+# stored in Terraform.
 # openrouter_api_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/openrouter-api-key"
 # litellm_master_key_secret_url = "https://<workload-vault>.vault.azure.net/secrets/litellm-master-key"

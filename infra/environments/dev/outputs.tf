@@ -88,6 +88,16 @@ output "runtime_identity_id" {
   value       = module.identities_rbac.runtime_identity_id
 }
 
+output "runtime_openai_user_role_assignment_id" {
+  description = "Cognitive Services OpenAI User role assignment ID for the runtime identity."
+  value       = module.identities_rbac.runtime_openai_user_role_assignment_id
+}
+
+output "runtime_application_insights_role_assignment_id" {
+  description = "Application Insights-scoped Monitoring Metrics Publisher role assignment ID for the runtime identity."
+  value       = module.identities_rbac.runtime_application_insights_role_assignment_id
+}
+
 output "operator_security_table_role_assignment_id" {
   description = "SecurityState-scoped Storage Table Data Contributor assignment for the smoke-test operator."
   value       = module.identities_rbac.operator_security_table_role_assignment_id
@@ -135,11 +145,21 @@ output "relay_container_app_id" {
 }
 
 output "relay_origin" {
-  description = "Deterministic Azure-provided relay WebSocket origin."
-  value       = local.relay_origin
+  description = "Deterministic Azure-provided relay WebSocket origin when the workload is deployed."
+  value       = var.deploy_relay_workload ? local.relay_origin : null
 }
 
 output "relay_latest_revision_name" {
   description = "Latest relay Container App revision name when the workload is deployed."
   value       = var.deploy_relay_workload ? module.container_app_workload[0].latest_revision_name : null
+}
+
+output "expiry_cleanup_job_name" {
+  description = "Expiry cleanup Container Apps Job name when the workload is deployed."
+  value       = var.deploy_relay_workload ? module.expiry_cleanup_job[0].name : null
+}
+
+output "expiry_cleanup_job_id" {
+  description = "Expiry cleanup Container Apps Job ARM resource ID when the workload is deployed."
+  value       = var.deploy_relay_workload ? module.expiry_cleanup_job[0].id : null
 }

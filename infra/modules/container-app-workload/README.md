@@ -2,9 +2,11 @@
 
 This module owns the complete relay Container App through one
 `azapi_resource` using `Microsoft.App/containerApps@2026-01-01`. It expects an
-immutable ACR digest and two user-assigned identities: one for image pulls and
-one for application runtime access. The module does not create secrets or
-accept registry credentials.
+immutable `<acr>.azurecr.io/palancar-relay@sha256:<digest>` image and two
+user-assigned identities: one for image pulls and one for application runtime
+access. The Container App name must contain 2-32 lower-case alphanumeric
+characters with single internal hyphens only. The module does not create
+secrets or accept registry credentials.
 
 The workload uses a single revision, exactly one warm replica with a hard
 maximum of one, an Azure-provided external WebSocket origin, a content-free
@@ -43,9 +45,9 @@ managed identity; no Azure API keys are accepted.
 ## Optional OpenRouter LiteLLM sidecar
 
 Set `enable_litellm_sidecar = true` to add a container named `litellm` on the
-same replica as the relay. The sidecar uses the immutable
-`litellm_image_digest` from the same `acr_login_server` used by the relay,
-binds internally on port 4000, and routes the fixed
+same replica as the relay. The sidecar uses the exact immutable
+`<acr>.azurecr.io/palancar-litellm-proxy@sha256:<digest>` image from the same
+`acr_login_server` used by the relay, binds internally on port 4000, and routes the fixed
 relay model alias `palancar-generation` to an `openrouter/` provider-prefixed
 `litellm_upstream_model`. Azure is not production-qualified and the module
 rejects it.

@@ -105,10 +105,10 @@ resource "azapi_resource" "this" {
     precondition {
       condition = (
         !can(regex("^[a-z0-9]{5,50}\\.azurecr\\.io$", var.acr_login_server)) ||
-        !can(regex("^[a-z0-9]{5,50}\\.azurecr\\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$", var.image_digest)) ||
+        !can(regex("^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-expiry-cleanup@sha256:[0-9a-f]{64}$", var.image_digest)) ||
         split("/", var.image_digest)[0] == var.acr_login_server
       )
-      error_message = "image_digest must be hosted by acr_login_server."
+      error_message = "image_digest must use the exact palancar-expiry-cleanup repository hosted by acr_login_server."
     }
   }
 }

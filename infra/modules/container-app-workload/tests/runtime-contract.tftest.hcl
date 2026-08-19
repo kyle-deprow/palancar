@@ -109,6 +109,92 @@ run "mock_runtime_contract" {
   }
 }
 
+run "accept_minimum_container_app_name" {
+  command = plan
+
+  variables {
+    name = "aa"
+  }
+
+  assert {
+    condition     = azapi_resource.this.name == "aa"
+    error_message = "a two-character lower-case Container App name must be accepted"
+  }
+}
+
+run "accept_maximum_container_app_name" {
+  command = plan
+
+  variables {
+    name = join("", [for index in range(32) : "a"])
+  }
+
+  assert {
+    condition     = length(azapi_resource.this.name) == 32
+    error_message = "a thirty-two-character lower-case Container App name must be accepted"
+  }
+}
+
+run "reject_one_character_container_app_name" {
+  command = plan
+
+  variables {
+    name = "a"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_overlong_container_app_name" {
+  command = plan
+
+  variables {
+    name = join("", [for index in range(33) : "a"])
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_uppercase_container_app_name" {
+  command = plan
+
+  variables {
+    name = "ca-Palancar-relay"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_leading_hyphen_container_app_name" {
+  command = plan
+
+  variables {
+    name = "-ca-relay"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_trailing_hyphen_container_app_name" {
+  command = plan
+
+  variables {
+    name = "ca-relay-"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "reject_double_hyphen_container_app_name" {
+  command = plan
+
+  variables {
+    name = "ca--relay"
+  }
+
+  expect_failures = [var.name]
+}
+
 run "live_four_field_connection_is_canonicalized" {
   command = plan
 
@@ -915,6 +1001,16 @@ run "reject_mutable_relay_image" {
   expect_failures = [var.image_digest]
 }
 
+run "reject_wrong_relay_image_repository" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar-relay-alt@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
 run "reject_uppercase_relay_image_repository" {
   command = plan
 
@@ -970,6 +1066,16 @@ run "reject_mutable_litellm_image" {
 
   variables {
     litellm_image_digest = "palancardev.azurecr.io/palancar-litellm-proxy:latest"
+  }
+
+  expect_failures = [var.litellm_image_digest]
+}
+
+run "reject_wrong_litellm_image_repository" {
+  command = plan
+
+  variables {
+    litellm_image_digest = "palancardev.azurecr.io/palancar-litellm@sha256:2222222222222222222222222222222222222222222222222222222222222222"
   }
 
   expect_failures = [var.litellm_image_digest]

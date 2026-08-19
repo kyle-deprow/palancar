@@ -28,6 +28,11 @@ output "runtime_principal_id" {
   value       = azurerm_user_assigned_identity.runtime.principal_id
 }
 
+output "runtime_openai_user_role_assignment_id" {
+  description = "Cognitive Services OpenAI User assignment for the runtime identity."
+  value       = azurerm_role_assignment.runtime_openai.id
+}
+
 output "runtime_application_insights_role_assignment_id" {
   description = "Application Insights-scoped Monitoring Metrics Publisher assignment for the runtime identity."
   value       = azurerm_role_assignment.runtime_application_insights.id

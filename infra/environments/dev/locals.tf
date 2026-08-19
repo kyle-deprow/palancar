@@ -18,8 +18,27 @@ locals {
     application_insights  = "appi-${var.prefix}-${var.environment}-${local.suffix}"
     container_environment = "cae-${var.prefix}-${var.environment}-${local.suffix}"
     relay_container_app   = "ca-${var.prefix}-${var.environment}-relay-${local.suffix}"
+    expiry_cleanup_job    = substr("caj-${local.name_seed}-cleanup-${local.suffix}", 0, 32)
     foundry               = substr("${local.name_seed}openai${local.suffix}", 0, 64)
   }
 
   relay_origin = "wss://${local.names.relay_container_app}.${module.container_app_environment.default_domain}"
+
+  foundry_realtime_endpoint = "wss://${trimprefix(trimsuffix(module.foundry.endpoint, "/"), "https://")}/openai/v1/realtime?intent=transcription"
+
+  relay_transcription_provider   = var.deploy_relay_workload ? "azure-realtime" : ""
+  relay_transcription_endpoint   = var.deploy_relay_workload ? local.foundry_realtime_endpoint : ""
+  relay_transcription_deployment = var.deploy_relay_workload ? "gpt-4o-mini-transcribe" : ""
+  relay_deployment_slot          = var.deploy_relay_workload ? "dev" : ""
+
+  required_foundry_deployments = {
+    "gpt-4o-mini-transcribe" = {
+      model_name             = "gpt-4o-mini-transcribe"
+      model_version          = "2025-12-15"
+      model_format           = "OpenAI"
+      sku_name               = "GlobalStandard"
+      capacity               = 1
+      version_upgrade_option = "NoAutoUpgrade"
+    }
+  }
 }
