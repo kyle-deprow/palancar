@@ -12,6 +12,7 @@
     }
   },
   "dependencies": {
+    "@azure/identity": "4.13.1",
     "@palancar/audio": "0.1.0",
     "@palancar/contracts": "0.1.0",
     "@palancar/language-registry": "0.1.0",

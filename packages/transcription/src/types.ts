@@ -198,7 +198,7 @@ export interface CreateTranscriptionSessionInput {
 export interface TranscriptionAdapter {
   readonly capabilities: Readonly<TranscriptionCapabilities>;
   createSession(input: CreateTranscriptionSessionInput): TranscriptionSession;
-  checkReadiness(): Promise<TranscriptionReadiness>;
+  checkReadiness(signal?: AbortSignal): Promise<TranscriptionReadiness>;
 }
 
 export interface TranscriptionReadiness {

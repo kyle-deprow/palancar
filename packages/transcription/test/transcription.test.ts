@@ -277,6 +277,23 @@ describe('provider-neutral capabilities', () => {
   });
 });
 
+describe('adapter readiness cancellation', () => {
+  it('makes the deterministic mock fail closed for an already-aborted signal', async () => {
+    const adapter = new DeterministicMockTranscriptionAdapter({
+      evidenceCategory: 'selected-target'
+    });
+    const controller = new AbortController();
+    controller.abort('readiness-canary');
+
+    await expect(adapter.checkReadiness(controller.signal)).resolves.toEqual({
+      ready: false,
+      provider: 'deterministic-mock',
+      model: 'symmetric-language-script'
+    });
+    await expect(adapter.checkReadiness()).resolves.toMatchObject({ ready: true });
+  });
+});
+
 describe('session lifecycle and offsets', () => {
   it('delivers automatic mock finals through the event callback before acknowledging finalization', () => {
     const events: NormalizedTranscriptionEvent[] = [];

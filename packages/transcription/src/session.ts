@@ -30,6 +30,7 @@ import type {
   StartUtteranceResult,
   TranscriptionAdapter,
   TranscriptionFinalizationReason,
+  TranscriptionReadiness,
   TranscriptionSession,
   TranscriptionSessionConfiguration,
   TranscriptionSessionState
@@ -671,13 +672,15 @@ export class DeterministicMockTranscriptionAdapter implements TranscriptionAdapt
     return new DeterministicMockTranscriptionSession(input, this.configuration);
   }
 
-  async checkReadiness(): Promise<Readonly<{
-    readonly ready: boolean;
-    readonly provider: string;
-    readonly model: string;
-  }>> {
+  async checkReadiness(signal?: AbortSignal): Promise<TranscriptionReadiness> {
+    let aborted = false;
+    try {
+      aborted = signal?.aborted === true;
+    } catch {
+      aborted = true;
+    }
     return Object.freeze({
-      ready: true,
+      ready: !aborted,
       provider: DETERMINISTIC_MOCK_CAPABILITIES.identity.provider,
       model: DETERMINISTIC_MOCK_CAPABILITIES.identity.model
     });

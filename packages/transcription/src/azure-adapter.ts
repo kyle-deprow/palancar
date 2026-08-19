@@ -393,7 +393,7 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
     });
   }
 
-  checkReadiness(): Promise<TranscriptionReadiness> {
+  checkReadiness(signal?: AbortSignal): Promise<TranscriptionReadiness> {
     const readiness = (ready: boolean): TranscriptionReadiness => Object.freeze({
       ready,
       provider: 'azure-realtime',
@@ -407,7 +407,9 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
       let settled = false;
       let socket: AzureRealtimeSocket | undefined;
       let updateSent = false;
+      let externalAbortAttached = false;
       const timerState: { value?: ReturnType<typeof setTimeout> } = {};
+      const registeredEvents = new Set<AzureRealtimeSocketEvent>();
       let listeners:
         | Readonly<{
           readonly open: () => void;
@@ -417,28 +419,62 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
         }>
         | undefined;
 
+      const shutdownSocket = (target: AzureRealtimeSocket): void => {
+        try { target.close(1000); } catch { /* best effort */ }
+        try { target.terminate(); } catch { /* best effort */ }
+      };
+
       const finish = (ready: boolean): void => {
         if (settled) return;
         settled = true;
         activeIdentity = undefined;
         controller.abort();
         if (timerState.value !== undefined) clearTimeout(timerState.value);
+        if (externalAbortAttached && signal !== undefined) {
+          try { signal.removeEventListener('abort', onExternalAbort); } catch { /* best effort */ }
+          externalAbortAttached = false;
+        }
         const currentSocket = socket;
         const currentListeners = listeners;
         if (currentSocket !== undefined && currentListeners !== undefined) {
-          try { currentSocket.off('open', currentListeners.open); } catch { /* best effort */ }
-          try { currentSocket.off('message', currentListeners.message); } catch { /* best effort */ }
-          try { currentSocket.off('error', currentListeners.error); } catch { /* best effort */ }
-          try { currentSocket.off('close', currentListeners.close); } catch { /* best effort */ }
+          if (registeredEvents.has('open')) {
+            try { currentSocket.off('open', currentListeners.open); } catch { /* best effort */ }
+          }
+          if (registeredEvents.has('message')) {
+            try { currentSocket.off('message', currentListeners.message); } catch { /* best effort */ }
+          }
+          if (registeredEvents.has('error')) {
+            try { currentSocket.off('error', currentListeners.error); } catch { /* best effort */ }
+          }
+          if (registeredEvents.has('close')) {
+            try { currentSocket.off('close', currentListeners.close); } catch { /* best effort */ }
+          }
         }
-        if (currentSocket !== undefined) {
-          try { currentSocket.close(1000); } catch { /* best effort */ }
-          try { currentSocket.terminate(); } catch { /* best effort */ }
-        }
+        registeredEvents.clear();
+        if (currentSocket !== undefined) shutdownSocket(currentSocket);
         socket = undefined;
         listeners = undefined;
         resolve(readiness(ready));
       };
+
+      const onExternalAbort = (): void => finish(false);
+      if (signal !== undefined) {
+        try {
+          if (signal.aborted) {
+            finish(false);
+            return;
+          }
+          signal.addEventListener('abort', onExternalAbort, { once: true });
+          externalAbortAttached = true;
+          if (signal.aborted) {
+            finish(false);
+            return;
+          }
+        } catch {
+          finish(false);
+          return;
+        }
+      }
 
       timerState.value = setTimeout(() => finish(false), this.#options.readyTimeoutMs);
 
@@ -450,30 +486,35 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
           finish(false);
           return;
         }
-        if (
-          settled ||
-          controller.signal.aborted ||
-          typeof credentials.token !== 'string' ||
-          credentials.token.length === 0 ||
-          !Number.isFinite(credentials.expiresOnTimestamp) ||
-          credentials.expiresOnTimestamp <= Date.now()
-        ) {
+        let token: string;
+        let expiresOnTimestamp: number;
+        try {
+          token = credentials.token;
+          expiresOnTimestamp = credentials.expiresOnTimestamp;
+        } catch {
           finish(false);
           return;
         }
+        if (settled || controller.signal.aborted || typeof token !== 'string' || token.length === 0 ||
+            !Number.isFinite(expiresOnTimestamp) || expiresOnTimestamp <= Date.now()) {
+          finish(false);
+          return;
+        }
+        let createdSocket: AzureRealtimeSocket;
         try {
-          socket = this.#socketFactory(this.endpoint, {
-            Authorization: `Bearer ${credentials.token}`
+          createdSocket = this.#socketFactory(this.endpoint, {
+            Authorization: `Bearer ${token}`
           });
         } catch {
           finish(false);
           return;
         }
-        const probeSocket = socket;
-        if (probeSocket === undefined || settled) {
-          finish(false);
+        if (settled || controller.signal.aborted) {
+          shutdownSocket(createdSocket);
           return;
         }
+        socket = createdSocket;
+        const probeSocket = createdSocket;
 
         const isCurrent = (): boolean =>
           !settled && socket === probeSocket && activeIdentity === identity;
@@ -519,16 +560,42 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
           error: onError,
           close: onClose
         });
+        const register = (
+          event: AzureRealtimeSocketEvent,
+          add: () => void,
+          remove: () => void
+        ): boolean => {
+          try {
+            add();
+          } catch {
+            try { remove(); } catch { /* best effort */ }
+            finish(false);
+            return false;
+          }
+          if (settled) {
+            try { remove(); } catch { /* best effort */ }
+            return false;
+          }
+          registeredEvents.add(event);
+          return true;
+        };
+        if (!register('open',
+          () => probeSocket.on('open', onOpen),
+          () => probeSocket.off('open', onOpen))) return;
+        if (!register('message',
+          () => probeSocket.on('message', onMessage),
+          () => probeSocket.off('message', onMessage))) return;
+        if (!register('error',
+          () => probeSocket.on('error', onError),
+          () => probeSocket.off('error', onError))) return;
+        if (!register('close',
+          () => probeSocket.on('close', onClose),
+          () => probeSocket.off('close', onClose))) return;
         try {
-          probeSocket.on('open', onOpen);
-          probeSocket.on('message', onMessage);
-          probeSocket.on('error', onError);
-          probeSocket.on('close', onClose);
+          if (probeSocket.readyState === SOCKET_OPEN) onOpen();
         } catch {
           finish(false);
-          return;
         }
-        if (probeSocket.readyState === SOCKET_OPEN) onOpen();
       })();
     });
   }

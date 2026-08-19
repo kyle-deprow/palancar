@@ -4,6 +4,7 @@ import {
   AZURE_REALTIME_TRANSCRIPTION_APPEND_MAX_BYTES,
   AzureRealtimeTranscriptionAdapter,
   type AzureRealtimeSocket,
+  type AzureRealtimeSocketEvent,
   type AzureRealtimeSocketFactory
 } from '../src/azure-adapter.js';
 import { buildAzureRealtimeSessionUpdateMessage } from '../src/azure-client.js';
@@ -22,6 +23,8 @@ class FakeSocket implements AzureRealtimeSocket {
   readyState = 0;
   bufferedAmount = 0;
   autoCompleteSends = true;
+  closeCalls = 0;
+  terminateCalls = 0;
   readonly sent: string[] = [];
   readonly pendingSendCallbacks: Array<(error?: Error) => void> = [];
   readonly #listeners = new Map<string, Set<Listener>>();
@@ -36,11 +39,13 @@ class FakeSocket implements AzureRealtimeSocket {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.readyState = 3;
     this.#emit('close');
   }
 
   terminate(): void {
+    this.terminateCalls += 1;
     this.readyState = 3;
   }
 
@@ -77,9 +82,44 @@ class FakeSocket implements AzureRealtimeSocket {
     this.#emit('error');
   }
 
+  listenerCount(event: AzureRealtimeSocketEvent): number {
+    return this.#listeners.get(event)?.size ?? 0;
+  }
+
   #emit(event: string, ...args: unknown[]): void {
     for (const listener of this.#listeners.get(event) ?? []) {
       listener(...args as never[]);
+    }
+  }
+}
+
+class ReentrantReadySocket extends FakeSocket {
+  override on(event: 'open' | 'message' | 'error' | 'close', listener: Listener): void {
+    super.on(event, listener);
+    if (event === 'open') {
+      this.readyState = 1;
+      listener();
+    } else if (event === 'message') {
+      listener(sessionUpdated() as never);
+    }
+  }
+}
+
+class ReentrantTimeoutSocket extends FakeSocket {
+  readonly #onMessageRegistration: () => void;
+
+  constructor(onMessageRegistration: () => void) {
+    super();
+    this.#onMessageRegistration = onMessageRegistration;
+  }
+
+  override on(event: 'open' | 'message' | 'error' | 'close', listener: Listener): void {
+    super.on(event, listener);
+    if (event === 'open') {
+      this.readyState = 1;
+      listener();
+    } else if (event === 'message') {
+      this.#onMessageRegistration();
     }
   }
 }
@@ -1119,6 +1159,116 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     expect(socket.readyState).toBe(3);
   });
 
+  it('fails readiness before token or socket work for an already-aborted signal', async () => {
+    const tokenProvider = vi.fn(async () => ({
+      token: 'must-not-be-read',
+      expiresOnTimestamp: Date.now() + 60_000
+    }));
+    const socketFactory = vi.fn(() => new FakeSocket());
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider,
+      socketFactory
+    });
+    const controller = new AbortController();
+    controller.abort('readiness-canary');
+
+    await expect(adapter.checkReadiness(controller.signal)).resolves.toMatchObject({ ready: false });
+    expect(tokenProvider).not.toHaveBeenCalled();
+    expect(socketFactory).not.toHaveBeenCalled();
+  });
+
+  it('caller cancellation closes and terminates an active readiness socket', async () => {
+    const socket = new FakeSocket();
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'readiness-cancellation-secret',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => socket
+    });
+    const controller = new AbortController();
+    const result = adapter.checkReadiness(controller.signal);
+    await Promise.resolve();
+
+    controller.abort('caller-cancellation-canary');
+
+    await expect(result).resolves.toMatchObject({ ready: false });
+    expect(socket.closeCalls).toBe(1);
+    expect(socket.terminateCalls).toBe(1);
+    expect(socket.readyState).toBe(3);
+  });
+
+  it('closes a socket returned after synchronous cancellation inside the factory', async () => {
+    const socket = new FakeSocket();
+    const controller = new AbortController();
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'factory-cancellation-secret',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => {
+        controller.abort();
+        return socket;
+      }
+    });
+
+    await expect(adapter.checkReadiness(controller.signal)).resolves.toMatchObject({ ready: false });
+    expect(socket.closeCalls).toBe(1);
+    expect(socket.terminateCalls).toBe(1);
+  });
+
+  it('settles once and removes listeners when socket registration is reentrant', async () => {
+    const socket = new ReentrantReadySocket();
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'reentrant-readiness-secret',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => socket
+    });
+
+    await expect(adapter.checkReadiness()).resolves.toMatchObject({ ready: true });
+    expect(socket.closeCalls).toBe(1);
+    expect(socket.terminateCalls).toBe(1);
+    for (const event of ['open', 'message', 'error', 'close'] as const) {
+      expect(socket.listenerCount(event)).toBe(0);
+    }
+  });
+
+  it('closes and terminates exactly once when timeout fires during reentrant registration', async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new ReentrantTimeoutSocket(() => vi.advanceTimersByTime(5_000));
+      const adapter = new AzureRealtimeTranscriptionAdapter({
+        endpoint: AZURE_ENDPOINT,
+        deployment: 'transcribe-prod',
+        tokenProvider: async () => ({
+          token: 'reentrant-timeout-secret',
+          expiresOnTimestamp: Date.now() + 60_000
+        }),
+        socketFactory: () => socket,
+        readyTimeoutMs: 5_000
+      });
+
+      await expect(adapter.checkReadiness()).resolves.toMatchObject({ ready: false });
+      expect(socket.closeCalls).toBe(1);
+      expect(socket.terminateCalls).toBe(1);
+      for (const event of ['open', 'message', 'error', 'close'] as const) {
+        expect(socket.listenerCount(event)).toBe(0);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('fails readiness closed on token, connect, and configuration timeouts without details', async () => {
     const tokenFailure = new AzureRealtimeTranscriptionAdapter({
       endpoint: AZURE_ENDPOINT,
@@ -1151,6 +1301,8 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
       await Promise.resolve();
       vi.advanceTimersByTime(5_000);
       await expect(connectResultPromise).resolves.toMatchObject({ ready: false });
+      expect(connectSocket.closeCalls).toBe(1);
+      expect(connectSocket.terminateCalls).toBe(1);
 
       const configSocket = new FakeSocket();
       const configProbe = new AzureRealtimeTranscriptionAdapter({
@@ -1171,6 +1323,8 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
       const configResult = await configResultPromise;
       expect(configResult).toMatchObject({ ready: false });
       expect(JSON.stringify(configResult)).not.toContain('config-secret');
+      expect(configSocket.closeCalls).toBe(1);
+      expect(configSocket.terminateCalls).toBe(1);
     } finally {
       vi.useRealTimers();
     }
