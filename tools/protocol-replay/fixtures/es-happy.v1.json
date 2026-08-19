@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "seed": 17,
+  "target": "es",
+  "durationMs": 100,
+  "steps": [
+    { "op": "transport.open" },
+    { "op": "client.control", "ref": "session.start" },
+    { "op": "server.control", "ref": "session.ready" },
+    { "op": "client.control", "ref": "utterance.start" },
+    { "op": "client.audio", "ref": "audio.frame.0" },
+    { "op": "client.audio", "ref": "audio.frame.1" },
+    { "op": "client.audio", "ref": "audio.frame.2" },
+    { "op": "clock.advance", "ms": 100 },
+    { "op": "server.control", "ref": "audio.ack" },
+    { "op": "client.control", "ref": "utterance.commit" },
+    { "op": "server.control", "ref": "transcript.partial" },
+    { "op": "server.control", "ref": "transcript.final" },
+    { "op": "server.control", "ref": "language.target" },
+    { "op": "server.control", "ref": "translation.ready" },
+    { "op": "server.control", "ref": "suggestions.ready" },
+    { "op": "client.control", "ref": "session.end" },
+    { "op": "transport.close" }
+  ]
+}

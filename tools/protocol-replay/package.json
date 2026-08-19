@@ -1,0 +1,30 @@
+{
+  "name": "@palancar/protocol-replay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "palancar-protocol-replay": "./dist/main.js"
+  },
+  "dependencies": {
+    "@palancar/contracts": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  }
+}

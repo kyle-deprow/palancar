@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "seed": 23,
+  "target": "es",
+  "durationMs": 0,
+  "steps": [
+    { "op": "transport.open" },
+    { "op": "client.control", "ref": "session.start" },
+    { "op": "server.control", "ref": "session.ready" },
+    { "op": "client.control", "ref": "utterance.start" },
+    { "op": "client.audio", "ref": "audio.frame.0" },
+    { "op": "fault.inject", "fault": "audio.gap" },
+    { "op": "client.audio", "ref": "audio.frame.1" },
+    { "op": "transport.close" }
+  ]
+}
