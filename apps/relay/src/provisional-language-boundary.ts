@@ -249,7 +249,8 @@ function detect(detector: EldDetector, text: string): Detection {
     languageDescriptor === undefined ||
     !Object.hasOwn(languageDescriptor, 'value') ||
     typeof languageDescriptor.value !== 'string' ||
-    !/^[a-z]{2,3}$/u.test(languageDescriptor.value) ||
+    (languageDescriptor.value !== '' &&
+      !/^[a-z]{2,3}$/u.test(languageDescriptor.value)) ||
     getScoresDescriptor === undefined ||
     !Object.hasOwn(getScoresDescriptor, 'value') ||
     typeof getScoresDescriptor.value !== 'function' ||
@@ -293,11 +294,21 @@ function detect(detector: EldDetector, text: string): Detection {
   entries.sort((left, right) => right[1] - left[1]);
   const top = entries[0];
   const reliable = Reflect.apply(reliableDescriptor.value, result, []) as unknown;
-  if (
-    top === undefined ||
-    languageDescriptor.value !== top[0] ||
-    typeof reliable !== 'boolean'
-  ) {
+  if (typeof reliable !== 'boolean') {
+    throw new TypeError('Invalid detector result');
+  }
+  if (languageDescriptor.value === '') {
+    if (entries.length !== 0 || reliable !== false) {
+      throw new TypeError('Invalid detector result');
+    }
+    return Object.freeze({
+      language: UNKNOWN_LANGUAGE,
+      score: 0,
+      margin: 0,
+      reliable: false
+    });
+  }
+  if (top === undefined || languageDescriptor.value !== top[0]) {
     throw new TypeError('Invalid detector result');
   }
   return Object.freeze({

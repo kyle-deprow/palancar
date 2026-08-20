@@ -18,7 +18,12 @@ points by the symmetric `eld-small-dev-4` profile. Within that bound every
 qualifying clause and every overlapping one-through-eight-word window is
 inspected. A conflicting window is strong only when its raw score and margin
 meet the profile thresholds; text above the bound is uncertain and cannot
-authorize release. Metrics contain only bounded mode/reason/detected labels and
+authorize release. ELD's exact no-detection tuple (an empty language, no score
+keys, and an unreliable result) is treated only as a weak internal unknown: it
+is ignored as an isolated window, cannot satisfy readiness, and cannot
+authorize a full source or generated result. Every other empty or mismatched
+detector shape fails closed. Metrics contain only bounded mode/reason/detected
+labels and
 raw-score basis points—never source or generated text. The raw score is not
 probability, confidence, or calibration.
 

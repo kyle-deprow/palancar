@@ -55,6 +55,29 @@ function detectorFor(
   });
 }
 
+function canonicalEmptyDetection(): Readonly<{
+  readonly language: '';
+  readonly getScores: () => Readonly<Record<string, number>>;
+  readonly isReliable: () => false;
+}> {
+  return Object.freeze({
+    language: '',
+    getScores: () => Object.freeze({}),
+    isReliable: () => false
+  });
+}
+
+function detectorWithExactResult(
+  exactText: string,
+  exactResult: unknown
+): Readonly<{ detect(text: string): unknown }> {
+  const baseline = detectorFor(tokenLanguage);
+  return Object.freeze({
+    detect: (text: string) =>
+      text === exactText ? exactResult : baseline.detect(text)
+  });
+}
+
 function tokenLanguage(text: string): string {
   for (const [language, fixture] of Object.entries(TEXT)) {
     if (text === fixture) return language;
@@ -158,6 +181,191 @@ describe('development provisional ELD-small boundary', () => {
       reason: 'MATCH'
     });
   });
+
+  it.each([
+    ['es', 0.8462327011788826],
+    ['tr', 0.726775956284153]
+  ] as const)(
+    'accepts pinned real-ELD %s source evidence with an isolated canonical-empty numeric window',
+    async (target, expectedScore) => {
+      const eld = (await import('eld/small')).default;
+      const detector = eld.newInstance();
+      let canonicalEmptyWindows = 0;
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => Object.freeze({
+          detect: (text: string) => {
+            const result = detector.detect(text);
+            if (
+              text === '2026' &&
+              result.language === '' &&
+              Reflect.ownKeys(result.getScores()).length === 0 &&
+              result.isReliable() === false
+            ) {
+              canonicalEmptyWindows += 1;
+            }
+            return result;
+          }
+        })
+      });
+
+      const result = await boundary.classifier.classify(
+        `${TEXT[target]} 2026`,
+        target
+      );
+
+      expect(result).toMatchObject({
+        status: 'provisional',
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH'
+      });
+      if (result.status !== 'provisional') {
+        throw new Error('expected provisional source evidence');
+      }
+      expect(result.provisionalScore).toBeCloseTo(expectedScore, 12);
+      expect(canonicalEmptyWindows).toBeGreaterThan(0);
+    }
+  );
+
+  it.each(['es', 'tr'] as const)(
+    'maps a canonical-empty full %s detection to unknown uncertain evidence',
+    async (target) => {
+      const fullText = 'canonical empty detector result';
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorWithExactResult(
+          fullText,
+          canonicalEmptyDetection()
+        )
+      });
+
+      await expect(boundary.classifier.classify(fullText, target)).resolves.toEqual({
+        status: 'provisional',
+        detectorVersion: 'eld-small-2.1.0',
+        profileVersion: 'eld-small-dev-4',
+        detectedLanguage: 'unknown',
+        provisionalScore: 0,
+        decision: 'uncertain',
+        reason: 'UNKNOWN'
+      });
+    }
+  );
+
+  it.each([
+    ['es', 5],
+    ['es', 7],
+    ['tr', 5],
+    ['tr', 7]
+  ] as const)(
+    'tolerates canonical-empty subwindows but rejects canonical-empty and wrong full %s %i-check results',
+    async (target, count) => {
+      const baseline = generatedInput(target, count);
+      const expected = baseline.checks[2]?.expectedLanguage;
+      if (expected === undefined) throw new Error('missing generated check');
+      const fullEmpty = 'canonical empty generated result';
+      const detector = detectorFor(tokenLanguage);
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => Object.freeze({
+          detect: (text: string) => {
+            if (text === '2026' || text === fullEmpty) {
+              return canonicalEmptyDetection();
+            }
+            return detector.detect(text);
+          }
+        })
+      });
+      const withEmptyWindow = Object.freeze({
+        checks: Object.freeze(baseline.checks.map((check) => Object.freeze({
+          ...check,
+          text: `${check.text} 2026`
+        })))
+      }) as GeneratedLanguageValidationInput;
+      const accepted = await boundary.generatedLanguageValidator.validate(
+        withEmptyWindow,
+        { signal: new AbortController().signal }
+      );
+      expect(isAcceptedGeneratedLanguageEvidence(
+        accepted,
+        'development-provisional'
+      )).toBe(true);
+
+      const emptyEvidence = await boundary.generatedLanguageValidator.validate(
+        generatedInput(target, count, { index: 2, text: fullEmpty }),
+        { signal: new AbortController().signal }
+      );
+      expect(emptyEvidence.checks[2]).toMatchObject({
+        expectedLanguage: expected,
+        detectedLanguage: 'undetermined',
+        verdict: 'indeterminate',
+        provisionalScoreBasisPoints: 0
+      });
+      expect(isAcceptedGeneratedLanguageEvidence(
+        emptyEvidence,
+        'development-provisional'
+      )).toBe(false);
+
+      const wrongEvidence = await boundary.generatedLanguageValidator.validate(
+        generatedInput(target, count, {
+          index: 2,
+          text: target === 'es' ? TEXT.tr : TEXT.es
+        }),
+        { signal: new AbortController().signal }
+      );
+      expect(wrongEvidence.checks[2]).toMatchObject({
+        verdict: 'mismatch'
+      });
+      expect(isAcceptedGeneratedLanguageEvidence(
+        wrongEvidence,
+        'development-provisional'
+      )).toBe(false);
+    }
+  );
+
+  it.each([
+    ['es', 5],
+    ['es', 7],
+    ['tr', 5],
+    ['tr', 7]
+  ] as const)(
+    'accepts pinned real-ELD %s %i-check output with canonical-empty numeric subwindows',
+    async (target, count) => {
+      const eld = (await import('eld/small')).default;
+      const detector = eld.newInstance();
+      let canonicalEmptyWindows = 0;
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => Object.freeze({
+          detect: (text: string) => {
+            const result = detector.detect(text);
+            if (
+              text === '2026' &&
+              result.language === '' &&
+              Reflect.ownKeys(result.getScores()).length === 0 &&
+              result.isReliable() === false
+            ) {
+              canonicalEmptyWindows += 1;
+            }
+            return result;
+          }
+        })
+      });
+      const baseline = generatedInput(target, count);
+      const input = Object.freeze({
+        checks: Object.freeze(baseline.checks.map((check) => Object.freeze({
+          ...check,
+          text: `${check.text} 2026`
+        })))
+      }) as GeneratedLanguageValidationInput;
+
+      const evidence = await boundary.generatedLanguageValidator.validate(input, {
+        signal: new AbortController().signal
+      });
+
+      expect(isAcceptedGeneratedLanguageEvidence(
+        evidence,
+        'development-provisional'
+      )).toBe(true);
+      expect(canonicalEmptyWindows).toBeGreaterThanOrEqual(count);
+    }
+  );
 
   it.each([
     ['English', 'es', TEXT.en, 'ENGLISH'],
@@ -551,6 +759,21 @@ describe('development provisional ELD-small boundary', () => {
 
     for (const malformed of [
       {
+        language: '',
+        getScores: () => ({ es: 0 }),
+        isReliable: () => false
+      },
+      {
+        language: '',
+        getScores: () => ({}),
+        isReliable: () => true
+      },
+      {
+        language: 'es',
+        getScores: () => ({}),
+        isReliable: () => false
+      },
+      {
         language: 'es',
         getScores: () => ({ tr: 0.9, es: 0.1 }),
         isReliable: () => true
@@ -574,6 +797,59 @@ describe('development provisional ELD-small boundary', () => {
         reason: 'DETECTOR_ERROR'
       });
     }
+  });
+
+  it('rejects proxy and accessor detector results without invoking accessors', async () => {
+    const probe = 'hostile detector result probe';
+    let resultAccessorCalls = 0;
+    let scoreAccessorCalls = 0;
+    const accessorResult = {
+      getScores: () => ({}),
+      isReliable: () => false
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorResult, 'language', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        resultAccessorCalls += 1;
+        return '';
+      }
+    });
+    const accessorScores = {} as Record<string, unknown>;
+    Object.defineProperty(accessorScores, 'es', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        scoreAccessorCalls += 1;
+        return 0.9;
+      }
+    });
+    const scoreAccessorResult = {
+      language: 'es',
+      getScores: () => accessorScores,
+      isReliable: () => true
+    };
+    for (const hostile of [
+      new Proxy(canonicalEmptyDetection(), {}),
+      {
+        language: '',
+        getScores: () => new Proxy({}, {}),
+        isReliable: () => false
+      },
+      accessorResult,
+      scoreAccessorResult
+    ]) {
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorWithExactResult(probe, hostile)
+      });
+      await expect(boundary.classifier.classify(probe, 'es')).resolves.toMatchObject({
+        detectedLanguage: 'unknown',
+        decision: 'reject',
+        reason: 'DETECTOR_ERROR'
+      });
+    }
+    expect(resultAccessorCalls).toBe(0);
+    expect(scoreAccessorCalls).toBe(0);
   });
 
   it('initializes one detector lazily through readiness and contains loader failure', async () => {
@@ -655,6 +931,18 @@ describe('development provisional ELD-small boundary', () => {
     });
     await expect(alwaysSpanish.classifier.ready).rejects.toThrow();
     await expect(alwaysSpanish.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+
+    const alwaysEmpty = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => Object.freeze({
+        detect: () => canonicalEmptyDetection()
+      })
+    });
+    await expect(alwaysEmpty.classifier.ready).rejects.toThrow();
+    await expect(alwaysEmpty.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'unknown',
       decision: 'reject',
       reason: 'DETECTOR_ERROR'
     });
