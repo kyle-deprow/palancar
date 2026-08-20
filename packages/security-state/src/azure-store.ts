@@ -55,6 +55,7 @@ import {
   MAX_AUDIO_GRANT_SAMPLES,
   MAX_AUDIO_GRANTS_PER_WINDOW,
   MAX_AUDIO_SAMPLES_PER_WINDOW,
+  MIN_AUDIO_GRANT_HANDOFF_MS,
   OPENING_LEASE_MS,
   PAIRING_TTL_MS,
   PENDING_CREDENTIAL_TTL_MS,
@@ -1446,6 +1447,22 @@ class AzureSecurityStateCore {
       installation.activeSessionEpoch === session.sessionEpoch &&
       installation.activeSessionLeaseVersion === session.leaseVersion &&
       installation.activeSessionLeaseExpiresAt === session.leaseExpiresAt;
+  }
+
+  #audioGrant(row: Omit<AudioGrantRow, 'entity'> | AudioGrantRow): AudioGrant {
+    return freeze({
+      grantId: row.grantId,
+      utteranceId: row.utteranceId,
+      installationId: row.installationId,
+      sessionId: row.sessionId,
+      sessionEpoch: row.sessionEpoch,
+      sessionLeaseVersion: row.sessionLeaseVersion,
+      issuedAt: row.issuedAt,
+      expiresAt: row.expiresAt,
+      fromOriginalSampleOffset: row.fromOriginalSampleOffset,
+      throughOriginalSampleOffset: row.throughOriginalSampleOffset,
+      reservedOriginalSamples: row.reservedOriginalSamples
+    });
   }
 
   #touchInstallation(row: InstallationRow, now: number): Omit<InstallationRow, 'entity'> {
@@ -2909,9 +2926,8 @@ class AzureSecurityStateCore {
     }, 'stale-lease');
   }
 
-  async #readActiveSession(
-    lease: SessionLease,
-    now: number
+  async #readSessionState(
+    lease: SessionLease
   ): Promise<Readonly<{ session: SessionRow; installation: InstallationRow }> | undefined> {
     const installationEntityValue = await this.#point(
       this.#security,
@@ -2930,8 +2946,46 @@ class AzureSecurityStateCore {
       lease.installationId
     );
     const session = parseSession(sessionEntityValue, this.environment, lease.installationId);
-    if (!this.#sessionActive(session, installation, now) || !this.#leaseMatches(lease, session)) return undefined;
     return { session, installation };
+  }
+
+  async #readActiveSession(
+    lease: SessionLease,
+    now: number
+  ): Promise<Readonly<{ session: SessionRow; installation: InstallationRow }> | undefined> {
+    const state = await this.#readSessionState(lease);
+    if (state === undefined) return undefined;
+    const { session, installation } = state;
+    if (!this.#sessionActive(session, installation, now) || !this.#leaseMatches(lease, session)) return undefined;
+    return state;
+  }
+
+  async #validateAudioGrantHandoff(lease: SessionLease, expiresAt: number): Promise<void> {
+    const state = await this.#readSessionState(lease);
+    const handoffNow = this.#now();
+    if (
+      state === undefined ||
+      !this.#sessionActive(state.session, state.installation, handoffNow) ||
+      !this.#leaseMatches(lease, state.session)
+    ) fail('stale-lease');
+    if (expiresAt - handoffNow < MIN_AUDIO_GRANT_HANDOFF_MS) fail('state-unavailable');
+  }
+
+  #audioGrantOperationMatches(
+    expected: Omit<AudioGrantRow, 'entity'>,
+    actual: AudioGrantRow
+  ): boolean {
+    return actual.grantId === expected.grantId &&
+      actual.utteranceId === expected.utteranceId &&
+      actual.installationId === expected.installationId &&
+      actual.sessionId === expected.sessionId &&
+      actual.sessionEpoch === expected.sessionEpoch &&
+      actual.sessionLeaseVersion === expected.sessionLeaseVersion &&
+      actual.issuedAt === expected.issuedAt &&
+      actual.expiresAt === expected.expiresAt &&
+      actual.fromOriginalSampleOffset === expected.fromOriginalSampleOffset &&
+      actual.throughOriginalSampleOffset === expected.throughOriginalSampleOffset &&
+      actual.reservedOriginalSamples === expected.reservedOriginalSamples;
   }
 
   async reserveAudio(value: ReserveAudioInput): Promise<AudioGrant> {
@@ -2954,15 +3008,20 @@ class AzureSecurityStateCore {
     const installWindowKey = 'audio-window:installation';
     const sessionWindowKey = `audio-window:session:${lease.sessionId}:${lease.sessionEpoch}`;
     for (let attempt = 0; attempt < AZURE_CAS_ATTEMPTS; attempt += 1) {
-      const now = this.#now();
-      const active = await this.#readActiveSession(lease, now);
-      if (active === undefined) fail('stale-lease');
+      const preflightNow = this.#now();
+      const active = await this.#readSessionState(lease);
       const [installWindowEntity, sessionWindowEntity, existingGrant] = await Promise.all([
         this.#point(this.#rate, partitionKey, installWindowKey),
         this.#point(this.#rate, partitionKey, sessionWindowKey),
         this.#point(this.#rate, partitionKey, audioGrantKey(grantId))
       ]);
       if (existingGrant !== undefined) fail('state-unavailable');
+      const issuedAt = this.#now(preflightNow);
+      if (
+        active === undefined ||
+        !this.#sessionActive(active.session, active.installation, issuedAt) ||
+        !this.#leaseMatches(lease, active.session)
+      ) fail('stale-lease');
       const installWindow = parseAudioWindow(
         installWindowEntity,
         this.environment,
@@ -2985,8 +3044,8 @@ class AzureSecurityStateCore {
         lease.sessionId,
         lease.sessionEpoch
       );
-      const installEvents = pruneEvents(installWindow.events, now, AUDIO_RESERVATION_WINDOW_MS);
-      const sessionEvents = pruneEvents(sessionWindow.events, now, AUDIO_RESERVATION_WINDOW_MS);
+      const installEvents = pruneEvents(installWindow.events, issuedAt, AUDIO_RESERVATION_WINDOW_MS);
+      const sessionEvents = pruneEvents(sessionWindow.events, issuedAt, AUDIO_RESERVATION_WINDOW_MS);
       if (sessionWindow.activeUtteranceId === undefined) {
         if (input.fromOriginalSampleOffset !== 0) fail('invalid-input');
       } else if (sessionWindow.activeUtteranceId === utteranceId) {
@@ -2994,22 +3053,22 @@ class AzureSecurityStateCore {
           fail('invalid-input');
         }
       } else {
-        if (now < sessionWindow.activeGrantExpiresAt || input.fromOriginalSampleOffset !== 0) {
+        if (issuedAt < sessionWindow.activeGrantExpiresAt || input.fromOriginalSampleOffset !== 0) {
           fail('invalid-input');
         }
       }
       if (
         installEvents.length >= MAX_AUDIO_GRANTS_PER_WINDOW ||
         sessionEvents.length >= MAX_AUDIO_GRANTS_PER_WINDOW ||
-        sumEvents(installEvents, now, AUDIO_RESERVATION_WINDOW_MS) + input.originalSamples > MAX_AUDIO_SAMPLES_PER_WINDOW ||
-        sumEvents(sessionEvents, now, AUDIO_RESERVATION_WINDOW_MS) + input.originalSamples > MAX_AUDIO_SAMPLES_PER_WINDOW
+        sumEvents(installEvents, issuedAt, AUDIO_RESERVATION_WINDOW_MS) + input.originalSamples > MAX_AUDIO_SAMPLES_PER_WINDOW ||
+        sumEvents(sessionEvents, issuedAt, AUDIO_RESERVATION_WINDOW_MS) + input.originalSamples > MAX_AUDIO_SAMPLES_PER_WINDOW
       ) fail('quota-exceeded');
       const event = Object.freeze({
-        at: now,
+        at: issuedAt,
         amount: input.originalSamples as number,
         operationId: grantId
       });
-      const expiresAt = checkedAdd(now, AUDIO_GRANT_TTL_MS, 'state-unavailable');
+      const expiresAt = checkedAdd(issuedAt, AUDIO_GRANT_TTL_MS, 'state-unavailable');
       const grant: Omit<AudioGrantRow, 'entity'> = {
         grantId,
         utteranceId,
@@ -3017,7 +3076,7 @@ class AzureSecurityStateCore {
         sessionId: lease.sessionId,
         sessionEpoch: lease.sessionEpoch,
         sessionLeaseVersion: lease.leaseVersion,
-        issuedAt: now,
+        issuedAt,
         expiresAt,
         fromOriginalSampleOffset: input.fromOriginalSampleOffset as number,
         throughOriginalSampleOffset,
@@ -3067,21 +3126,8 @@ class AzureSecurityStateCore {
       ];
       try {
         await this.#rate.transaction(mutations);
-        const postNow = this.#now(now);
-        if (await this.#readActiveSession(lease, postNow) === undefined) fail('stale-lease');
-        return freeze({
-          grantId,
-          utteranceId,
-          installationId: lease.installationId,
-          sessionId: lease.sessionId,
-          sessionEpoch: lease.sessionEpoch,
-          sessionLeaseVersion: lease.leaseVersion,
-          issuedAt: now,
-          expiresAt,
-          fromOriginalSampleOffset: input.fromOriginalSampleOffset as number,
-          throughOriginalSampleOffset,
-          reservedOriginalSamples: input.originalSamples as number
-        });
+        await this.#validateAudioGrantHandoff(lease, expiresAt);
+        return this.#audioGrant(grant);
       } catch (error) {
         if (error instanceof SecurityStateError) throw error;
         if (isBoundary(error, 'conflict', 'precondition-failed')) continue;
@@ -3089,27 +3135,9 @@ class AzureSecurityStateCore {
           const reconciled = await this.#point(this.#rate, partitionKey, audioGrantKey(grantId));
           if (reconciled !== undefined) {
             const parsed = parseAudioGrant(reconciled, this.environment, partitionKey, grantId);
-            if (
-              parsed.sessionId === lease.sessionId && parsed.sessionEpoch === lease.sessionEpoch &&
-              parsed.fromOriginalSampleOffset === input.fromOriginalSampleOffset &&
-              parsed.reservedOriginalSamples === input.originalSamples
-            ) {
-              const postNow = this.#now(now);
-              if (await this.#readActiveSession(lease, postNow) === undefined) fail('stale-lease');
-              return freeze({
-                grantId: parsed.grantId,
-                utteranceId: parsed.utteranceId,
-                installationId: parsed.installationId,
-                sessionId: parsed.sessionId,
-                sessionEpoch: parsed.sessionEpoch,
-                sessionLeaseVersion: parsed.sessionLeaseVersion,
-                issuedAt: parsed.issuedAt,
-                expiresAt: parsed.expiresAt,
-                fromOriginalSampleOffset: parsed.fromOriginalSampleOffset,
-                throughOriginalSampleOffset: parsed.throughOriginalSampleOffset,
-                reservedOriginalSamples: parsed.reservedOriginalSamples
-              });
-            }
+            if (!this.#audioGrantOperationMatches(grant, parsed)) fail('state-unavailable');
+            await this.#validateAudioGrantHandoff(lease, parsed.expiresAt);
+            return this.#audioGrant(parsed);
           }
           continue;
         }

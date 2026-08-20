@@ -31,6 +31,7 @@ import {
   MAX_AUDIO_GRANT_SAMPLES,
   MAX_AUDIO_GRANTS_PER_WINDOW,
   MAX_AUDIO_SAMPLES_PER_WINDOW,
+  MIN_AUDIO_GRANT_HANDOFF_MS,
   OPENING_LEASE_MS,
   PAIRING_TTL_MS,
   PENDING_CREDENTIAL_TTL_MS,
@@ -461,7 +462,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
   #externalActive = false;
   #commitActive = false;
   #reentryDetected = false;
-  #lastCommittedNow = 0;
+  #latestAcceptedObservation = 0;
 
   readonly #pairings = new Map<CanonicalSha256, PairingRow>();
   readonly #credentials = new Map<CanonicalSha256, CredentialRow>();
@@ -517,24 +518,26 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     }
   }
 
-  #context(minimum = this.#lastCommittedNow): number {
+  #context(minimum = this.#latestAcceptedObservation): number {
     const available = this.#external(() => this.#availability.isAvailable());
     if (available !== true) fail('state-unavailable');
     const now = this.#external(() => this.#clock.now());
-    if (!nonNegativeSafeInteger(now) || now < this.#lastCommittedNow || now < minimum) {
+    if (!nonNegativeSafeInteger(now) || now < this.#latestAcceptedObservation || now < minimum) {
       fail('state-unavailable');
     }
+    this.#latestAcceptedObservation = now;
     return now;
   }
 
   #commit<T>(now: number, transaction: () => T): T {
-    if (this.#externalActive || this.#commitActive || now < this.#lastCommittedNow) fail('state-unavailable');
+    if (this.#externalActive || this.#commitActive || now < this.#latestAcceptedObservation) {
+      fail('state-unavailable');
+    }
     const available = this.#external(() => this.#availability.isAvailable());
-    if (available !== true || now < this.#lastCommittedNow) fail('state-unavailable');
+    if (available !== true || now < this.#latestAcceptedObservation) fail('state-unavailable');
     this.#commitActive = true;
     try {
       const result = transaction();
-      this.#lastCommittedNow = now;
       return result;
     } finally {
       this.#commitActive = false;
@@ -1342,26 +1345,26 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     );
     const before = this.#context();
     const grantId = this.#candidate(this.#ids.grantId, assertCanonicalUuid, (id) => this.#grants.has(id));
-    const now = this.#context(before);
-    const result = this.#commit(now, () => {
+    const issuedAt = this.#context(before);
+    const result = this.#commit(issuedAt, () => {
       const row = this.#sessions.get(lease.sessionId);
       const installation = this.#installations.get(lease.installationId);
       if (
-        row === undefined || installation === undefined || !this.#sessionActive(row, installation, now) ||
+        row === undefined || installation === undefined || !this.#sessionActive(row, installation, issuedAt) ||
         !this.#leaseMatches(lease, row)
       ) return undefined;
-      this.#cleanupSessionGrants(row, now);
+      this.#cleanupSessionGrants(row, issuedAt);
       if (
-        row.grantWindow.count(now, AUDIO_RESERVATION_WINDOW_MS) >= MAX_AUDIO_GRANTS_PER_WINDOW ||
-        installation.grantWindow.count(now, AUDIO_RESERVATION_WINDOW_MS) >= MAX_AUDIO_GRANTS_PER_WINDOW
+        row.grantWindow.count(issuedAt, AUDIO_RESERVATION_WINDOW_MS) >= MAX_AUDIO_GRANTS_PER_WINDOW ||
+        installation.grantWindow.count(issuedAt, AUDIO_RESERVATION_WINDOW_MS) >= MAX_AUDIO_GRANTS_PER_WINDOW
       ) fail('quota-exceeded');
       const sessionWindowTotal = checkedAdd(
-        row.audioWindow.amount(now, AUDIO_RESERVATION_WINDOW_MS),
+        row.audioWindow.amount(issuedAt, AUDIO_RESERVATION_WINDOW_MS),
         input.originalSamples as number,
         'quota-exceeded'
       );
       const installationWindowTotal = checkedAdd(
-        installation.audioWindow.amount(now, AUDIO_RESERVATION_WINDOW_MS),
+        installation.audioWindow.amount(issuedAt, AUDIO_RESERVATION_WINDOW_MS),
         input.originalSamples as number,
         'quota-exceeded'
       );
@@ -1370,7 +1373,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         installationWindowTotal > MAX_AUDIO_SAMPLES_PER_WINDOW
       ) fail('quota-exceeded');
       const total = checkedAdd(row.audioReservedOriginalSamples, input.originalSamples as number, 'quota-exceeded');
-      const expiresAt = checkedAdd(now, AUDIO_GRANT_TTL_MS);
+      const expiresAt = checkedAdd(issuedAt, AUDIO_GRANT_TTL_MS);
       if (this.#grants.has(grantId)) fail('state-unavailable');
       const grant: GrantRow = {
         id: grantId,
@@ -1380,22 +1383,31 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         sessionEpoch: row.epoch,
         tombstoneVersion: row.tombstoneVersion,
         sessionLeaseVersion: row.leaseVersion,
-        issuedAt: now,
+        issuedAt,
         expiresAt,
         fromOriginalSampleOffset: input.fromOriginalSampleOffset as number,
         throughOriginalSampleOffset,
         reservedOriginalSamples: input.originalSamples as number,
       };
-      row.audioWindow.add(now, AUDIO_RESERVATION_WINDOW_MS, input.originalSamples as number);
-      installation.audioWindow.add(now, AUDIO_RESERVATION_WINDOW_MS, input.originalSamples as number);
-      row.grantWindow.add(now, AUDIO_RESERVATION_WINDOW_MS);
-      installation.grantWindow.add(now, AUDIO_RESERVATION_WINDOW_MS);
+      row.audioWindow.add(issuedAt, AUDIO_RESERVATION_WINDOW_MS, input.originalSamples as number);
+      installation.audioWindow.add(issuedAt, AUDIO_RESERVATION_WINDOW_MS, input.originalSamples as number);
+      row.grantWindow.add(issuedAt, AUDIO_RESERVATION_WINDOW_MS);
+      installation.grantWindow.add(issuedAt, AUDIO_RESERVATION_WINDOW_MS);
       row.audioReservedOriginalSamples = total;
       this.#grants.set(grantId, grant);
       row.grantIds.add(grantId);
       return this.#grant(grant);
     });
     if (result === undefined) fail('stale-lease');
+    const handoffNow = this.#context(issuedAt);
+    const row = this.#sessions.get(lease.sessionId);
+    const installation = this.#installations.get(lease.installationId);
+    if (
+      row === undefined || installation === undefined ||
+      !this.#sessionActive(row, installation, handoffNow) ||
+      !this.#leaseMatches(lease, row)
+    ) fail('stale-lease');
+    if (result.expiresAt - handoffNow < MIN_AUDIO_GRANT_HANDOFF_MS) fail('state-unavailable');
     return result;
   }
 

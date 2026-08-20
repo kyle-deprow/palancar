@@ -9,6 +9,7 @@ import {
   CREDENTIAL_IDLE_TTL_MS,
   LOCAL_MOCK_ENVIRONMENT,
   MAX_AUDIO_GRANTS_PER_WINDOW,
+  MIN_AUDIO_GRANT_HANDOFF_MS,
   OPENING_LEASE_MS,
   REVOCATION_TOMBSTONE_TTL_MS,
   SecurityStateError,
@@ -23,6 +24,7 @@ import {
 import {
   AzureTableBoundaryError,
   createAzureTableStoresForTesting,
+  createAudioGrantMeter,
   createDeterministicIdFactory,
   createDeterministicTokenFactory,
   createFakeClock,
@@ -183,6 +185,7 @@ function fakeTable() {
   let failure: Failure | undefined;
   let afterTransaction: (() => Promise<void>) | undefined;
   let beforeTransaction: (() => Promise<void>) | undefined;
+  let afterPointRead: (() => Promise<void>) | undefined;
   const transactions: AzureTableMutation[][] = [];
   const key = (partitionKey: string, rowKey: string): string => `${partitionKey}\u0000${rowKey}`;
   const nextEtag = (): string => `"etag-${++version}"`;
@@ -204,6 +207,9 @@ function fakeTable() {
       takeFailure('pointRead', false);
       const result = rows.get(key(partitionKey, rowKey));
       takeFailure('pointRead', true);
+      const callback = afterPointRead;
+      afterPointRead = undefined;
+      if (callback !== undefined) await callback();
       return result === undefined ? undefined : cloneEntity(result);
     },
     create: async (entity: AzureNewEntity) => {
@@ -257,10 +263,10 @@ function fakeTable() {
       }
       rows = next;
       transactions.push([...mutations]);
-      takeFailure('transaction', true);
       const callback = afterTransaction;
       afterTransaction = undefined;
       if (callback !== undefined) await callback();
+      takeFailure('transaction', true);
     },
     listPage: async (input: Parameters<AzureTableClientLike['listPage']>[0]) => {
       takeFailure('listPage', false);
@@ -279,6 +285,7 @@ function fakeTable() {
     failNext: (operation: Operation, kind: AzureBoundaryErrorKind, after = false): void => {
       failure = { operation, kind, after };
     },
+    afterNextPointRead: (callback: () => Promise<void>): void => { afterPointRead = callback; },
     beforeNextTransaction: (callback: () => Promise<void>): void => { beforeTransaction = callback; },
     afterNextTransaction: (callback: () => Promise<void>): void => { afterTransaction = callback; },
     insertRaw: (entity: AzureNewEntity): void => { rows.set(key(entity.partitionKey, entity.rowKey), store(entity)); },
@@ -344,6 +351,31 @@ async function activeFixture() {
   const { redeemed } = await enroll(base);
   const opened = await open(base, redeemed.credential);
   return { ...base, redeemed, ...opened };
+}
+
+function audioRows(base: ReturnType<typeof fixture>): readonly AzureStoredEntity[] {
+  return base.rate.snapshot().filter((row) =>
+    row.properties.kind === 'audio-grant' || row.properties.kind === 'audio-window'
+  );
+}
+
+function expectSingleAudioCharge(base: ReturnType<typeof fixture>): AzureStoredEntity {
+  const rows = audioRows(base);
+  const grants = rows.filter((row) => row.properties.kind === 'audio-grant');
+  expect(grants).toHaveLength(1);
+  const windows = rows.filter((row) => row.properties.kind === 'audio-window');
+  expect(windows).toHaveLength(2);
+  for (const window of windows) {
+    const events = JSON.parse(String(window.properties.events)) as readonly {
+      readonly at: number;
+      readonly amount: number;
+      readonly operationId: string;
+    }[];
+    expect(events).toHaveLength(1);
+    expect(events[0]?.amount).toBe(100);
+    expect(events[0]?.operationId).toBe(grants[0]?.properties.grantId);
+  }
+  return grants[0] as AzureStoredEntity;
 }
 
 function correlation(lease: SessionLease, revision = 1) {
@@ -1072,6 +1104,250 @@ describe('Azure Table durable adapter', () => {
     const next = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
     const consumed = await base.runtime.consumeSessionTicket(ticketConsume(next.ticket));
     expect(consumed.sessionEpoch).toBe(7);
+  });
+
+  it.each(['conflict', 'precondition-failed'] as const)(
+    'retries the same Azure audio grant operation after a noncommit %s boundary',
+    async (boundaryKind) => {
+      const base = await activeFixture();
+      base.rate.failNext('transaction', boundaryKind);
+
+      const grant = await base.runtime.reserveAudio({
+        lease: base.active,
+        utteranceId: uuid(9_499) as never,
+        fromOriginalSampleOffset: 0,
+        originalSamples: 100
+      });
+
+      expect(base.rate.transactions()).toHaveLength(1);
+      const grantRow = expectSingleAudioCharge(base);
+      expect(grantRow.rowKey).toBe(`audio-grant:${grant.grantId}`);
+      expect(grantRow.properties.grantId).toBe(grant.grantId);
+      expect(grant).toMatchObject({
+        utteranceId: uuid(9_499),
+        issuedAt: 1_000,
+        expiresAt: 2_000,
+        reservedOriginalSamples: 100
+      });
+    }
+  );
+
+  it('anchors Azure audio grants after preflight reads and accepts exactly 500ms of handoff', async () => {
+    const base = await activeFixture();
+    base.security.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextTransaction(async () => { base.fake.advance(500); });
+
+    const grant = await base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_500) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    });
+    expect(MIN_AUDIO_GRANT_HANDOFF_MS).toBe(500);
+    expect(base.fake.now()).toBe(2_100);
+    expect(grant).toMatchObject({ issuedAt: 1_600, expiresAt: 2_600 });
+    expect(grant.expiresAt - base.fake.now()).toBe(MIN_AUDIO_GRANT_HANDOFF_MS);
+
+    const preFixMeter = createAudioGrantMeter({
+      grant: { ...grant, issuedAt: 1_000, expiresAt: 2_000 },
+      clock: base.fake.clock
+    });
+    let preFixError: unknown;
+    try {
+      preFixMeter.accept({ fromOriginalSampleOffset: 0, throughOriginalSampleOffset: 100 });
+    } catch (error) {
+      preFixError = error;
+    }
+    expect(preFixError).toMatchObject({ category: 'stale-lease' });
+
+    const fixedMeter = createAudioGrantMeter({ grant, clock: base.fake.clock });
+    expect(fixedMeter.accept({ fromOriginalSampleOffset: 0, throughOriginalSampleOffset: 100 }))
+      .toMatchObject({ acceptedThroughOriginalSampleOffset: 100, complete: true });
+
+    expect(base.rate.transactions()).toHaveLength(1);
+    const grantRow = base.rate.snapshot().find((row) => row.properties.kind === 'audio-grant');
+    expect(grantRow).toMatchObject({
+      properties: { issuedAt: 1_600, expiresAt: 2_600, throughOriginalSampleOffset: 100 }
+    });
+    const windows = base.rate.snapshot().filter((row) => row.properties.kind === 'audio-window');
+    expect(windows).toHaveLength(2);
+    expect(windows.every((row) =>
+      row.properties.retainUntil === 2_600 &&
+      row.properties.activeGrantExpiresAt === 2_600 &&
+      row.properties.nextOriginalSampleOffset === 100
+    )).toBe(true);
+    expect(windows.every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
+    expect(windows.every((row) => JSON.parse(String(row.properties.events))[0].at === 1_600)).toBe(true);
+  });
+
+  it('retains the committed Azure reservation and cursor when handoff has only 499ms left', async () => {
+    const base = await activeFixture();
+    base.security.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextTransaction(async () => { base.fake.advance(501); });
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_501) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'state-unavailable' });
+    expect(base.fake.now()).toBe(2_101);
+    expect(base.rate.transactions()).toHaveLength(1);
+    const rows = audioRows(base);
+    expect(rows.filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    const windows = rows.filter((row) => row.properties.kind === 'audio-window');
+    expect(windows).toHaveLength(2);
+    expect(windows.every((row) =>
+      row.properties.retainUntil === 2_600 &&
+      row.properties.activeGrantExpiresAt === 2_600 &&
+      row.properties.nextOriginalSampleOffset === 100
+    )).toBe(true);
+    expect(windows.every((row) => {
+      const events = JSON.parse(String(row.properties.events));
+      return events.length === 1 && events[0].at === 1_600 && events[0].amount === 100;
+    })).toBe(true);
+  });
+
+  it('leaves one ambiguous committed Azure reservation when handoff has only 499ms left', async () => {
+    const base = await activeFixture();
+    base.security.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextPointRead(async () => { base.fake.advance(300); });
+    base.rate.afterNextTransaction(async () => { base.fake.advance(501); });
+    base.rate.failNext('transaction', 'ambiguous', true);
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_505) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'state-unavailable' });
+    expect(base.fake.now()).toBe(2_101);
+    expect(base.rate.transactions()).toHaveLength(1);
+    const rows = audioRows(base);
+    const grants = rows.filter((row) => row.properties.kind === 'audio-grant');
+    expect(grants).toHaveLength(1);
+    const windows = rows.filter((row) => row.properties.kind === 'audio-window');
+    expect(windows).toHaveLength(2);
+    expect(windows.every((row) =>
+      row.properties.retainUntil === 2_600 &&
+      row.properties.activeGrantExpiresAt === 2_600 &&
+      row.properties.nextOriginalSampleOffset === 100
+    )).toBe(true);
+    expect(windows.every((row) => {
+      const events = JSON.parse(String(row.properties.events));
+      return events.length === 1 &&
+        events[0].at === 1_600 &&
+        events[0].amount === 100 &&
+        events[0].operationId === grants[0]?.properties.grantId;
+    })).toBe(true);
+  });
+
+  it('retries an ambiguous Azure audio transaction only when no grant row committed', async () => {
+    const base = await activeFixture();
+    base.rate.failNext('transaction', 'ambiguous');
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_502) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).resolves.toMatchObject({ throughOriginalSampleOffset: 100 });
+    expect(base.rate.transactions()).toHaveLength(1);
+    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    expect(audioRows(base)
+      .filter((row) => row.properties.kind === 'audio-window')
+      .every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
+  });
+
+  it('reconciles a fresh ambiguous committed Azure audio transaction exactly once', async () => {
+    const base = await activeFixture();
+    base.rate.failNext('transaction', 'ambiguous', true);
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_503) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).resolves.toMatchObject({ throughOriginalSampleOffset: 100 });
+    expect(base.rate.transactions()).toHaveLength(1);
+    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    expect(audioRows(base)
+      .filter((row) => row.properties.kind === 'audio-window')
+      .every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
+  });
+
+  it('fails an ambiguous committed Azure audio grant with a stale final lease without compensation', async () => {
+    const base = await activeFixture();
+    base.rate.beforeNextTransaction(async () => {
+      await base.runtime.revokeInstallation({ installationId: base.redeemed.installationId });
+    });
+    base.rate.failNext('transaction', 'ambiguous', true);
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_504) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'stale-lease' });
+    expect(base.rate.transactions()).toHaveLength(1);
+    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    expect(audioRows(base)
+      .filter((row) => row.properties.kind === 'audio-window')
+      .every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'binding mismatch (utterance ID)',
+      mutate: (properties: AzureStoredEntity['properties']) => ({
+        ...properties,
+        utteranceId: uuid(9_505)
+      })
+    },
+    {
+      label: 'structurally valid offset mismatch',
+      mutate: (properties: AzureStoredEntity['properties']) => ({
+        ...properties,
+        fromOriginalSampleOffset: Number(properties.fromOriginalSampleOffset) + 1,
+        throughOriginalSampleOffset: Number(properties.throughOriginalSampleOffset) + 1
+      })
+    },
+    {
+      label: 'structurally valid timestamp mismatch',
+      mutate: (properties: AzureStoredEntity['properties']) => ({
+        ...properties,
+        issuedAt: Number(properties.issuedAt) + 1,
+        expiresAt: Number(properties.expiresAt) + 1
+      })
+    },
+    {
+      label: 'malformed row',
+      mutate: (properties: AzureStoredEntity['properties']) => ({
+        ...properties,
+        expiresAt: 'malformed'
+      })
+    }
+  ] as const)('fails ambiguous committed audio reconciliation for $label without retry or compensation', async ({ mutate }) => {
+    const base = await activeFixture();
+    base.rate.afterNextTransaction(async () => {
+      const row = base.rate.snapshot().find((item) => item.properties.kind === 'audio-grant');
+      if (row === undefined) throw new Error('audio grant row missing');
+      base.rate.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: Object.freeze(mutate(row.properties))
+      });
+    });
+    base.rate.failNext('transaction', 'ambiguous', true);
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_506) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'state-unavailable' });
+
+    expect(base.rate.transactions()).toHaveLength(1);
+    expectSingleAudioCharge(base);
   });
 
   it('reserves durable offset grants with exact rolling sample and grant limits', async () => {

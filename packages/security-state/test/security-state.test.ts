@@ -13,6 +13,7 @@ import {
   MAX_AUDIO_GRANT_SAMPLES,
   MAX_AUDIO_GRANTS_PER_WINDOW,
   MAX_AUDIO_SAMPLES_PER_WINDOW,
+  MIN_AUDIO_GRANT_HANDOFF_MS,
   OPENING_LEASE_MS,
   PAIRING_TTL_MS,
   PENDING_CREDENTIAL_TTL_MS,
@@ -152,6 +153,31 @@ async function activeFixture() {
   const { redeemed } = await enroll(base.store);
   const opened = await open(base.store, redeemed.credential);
   return { ...base, ...opened, redeemed };
+}
+
+async function audioHandoffFixture(handoffMilliseconds: number) {
+  const fake = createFakeClock(1_000);
+  const state = { enabled: false, calls: 0 };
+  const clock: SecurityClock = {
+    now: () => {
+      if (state.enabled) {
+        state.calls += 1;
+        if (state.calls === 3) fake.advance(handoffMilliseconds);
+      }
+      return fake.now();
+    }
+  };
+  const store = createTestSecurityStateStore({
+    ...MOCK_PROVIDERS,
+    audience: AUDIENCE,
+    clock,
+    ids: deterministicIds(),
+    tokens: deterministicTokens()
+  });
+  const { redeemed } = await enroll(store);
+  const opened = await open(store, redeemed.credential);
+  state.enabled = true;
+  return { store, fake, active: opened.active };
 }
 
 function correlation(lease: SessionLease, revision = 1) {
@@ -1091,6 +1117,104 @@ describe('credential rotation, tickets, and session leases', () => {
 });
 
 describe('audio grants and generation claims', () => {
+  it('retains a successful 500ms handoff observation before a rolled-back next operation', async () => {
+    const base = await audioHandoffFixture(MIN_AUDIO_GRANT_HANDOFF_MS);
+    await expect(base.store.reserveAudio(audioRequest(base.active, 100)))
+      .resolves.toMatchObject({ issuedAt: 1_000, expiresAt: 2_000 });
+
+    base.fake.set(1_000);
+    await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_500, 100)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+
+    base.fake.set(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS);
+    const snapshot = base.store.snapshot();
+    expect(snapshot.grants).toHaveLength(1);
+    expect(snapshot.grants[0]).toMatchObject({
+      fromOriginalSampleOffset: 0,
+      throughOriginalSampleOffset: 100,
+      reservedOriginalSamples: 100
+    });
+    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(100);
+  });
+
+  it('retains a failed 501ms handoff observation before a rolled-back next operation', async () => {
+    const base = await audioHandoffFixture(MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+    await expect(base.store.reserveAudio(audioRequest(base.active, 100)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+
+    base.fake.set(1_000);
+    await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_500, 100)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+
+    base.fake.set(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+    const snapshot = base.store.snapshot();
+    expect(snapshot.grants).toHaveLength(1);
+    expect(snapshot.grants[0]).toMatchObject({
+      fromOriginalSampleOffset: 0,
+      throughOriginalSampleOffset: 100,
+      reservedOriginalSamples: 100
+    });
+    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(100);
+  });
+
+  it('accepts exactly 500ms of in-memory post-commit handoff and retains a committed reservation at 501ms', async () => {
+    expect(AUDIO_GRANT_TTL_MS).toBe(1_000);
+    expect(MIN_AUDIO_GRANT_HANDOFF_MS).toBe(500);
+
+    const exactNow = { value: 1_000, enabled: false, calls: 0 };
+    const exactClock: SecurityClock = {
+      now: () => {
+        if (exactNow.enabled) {
+          exactNow.calls += 1;
+          if (exactNow.calls === 3) exactNow.value += MIN_AUDIO_GRANT_HANDOFF_MS;
+        }
+        return exactNow.value;
+      }
+    };
+    const exactStore = createTestSecurityStateStore({
+      ...MOCK_PROVIDERS,
+      audience: AUDIENCE,
+      clock: exactClock,
+      ids: deterministicIds(),
+      tokens: deterministicTokens()
+    });
+    const exactEnrollment = await enroll(exactStore);
+    const exactSession = await open(exactStore, exactEnrollment.redeemed.credential);
+    exactNow.enabled = true;
+    await expect(exactStore.reserveAudio(audioRequest(exactSession.active, 100)))
+      .resolves.toMatchObject({ issuedAt: 1_000, expiresAt: 2_000 });
+
+    const lateNow = { value: 1_000, enabled: false, calls: 0 };
+    const lateClock: SecurityClock = {
+      now: () => {
+        if (lateNow.enabled) {
+          lateNow.calls += 1;
+          if (lateNow.calls === 3) lateNow.value += MIN_AUDIO_GRANT_HANDOFF_MS + 1;
+        }
+        return lateNow.value;
+      }
+    };
+    const lateStore = createTestSecurityStateStore({
+      ...MOCK_PROVIDERS,
+      audience: AUDIENCE,
+      clock: lateClock,
+      ids: deterministicIds(),
+      tokens: deterministicTokens()
+    });
+    const lateEnrollment = await enroll(lateStore);
+    const lateSession = await open(lateStore, lateEnrollment.redeemed.credential);
+    lateNow.enabled = true;
+    await expect(lateStore.reserveAudio(audioRequest(lateSession.active, 100)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+    expect(lateStore.snapshot().grants).toHaveLength(1);
+    expect(lateStore.snapshot().grants[0]).toMatchObject({
+      fromOriginalSampleOffset: 0,
+      throughOriginalSampleOffset: 100,
+      reservedOriginalSamples: 100
+    });
+    expect(lateStore.snapshot().sessions[0]?.audioReservedOriginalSamples).toBe(100);
+  });
+
   it('enforces utterance-bound 1..8000 grants and exact 16000/1000ms rolling boundaries', async () => {
     const { store, active, fake } = await activeFixture();
     await expect(store.reserveAudio(audioRequest(active, 0)))
