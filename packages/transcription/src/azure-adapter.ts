@@ -66,7 +66,7 @@ export type AzureRealtimeSocketEvent = 'open' | 'message' | 'error' | 'close';
 export interface AzureRealtimeSocket {
   readonly readyState: number;
   readonly bufferedAmount: number;
-  send(data: string, callback: (error?: Error) => void): void;
+  send(data: string, callback: (error?: Error | null) => void): void;
   close(code?: number): void;
   terminate(): void;
   on(event: 'open', listener: () => void): void;
@@ -526,9 +526,9 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
             'palancar-readiness-1'
           );
           try {
-            probeSocket.send(payload, (error?: Error) => {
+            probeSocket.send(payload, (error?: Error | null) => {
               if (!isCurrent() || socket !== probeSocket) return;
-              if (error !== undefined) finish(false);
+              if (error !== undefined && error !== null) finish(false);
             });
           } catch {
             finish(false);
@@ -1146,10 +1146,10 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#sending = true;
     if (next.kind === 'session.update') this.#sessionUpdateSent = true;
     try {
-      socket.send(next.payload, (error?: Error) => {
+      socket.send(next.payload, (error?: Error | null) => {
         if (!this.#isCurrent(epoch, socketIdentity) || this.#socket !== socket) return;
         this.#sending = false;
-        if (error !== undefined) {
+        if (error !== undefined && error !== null) {
           this.#fail('socket');
           return;
         }

@@ -26,13 +26,13 @@ class FakeSocket implements AzureRealtimeSocket {
   closeCalls = 0;
   terminateCalls = 0;
   readonly sent: string[] = [];
-  readonly pendingSendCallbacks: Array<(error?: Error) => void> = [];
+  readonly pendingSendCallbacks: Array<(error?: Error | null) => void> = [];
   readonly #listeners = new Map<string, Set<Listener>>();
 
-  send(data: string, callback: (error?: Error) => void): void {
+  send(data: string, callback: (error?: Error | null) => void): void {
     this.sent.push(data);
     if (this.autoCompleteSends) {
-      callback();
+      callback(null);
     } else {
       this.pendingSendCallbacks.push(callback);
     }
@@ -68,10 +68,11 @@ class FakeSocket implements AzureRealtimeSocket {
     this.readyState = 0;
   }
 
-  completeNextSend(error?: Error): void {
+  completeNextSend(error?: Error | null): void {
     const callback = this.pendingSendCallbacks.shift();
     if (callback === undefined) throw new Error('No pending send callback');
-    callback(error);
+    if (arguments.length === 0) callback(null);
+    else callback(error);
   }
 
   message(value: unknown): void {
@@ -614,7 +615,10 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     );
   });
 
-  it('keeps exactly one send in flight and waits for its callback before pumping audio', async () => {
+  it.each([
+    ['null', null],
+    ['undefined', undefined]
+  ] as const)('accepts a %s send callback and pumps the normal session queue', async (_label, completion) => {
     const socket = new FakeSocket();
     socket.autoCompleteSends = false;
     const session = makeSession(socket, []);
@@ -631,7 +635,7 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     socket.message(sessionCreated());
     socket.message(sessionUpdated());
     expect(messageTypes(socket)).toEqual(['session.update']);
-    socket.completeNextSend();
+    socket.completeNextSend(completion);
     expect(messageTypes(socket)).toEqual([
       'session.update',
       'input_audio_buffer.append'
@@ -640,6 +644,39 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     session.close();
     while (socket.pendingSendCallbacks.length > 0) socket.completeNextSend();
   });
+
+  it('fails the production session closed when a send callback returns an Error', async () => {
+    const socket = new FakeSocket();
+    socket.autoCompleteSends = false;
+    const failures: unknown[] = [];
+    const session = makeSession(socket, [], failures);
+    session.start({ utteranceId: UTTERANCE_ID });
+    await Promise.resolve();
+    socket.open();
+
+    socket.completeNextSend(new Error('send failed'));
+
+    expect(failures).toMatchObject([{ reason: 'socket' }]);
+    expect(session.state.connectionState).toBe('failed');
+  });
+
+  it.each([false, 0, ''] as const)(
+    'rejects a non-nullish falsey production send callback: %j',
+    async (completion) => {
+      const socket = new FakeSocket();
+      socket.autoCompleteSends = false;
+      const failures: unknown[] = [];
+      const session = makeSession(socket, [], failures);
+      session.start({ utteranceId: UTTERANCE_ID });
+      await Promise.resolve();
+      socket.open();
+
+      socket.completeNextSend(completion as unknown as Error);
+
+      expect(failures).toMatchObject([{ reason: 'socket' }]);
+      expect(session.state.connectionState).toBe('failed');
+    }
+  );
 
   it('rejects a malicious acknowledgement for a commit still queued behind an unsent append', async () => {
     const socket = new FakeSocket();
@@ -1134,8 +1171,40 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     expect(failures).toEqual([]);
   });
 
-  it('reports ready only after a real configured readiness handshake and tears it down', async () => {
+  it('accepts a null readiness send callback and waits for configured session.updated', async () => {
     const socket = new FakeSocket();
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'readiness-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => socket
+    });
+    const resultPromise = adapter.checkReadiness();
+    const settled = vi.fn();
+    void resultPromise.then(settled);
+    await Promise.resolve();
+    socket.open();
+    expect(messageTypes(socket)).toEqual(['session.update']);
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    socket.message(sessionCreated());
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    socket.message(sessionUpdated());
+    await expect(resultPromise).resolves.toEqual({
+      ready: true,
+      provider: 'azure-realtime',
+      model: 'transcribe-prod'
+    });
+    expect(socket.readyState).toBe(3);
+  });
+
+  it('accepts an undefined readiness send callback', async () => {
+    const socket = new FakeSocket();
+    socket.autoCompleteSends = false;
     const adapter = new AzureRealtimeTranscriptionAdapter({
       endpoint: AZURE_ENDPOINT,
       deployment: 'transcribe-prod',
@@ -1148,16 +1217,61 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     const resultPromise = adapter.checkReadiness();
     await Promise.resolve();
     socket.open();
-    expect(messageTypes(socket)).toEqual(['session.update']);
+    expect(socket.pendingSendCallbacks).toHaveLength(1);
+
+    socket.completeNextSend(undefined);
     socket.message(sessionCreated());
     socket.message(sessionUpdated());
-    await expect(resultPromise).resolves.toEqual({
-      ready: true,
-      provider: 'azure-realtime',
-      model: 'transcribe-prod'
-    });
-    expect(socket.readyState).toBe(3);
+
+    await expect(resultPromise).resolves.toMatchObject({ ready: true });
   });
+
+  it('fails readiness closed when the send callback returns an Error', async () => {
+    const socket = new FakeSocket();
+    socket.autoCompleteSends = false;
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'readiness-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => socket
+    });
+    const resultPromise = adapter.checkReadiness();
+    await Promise.resolve();
+    socket.open();
+
+    socket.completeNextSend(new Error('send failed'));
+
+    await expect(resultPromise).resolves.toMatchObject({ ready: false });
+    expect(socket.closeCalls).toBe(1);
+    expect(socket.terminateCalls).toBe(1);
+  });
+
+  it.each([false, 0, ''] as const)(
+    'rejects a non-nullish falsey readiness send callback: %j',
+    async (completion) => {
+      const socket = new FakeSocket();
+      socket.autoCompleteSends = false;
+      const adapter = new AzureRealtimeTranscriptionAdapter({
+        endpoint: AZURE_ENDPOINT,
+        deployment: 'transcribe-prod',
+        tokenProvider: async () => ({
+          token: 'readiness-token',
+          expiresOnTimestamp: Date.now() + 60_000
+        }),
+        socketFactory: () => socket
+      });
+      const resultPromise = adapter.checkReadiness();
+      await Promise.resolve();
+      socket.open();
+
+      socket.completeNextSend(completion as unknown as Error);
+
+      await expect(resultPromise).resolves.toMatchObject({ ready: false });
+    }
+  );
 
   it('fails readiness before token or socket work for an already-aborted signal', async () => {
     const tokenProvider = vi.fn(async () => ({
