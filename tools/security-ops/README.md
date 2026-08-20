@@ -27,9 +27,14 @@ node tools/security-ops/dist/main.js cleanup
 ```
 
 `smoke` runs exactly one fresh Spanish session and one fresh Turkish session
-using synthetic audio. It prints only fixed pass/fail metadata and timings.
-Pairing codes, installation credentials, tickets, transcripts, translations,
-suggestions, and HTTP bodies are never printed.
+using the checked-in deterministic synthetic PCM fixtures under `fixtures/`.
+It validates each target's exact byte length and SHA-256 before sending every
+100 ms frame. After pairing redemption it always attempts authenticated
+deletion of the newly created installation, including after either target
+fails; a smoke pass is printed only after that deletion succeeds. The command
+prints only fixed pass/fail metadata and timings. Pairing codes, installation
+credentials, tickets, fixture paths or hashes, audio, transcripts,
+translations, suggestions, and HTTP bodies are never printed.
 
 `issue-pairing` is for a human enrollment flow. It refuses redirected input or
 output and prints the one-time code exactly once. Do not invoke it through CI,

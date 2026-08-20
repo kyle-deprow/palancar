@@ -1,5 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 import {
@@ -30,7 +31,6 @@ const STREAM_PATH = '/v1/stream';
 const READY_PATH = '/readyz';
 const GATE_POLICY_VERSION = '1.0.0';
 const AUDIO_SAMPLES_PER_FRAME = 1_600;
-const AUDIO_FRAME_COUNT = 18;
 const AUDIO_BYTES_PER_FRAME = AUDIO_SAMPLES_PER_FRAME * 2;
 const OPERATION_TIMEOUT_MS = 20_000;
 const GENERATION_TIMEOUT_MS = 120_000;
@@ -48,6 +48,27 @@ const ALLOWED_ENV = new Set([
 ]);
 
 export type SecurityOpsCommand = 'initialize' | 'issue-pairing' | 'cleanup' | 'smoke';
+export type SmokeTargetLanguage = Extract<TargetLanguage, 'es' | 'tr'>;
+
+interface SmokeFixtureContract {
+  readonly relativeUrl: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
+const SMOKE_FIXTURE_CONTRACTS: Readonly<Record<SmokeTargetLanguage, SmokeFixtureContract>> =
+  Object.freeze({
+    es: Object.freeze({
+      relativeUrl: '../fixtures/smoke-es-spanish.pcm',
+      byteLength: 96_000,
+      sha256: '2acdb87adc12791634b1c8c9602ba20abc62621f2d6184a3d60a62787ccd7357'
+    }),
+    tr: Object.freeze({
+      relativeUrl: '../fixtures/smoke-tr-turkish.pcm',
+      byteLength: 102_400,
+      sha256: 'fa0357cf46980fb436140105a6d7ecdd06ad7abc0f7fd8fdcf27ef9c47de7d6a'
+    })
+  });
 
 export interface SecurityOpsConfig extends AzureCliTableOperationsOptions {
   readonly relayOrigin: `wss://${string}`;
@@ -83,6 +104,7 @@ export interface SecurityOpsDependencies {
   readonly delay: (milliseconds: number) => Promise<void>;
   readonly now: () => number;
   readonly verifyAzureContext: (config: SecurityOpsConfig) => Promise<void>;
+  readonly loadSmokeFixture: (targetLanguage: SmokeTargetLanguage) => Promise<Uint8Array>;
 }
 
 export interface SecurityOpsIo {
@@ -101,6 +123,48 @@ class SecurityOpsError extends Error {
 
 function fail(): never {
   throw new SecurityOpsError();
+}
+
+function validatedSmokePcm(input: unknown): Uint8Array {
+  try {
+    if (!(input instanceof Uint8Array)) fail();
+    const bytes = Uint8Array.from(input);
+    if (
+      bytes.byteLength === 0 ||
+      bytes.byteLength % AUDIO_BYTES_PER_FRAME !== 0 ||
+      !bytes.some((value) => value !== 0)
+    ) {
+      fail();
+    }
+    return bytes;
+  } catch (error) {
+    if (error instanceof SecurityOpsError) throw error;
+    fail();
+  }
+}
+
+export async function loadCheckedInSmokeFixture(
+  targetLanguage: SmokeTargetLanguage,
+  readFixture: (url: URL) => Promise<Uint8Array> = async (url) => readFile(url)
+): Promise<Uint8Array> {
+  try {
+    if (!Object.hasOwn(SMOKE_FIXTURE_CONTRACTS, targetLanguage)) fail();
+    const contract = SMOKE_FIXTURE_CONTRACTS[targetLanguage];
+    if (contract === undefined) fail();
+    const bytes = validatedSmokePcm(
+      await readFixture(new URL(contract.relativeUrl, import.meta.url))
+    );
+    if (
+      bytes.byteLength !== contract.byteLength ||
+      createHash('sha256').update(bytes).digest('hex') !== contract.sha256
+    ) {
+      fail();
+    }
+    return bytes;
+  } catch (error) {
+    if (error instanceof SecurityOpsError) throw error;
+    fail();
+  }
 }
 
 function required(env: NodeJS.ProcessEnv, name: string, maximum: number): string {
@@ -220,7 +284,8 @@ const PRODUCTION_DEPENDENCIES: SecurityOpsDependencies = Object.freeze({
   }) as unknown as SecurityOpsSocket,
   delay: (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
   now: () => performance.now(),
-  verifyAzureContext: verifyAzureCliContext
+  verifyAzureContext: verifyAzureCliContext,
+  loadSmokeFixture: loadCheckedInSmokeFixture
 });
 
 async function responseJson(response: Response): Promise<unknown> {
@@ -484,6 +549,36 @@ async function issueSessionTicket(
   return ticket.ticket;
 }
 
+async function deleteCurrentInstallation(
+  config: SecurityOpsConfig,
+  credential: string,
+  dependencies: SecurityOpsDependencies
+): Promise<void> {
+  try {
+    const response = await dependencies.fetch(
+      `${httpsOrigin(config.relayOrigin)}/v1/installations/current`,
+      {
+        method: 'DELETE',
+        redirect: 'error',
+        headers: { authorization: `Bearer ${credential}` },
+        signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS)
+      }
+    );
+    if (
+      response.status !== 204 ||
+      response.body !== null ||
+      response.headers.get('content-type') !== null ||
+      response.headers.get('content-length') !== null ||
+      response.headers.get('cache-control') !== 'no-store'
+    ) {
+      fail();
+    }
+  } catch (error) {
+    if (error instanceof SecurityOpsError) throw error;
+    fail();
+  }
+}
+
 function isRelayReady(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   if (Object.getPrototypeOf(value) !== Object.prototype) return false;
@@ -642,11 +737,15 @@ function effectiveLimitsDoNotExceed(
 
 async function smokeTarget(
   config: SecurityOpsConfig,
-  targetLanguage: TargetLanguage,
+  targetLanguage: SmokeTargetLanguage,
   credential: string,
   dependencies: SecurityOpsDependencies
 ): Promise<number> {
   const started = dependencies.now();
+  const audio = validatedSmokePcm(
+    await withTimeout(dependencies.loadSmokeFixture(targetLanguage), OPERATION_TIMEOUT_MS)
+  );
+  const frameCount = audio.byteLength / AUDIO_BYTES_PER_FRAME;
   const ticket = await issueSessionTicket(config, credential, dependencies);
   const socket = dependencies.createSocket(
     socketUrl(config.relayOrigin),
@@ -682,7 +781,7 @@ async function smokeTarget(
       sessionEpoch: ready.sessionEpoch,
       utteranceId
     }));
-    for (let sequence = 0; sequence < AUDIO_FRAME_COUNT; sequence += 1) {
+    for (let sequence = 0; sequence < frameCount; sequence += 1) {
       const expectedOffset = (sequence + 1) * AUDIO_SAMPLES_PER_FRAME;
       const ack = waitForMessage(
         socket,
@@ -697,10 +796,13 @@ async function smokeTarget(
         utteranceId,
         sequence,
         offset: sequence * AUDIO_SAMPLES_PER_FRAME,
-        payload: new Uint8Array(AUDIO_BYTES_PER_FRAME)
+        payload: audio.subarray(
+          sequence * AUDIO_BYTES_PER_FRAME,
+          (sequence + 1) * AUDIO_BYTES_PER_FRAME
+        )
       }));
       await lifecycle.race(ack);
-      if (sequence + 1 < AUDIO_FRAME_COUNT) {
+      if (sequence + 1 < frameCount) {
         await lifecycle.race(dependencies.delay(100));
       }
     }
@@ -710,7 +812,7 @@ async function smokeTarget(
       sessionId: ready.sessionId,
       sessionEpoch: ready.sessionEpoch,
       utteranceId,
-      finalOriginalSampleOffset: AUDIO_FRAME_COUNT * AUDIO_SAMPLES_PER_FRAME
+      finalOriginalSampleOffset: audio.byteLength / 2
     }));
     await lifecycle.race(turnResults);
     lifecycle.expectNormalClose();
@@ -774,8 +876,17 @@ export async function runSecurityOps(
     redeemPairingCredential(config, operations, dependencies),
     GENERATION_TIMEOUT_MS
   );
-  const spanishMs = await smokeTarget(config, 'es', credential, dependencies);
-  const turkishMs = await smokeTarget(config, 'tr', credential, dependencies);
+  let spanishMs = 0;
+  let turkishMs = 0;
+  try {
+    spanishMs = await smokeTarget(config, 'es', credential, dependencies);
+    turkishMs = await smokeTarget(config, 'tr', credential, dependencies);
+  } finally {
+    await withTimeout(
+      deleteCurrentInstallation(config, credential, dependencies),
+      OPERATION_TIMEOUT_MS
+    );
+  }
   io.stdout(`security-ops smoke: pass targets=2 es_ms=${spanishMs} tr_ms=${turkishMs}\n`);
 }
 

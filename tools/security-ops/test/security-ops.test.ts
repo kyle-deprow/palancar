@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 import { decodeAudioFrame, MAX_CONTROL_MESSAGE_BYTES, WEBSOCKET_SUBPROTOCOL } from '@palancar/contracts';
@@ -7,10 +8,12 @@ import WebSocket from 'ws';
 
 import {
   contentFreeFailure,
+  loadCheckedInSmokeFixture,
   parseSecurityOpsConfig,
   runSecurityOps,
   type SecurityOpsDependencies,
-  type SecurityOpsIo
+  type SecurityOpsIo,
+  type SmokeTargetLanguage
 } from '../src/index.js';
 
 const ENV = Object.freeze({
@@ -33,6 +36,20 @@ const SESSION_ID = '00000000-0000-4000-8000-000000000010';
 const SEGMENT_ID = '00000000-0000-4000-8000-000000000011';
 const OTHER_UTTERANCE_ID = '00000000-0000-4000-8000-000000000012';
 const IRRELEVANT_PARTIAL_TEXT = 'irrelevant partial content';
+const AUDIO_BYTES_PER_FRAME = 3_200;
+
+function unitFixture(frameCount: number, seed: number): Uint8Array {
+  const fixture = new Uint8Array(frameCount * AUDIO_BYTES_PER_FRAME);
+  for (let index = 0; index < fixture.byteLength; index += 1) {
+    fixture[index] = (index + seed) % 251 + 1;
+  }
+  return fixture;
+}
+
+const UNIT_FIXTURES: Readonly<Record<SmokeTargetLanguage, Uint8Array>> = Object.freeze({
+  es: unitFixture(2, 7),
+  tr: unitFixture(3, 19)
+});
 
 type InterFrameFailure = 'error' | 'close';
 type ReadyMutation = 'registry' | 'gate' | 'limits';
@@ -43,8 +60,14 @@ interface AudioObservation {
   readonly sequence: number;
   readonly offset: number;
   readonly samples: number;
+  readonly payload: Uint8Array;
   readonly sentAt: number;
   acknowledgedAt: number | undefined;
+}
+
+interface CommitObservation {
+  readonly target: string;
+  readonly finalOriginalSampleOffset: number;
 }
 
 class FakeSocket extends EventEmitter {
@@ -58,6 +81,7 @@ class FakeSocket extends EventEmitter {
   readonly interFrameFailure: InterFrameFailure | undefined;
   readonly readyMutation: ReadyMutation | undefined;
   readonly audio: AudioObservation[];
+  readonly commits: CommitObservation[];
   readonly now: () => number;
   readonly delay: (milliseconds: number) => Promise<void>;
   terminateCount = 0;
@@ -75,6 +99,7 @@ class FakeSocket extends EventEmitter {
       readonly interFrameFailure: InterFrameFailure | undefined;
       readonly readyMutation: ReadyMutation | undefined;
       readonly audio: AudioObservation[];
+      readonly commits: CommitObservation[];
       readonly now: () => number;
       readonly delay: (milliseconds: number) => Promise<void>;
     }
@@ -87,6 +112,7 @@ class FakeSocket extends EventEmitter {
     this.interFrameFailure = options.interFrameFailure;
     this.readyMutation = options.readyMutation;
     this.audio = options.audio;
+    this.commits = options.commits;
     this.now = options.now;
     this.delay = options.delay;
     if (!this.neverOpen) {
@@ -106,6 +132,7 @@ class FakeSocket extends EventEmitter {
         sequence: frame.sequence,
         offset: frame.offset,
         samples: frame.payload.byteLength / 2,
+        payload: Uint8Array.from(frame.payload),
         sentAt: this.now(),
         acknowledgedAt: undefined
       };
@@ -149,6 +176,10 @@ class FakeSocket extends EventEmitter {
     } else if (message.type === 'utterance.start') {
       this.#utteranceId = String(message.utteranceId);
     } else if (message.type === 'utterance.commit') {
+      this.commits.push({
+        target: this.#target,
+        finalOriginalSampleOffset: Number(message.finalOriginalSampleOffset)
+      });
       queueMicrotask(() => {
         const targetText = this.#target === 'es' ? '¿Cómo está usted hoy?' : 'Bugün nasılsınız?';
         const targetSuggestions = this.#target === 'es'
@@ -250,6 +281,9 @@ function fakeDependencies(options: {
   readonly holdInterFrameDelay?: boolean;
   readonly readyOutcomes?: readonly ReadyOutcome[];
   readonly readyOutcome?: ReadyOutcome;
+  readonly fixtureErrorTarget?: SmokeTargetLanguage;
+  readonly fixtures?: Partial<Readonly<Record<SmokeTargetLanguage, Uint8Array>>>;
+  readonly cleanupResponse?: () => Response;
 } = {}): {
   dependencies: SecurityOpsDependencies;
   targets: string[];
@@ -259,18 +293,24 @@ function fakeDependencies(options: {
   issueCount: () => number;
   redemptionCount: () => number;
   ticketCount: () => number;
+  cleanupCount: () => number;
   readinessCount: () => number;
+  loadedTargets: SmokeTargetLanguage[];
   audio: AudioObservation[];
+  commits: CommitObservation[];
   sockets: FakeSocket[];
 } {
   const targets: string[] = [];
   const protocols: string[][] = [];
   const requests: RequestInit[] = [];
   const requestUrls: string[] = [];
+  const loadedTargets: SmokeTargetLanguage[] = [];
   const audio: AudioObservation[] = [];
+  const commits: CommitObservation[] = [];
   let issues = 0;
   let redemptions = 0;
   let tickets = 0;
+  let cleanups = 0;
   let readiness = 0;
   let clock = 0;
   let currentSocket: FakeSocket | undefined;
@@ -343,6 +383,18 @@ function fakeDependencies(options: {
           protocolVersion: 1, expiresAt: '2026-08-18T00:01:00.000Z'
         });
       }
+      if (url === 'https://relay.example.test/v1/installations/current') {
+        cleanups += 1;
+        expect(init?.method).toBe('DELETE');
+        expect(init?.redirect).toBe('error');
+        expect(init?.headers).toEqual({ authorization: `Bearer ${CREDENTIAL}` });
+        expect(init?.body).toBeUndefined();
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        return options.cleanupResponse?.() ?? new Response(null, {
+          status: 204,
+          headers: { 'cache-control': 'no-store' }
+        });
+      }
       throw new Error('unexpected request');
     },
     createSocket: (url, offered) => {
@@ -355,6 +407,7 @@ function fakeDependencies(options: {
         readyMutation: options.readyMutation,
         neverOpen: options.neverOpen === true,
         audio,
+        commits,
         now: () => clock,
         delay
       });
@@ -364,7 +417,14 @@ function fakeDependencies(options: {
     },
     delay,
     now: () => clock,
-    verifyAzureContext: async () => undefined
+    verifyAzureContext: async () => undefined,
+    loadSmokeFixture: async (targetLanguage) => {
+      loadedTargets.push(targetLanguage);
+      if (options.fixtureErrorTarget === targetLanguage) {
+        throw new Error('fixture failure canary');
+      }
+      return Uint8Array.from(options.fixtures?.[targetLanguage] ?? UNIT_FIXTURES[targetLanguage]);
+    }
   };
   return {
     dependencies,
@@ -375,11 +435,63 @@ function fakeDependencies(options: {
     issueCount: () => issues,
     redemptionCount: () => redemptions,
     ticketCount: () => tickets,
+    cleanupCount: () => cleanups,
     readinessCount: () => readiness,
+    loadedTargets,
     audio,
+    commits,
     sockets
   };
 }
+
+describe('checked-in smoke fixtures', () => {
+  it.each([
+    {
+      targetLanguage: 'es' as const,
+      byteLength: 96_000,
+      sha256: '2acdb87adc12791634b1c8c9602ba20abc62621f2d6184a3d60a62787ccd7357'
+    },
+    {
+      targetLanguage: 'tr' as const,
+      byteLength: 102_400,
+      sha256: 'fa0357cf46980fb436140105a6d7ecdd06ad7abc0f7fd8fdcf27ef9c47de7d6a'
+    }
+  ])(
+    'verifies the exact checked-in $targetLanguage PCM fixture',
+    async ({ targetLanguage, byteLength, sha256 }) => {
+      const fixture = await loadCheckedInSmokeFixture(targetLanguage);
+      expect(fixture.byteLength).toBe(byteLength);
+      expect(fixture.byteLength % AUDIO_BYTES_PER_FRAME).toBe(0);
+      expect(fixture.some((value) => value !== 0)).toBe(true);
+      expect(createHash('sha256').update(fixture).digest('hex')).toBe(sha256);
+
+      const tampered = Uint8Array.from(fixture);
+      tampered[Math.floor(tampered.byteLength / 2)]! ^= 1;
+      await expect(
+        loadCheckedInSmokeFixture(targetLanguage, async () => tampered)
+      ).rejects.toThrow('Security operation failed.');
+    }
+  );
+
+  it.each([
+    ['missing', async (): Promise<Uint8Array> => { throw new Error('private path canary'); }],
+    ['wrong-size', async () => unitFixture(1, 3)],
+    ['misaligned', async () => new Uint8Array(3_201).fill(1)],
+    ['all-zero', async () => new Uint8Array(96_000)],
+    ['malformed-target', async () => unitFixture(30, 3)]
+  ] as const)('fails content-free for %s fixture input', async (kind, readFixture) => {
+    const target = kind === 'malformed-target' ? ('fr' as never) : 'es';
+    let failure: unknown;
+    try {
+      await loadCheckedInSmokeFixture(target, readFixture);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe('Security operation failed.');
+    expect((failure as Error).message).not.toMatch(/private|fixture|path|sha|pcm/i);
+  });
+});
 
 describe('security operations configuration', () => {
   it('constructs the exact table and audience boundary', () => {
@@ -451,12 +563,15 @@ describe('security operations configuration', () => {
     expect(fixture.issueCount()).toBe(1);
     expect(fixture.redemptionCount()).toBe(1);
     expect(fixture.ticketCount()).toBe(2);
-    expect(fixture.requests).toHaveLength(4);
+    expect(fixture.cleanupCount()).toBe(1);
+    expect(fixture.loadedTargets).toEqual(['es', 'tr']);
+    expect(fixture.requests).toHaveLength(5);
     expect(fixture.requestUrls).toEqual([
       'https://relay.example.test/readyz',
       'https://relay.example.test/v1/pairing-redemptions',
       'https://relay.example.test/v1/session-tickets',
-      'https://relay.example.test/v1/session-tickets'
+      'https://relay.example.test/v1/session-tickets',
+      'https://relay.example.test/v1/installations/current'
     ]);
     expect(fixture.protocols).toEqual([
       [WEBSOCKET_SUBPROTOCOL, `palancar.ticket.${TICKETS[0]}`],
@@ -467,6 +582,100 @@ describe('security operations configuration', () => {
     for (const canary of [PAIRING, CREDENTIAL, ...TICKETS, IRRELEVANT_PARTIAL_TEXT, 'Cómo', 'Bugün', 'How are you']) {
       expect(visible).not.toContain(canary);
     }
+  });
+
+  it.each(['es', 'tr'] as const)(
+    'deletes the redeemed installation after a %s target fixture failure',
+    async (targetLanguage) => {
+      const fixture = fakeDependencies({ fixtureErrorTarget: targetLanguage });
+      const output = fakeIo();
+
+      await expect(
+        runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)
+      ).rejects.toThrow('Security operation failed.');
+
+      expect(fixture.cleanupCount()).toBe(1);
+      expect(fixture.requestUrls.at(-1)).toBe(
+        'https://relay.example.test/v1/installations/current'
+      );
+      expect(fixture.loadedTargets).toEqual(targetLanguage === 'es' ? ['es'] : ['es', 'tr']);
+      expect(fixture.ticketCount()).toBe(targetLanguage === 'es' ? 0 : 1);
+      const visible = `${output.stdout.join('')}${output.stderr.join('')}`;
+      expect(visible).toBe('');
+      expect(visible).not.toContain(CREDENTIAL);
+      expect(visible).not.toMatch(/fixture|audio|content/i);
+    }
+  );
+
+  it.each([
+    ['empty', new Uint8Array()],
+    ['misaligned', new Uint8Array(3_201).fill(1)],
+    ['all-zero', new Uint8Array(AUDIO_BYTES_PER_FRAME)]
+  ] as const)('rejects %s injected PCM and still deletes the installation', async (_kind, pcm) => {
+    const fixture = fakeDependencies({ fixtures: { es: pcm } });
+    const output = fakeIo();
+
+    await expect(
+      runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)
+    ).rejects.toThrow('Security operation failed.');
+
+    expect(fixture.cleanupCount()).toBe(1);
+    expect(fixture.ticketCount()).toBe(0);
+    expect(output.stdout).toEqual([]);
+    expect(output.stderr).toEqual([]);
+  });
+
+  it('fails content-free when installation deletion violates the exact 204 contract', async () => {
+    const cleanupCanary = 'private cleanup response content';
+    const fixture = fakeDependencies({
+      cleanupResponse: () => new Response(cleanupCanary, {
+        status: 200,
+        headers: {
+          'cache-control': 'no-store',
+          'content-type': 'text/plain'
+        }
+      })
+    });
+    const output = fakeIo();
+
+    await expect(
+      runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)
+    ).rejects.toThrow('Security operation failed.');
+
+    expect(fixture.cleanupCount()).toBe(1);
+    const visible = `${output.stdout.join('')}${output.stderr.join('')}`;
+    expect(visible).toBe('');
+    expect(visible).not.toContain(cleanupCanary);
+    expect(visible).not.toContain(CREDENTIAL);
+  });
+
+  it.each([
+    ['missing no-store', () => new Response(null, { status: 204 })],
+    [
+      'content type',
+      () => new Response(null, {
+        status: 204,
+        headers: { 'cache-control': 'no-store', 'content-type': 'text/plain' }
+      })
+    ],
+    [
+      'content length',
+      () => new Response(null, {
+        status: 204,
+        headers: { 'cache-control': 'no-store', 'content-length': '0' }
+      })
+    ]
+  ] as const)('rejects deletion success with %s', async (_kind, cleanupResponse) => {
+    const fixture = fakeDependencies({ cleanupResponse });
+    const output = fakeIo();
+
+    await expect(
+      runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)
+    ).rejects.toThrow('Security operation failed.');
+
+    expect(fixture.cleanupCount()).toBe(1);
+    expect(output.stdout).toEqual([]);
+    expect(output.stderr).toEqual([]);
   });
 
   it('waits for relay readiness through 503 and network failure before pairing', async () => {
@@ -590,16 +799,26 @@ describe('security operations configuration', () => {
     const fixture = fakeDependencies({ firstAckDelayMs: 1_200 });
     await runSecurityOps(['smoke'], ENV, fakeIo().io, fixture.dependencies);
 
-    expect(fixture.audio).toHaveLength(36);
-    for (const target of ['es', 'tr']) {
+    expect(fixture.audio).toHaveLength(5);
+    for (const target of ['es', 'tr'] as const) {
+      const expectedFixture = UNIT_FIXTURES[target];
+      const frameCount = expectedFixture.byteLength / AUDIO_BYTES_PER_FRAME;
       const frames = fixture.audio.filter((frame) => frame.target === target);
-      expect(frames).toHaveLength(18);
+      expect(frames).toHaveLength(frameCount);
       expect(frames.map((frame) => frame.sequence)).toEqual(
-        Array.from({ length: 18 }, (_, sequence) => sequence)
+        Array.from({ length: frameCount }, (_, sequence) => sequence)
       );
       expect(frames.every((frame, index) =>
         frame.offset === index * 1_600 && frame.samples === 1_600
       )).toBe(true);
+      for (const [index, frame] of frames.entries()) {
+        expect(frame.payload).toEqual(
+          expectedFixture.slice(
+            index * AUDIO_BYTES_PER_FRAME,
+            (index + 1) * AUDIO_BYTES_PER_FRAME
+          )
+        );
+      }
       for (let index = 1; index < frames.length; index += 1) {
         const previous = frames[index - 1]!;
         const current = frames[index]!;
@@ -620,6 +839,10 @@ describe('security operations configuration', () => {
     const spanish = fixture.audio.filter((frame) => frame.target === 'es');
     expect(spanish[0]!.acknowledgedAt).toBe(1_200);
     expect(spanish[1]!.sentAt).toBe(1_300);
+    expect(fixture.commits).toEqual([
+      { target: 'es', finalOriginalSampleOffset: UNIT_FIXTURES.es.byteLength / 2 },
+      { target: 'tr', finalOriginalSampleOffset: UNIT_FIXTURES.tr.byteLength / 2 }
+    ]);
   });
 
   it('runs initialization and bounded cleanup without content output', async () => {
@@ -651,7 +874,7 @@ describe('security operations configuration', () => {
       createSocket: () => {
         sockets += 1;
         return new FakeSocket([], {
-          audio: [], now: () => 0, delay: async () => undefined,
+          audio: [], commits: [], now: () => 0, delay: async () => undefined,
           neverOpen: false, interFrameFailure: undefined, readyMutation: undefined
         }) as never;
       }
