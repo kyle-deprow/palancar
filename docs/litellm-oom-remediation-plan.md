@@ -2,7 +2,7 @@
 
 Status: completed. The Phase A sizing change and its original guarded rollout
 are retained below as historical implementation evidence. The active rollout
-is the Phase B parser-fix relay-image transition.
+is the second relay-image-only correction after the parser-fix rollout.
 
 ## Evidence and decision
 
@@ -52,25 +52,28 @@ Verification used `/home/dev/.local/bin/terraform-1.15.8`:
 - remove only the generated module-local `.terraform.lock.hcl`
 - `git diff --check`
 
-## Phase B: genuine remediation plan and guard repin
+## Phase B history and second image-correction guard repin
 
-After Phase A was reviewed and committed, the parent generated a complete saved
-live plan for the parser-fix relay-image-only transition with the deployment
-inputs unchanged. The approved saved binary hash is
-`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4`; verify
-it immediately before guarding and applying that exact file. This is the
-saved-binary hash, not the JSON-view hash. Keep both raw files mode `0600` and
-never commit them. The expected
-shape is 39 resources: one Container App update and 38 no-ops, with no delete,
-replacement, import, or extra resource. LiteLLM remains exactly 0.75 CPU/1.5
-GiB and relay remains exactly 0.25 CPU/0.5 GiB. The Container App transition
-differs recursively only at relay `containers[0].image` and the computed
-provider output: the prior relay digest is the reviewed hard-pinned digest,
-while the planned image equals the immutable same-ACR `var.relay_image_digest`
-and is distinct from prior. The `relay_latest_revision_name` output becomes
-unknown. The genuine transition has zero resource drift, represented by the
-omitted `resource_drift` envelope. The subsequent idempotent form requires all
-39 resources and all outputs to be no-op, all 101 checks to pass with no unknown
+After Phase A, the first parser-fix relay-image-only transition used the saved
+binary SHA-256
+`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4`.
+That hash is historical and must not be reused for the active second
+correction. Record and verify the separately reviewed second-correction binary
+SHA-256 immediately before guarding and applying that exact file. Verify the
+saved-binary hash, not the JSON-view hash; keep both raw files mode `0600` and
+never commit them. The expected shape remains 39 resources: one Container App
+update and 38 no-ops, with no delete, replacement, import, or extra resource.
+LiteLLM remains exactly 0.75 CPU/1.5 GiB and relay remains exactly 0.25 CPU/0.5
+GiB. The Container App transition differs recursively only at relay
+`containers[0].image` and the computed provider output. The currently deployed
+prior relay digest is hard-pinned as
+`sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
+the planned image equals the immutable same-ACR `var.relay_image_digest`, is
+distinct from prior, and is not hard-coded in the committed guard or sanitized
+fixture. The `relay_latest_revision_name` output becomes unknown. The genuine
+transition has zero resource drift, represented by the omitted
+`resource_drift` envelope. The subsequent idempotent form requires all 39
+resources and all outputs to be no-op, all 101 checks to pass with no unknown
 checks, and zero resource drift.
 
 The parent creates a coherent sanitized copy from that genuine plan. A second
@@ -84,7 +87,7 @@ bounded worker may then edit only:
 - `docs/litellm-oom-remediation-plan.md`
 
 The operational `final-rollout` guard is repinned to this exact one-update
-relay-image transition and its subsequent 39-resource all-no-op state.
+second relay-image correction and its subsequent 39-resource all-no-op state.
 Historical guard modes remain unchanged. The completed OOM sizing remains
 background evidence, not a current resource transition. Tests must reject old
 LiteLLM resources, altered relay resources, invalid aggregate pairs, prior

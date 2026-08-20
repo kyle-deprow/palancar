@@ -174,30 +174,36 @@ For the reviewed final rollout, after the pinned transcription deployment is
 already present, create a complete saved plan without `-target`, guard its JSON
 view, and apply that exact same file only when the guard exits successfully.
 Keep the binary and JSON view mode `0600`; neither may be committed. For the
-current parser-fix rollout:
+active second relay-image correction rollout:
 
 ```sh
 set -eu
 umask 077
 PALANCAR_TERRAFORM=/home/dev/.local/bin/terraform-1.15.8
-PALANCAR_PLAN=/tmp/palancar-realtime-parser-v2.tfplan
-PALANCAR_PLAN_JSON=/tmp/palancar-realtime-parser-v2.tfplan.json
-PALANCAR_PLAN_SHA=f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4
+PALANCAR_PLAN=/tmp/palancar-ws-null-callback.tfplan
+PALANCAR_PLAN_JSON=/tmp/palancar-ws-null-callback.tfplan.json
+PALANCAR_PLAN_SHA=423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986
 
 chmod 600 "$PALANCAR_PLAN"
 test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
 "$PALANCAR_TERRAFORM" -chdir=infra/environments/dev show -json \
   "$PALANCAR_PLAN" > "$PALANCAR_PLAN_JSON"
 chmod 600 "$PALANCAR_PLAN_JSON"
+test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
 node infra/scripts/assert-dev-plan.mjs --mode=final-rollout \
   < "$PALANCAR_PLAN_JSON"
-test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
 chmod 600 "$PALANCAR_PLAN" "$PALANCAR_PLAN_JSON"
+test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
 "$PALANCAR_TERRAFORM" -chdir=infra/environments/dev apply "$PALANCAR_PLAN"
 ```
 
 The approved SHA is for the saved binary, not its deterministic JSON view;
 the two files normally have different hashes.
+
+The superseded parser-plan path
+`/tmp/palancar-realtime-parser-v2.tfplan` and binary SHA-256
+`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4` are
+historical and non-applicable. Do not guard or apply that old plan.
 
 Do not run the apply command after a guard rejection, do not substitute a
 newly generated plan file between guard and apply, and do not apply a
@@ -207,14 +213,16 @@ refresh-only plan.
 39-resource transition inventory: 38 no-ops and the reviewed resource-only
 Container App update at
 `module.container_app_workload[0].azapi_resource.this`. This is the
-post-remediation parser-fix transition: LiteLLM remains at 0.75 CPU/1.5Gi,
-relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
-The only recursive Container App differences are relay
+second post-remediation relay-image correction: LiteLLM remains at 0.75
+CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
+1 CPU/2Gi. The only recursive Container App differences are relay
 `containers[0].image` and the provider output. The prior relay image is pinned
 to the reviewed digest
-`sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170`;
-the planned image must equal `var.relay_image_digest`, remain immutable in the
-same ACR/repository, and be distinct from that prior digest. The
+`sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
+the reviewed planned image digest is
+`sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`.
+The planned image must equal `var.relay_image_digest`, remain immutable in the
+same ACR/repository, and be distinct from the prior digest. The
 `relay_latest_revision_name` output becomes provider-unknown. There is zero
 resource drift. The action group, cleanup Job, alerts, and all other resources
 are already deployed and no-op. The action group must use the exact

@@ -1,16 +1,15 @@
 # Final rollout plan-guard implementation
 
 Status: Approved for bounded implementation
-Date: 2026-08-19
+Date: 2026-08-20
 
 ## Objective
 
-Add a new fail-closed `final-rollout` mode to the native development Terraform
-saved-plan guard. The approved current transition is the relay-image-only
-parser fix after the completed LiteLLM OOM remediation. It retains the deployed
-Azure Realtime relay, OpenRouter LiteLLM sidecar, expiry-cleanup Job, action
-group, and six scheduled-query alerts while retaining the already deployed
-pinned transcription model.
+Maintain the fail-closed `final-rollout` mode for the second relay-image-only
+correction after the parser fix and completed LiteLLM OOM remediation. It
+retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
+expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
+transcription model.
 
 The existing `model-spike`, `full-deploy`, and `runtime-rollout` behavior must
 remain unchanged. `final-rollout` is a new mode, not an alias and not a relaxed
@@ -52,9 +51,11 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   The Container App before/after recursive differences are exactly
   `body.properties.template.containers[0].image` and `output`. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170`;
+  `sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
-  same ACR/repository, and is distinct from prior. The provider-computed
+  same ACR/repository, and is distinct from prior. The production after digest
+  remains supplied by the reviewed saved plan and is not hard-coded in the
+  committed guard or sanitized fixture. The provider-computed
   `relay_latest_revision_name` output becomes unknown. The already deployed
   cleanup Job, action group, and six scheduled-query alerts remain no-op.
   The action group is enabled/global/tagged, contains exactly one common-schema
@@ -132,12 +133,13 @@ Terraform 1.15.8 `show -json` output, preserving the provider/resource envelopes
 applyable flags, configuration and child-module trees, prior/planned values,
 nulls, computed values, unknown maps, and sensitivity maps. It must contain no
 live contact, secret, credential, instrumentation key, or personal principal
-identifier; synthetic placeholders must be cross-bound throughout. The saved
-binary approved for the guarded transition has SHA-256
-`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4`, which
-must be verified immediately before guard and apply. That is the binary hash,
-not the hash of its JSON view. Keep both protected with mode `0600`, and never
-commit either raw artifact. Build the idempotent
+identifier; synthetic placeholders must be cross-bound throughout. The
+previous parser-fix binary had SHA-256
+`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4` and must
+not be reused for this second correction. Record the separately reviewed
+second-correction saved-binary SHA-256 and verify it immediately before guard
+and apply. Verify the binary hash, not the hash of its JSON view. Keep both
+protected with mode `0600`, and never commit either raw artifact. Build the idempotent
 fixture from the same genuine schema and prove acceptance
 for the initial transition and idempotent state. Add adversarial mutations covering every
 accepted resource and invariant above, especially omitted inventory entries,

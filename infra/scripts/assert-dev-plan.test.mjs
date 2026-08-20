@@ -1693,7 +1693,7 @@ test("the final fixture contains only synthetic contacts and credential-free pla
 
   assert.match(
     finalFixtureText,
-    /palancar-relay@sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170/,
+    /palancar-relay@sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b/,
   );
   for (const pattern of [
     /\bsk-[A-Za-z0-9_-]{20,}\b/,
