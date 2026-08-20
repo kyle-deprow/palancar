@@ -247,7 +247,7 @@ one for every planned relay environment entry. The check envelope contains
 exactly one passing module `language_boundary_mode` variable check. The prior
 relay image is pinned
 to the reviewed digest
-`sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`.
+`sha256:d98f53283c4e3209a9bc8b9916b4062f2385c58542f64737700f8a549528185d`.
 The planned image must equal `var.relay_image_digest`, remain immutable in the
 same ACR/repository, and be distinct from the prior digest; its reviewed digest
 is intentionally not hard-coded in the generic guard or fixture. The

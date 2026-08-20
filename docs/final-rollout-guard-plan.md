@@ -63,7 +63,7 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   transition has 25 ordered empty relay `after_unknown.env` descriptors and
   exactly one passing module `language_boundary_mode` variable check. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`;
+  `sha256:d98f53283c4e3209a9bc8b9916b4062f2385c58542f64737700f8a549528185d`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
   same ACR/repository, and is distinct from prior. The reviewed after digest
   remains variable-bound and is not hard-coded in the committed guard or
