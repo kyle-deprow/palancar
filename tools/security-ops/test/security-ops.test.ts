@@ -54,6 +54,13 @@ const UNIT_FIXTURES: Readonly<Record<SmokeTargetLanguage, Uint8Array>> = Object.
 type InterFrameFailure = 'error' | 'close';
 type ReadyMutation = 'registry' | 'gate' | 'limits';
 type ReadyOutcome = '200' | '503' | 'network' | 'malformed' | 'status500';
+type TerminalMutation =
+  | 'uncertain-decision'
+  | 'non-target-decision'
+  | 'malformed-decision'
+  | 'duplicate-decision'
+  | 'mismatched-decision'
+  | 'wrong-utterance';
 
 interface AudioObservation {
   readonly target: string;
@@ -80,6 +87,7 @@ class FakeSocket extends EventEmitter {
   readonly neverOpen: boolean;
   readonly interFrameFailure: InterFrameFailure | undefined;
   readonly readyMutation: ReadyMutation | undefined;
+  readonly terminalMutation: TerminalMutation | undefined;
   readonly audio: AudioObservation[];
   readonly commits: CommitObservation[];
   readonly now: () => number;
@@ -98,6 +106,7 @@ class FakeSocket extends EventEmitter {
       readonly neverOpen: boolean;
       readonly interFrameFailure: InterFrameFailure | undefined;
       readonly readyMutation: ReadyMutation | undefined;
+      readonly terminalMutation: TerminalMutation | undefined;
       readonly audio: AudioObservation[];
       readonly commits: CommitObservation[];
       readonly now: () => number;
@@ -111,6 +120,7 @@ class FakeSocket extends EventEmitter {
     this.neverOpen = options.neverOpen === true;
     this.interFrameFailure = options.interFrameFailure;
     this.readyMutation = options.readyMutation;
+    this.terminalMutation = options.terminalMutation;
     this.audio = options.audio;
     this.commits = options.commits;
     this.now = options.now;
@@ -199,11 +209,28 @@ class FakeSocket extends EventEmitter {
         };
         this.emitJson(finalTranscript);
         if (this.duplicateFinal) this.emitJson(finalTranscript);
-        this.emitJson({
+        const decision = {
           type: 'language.decision', ...common, revision: 1, decision: 'target',
           selectedTargetLanguage: this.#target, detectedLanguage: this.#target,
           confidence: 0.99, gatePolicyVersion: '1.0.0'
-        });
+        } as Record<string, unknown>;
+        if (this.terminalMutation === 'uncertain-decision') {
+          decision.decision = 'uncertain';
+          delete decision.detectedLanguage;
+          delete decision.confidence;
+        } else if (this.terminalMutation === 'non-target-decision') {
+          decision.decision = 'english';
+          decision.detectedLanguage = 'en';
+        } else if (this.terminalMutation === 'malformed-decision') {
+          decision.extra = 'private-terminal-canary';
+        } else if (this.terminalMutation === 'mismatched-decision') {
+          decision.revision = 2;
+        } else if (this.terminalMutation === 'wrong-utterance') {
+          decision.utteranceId = OTHER_UTTERANCE_ID;
+        }
+        this.emitJson(decision);
+        if (this.terminalMutation === 'duplicate-decision') this.emitJson(decision);
+        if (this.terminalMutation !== undefined) return;
         this.emitJson({
           type: 'translation.ready', ...common, acceptedFinalRevision: 1,
           englishTranslation: 'How are you today?'
@@ -277,6 +304,7 @@ function fakeDependencies(options: {
   readonly firstAckDelayMs?: number;
   readonly interFrameFailure?: InterFrameFailure;
   readonly readyMutation?: ReadyMutation;
+  readonly terminalMutation?: TerminalMutation;
   readonly neverOpen?: boolean;
   readonly holdInterFrameDelay?: boolean;
   readonly readyOutcomes?: readonly ReadyOutcome[];
@@ -405,6 +433,7 @@ function fakeDependencies(options: {
         firstAckDelayMs: options.firstAckDelayMs ?? 0,
         interFrameFailure: options.interFrameFailure,
         readyMutation: options.readyMutation,
+        terminalMutation: options.terminalMutation,
         neverOpen: options.neverOpen === true,
         audio,
         commits,
@@ -861,8 +890,34 @@ describe('security operations configuration', () => {
     await expect(runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)).rejects.toThrow(
       'Security operation failed.'
     );
+    expect(fixture.cleanupCount()).toBe(1);
+    expect(fixture.sockets[0]?.listenerCount('message')).toBe(0);
     expect(output.stdout).toEqual([]);
     expect(output.stderr).toEqual([]);
+  });
+
+  it.each([
+    'uncertain-decision',
+    'non-target-decision',
+    'malformed-decision',
+    'duplicate-decision',
+    'mismatched-decision',
+    'wrong-utterance'
+  ] as const)('fails immediately and cleans up on a %s terminal tuple', async (terminalMutation) => {
+    const fixture = fakeDependencies({ terminalMutation });
+    const output = fakeIo();
+
+    await expect(
+      runSecurityOps(['smoke'], ENV, output.io, fixture.dependencies)
+    ).rejects.toThrow('Security operation failed.');
+
+    expect(fixture.cleanupCount()).toBe(1);
+    expect(fixture.sockets).toHaveLength(1);
+    expect(fixture.sockets[0]?.listenerCount('message')).toBe(0);
+    const visible = `${output.stdout.join('')}${output.stderr.join('')}`;
+    expect(visible).toBe('');
+    expect(visible).not.toContain(CREDENTIAL);
+    expect(visible).not.toContain('private-terminal-canary');
   });
 
   it('rejects oversized HTTP bodies before parsing or opening a socket', async () => {
@@ -875,7 +930,8 @@ describe('security operations configuration', () => {
         sockets += 1;
         return new FakeSocket([], {
           audio: [], commits: [], now: () => 0, delay: async () => undefined,
-          neverOpen: false, interFrameFailure: undefined, readyMutation: undefined
+          neverOpen: false, interFrameFailure: undefined, readyMutation: undefined,
+          terminalMutation: undefined
         }) as never;
       }
     };

@@ -1357,8 +1357,10 @@ describe('relay session core', () => {
         })
       }
     ] satisfies readonly TextLanguageClassifier[]) {
+      const metrics = recordingMetricSink();
       const { core } = openNew(recordingAdapter(), 'es', {
         languageClassifier,
+        metricSink: metrics.sink,
         generationService: generationService({
           id: 'must-not-run',
           version: '1.0.0',
@@ -1374,6 +1376,21 @@ describe('relay session core', () => {
       expect(result.outgoing.some((message) => message.type.startsWith('transcript.'))).toBe(false);
       expect(JSON.stringify(result)).not.toContain('normal user text');
       expect(JSON.stringify(result)).not.toContain('classifier secret');
+      expect(await core.handleTranscriptionEvent(event)).toEqual({ outgoing: [] });
+      expect(metrics.records.filter((record) => record.name === 'language.decision')).toEqual([
+        expect.objectContaining({
+          gateDecision: 'uncertain',
+          languageBoundaryMode: 'fixture',
+          languageReason: 'DETECTOR_ERROR',
+          operation: 'language',
+          outcome: 'rejected'
+        })
+      ]);
+      const languageMetric = metrics.records.find(
+        (record) => record.name === 'language.decision'
+      );
+      expect(languageMetric).not.toHaveProperty('detectedLanguage');
+      expect(languageMetric).not.toHaveProperty('provisionalScoreBasisPoints');
       expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toEqual({ outgoing: [] });
     }
     expect(complete).not.toHaveBeenCalled();
@@ -1488,6 +1505,117 @@ describe('relay session core', () => {
       })
     ]));
     expect(JSON.stringify(metrics.records)).not.toContain('es-selected-target-final');
+  });
+
+  it.each([
+    ['TOO_SHORT', 0.2],
+    ['UNKNOWN', 0.41]
+  ] as const)(
+    'omits unknown from the public %s decision while recording bounded provisional metadata',
+    async (reason, provisionalScore) => {
+      const metrics = recordingMetricSink();
+      const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+        englishTranslation: 'must-not-run',
+        suggestions: [
+          { englishText: 'one', selectedTargetText: 'uno' },
+          { englishText: 'two', selectedTargetText: 'dos' }
+        ]
+      }));
+      const { core } = openNew(recordingAdapter(), 'es', {
+        languageBoundaryMode: 'development-provisional',
+        metricSink: metrics.sink,
+        languageClassifier: {
+          ready: Promise.resolve(),
+          classify: async () => ({
+            status: 'provisional',
+            detectorVersion: 'eld-small-2.1.0',
+            profileVersion: 'eld-small-dev-4',
+            detectedLanguage: 'unknown',
+            provisionalScore,
+            decision: 'uncertain',
+            reason
+          })
+        },
+        generationService: generationService({
+          id: 'must-not-run',
+          version: '1.0.0',
+          complete
+        })
+      });
+      core.handleText(utteranceStartText());
+
+      const result = await core.handleTranscriptionEvent(finalEvent());
+
+      expect(result.outgoing).toEqual([
+        expect.objectContaining({
+          type: 'language.decision',
+          decision: 'uncertain'
+        })
+      ]);
+      expect(result.outgoing[0]).not.toHaveProperty('detectedLanguage');
+      expect(complete).not.toHaveBeenCalled();
+      expect(metrics.records.filter((record) => record.name === 'language.decision')).toEqual([
+        expect.objectContaining({
+          languageBoundaryMode: 'development-provisional',
+          languageReason: reason,
+          detectedLanguage: 'unknown',
+          provisionalScoreBasisPoints: Math.round(provisionalScore * 10_000)
+        })
+      ]);
+    }
+  );
+
+  it('records detector failure without inventing a provisional score or public language code', async () => {
+    const metrics = recordingMetricSink();
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'bir' },
+        { englishText: 'two', selectedTargetText: 'iki' }
+      ]
+    }));
+    const { core } = openNew(recordingAdapter(), 'tr', {
+      languageBoundaryMode: 'development-provisional',
+      metricSink: metrics.sink,
+      languageClassifier: {
+        ready: Promise.resolve(),
+        classify: async () => ({
+          status: 'provisional',
+          detectorVersion: 'eld-small-2.1.0',
+          profileVersion: 'eld-small-dev-4',
+          detectedLanguage: 'unknown',
+          provisionalScore: 0,
+          decision: 'reject',
+          reason: 'DETECTOR_ERROR'
+        })
+      },
+      generationService: generationService({
+        id: 'must-not-run',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+
+    const result = await core.handleTranscriptionEvent(finalEvent('target', TEST_UTTERANCE_ID, 1, 'tr'));
+
+    expect(result.outgoing).toEqual([
+      expect.objectContaining({ type: 'language.decision', decision: 'uncertain' })
+    ]);
+    expect(result.outgoing[0]).not.toHaveProperty('detectedLanguage');
+    expect(complete).not.toHaveBeenCalled();
+    const languageMetrics = metrics.records.filter(
+      (record) => record.name === 'language.decision'
+    );
+    expect(languageMetrics).toEqual([
+      expect.objectContaining({
+        languageBoundaryMode: 'development-provisional',
+        languageReason: 'DETECTOR_ERROR',
+        gateDecision: 'uncertain'
+      })
+    ]);
+    expect(languageMetrics[0]).not.toHaveProperty('detectedLanguage');
+    expect(languageMetrics[0]).not.toHaveProperty('provisionalScoreBasisPoints');
   });
 
   it('suppresses a classifier result that becomes stale during cancellation', async () => {

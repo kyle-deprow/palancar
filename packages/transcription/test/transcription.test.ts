@@ -795,12 +795,14 @@ describe('normalized deterministic events', () => {
             expect(() => evaluateLanguageGate({
               selectedLanguage: selectedTargetLanguage,
               evidence: event.languageEvidence as unknown as ClassifiedLanguageEvidence,
-              isFinal: event.type === 'transcript.final'
+              isFinal: event.type === 'transcript.final',
+              boundaryMode: 'production-calibrated'
             })).toThrow();
             const result = evaluateLanguageGate({
               selectedLanguage: selectedTargetLanguage,
               evidence: controlledEvidence,
-              isFinal: event.type === 'transcript.final'
+              isFinal: event.type === 'transcript.final',
+              boundaryMode: 'production-calibrated'
             });
             if (event.type === 'transcript.partial') {
               expect(result).toMatchObject({

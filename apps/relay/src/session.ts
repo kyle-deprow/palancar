@@ -597,15 +597,15 @@ export class RelaySessionCore {
     this.#recordFinalLatency(active);
 
     if (this.#languageBoundaryMode === 'deny-all') {
+      this.#recordLanguageDecision(active, 'uncertain');
       let languageDecision: ServerControlMessage;
       try {
         languageDecision = this.#languageDecision(event, 'uncertain');
       } catch {
         this.#recordUtteranceTerminal(active, 'completed');
         this.#finishActive(false);
-        return this.#result([]);
+        return this.#protocolBoundaryFailure();
       }
-      this.#recordLanguageDecision(active, 'uncertain');
       this.#recordUtteranceTerminal(active, 'completed');
       this.#finishActive(false);
       return this.#result([languageDecision]);
@@ -646,15 +646,15 @@ export class RelaySessionCore {
 
     const finalDecision: Exclude<LanguageDecisionValue, 'provisional'> =
       gateResult.decision === 'provisional' ? 'uncertain' : gateResult.decision;
+    this.#recordLanguageDecision(active, finalDecision, evidence);
     let languageDecision: ServerControlMessage;
     try {
       languageDecision = this.#languageDecision(event, finalDecision, gateResult);
     } catch {
       this.#recordUtteranceTerminal(active, 'completed');
       this.#finishActive(false);
-      return this.#result([]);
+      return this.#protocolBoundaryFailure();
     }
-    this.#recordLanguageDecision(active, finalDecision, evidence);
     this.#recordUtteranceTerminal(active, 'completed');
     if (
       finalDecision !== 'target' ||
@@ -1531,16 +1531,23 @@ export class RelaySessionCore {
   #recordLanguageDecision(
     active: ActiveUtterance,
     gateDecision: Exclude<LanguageDecisionValue, 'provisional'>,
-    evidence?: ClassifiedLanguageEvidence
+    evidence?: ClassifiedLanguageEvidence,
+    classifierFailed = false
   ): void {
     if (active.languageDecisionMetricRecorded) return;
     active.languageDecisionMetricRecorded = true;
+    const detectorError =
+      classifierFailed ||
+      evidence?.status === 'unavailable' ||
+      (evidence?.status === 'provisional' && evidence.reason === 'DETECTOR_ERROR');
     this.#recordMetric({
       name: 'language.decision',
       count: 1,
       gateDecision,
       languageBoundaryMode: this.#languageBoundaryMode,
-      ...(evidence?.status === 'provisional'
+      ...(detectorError
+        ? { languageReason: 'DETECTOR_ERROR' as const }
+        : evidence?.status === 'provisional'
         ? {
             languageReason: evidence.reason,
             detectedLanguage:
@@ -1756,7 +1763,9 @@ export class RelaySessionCore {
       revision: event.revision,
       decision,
       selectedTargetLanguage: this.#selectedTargetLanguage,
-      ...(detectedLanguage === undefined ? {} : { detectedLanguage }),
+      ...(detectedLanguage === undefined || detectedLanguage === 'unknown'
+        ? {}
+        : { detectedLanguage }),
       ...(confidence === undefined ? {} : { confidence }),
       gatePolicyVersion: this.#gatePolicyVersion
     });
@@ -1772,15 +1781,15 @@ export class RelaySessionCore {
     if (event.type === 'transcript.partial') {
       return this.#result([]);
     }
+    this.#recordLanguageDecision(active, 'uncertain', undefined, true);
     let decision: ServerControlMessage;
     try {
       decision = this.#languageDecision(event, 'uncertain');
     } catch {
       this.#recordUtteranceTerminal(active, 'completed');
       this.#finishActive(false);
-      return this.#result([]);
+      return this.#protocolBoundaryFailure();
     }
-    this.#recordLanguageDecision(active, 'uncertain');
     this.#recordUtteranceTerminal(active, 'completed');
     this.#finishActive(false);
     return this.#result([decision]);

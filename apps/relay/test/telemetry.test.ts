@@ -762,6 +762,67 @@ describe('record', () => {
   });
 
   it.each([
+    'fixture',
+    'deny-all',
+    'production-approved',
+    'development-provisional'
+  ] as const)(
+    'exports the bounded scoreless detector-error exception for %s',
+    (languageBoundaryMode) => {
+      const harness = createHarness();
+      const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+      sink.record({
+        name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+        timestamp: TIMESTAMP,
+        deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+        count: 1,
+        gateDecision: GATE_DECISIONS.UNCERTAIN,
+        operation: TELEMETRY_OPERATIONS.LANGUAGE,
+        outcome: TELEMETRY_OUTCOMES.REJECTED,
+        languageBoundaryMode,
+        languageReason: 'DETECTOR_ERROR'
+      });
+
+      expect(harness.measurements).toHaveLength(1);
+      expect(harness.measurements[0]?.attributes).toMatchObject({
+        'palancar.language.boundary_mode': languageBoundaryMode,
+        'palancar.language.reason': 'DETECTOR_ERROR'
+      });
+      expect(harness.measurements[0]?.attributes).not.toHaveProperty(
+        'palancar.language.detected'
+      );
+      expect(harness.measurements[0]?.attributes).not.toHaveProperty(
+        'palancar.language.provisional_score_basis_points'
+      );
+    }
+  );
+
+  it.each([
+    { detectedLanguage: 'unknown' },
+    { provisionalScoreBasisPoints: 0 },
+    { detectedLanguage: 'unknown', provisionalScoreBasisPoints: 0 },
+    { gateDecision: 'target' },
+    { outcome: 'accepted' }
+  ])('drops an expanded detector-error exception %#', (override) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      gateDecision: GATE_DECISIONS.UNCERTAIN,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.REJECTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'DETECTOR_ERROR',
+      ...override
+    });
+    expect(harness.measurements).toHaveLength(0);
+  });
+
+  it.each([
     { provisionalScoreBasisPoints: -1 },
     { provisionalScoreBasisPoints: 10_001 },
     { provisionalScoreBasisPoints: 1.5 },

@@ -696,21 +696,70 @@ function collectTurnResults(
           onFailure();
           return;
         }
+        if (!['transcript.final', 'language.decision', 'translation.ready', 'suggestions.ready'].includes(message.type)) return;
         if (
           !('utteranceId' in message) || message.utteranceId !== utteranceId ||
-          !['transcript.final', 'language.decision', 'translation.ready', 'suggestions.ready'].includes(message.type)
-        ) return;
+          message.sessionId !== ready.sessionId || message.sessionEpoch !== ready.sessionEpoch
+        ) {
+          onFailure();
+          return;
+        }
         if (message.type === 'transcript.final') {
           if (transcript !== undefined) { onFailure(); return; }
           transcript = message;
+          if (
+            (decision !== undefined &&
+              (decision.segmentId !== message.segmentId || decision.revision !== message.revision)) ||
+            (translation !== undefined &&
+              (translation.segmentId !== message.segmentId ||
+                translation.acceptedFinalRevision !== message.revision)) ||
+            (suggestions !== undefined &&
+              (suggestions.segmentId !== message.segmentId ||
+                suggestions.acceptedFinalRevision !== message.revision))
+          ) {
+            onFailure();
+            return;
+          }
         } else if (message.type === 'language.decision') {
           if (decision !== undefined) { onFailure(); return; }
+          if (
+            message.decision !== 'target' ||
+            message.selectedTargetLanguage !== targetLanguage ||
+            message.detectedLanguage !== targetLanguage ||
+            message.gatePolicyVersion !== GATE_POLICY_VERSION
+          ) {
+            onFailure();
+            return;
+          }
+          if (
+            transcript !== undefined &&
+            (message.segmentId !== transcript.segmentId || message.revision !== transcript.revision)
+          ) {
+            onFailure();
+            return;
+          }
           decision = message;
         } else if (message.type === 'translation.ready') {
           if (translation !== undefined) { onFailure(); return; }
+          if (
+            transcript !== undefined &&
+            (message.segmentId !== transcript.segmentId ||
+              message.acceptedFinalRevision !== transcript.revision)
+          ) {
+            onFailure();
+            return;
+          }
           translation = message;
         } else if (message.type === 'suggestions.ready') {
           if (suggestions !== undefined) { onFailure(); return; }
+          if (
+            transcript !== undefined &&
+            (message.segmentId !== transcript.segmentId ||
+              message.acceptedFinalRevision !== transcript.revision)
+          ) {
+            onFailure();
+            return;
+          }
           suggestions = message;
         }
         finish();

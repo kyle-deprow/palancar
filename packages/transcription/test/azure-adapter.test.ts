@@ -520,6 +520,49 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     expect(session.state.activeUtteranceId).toBeUndefined();
   });
 
+  it.each([
+    { target: 'es', first: 'hola hola', second: 'mundo' },
+    { target: 'tr', first: 'merhaba merhaba', second: 'dünya' }
+  ] as const)(
+    'does not release the aggregate $target final before client finalization and preserves its exact offset',
+    async ({ first, second }) => {
+      const socket = new FakeSocket();
+      const events: NormalizedTranscriptionEvent[] = [];
+      const failures: unknown[] = [];
+      const session = makeSession(socket, events, failures);
+      await openSession(session, socket);
+
+      const committedFinalOriginalSampleOffset = 9_601;
+      session.pushAudio({
+        utteranceId: UTTERANCE_ID,
+        originalSampleOffset: 0,
+        pcm: new Uint8Array(committedFinalOriginalSampleOffset * 2)
+      });
+      expect(messageTypes(socket)).toContain('input_audio_buffer.commit');
+      socket.message(committed('item-1', null));
+      socket.message(itemAdded('item-1', null));
+      socket.message(completed('item-1', first));
+
+      expect(session.state.finalizationRequested).toBe(false);
+      expect(events.some((event) => event.type === 'transcript.final')).toBe(false);
+
+      expect(session.finalize(UTTERANCE_ID)).toEqual({
+        status: 'finalization-requested'
+      });
+      socket.message(committed('item-2', 'item-1'));
+      socket.message(itemAdded('item-2', 'item-1'));
+      socket.message(completed('item-2', second));
+
+      expect(failures).toEqual([]);
+      expect(events.at(-1)).toMatchObject({
+        type: 'transcript.final',
+        text: `${first} ${second}`,
+        acceptedThroughOriginalSampleOffset: committedFinalOriginalSampleOffset,
+        finalizationReason: 'explicit'
+      });
+    }
+  );
+
   it('produces byte-identical provider audio for arbitrary original-frame partitions', async () => {
     const oneShotSocket = new FakeSocket();
     const partitionedSocket = new FakeSocket();

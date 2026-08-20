@@ -435,6 +435,8 @@ function recordWithDeploymentSlot(
     const reason = valueFor('languageReason');
     const detectedLanguage = valueFor('detectedLanguage');
     const provisionalScoreBasisPoints = valueFor('provisionalScoreBasisPoints');
+    const gateDecision = valueFor('gateDecision');
+    const outcome = valueFor('outcome');
     let languageAttributes:
       | Readonly<{
           boundaryMode: string;
@@ -451,7 +453,20 @@ function recordWithDeploymentSlot(
       ) {
         return undefined;
       }
-      if (boundaryMode === 'development-provisional') {
+      if (reason === 'DETECTOR_ERROR') {
+        if (
+          gateDecision !== 'uncertain' ||
+          outcome !== 'rejected' ||
+          detectedLanguage !== undefined ||
+          provisionalScoreBasisPoints !== undefined
+        ) {
+          return undefined;
+        }
+        languageAttributes = Object.freeze({
+          boundaryMode,
+          reason
+        });
+      } else if (boundaryMode === 'development-provisional') {
         if (
           typeof reason !== 'string' ||
           !PROVISIONAL_REASONS.has(reason) ||
