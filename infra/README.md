@@ -22,9 +22,12 @@ outputs.
 The foundation can optionally create the relay Container App and its workload
 Key Vault once immutable relay and LiteLLM image digests are supplied. The
 runtime workload is relay plus an OpenRouter-only LiteLLM sidecar; Azure
-LiteLLM and Azure transcription remain blocked. The cleanup Job, private
-endpoint, custom DNS, CI federation, and placeholder images remain outside
-this stack.
+hosted LiteLLM/generation remains disabled. The exact pinned Azure Realtime
+`gpt-4o-mini-transcribe` deployment and relay transcription path are deployed
+and enabled. This is not a language or physical-hardware production
+promotion. The deployed workload stack also owns the expiry-cleanup Job, the
+relay action group, and its six scheduled-query alerts. Private endpoint,
+custom DNS, CI federation, and placeholder images remain outside this stack.
 
 ## Bootstrap with local state, then migrate
 
@@ -184,37 +187,38 @@ newly generated plan file between guard and apply, and do not apply a
 refresh-only plan.
 
 `final-rollout` is a separate fail-closed mode. It requires the complete
-39-resource transition inventory: 29 no-ops, the reviewed Container App update,
-and nine creates comprising the monitoring assignment, cleanup Job, relay
-action group, and six scheduled-query alerts. The action group must use the
-exact deterministic development ARM ID and one common-schema, ordinally named
-email receiver per sorted budget contact. The same contact set must appear in
-all four budget notifications. Every alert is bound to that action group and
-must match the committed workspace scope, KQL, threshold, aggregation,
-severity, periods, properties, and provider envelope, with no dimensions. The
-idempotent form requires the same 39 resources as no-ops and no drift.
+39-resource transition inventory: 38 no-ops and the reviewed resource-only
+Container App update at
+`module.container_app_workload[0].azapi_resource.this`. Only the LiteLLM
+containers change from 0.25 CPU/0.5Gi to 0.75 CPU/1.5Gi; relay remains 0.25
+CPU/0.5Gi and the aggregate is exactly 1 CPU/2Gi. The transition has exactly
+six one-time scheduled-query alert drift envelopes; each corresponding alert
+resource change remains no-op and its sole recursive value difference is
+`target_resource_types` changing from prior `null` to refreshed `[]`. The
+action group, cleanup Job, alerts, and all other resources are already deployed
+and no-op. The action group must use the exact deterministic development ARM ID
+and one common-schema, ordinally named email receiver per sorted budget
+contact. The same contact set must appear in all four budget notifications.
+Every alert is bound to that action group and must match the committed
+workspace scope, KQL, threshold, aggregation, severity, periods, properties,
+and provider envelope, with no dimensions. The idempotent form requires all 39
+resources and all outputs to be no-op, all 101 checks to pass, and
+`resource_drift` to be empty.
 
 The mode also requires the exact pinned Foundry deployment as a no-op, exact
 development ACR digests for the relay, LiteLLM proxy, and expiry-cleanup Job,
-and the complete final Container App and scheduled Job payloads. It permits
-only the reviewed Container App create/update/no-op, Job create/no-op, and
-create-if-absent/no-op-if-present monitoring, action-group, alert, and operator
-resources. The initial transition accepts only the exact reviewed preexisting
-Container App drift represented in the refreshed saved plan and only alongside
-the complete final update. It rejects all other drift, deletes, replacements,
+and the complete final Container App and scheduled Job payloads. In the initial
+transition every resource is no-op except the single Container App update; the
+idempotent form requires all 39 resources to be no-op. The initial transition
+accepts only the exact six one-time provider normalizations alongside that
+resource-only update. It rejects all other drift, deletes, replacements,
 imports, deferred or unknown security values, extra topology or receivers,
 plaintext credentials, mutable or aliased images, and any second deployment or
 workload resource.
 
-The reviewed transition has exactly two allowed unknown checks: the
-`module.container_app_workload.azapi_resource.this` check and the
-`module.container_app_workload.var.runtime_monitoring_metrics_publisher_role_assignment_id`
-check, each with its exact indexed instance address and unknown status, and
-only while the monitoring-role action is create. The Container App body and the
-monitoring-role create are independently validated against their complete exact
-contracts. Every other unknown check, any altered check envelope, and any
-additional unknown check fails closed; the idempotent plan must report every
-check as passing.
+The transition requires exactly 101 passing checks and no unknown checks. Any
+altered, failed, unknown, or additional check fails closed. The idempotent plan
+must report the same 101 checks as passing and contain no drift.
 
 ## State recovery verification
 

@@ -52,9 +52,15 @@ Verification uses `/home/dev/.local/bin/terraform-1.15.8`:
 
 After Phase A is reviewed and committed, the parent generates a complete saved
 live plan with the unchanged three image digests and deployment inputs. The
-expected shape is 39 resources: one Container App update and 38 no-ops, no
-drift, delete, replacement, import, or extra resource. Prior LiteLLM resources
-must be 0.25 CPU/0.5 GiB and planned resources 0.75 CPU/1.5 GiB.
+expected shape is 39 resources: one Container App update and 38 no-ops, with
+no delete, replacement, import, or extra resource. Prior LiteLLM resources
+must be 0.25 CPU/0.5 GiB and planned resources 0.75 CPU/1.5 GiB. The genuine
+transition contains exactly six one-time resource-drift envelopes at the
+scheduled-query alert instances. Each corresponding resource change remains
+no-op, and each drift is pinned to the sole recursive value difference of
+prior `target_resource_types = null` to refreshed `target_resource_types = []`.
+The subsequent idempotent form requires all 39 resources and all outputs to be
+no-op, all 101 checks to pass with no unknown checks, and `resource_drift = []`.
 
 The parent creates a coherent sanitized copy from that genuine plan. A second
 bounded worker may then edit only:
@@ -64,6 +70,7 @@ bounded worker may then edit only:
 - `infra/scripts/fixtures/final-rollout-transition.plan-fixture.json`
 - `infra/README.md`
 - `docs/final-rollout-guard-plan.md`
+- `docs/litellm-oom-remediation-plan.md`
 
 The operational `final-rollout` guard is repinned to this exact one-update
 remediation and its subsequent 39-resource all-no-op state. Historical guard

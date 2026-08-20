@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 
@@ -61,7 +62,6 @@ const FINAL_ACTION_GROUP_ID =
   `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Insights/actionGroups/${FINAL_ACTION_GROUP_NAME}`;
 const FINAL_WORKSPACE_ID =
   `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.OperationalInsights/workspaces/law-palancar-dev-aeeacd8c`;
-const FINAL_ALERT_API_VERSION = "2023-12-01";
 const FINAL_CLEANUP_JOB_NAME = "caj-palancardev-cleanup-aeeacd8c";
 const FINAL_ROLE_DEFINITION_MONITORING_ID =
   "3913510d-42f4-4e42-8a64-420c390055eb";
@@ -2020,8 +2020,8 @@ function hasExactFinalContainerApp(change, images, runtimeClientId) {
     hasExactKeys(litellm.resources, ["cpu", "memory"]) &&
     relay.resources.cpu === 0.25 &&
     relay.resources.memory === "0.5Gi" &&
-    litellm.resources.cpu === 0.25 &&
-    litellm.resources.memory === "0.5Gi" &&
+    litellm.resources.cpu === 0.75 &&
+    litellm.resources.memory === "1.5Gi" &&
     Array.isArray(relay.probes) &&
     relay.probes.length === 2 &&
     Array.isArray(litellm.probes) &&
@@ -2609,7 +2609,11 @@ function finalHasExactRoleChange(resourceChange, context) {
     return false;
   }
   const after = resourceChange.change.after;
-  const name = uuidV5Url(contract.nameInput);
+  const name = after?.name;
+  const expectedName = uuidV5Url(contract.nameInput);
+  if (!finalUuid(name) || name !== expectedName) {
+    return false;
+  }
   const common = {
     name,
     principal_id: contract.principal,
@@ -2688,7 +2692,100 @@ function finalAzapiIdentity(after, action) {
   );
 }
 
-function finalAzapiProviderEnvelope(after, kind, action, defaultDomain) {
+function finalHasExactJobProviderOutput(output, after, context) {
+  const referenceOutput =
+    FINAL_REFERENCE_CHANGES.get(EXPIRY_CLEANUP_JOB).change.after.output;
+  if (
+    !isObject(output) ||
+    !finalExactKeys(output, Object.keys(referenceOutput)) ||
+    output.id !== after.id ||
+    output.type !== referenceOutput.type ||
+    !hasExactFinalTags(output.tags)
+  ) {
+    return false;
+  }
+
+  const referenceProperties = referenceOutput.properties;
+  const properties = output.properties;
+  const outboundIpAddresses = properties?.outboundIpAddresses;
+  if (
+    !finalExactKeys(properties, Object.keys(referenceProperties)) ||
+    properties.provisioningState !== referenceProperties.provisioningState ||
+    !Array.isArray(outboundIpAddresses) ||
+    outboundIpAddresses.length === 0 ||
+    new Set(outboundIpAddresses).size !== outboundIpAddresses.length ||
+    !outboundIpAddresses.every((value) => isIP(value) === 4)
+  ) {
+    return false;
+  }
+
+  const referenceEventStreamEndpoint =
+    referenceProperties.eventStreamEndpoint;
+  let eventStreamUrl;
+  try {
+    eventStreamUrl = new URL(referenceEventStreamEndpoint);
+  } catch {
+    return false;
+  }
+  const expectedEventStreamEndpoint =
+    `${eventStreamUrl.origin}/subscriptions/${FINAL_SUBSCRIPTION_ID}/resourceGroups/${FINAL_RESOURCE_GROUP_NAME}/containerApps/${after.name}/eventstream`;
+  if (properties.eventStreamEndpoint !== expectedEventStreamEndpoint) {
+    return false;
+  }
+
+  if (
+    !isDeepStrictEqual(properties.configuration, referenceProperties.configuration) ||
+    !isDeepStrictEqual(properties.template, referenceProperties.template)
+  ) {
+    return false;
+  }
+
+  if (!finalExactKeys(output.identity, ["userAssignedIdentities"])) {
+    return false;
+  }
+  const identities = output.identity.userAssignedIdentities;
+  const expectedIdentityIds = after.identity?.[0]?.identity_ids?.map((id) =>
+    id.replace("resourceGroups", "resourcegroups"),
+  );
+  if (
+    !Array.isArray(expectedIdentityIds) ||
+    expectedIdentityIds.length !== 2 ||
+    !isObject(identities) ||
+    !hasExactKeys(identities, expectedIdentityIds)
+  ) {
+    return false;
+  }
+
+  const expectedIdentityValues = new Map([
+    [
+      expectedIdentityIds[0],
+      {
+        clientId: context.imagePullClient,
+        principalId: context.imagePullPrincipal,
+      },
+    ],
+    [
+      expectedIdentityIds[1],
+      {
+        clientId: context.runtimeClient,
+        principalId: context.runtimePrincipal,
+      },
+    ],
+  ]);
+  return expectedIdentityIds.every(
+    (id) =>
+      finalExactKeys(identities[id], ["clientId", "principalId"]) &&
+      isDeepStrictEqual(identities[id], expectedIdentityValues.get(id)),
+  );
+}
+
+function finalAzapiProviderEnvelope(
+  after,
+  kind,
+  action,
+  defaultDomain,
+  context,
+) {
   const referenceChange = FINAL_REFERENCE_CHANGES.get(
     kind === "app" ? CONTAINER_APP : EXPIRY_CLEANUP_JOB,
   );
@@ -2731,13 +2828,13 @@ function finalAzapiProviderEnvelope(after, kind, action, defaultDomain) {
     return false;
   }
   if (isNoOp(action)) {
-    if (
-      !finalExactKeys(after.output, ["properties"]) ||
-      !isObject(after.output.properties)
-    ) {
-      return false;
-    }
     if (kind === "app") {
+      if (
+        !finalExactKeys(after.output, ["properties"]) ||
+        !isObject(after.output.properties)
+      ) {
+        return false;
+      }
       const output = after.output.properties;
       if (
         !finalExactKeys(output, [
@@ -2755,9 +2852,91 @@ function finalAzapiProviderEnvelope(after, kind, action, defaultDomain) {
       ) {
         return false;
       }
+    } else if (!finalHasExactJobProviderOutput(after.output, after, context)) {
+      return false;
     }
   }
   return true;
+}
+
+function finalRecursiveDifferencePaths(before, after, path = "") {
+  if (isDeepStrictEqual(before, after)) {
+    return [];
+  }
+  if (isObject(before) && isObject(after)) {
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    return [...keys].sort().flatMap((key) => {
+      const childPath = path ? `${path}.${key}` : key;
+      if (!Object.hasOwn(before, key) || !Object.hasOwn(after, key)) {
+        return [childPath];
+      }
+      return finalRecursiveDifferencePaths(before[key], after[key], childPath);
+    });
+  }
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const length = Math.max(before.length, after.length);
+    return [...Array(length).keys()].flatMap((index) => {
+      const childPath = `${path}[${index}]`;
+      if (index >= before.length || index >= after.length) {
+        return [childPath];
+      }
+      return finalRecursiveDifferencePaths(before[index], after[index], childPath);
+    });
+  }
+  return [path];
+}
+
+function finalHasExactTransitionContainerAppPrior(resourceChange) {
+  if (!isUpdate(resourceChange.change.actions)) {
+    return true;
+  }
+  const before = resourceChange.change.before;
+  const after = resourceChange.change.after;
+  const expectedDifferences = [
+    "body.properties.template.containers[1].resources.cpu",
+    "body.properties.template.containers[1].resources.memory",
+    "output",
+  ];
+  if (
+    !isObject(before) ||
+    !isObject(after) ||
+    !isDeepStrictEqual(
+      finalRecursiveDifferencePaths(before, after),
+      expectedDifferences,
+    )
+  ) {
+    return false;
+  }
+
+  const beforeContainers = before.body?.properties?.template?.containers;
+  const afterContainers = after.body?.properties?.template?.containers;
+  if (
+    !Array.isArray(beforeContainers) ||
+    !Array.isArray(afterContainers) ||
+    beforeContainers.length !== 2 ||
+    afterContainers.length !== 2
+  ) {
+    return false;
+  }
+
+  const beforeRelay = beforeContainers[0];
+  const afterRelay = afterContainers[0];
+  const beforeLiteLLM = beforeContainers[1];
+  const afterLiteLLM = afterContainers[1];
+  return (
+    hasExactKeys(beforeRelay?.resources, ["cpu", "memory"]) &&
+    hasExactKeys(afterRelay?.resources, ["cpu", "memory"]) &&
+    beforeRelay.resources.cpu === 0.25 &&
+    beforeRelay.resources.memory === "0.5Gi" &&
+    afterRelay.resources.cpu === 0.25 &&
+    afterRelay.resources.memory === "0.5Gi" &&
+    hasExactKeys(beforeLiteLLM?.resources, ["cpu", "memory"]) &&
+    hasExactKeys(afterLiteLLM?.resources, ["cpu", "memory"]) &&
+    beforeLiteLLM.resources.cpu === 0.25 &&
+    beforeLiteLLM.resources.memory === "0.5Gi" &&
+    afterLiteLLM.resources.cpu === 0.75 &&
+    afterLiteLLM.resources.memory === "1.5Gi"
+  );
 }
 
 function finalNormalizedAppContractChange(resourceChange) {
@@ -2925,8 +3104,10 @@ function finalHasExactAlert(resourceChange) {
   const key = resourceChange?.index;
   const contract = FINAL_ALERT_CONTRACTS.get(key);
   const after = resourceChange?.change?.after;
+  const referenceAfter = FINAL_REFERENCE_CHANGES.get(resourceChange.address)?.change
+    ?.after;
   const noOp = isNoOp(resourceChange?.change?.actions);
-  if (!contract) {
+  if (!contract || !referenceAfter) {
     return false;
   }
   const expectedName = `${FINAL_APPLICATION_INSIGHTS_NAME}-${key.replaceAll("_", "-")}`;
@@ -2976,7 +3157,7 @@ function finalHasExactAlert(resourceChange) {
     finalExactKeys(action.custom_properties, ["service", "signal"]) &&
     action.custom_properties.service === "relay" &&
     action.custom_properties.signal === key &&
-    action.email_subject === null &&
+    action.email_subject === referenceAfter.action[0].email_subject &&
     after.auto_mitigation_enabled === true &&
     Array.isArray(after.criteria) &&
     after.criteria.length === 1 &&
@@ -3003,7 +3184,7 @@ function finalHasExactAlert(resourceChange) {
     criteria.metric_measure_column === "SignalValue" &&
     criteria.operator === "GreaterThanOrEqual" &&
     criteria.query === contract.query &&
-    criteria.resource_id_column === null &&
+    criteria.resource_id_column === referenceAfter.criteria[0].resource_id_column &&
     criteria.threshold === contract.threshold &&
     criteria.time_aggregation_method === contract.aggregation &&
     after.description === contract.description &&
@@ -3013,20 +3194,21 @@ function finalHasExactAlert(resourceChange) {
     Array.isArray(after.identity) &&
     after.identity.length === 0 &&
     after.location === "eastus2" &&
-    after.mute_actions_after_alert_duration === null &&
+    after.mute_actions_after_alert_duration ===
+      referenceAfter.mute_actions_after_alert_duration &&
     after.name === expectedName &&
-    after.query_time_range_override === null &&
+    after.query_time_range_override === referenceAfter.query_time_range_override &&
     after.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
     isDeepStrictEqual(after.scopes, [FINAL_WORKSPACE_ID]) &&
     after.severity === contract.severity &&
     after.skip_query_validation === false &&
     hasExactFinalTags(after.tags) &&
-    after.target_resource_types === null &&
+    isDeepStrictEqual(after.target_resource_types, []) &&
     after.timeouts === null &&
     after.window_duration === "PT15M" &&
     after.workspace_alerts_storage_enabled === false &&
     (!noOp ||
-      (after.created_with_api_version === FINAL_ALERT_API_VERSION &&
+      (after.created_with_api_version === referenceAfter.created_with_api_version &&
         after.id === finalAlertId(expectedName) &&
         after.is_a_legacy_log_analytics_rule === false &&
         after.is_workspace_alerts_storage_configured === false))
@@ -3150,30 +3332,39 @@ function finalHasExactTopology(plan, changesByAddress, context, images) {
     return false;
   }
 
+  const appProvider = finalAzapiProviderEnvelope(
+    app.change.after,
+    "app",
+    app.change.actions,
+    defaultDomain,
+    context,
+  );
+  const appContract = hasExactFinalContainerApp(
+    finalNormalizedAppContractChange(app),
+    images,
+    context.runtimeClient,
+  );
+  const appPriorContract = finalHasExactTransitionContainerAppPrior(app);
+  const jobProvider = finalAzapiProviderEnvelope(
+    job.change.after,
+    "job",
+    job.change.actions,
+    defaultDomain,
+    context,
+  );
+  const jobContract = hasExactFinalCleanupJob(
+    finalNormalizedJobContractChange(job),
+    images,
+    context.runtimeClient,
+    plan.planned_values.outputs.relay_origin.value,
+  );
+  const criticalBindings = finalCriticalBindings(plan, changesByAddress);
   if (
-    !finalAzapiProviderEnvelope(
-      app.change.after,
-      "app",
-      app.change.actions,
-      defaultDomain,
-    ) ||
-    !hasExactFinalContainerApp(
-      finalNormalizedAppContractChange(app),
-      images,
-      context.runtimeClient,
-    ) ||
-    !finalAzapiProviderEnvelope(
-      job.change.after,
-      "job",
-      job.change.actions,
-      defaultDomain,
-    ) ||
-    !hasExactFinalCleanupJob(
-      finalNormalizedJobContractChange(job),
-      images,
-      context.runtimeClient,
-      plan.planned_values.outputs.relay_origin.value,
-    )
+    !appProvider ||
+    !appContract ||
+    !appPriorContract ||
+    !jobProvider ||
+    !jobContract
   ) {
     return false;
   }
@@ -3184,7 +3375,7 @@ function finalHasExactTopology(plan, changesByAddress, context, images) {
     appContainers[1].name === "litellm" &&
     appContainers[1].env[1]?.name === "PALANCAR_LITELLM_UPSTREAM_MODEL" &&
     appContainers[1].env[1]?.value === FINAL_GENERATION_MODEL &&
-    finalCriticalBindings(plan, changesByAddress)
+    criticalBindings
   );
 }
 
@@ -3320,24 +3511,34 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
     const change = resourceChange.change;
     const action = change.actions;
     const expectedOuter = FINAL_REFERENCE_CHANGES.get(address);
-    if (
-      !finalExactKeys(resourceChange, Object.keys(expectedOuter)) ||
-      !Object.keys(expectedOuter).every(
+    const outerMatch =
+      finalExactKeys(resourceChange, Object.keys(expectedOuter)) &&
+      Object.keys(expectedOuter).every(
         (key) =>
           key === "change" ||
           isDeepStrictEqual(resourceChange[key], expectedOuter[key]),
-      ) ||
-      !finalExactKeys(change, finalChangeEnvelopeKeys(resourceChange)) ||
-      !finalActionAllowed(resourceChange, priorResources) ||
-      !isObject(change.after) ||
-      !isDeepStrictEqual(
-        change.after_unknown,
-        finalExpectedAfterUnknown(resourceChange),
-      ) ||
-      !isDeepStrictEqual(
-        change.after_sensitive,
-        finalExpectedAfterSensitive(resourceChange),
-      )
+      );
+    const envelopeMatch = finalExactKeys(
+      change,
+      finalChangeEnvelopeKeys(resourceChange),
+    );
+    const actionAllowed = finalActionAllowed(resourceChange, priorResources);
+    const afterObject = isObject(change.after);
+    const unknownMatch = isDeepStrictEqual(
+      change.after_unknown,
+      finalExpectedAfterUnknown(resourceChange),
+    );
+    const sensitiveMatch = isDeepStrictEqual(
+      change.after_sensitive,
+      finalExpectedAfterSensitive(resourceChange),
+    );
+    if (
+      !outerMatch ||
+      !envelopeMatch ||
+      !actionAllowed ||
+      !afterObject ||
+      !unknownMatch ||
+      !sensitiveMatch
     ) {
       return false;
     }
@@ -3353,12 +3554,12 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
         return false;
       }
     } else {
-      if (
-        !prior ||
-        !isObject(change.before) ||
-        !isDeepStrictEqual(prior.values, change.before) ||
-        !isDeepStrictEqual(prior.sensitive_values, change.before_sensitive)
-      ) {
+      const priorMatch =
+        Boolean(prior) &&
+        isObject(change.before) &&
+        isDeepStrictEqual(prior.values, change.before) &&
+        isDeepStrictEqual(prior.sensitive_values, change.before_sensitive);
+      if (!priorMatch) {
         return false;
       }
       if (isNoOp(action) && !isDeepStrictEqual(change.before, change.after)) {
@@ -3372,19 +3573,17 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
       }
     }
 
-    if (
-      !finalResourceEnvelopeMatches(planned, resourceChange, "planned", {
+    const plannedEnvelopeIsCoherent = finalResourceEnvelopeMatches(planned, resourceChange, "planned", {
         values: change.after,
         map: change.after_sensitive,
         identity: change.after_identity,
-      }) ||
-      (!isCreate(action) &&
-        !finalResourceEnvelopeMatches(prior, resourceChange, "prior", {
+      });
+    const priorEnvelopeIsIncoherent = !isCreate(action) && !finalResourceEnvelopeMatches(prior, resourceChange, "prior", {
           values: change.before,
           map: change.before_sensitive,
           identity: change.before_identity,
-        }))
-    ) {
+    });
+    if (!plannedEnvelopeIsCoherent || priorEnvelopeIsIncoherent) {
       return false;
     }
 
@@ -3602,17 +3801,8 @@ function finalHasExactOutputs(plan) {
   return hasExactKeys(prior, expectedPriorNames);
 }
 
-function finalHasExactChecks(checks, monitoringRoleCreate) {
-  const passingChecks = structuredClone(FINAL_REFERENCE_PLAN.checks);
-  for (const check of passingChecks) {
-    if (check.status === "unknown") check.status = "pass";
-    for (const instance of check.instances ?? []) {
-      if (instance.status === "unknown") instance.status = "pass";
-    }
-  }
-  return monitoringRoleCreate
-    ? isDeepStrictEqual(checks, FINAL_REFERENCE_PLAN.checks)
-    : isDeepStrictEqual(checks, passingChecks);
+function finalHasExactChecks(checks) {
+  return isDeepStrictEqual(checks, FINAL_REFERENCE_PLAN.checks);
 }
 
 function finalHasExactPlanSections(plan) {
@@ -3654,9 +3844,6 @@ function acceptsFinalRolloutV2(plan, changes) {
     return false;
   }
 
-  const monitoringRoleCreate = isCreate(
-    changesByAddress.get(FINAL_MONITORING_ROLE_ASSIGNMENT)?.change?.actions,
-  );
   const transitionActions = [...changesByAddress].every(
     ([address, entry]) =>
       isDeepStrictEqual(
@@ -3682,7 +3869,7 @@ function acceptsFinalRolloutV2(plan, changes) {
   if (!outputActionsMatch) {
     return false;
   }
-  if (!finalHasExactChecks(plan.checks, monitoringRoleCreate)) {
+  if (!finalHasExactChecks(plan.checks)) {
     return false;
   }
 
@@ -3714,11 +3901,13 @@ function acceptsFinalRolloutV2(plan, changes) {
     runtimePrincipal: runtimeIdentity.principal_id,
     runtimeClient: runtimeIdentity.client_id,
     imagePullPrincipal: imagePullIdentity.principal_id,
+    imagePullClient: imagePullIdentity.client_id,
   };
   if (
     !finalUuid(context.runtimePrincipal) ||
     !finalUuid(context.runtimeClient) ||
     !finalUuid(context.imagePullPrincipal) ||
+    !finalUuid(context.imagePullClient) ||
     !finalUuid(context.cliPrincipal) ||
     new Set([
       context.operatorPrincipal,

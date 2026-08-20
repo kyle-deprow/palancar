@@ -6,10 +6,10 @@ Date: 2026-08-19
 ## Objective
 
 Add a new fail-closed `final-rollout` mode to the native development Terraform
-saved-plan guard. This mode protects the one reviewed rollout that replaces the
-old mock Container App revision with the final Azure Realtime relay, OpenRouter
-LiteLLM sidecar, and scheduled expiry-cleanup Job while retaining the already
-deployed pinned transcription model.
+saved-plan guard. This mode protects the resource-only LiteLLM OOM remediation
+that retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
+expiry-cleanup Job, action group, and six scheduled-query alerts while
+retaining the already deployed pinned transcription model.
 
 The existing `model-spike`, `full-deploy`, and `runtime-rollout` behavior must
 remain unchanged. `final-rollout` is a new mode, not an alias and not a relaxed
@@ -23,9 +23,11 @@ The implementation worker owns only:
 - `infra/scripts/assert-dev-plan.test.mjs`
 - `infra/scripts/fixtures/final-rollout-transition.plan-fixture.json`
 - `infra/README.md`
+- `docs/final-rollout-guard-plan.md`
+- `docs/litellm-oom-remediation-plan.md`
 
-This plan is read-only. All other files, live Terraform inputs/state, Azure
-resources, credentials, images, and application code are out of scope.
+All other files, live Terraform inputs/state, Azure resources, credentials,
+images, and application code are out of scope.
 
 ## Exact accepted topology
 
@@ -34,28 +36,35 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
 - `format_version` is exactly the already-supported version; all Terraform
   checks pass; there is no deferred change, unknown security-relevant value,
   duplicate resource address, delete, replacement, import, or unrelated
-  mutation. The initial transition may contain exactly the one reviewed
-  pre-existing Container App drift recorded by the genuine refreshed plan:
-  Azure-normalized identity path/HTTP transport casing and the old LiteLLM
-  probe ordering/initial-delay placement. That drift is accepted only when the
-  same resource's planned update has the complete exact final after-state; all
-  other drift and all idempotent-plan drift are rejected.
+  mutation. The initial transition contains exactly six reviewed provider
+  normalizations at the scheduled-query alert instances. Each corresponding
+  resource change remains no-op, and each drift envelope is accepted only when
+  its sole recursive value difference is prior `target_resource_types = null`
+  to refreshed `target_resource_types = []`; all other drift and all
+  idempotent-plan drift are rejected.
 - Every configured foundation resource is present in `resource_changes` as
   no-op, including the resource group, budget, observability, Tables/storage,
   ACR, Container Apps environment, Foundry account, identities, Key Vault, and
   all existing role assignments.
-- The initial transition contains exactly 39 managed resource changes: 29
-  no-op, the one Container App update, and exactly nine creates (Monitoring
-  Metrics Publisher assignment, cleanup Job, root relay action group, and six
-  scheduled-query alerts). The action group is enabled/global/tagged, contains
-  exactly one common-schema email receiver per sorted synthetic fixture budget
-  contact under non-PII ordinal names, and has no other receiver type. Its
-  deterministic plan-known ARM ID is cross-bound to the root output and every
-  alert action list. All four budget notification lists, the action-group
-  receivers, and `budget_contact_emails` contain the same contact set. Every
-  alert has the exact committed KQL, threshold, severity, aggregation, periods,
-  action group, static properties, and no dimensions. Initial action group and
-  alerts are create-only; they are no-op in the idempotent form.
+- The initial transition contains exactly 39 managed resource changes: 38
+  no-ops and one update at
+  `module.container_app_workload[0].azapi_resource.this`; there are no creates.
+  It is resource-only: LiteLLM changes from 0.25 CPU/0.5Gi to 0.75 CPU/1.5Gi,
+  relay remains 0.25 CPU/0.5Gi, and the aggregate is exactly 1 CPU/2Gi. The
+  already deployed cleanup Job, action group, and six scheduled-query alerts
+  remain no-op. The transition contains exactly six one-time provider
+  normalizations, one for each scheduled-query alert: the corresponding
+  resource change is no-op and the sole recursive value difference in each
+  drift envelope is `target_resource_types` from prior `null` to refreshed `[]`.
+  The action group is enabled/global/tagged, contains exactly one common-schema
+  email receiver per sorted synthetic fixture budget contact under non-PII
+  ordinal names, and has no other receiver type. Its deterministic plan-known
+  ARM ID is cross-bound to the root output and every alert action list. All four
+  budget notification lists, the action-group receivers, and
+  `budget_contact_emails` contain the same contact set. Every alert has the
+  exact committed KQL, threshold, severity, aggregation, periods, action group,
+  static properties, and no dimensions. The idempotent form requires all 39
+  resources and all outputs to be no-op, all 101 checks to pass, and zero drift.
 - `foundry_deployments` is exactly the one pinned
   `gpt-4o-mini-transcribe` deployment: model/version `2025-12-15`, format
   `OpenAI`, SKU `GlobalStandard`, capacity `1`, and `NoAutoUpgrade`.
@@ -66,15 +75,15 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   `openrouter/openai/gpt-5.6-luna`; the Container App sidecar environment and
   root plan variable must match that value exactly.
 - The Monitoring Metrics Publisher assignment for the runtime identity at the
-  exact Application Insights component scope is present exactly once. It may
-  be create only when absent from prior state, otherwise no-op. Its deterministic
-  UUIDv5 name, canonical role definition ID, principal, principal type, and
-  exact scope must be validated without accepting unknown values.
-- Both existing table-scoped operator assignments follow the same create-if-
-  absent/no-op-if-present rule already validated by `runtime-rollout`, and both
-  resolve to the same Table service.
-- The Container App resource is present exactly once and may create, update, or
-  no-op. Its complete after-state exactly matches the committed final module:
+  exact Application Insights component scope is present exactly once and is
+  no-op in this transition. Its deterministic UUIDv5 name, canonical role
+  definition ID, principal, principal type, and exact scope must be validated
+  without accepting unknown values.
+- Both existing table-scoped operator assignments are present exactly once and
+  are no-op in this transition; both resolve to the same Table service.
+- The Container App resource is present exactly once and is the sole update in
+  the transition, then no-op in the idempotent form. Its complete after-state
+  exactly matches the committed final module:
   two distinct user-assigned identities with image-pull lifecycle `None` and
   runtime lifecycle `Main`; ACR registry through image-pull identity; external
   secure HTTP ingress to relay port 8787; single revision and 100% latest
@@ -95,7 +104,8 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   `palancar-relay`, `palancar-litellm-proxy`, and
   `palancar-expiry-cleanup`. The Container App/Job images must equal those
   variable values exactly.
-- The expiry-cleanup Job is present exactly once and may create or no-op. Its
+- The expiry-cleanup Job is present exactly once and is no-op in this
+  remediation. Its
   complete after-state exactly matches the committed module: API type and
   canonical name/location/parent/tags; two identities with the same lifecycle
   split; same ACR/image-pull identity; no secrets; schedule `0 3 * * *`, one
@@ -110,13 +120,9 @@ containers, environments, secrets, registries, identities, probes, ports,
 resources, role assignments, model deployments, or mutable/foreign images are
 rejected. Unknowns fail closed.
 
-The transition may contain exactly two `unknown` checks only while the exact
-Monitoring Metrics Publisher assignment is being created:
-`module.container_app_workload.azapi_resource.this` and
-`module.container_app_workload.var.runtime_monitoring_metrics_publisher_role_assignment_id`,
-with their exact indexed instance addresses. Their underlying role and app
-contracts are independently validated. All other unknown checks reject; the
-idempotent form requires every check to pass.
+The transition requires exactly 101 passing checks and no unknown checks. Any
+failed, unknown, altered, duplicated, omitted, or additional check rejects;
+the idempotent form requires the same all-pass check envelope.
 
 ## Tests
 

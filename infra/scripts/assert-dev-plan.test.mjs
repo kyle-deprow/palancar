@@ -29,6 +29,8 @@ const operatorSecurityRoleAddress =
   "module.identities_rbac.azurerm_role_assignment.operator_security_table";
 const operatorRateRoleAddress =
   "module.identities_rbac.azurerm_role_assignment.operator_rate_table";
+const cliRoleAddress =
+  "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer";
 const OPERATOR_ROLE_ASSIGNMENTS_FOR_TEST = new Set([
   operatorSecurityRoleAddress,
   operatorRateRoleAddress,
@@ -1145,96 +1147,27 @@ function finalRolloutPlan({ idempotent = false } = {}) {
   if (!idempotent) return planValue;
 
   planValue.resource_drift = [];
-  for (const check of planValue.checks) {
-    if (check.status === "unknown") check.status = "pass";
-    for (const instance of check.instances ?? []) {
-      if (instance.status === "unknown") instance.status = "pass";
-    }
-  }
 
   const appEntry = finalChange(planValue, containerAppAddress);
   const appAfter = clone(appEntry.change.after);
   appAfter.output = clone(appEntry.change.before.output);
   finalMakeResourceNoOp(planValue, containerAppAddress, appAfter);
 
-  const jobEntry = finalChange(planValue, finalCleanupJobAddress);
-  const jobAfter = clone(jobEntry.change.after);
-  jobAfter.id = `${finalResourceGroupId}/providers/Microsoft.App/jobs/${jobAfter.name}`;
-  jobAfter.identity[0].principal_id = "";
-  jobAfter.identity[0].tenant_id = "";
-  jobAfter.output = { properties: {} };
-  finalMakeResourceNoOp(planValue, finalCleanupJobAddress, jobAfter);
-
-  const monitoringAddress =
-    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights";
-  const monitoringEntry = finalChange(planValue, monitoringAddress);
-  const monitoringCreate = monitoringEntry.change.after;
-  const monitoringAfter = {
-    condition: "",
-    condition_version: "",
-    delegated_managed_identity_resource_id: "",
-    description: "",
-    id: `${monitoringCreate.scope}/providers/Microsoft.Authorization/roleAssignments/${monitoringCreate.name}`,
-    name: monitoringCreate.name,
-    principal_id: monitoringCreate.principal_id,
-    principal_type: monitoringCreate.principal_type,
-    role_definition_id: monitoringCreate.role_definition_id,
-    role_definition_name: "Monitoring Metrics Publisher",
-    scope: monitoringCreate.scope,
-    skip_service_principal_aad_check: null,
-    timeouts: null,
-  };
-  finalMakeResourceNoOp(planValue, monitoringAddress, monitoringAfter);
-
-  const actionGroupAfter = clone(
-    finalChange(planValue, finalActionGroupAddress).change.after,
-  );
-  actionGroupAfter.id = finalActionGroupId;
-  finalMakeResourceNoOp(planValue, finalActionGroupAddress, actionGroupAfter);
-
-  const alertIds = {};
-  for (const address of finalAlertAddresses) {
-    const entry = finalChange(planValue, address);
-    const alertAfter = clone(entry.change.after);
-    alertAfter.created_with_api_version = "2023-12-01";
-    alertAfter.id =
-      `${finalResourceGroupId}/providers/Microsoft.Insights/scheduledQueryRules/${alertAfter.name}`;
-    alertAfter.is_a_legacy_log_analytics_rule = false;
-    alertAfter.is_workspace_alerts_storage_configured = false;
-    alertIds[entry.index] = alertAfter.id;
-    finalMakeResourceNoOp(planValue, address, alertAfter);
-  }
-
-  const knownOutputs = {
-    expiry_cleanup_job_id: jobAfter.id,
-    relay_alert_rule_ids: alertIds,
-    runtime_application_insights_role_assignment_id: monitoringAfter.id,
-    relay_latest_revision_name: appAfter.output.properties.latestRevisionName,
-  };
   for (const [name, outputChange] of Object.entries(planValue.output_changes)) {
-    const plannedDescriptor = planValue.planned_values.outputs[name];
-    const value = Object.hasOwn(knownOutputs, name)
-      ? knownOutputs[name]
-      : outputChange.after;
+    const value =
+      name === "relay_latest_revision_name"
+        ? appAfter.output.properties.latestRevisionName
+        : outputChange.after;
     outputChange.actions = ["no-op"];
     outputChange.before = clone(value);
     outputChange.after = clone(value);
     outputChange.after_unknown = false;
     outputChange.before_sensitive = outputChange.after_sensitive;
-    planValue.planned_values.outputs[name] = {
-      sensitive: outputChange.after_sensitive,
-      type:
-        name === "relay_alert_rule_ids"
-          ? [
-              "object",
-              Object.fromEntries(Object.keys(alertIds).map((key) => [key, "string"])),
-            ]
-          : (plannedDescriptor.type ?? "string"),
-      value: clone(value),
-    };
-    planValue.prior_state.values.outputs[name] = clone(
-      planValue.planned_values.outputs[name],
-    );
+    const descriptor = planValue.planned_values.outputs[name];
+    descriptor.sensitive = outputChange.after_sensitive;
+    descriptor.type ??= "string";
+    descriptor.value = clone(value);
+    planValue.prior_state.values.outputs[name] = clone(descriptor);
   }
   return planValue;
 }
@@ -1279,6 +1212,34 @@ function mutateFinalAfterCoherently(planValue, address, mutate) {
     );
     prior.values = clone(entry.change.after);
   }
+}
+
+function mutateFinalTransitionPriorCoherently(planValue, mutate) {
+  const entry = finalChange(planValue, containerAppAddress);
+  assert.deepEqual(entry.change.actions, ["update"]);
+  mutate(entry.change.before);
+  const prior = finalValueResource(
+    planValue.prior_state.values.root_module,
+    containerAppAddress,
+  );
+  prior.values = clone(entry.change.before);
+}
+
+function mutateFinalJobOutputNoOpCoherently(planValue, mutate) {
+  const entry = finalChange(planValue, finalCleanupJobAddress);
+  assert.deepEqual(entry.change.actions, ["no-op"]);
+  mutate(entry.change.after.output);
+  entry.change.before.output = clone(entry.change.after.output);
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    finalCleanupJobAddress,
+  );
+  planned.values.output = clone(entry.change.after.output);
+  const prior = finalValueResource(
+    planValue.prior_state.values.root_module,
+    finalCleanupJobAddress,
+  );
+  prior.values.output = clone(entry.change.after.output);
 }
 
 function setFinalNoOpOutputCoherently(planValue, name, value) {
@@ -1374,12 +1335,17 @@ test("final-rollout requires the unconditional 39-resource inventory and exact a
   assert.equal(
     valid.resource_changes.filter((entry) => entry.change.actions[0] === "no-op")
       .length,
-    29,
+    38,
   );
   assert.equal(
     valid.resource_changes.filter((entry) => entry.change.actions[0] === "create")
       .length,
-    9,
+    0,
+  );
+  assert.equal(
+    valid.resource_changes.filter((entry) => entry.change.actions[0] === "update")
+      .length,
+    1,
   );
   for (const omitted of valid.resource_changes) {
     rejectsFinalMutation((candidate) => {
@@ -1396,6 +1362,30 @@ test("final-rollout requires the unconditional 39-resource inventory and exact a
   rejectsFinalMutation((candidate) => {
     candidate.resource_changes.push(clone(candidate.resource_changes[0]));
   });
+});
+
+test("final-rollout rejects the superseded nine-create rollout vector", () => {
+  const candidate = finalRolloutPlan();
+  const createAddresses = new Set([
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+    finalCleanupJobAddress,
+    finalActionGroupAddress,
+    ...finalAlertAddresses,
+  ]);
+  for (const entry of candidate.resource_changes) {
+    if (createAddresses.has(entry.address)) entry.change.actions = ["create"];
+  }
+  assert.equal(
+    candidate.resource_changes.filter((entry) => entry.change.actions[0] === "no-op")
+      .length,
+    29,
+  );
+  assert.equal(
+    candidate.resource_changes.filter((entry) => entry.change.actions[0] === "create")
+      .length,
+    9,
+  );
+  assert.equal(acceptsPlan(candidate, "final-rollout"), false);
 });
 
 test("final-rollout validates and cross-binds the exact relay action group contacts", () => {
@@ -1463,7 +1453,7 @@ test("final-rollout validates and cross-binds the exact relay action group conta
       true;
   });
   rejectsFinalMutation((candidate) => {
-    finalChange(candidate, finalActionGroupAddress).change.actions = ["no-op"];
+    finalChange(candidate, finalActionGroupAddress).change.actions = ["update"];
   });
   rejectsFinalMutation(
     (candidate) => {
@@ -1473,14 +1463,10 @@ test("final-rollout validates and cross-binds the exact relay action group conta
   );
   rejectsFinalMutation(
     (candidate) => {
-      candidate.output_changes.relay_action_group_id = clone(
-        finalTransitionFixture.output_changes.relay_action_group_id,
-      );
-      candidate.planned_values.outputs.relay_action_group_id = clone(
-        finalTransitionFixture.planned_values.outputs.relay_action_group_id,
-      );
-      candidate.prior_state.values.outputs.relay_action_group_id = clone(
-        finalTransitionFixture.prior_state.values.outputs.relay_action_group_id,
+      setFinalNoOpOutputCoherently(
+        candidate,
+        "relay_action_group_id",
+        `${candidate.output_changes.relay_action_group_id.after}-other`,
       );
     },
     true,
@@ -1525,7 +1511,7 @@ test("final-rollout validates every exact scheduled-query alert contract", () =>
       finalChange(candidate, address).change.after_sensitive.extra = true;
     });
     rejectsFinalMutation((candidate) => {
-      finalChange(candidate, address).change.actions = ["no-op"];
+      finalChange(candidate, address).change.actions = ["update"];
     });
     rejectsFinalMutation(
       (candidate) => {
@@ -1659,12 +1645,38 @@ test("final-rollout requires complete/applyable/non-errored Terraform 1.15.8 pla
 });
 
 test("final-rollout accepts only the exact reviewed transition drift and no idempotent drift", () => {
+  assert.equal(finalTransitionFixture.resource_drift.length, 6);
+  assert.equal(
+    finalTransitionFixture.resource_drift.every(
+      (entry) =>
+        entry.change.actions[0] === "update" &&
+        entry.change.before.target_resource_types === null &&
+        Array.isArray(entry.change.after.target_resource_types) &&
+        entry.change.after.target_resource_types.length === 0,
+    ),
+    true,
+  );
   rejectsFinalMutation((candidate) => { candidate.resource_drift = []; });
   rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.after.body.properties.configuration.ingress.transport = "Tcp";
+    candidate.resource_drift[0].change.after.criteria[0].threshold += 1;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift[0].change.before.target_resource_types = [];
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift[0].change.after.target_resource_types = null;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift[0].change.after.extra = null;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift[0].change.actions = ["no-op"];
   });
   rejectsFinalMutation((candidate) => {
     candidate.resource_drift.push(clone(candidate.resource_drift[0]));
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift.reverse();
   });
   rejectsFinalMutation(
     (candidate) => { candidate.resource_drift = clone(finalTransitionFixture.resource_drift); },
@@ -1760,6 +1772,44 @@ test("final-rollout validates every deterministic role assignment contract", () 
   });
 });
 
+test("v2 recomputes every synthetic-principal-dependent role UUID exactly", () => {
+  const roleInputs = [
+    [operatorSecurityRoleAddress, (after) =>
+      `${after.scope}/operator/${after.principal_id}/${after.role_definition_id}`],
+    [operatorRateRoleAddress, (after) =>
+      `${after.scope}/operator/${after.principal_id}/${after.role_definition_id}`],
+    [cliRoleAddress, (after) =>
+      `${after.scope}/terraform-cli/${after.principal_id}/${after.role_definition_id}`],
+  ];
+  for (const [address, input] of roleInputs) {
+    const after = finalChange(finalTransitionFixture, address).change.after;
+    const expectedName = fixtureUuidV5Url(input(after));
+    assert.equal(after.name, expectedName);
+    assert.equal(
+      after.id,
+      `${after.scope}/providers/Microsoft.Authorization/roleAssignments/${expectedName}`,
+    );
+  }
+});
+
+test("final-rollout rejects a valid UUID with the wrong deterministic role name", () => {
+  rejectsFinalMutation((candidate) => {
+    const address = operatorSecurityRoleAddress;
+    mutateFinalAfterCoherently(candidate, address, (after) => {
+      const wrongName = fixtureUuidV5Url(
+        `${after.scope}/wrong-role/${after.role_definition_id}`,
+      );
+      after.name = wrongName;
+      after.id = `${after.scope}/providers/Microsoft.Authorization/roleAssignments/${wrongName}`;
+    });
+    setFinalNoOpOutputCoherently(
+      candidate,
+      "operator_security_table_role_assignment_id",
+      finalAfter(candidate, address).id,
+    );
+  });
+});
+
 test("final-rollout requires exact ordered identities, probes, ingress, containers, and scale", () => {
   const mutations = [
     (after) => { after.identity[0].identity_ids.reverse(); },
@@ -1798,6 +1848,51 @@ test("final-rollout requires exact ordered identities, probes, ingress, containe
         "/always-ready";
     });
   });
+});
+
+test("final-rollout pins the remediation resources and aggregate exactly", () => {
+  for (const resources of [
+    { cpu: 0.25, memory: "0.5Gi" },
+    { cpu: 0.5, memory: "1Gi" },
+    { cpu: 0.75, memory: "2Gi" },
+  ]) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+        after.body.properties.template.containers[1].resources = clone(resources);
+      });
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, containerAppAddress).change.before.body.properties.template.containers[1].resources.cpu = 0.5;
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.template.containers[0].resources.cpu = 0.5;
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.template.containers[1].extra = true;
+    });
+  });
+});
+
+test("final-rollout pins the complete prior Container App transition", () => {
+  const mutations = [
+    (before) => { before.body.properties.template.containers[1].resources.cpu = 0.5; },
+    (before) => { before.body.properties.template.containers[1].resources.memory = "1Gi"; },
+    (before) => { before.body.properties.template.containers[0].resources.cpu = 0.5; },
+    (before) => { before.body.properties.template.containers[0].resources.memory = "1Gi"; },
+    (before) => { before.body.properties.template.containers[0].probes[0].periodSeconds = 11; },
+    (before) => { before.body.properties.template.containers[0].image = "foreign.example.invalid/relay@sha256:" + "a".repeat(64); },
+    (before) => { before.body.properties.template.containers[0].env.push({ name: "EXTRA", value: "unexpected" }); },
+    (before) => { before.body.properties.configuration.ingress.targetPort = 4000; },
+  ];
+  for (const mutate of mutations) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalTransitionPriorCoherently(candidate, mutate);
+    });
+  }
 });
 
 test("final-rollout requires the complete relay and LiteLLM environments", () => {
@@ -1866,6 +1961,13 @@ test("final-rollout binds observability and Container Apps outputs exactly", () 
       connection.value = connection.value.replace(originalKey, rotatedKey);
     },
   );
+  mutateFinalTransitionPriorCoherently(rotatedKeyPlan, (before) => {
+    const env = before.body.properties.template.containers[0].env;
+    const connection = env.find(
+      (entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    );
+    connection.value = connection.value.replace(originalKey, rotatedKey);
+  });
   assert.equal(acceptsPlan(rotatedKeyPlan, "final-rollout"), true);
 
   rejectsFinalMutation((candidate) => {
@@ -1982,6 +2084,37 @@ test("final-rollout requires the exact expiry cleanup Job contract", () => {
   }
 });
 
+test("final-rollout requires the exact no-op Job provider output shape", () => {
+  const mutations = [
+    (output) => { output.properties.outboundIpAddresses[0] = "256.1.1.1"; },
+    (output) => { output.properties.outboundIpAddresses.push(output.properties.outboundIpAddresses[0]); },
+    (output) => { output.properties.outboundIpAddresses[0] = "2001:db8::1"; },
+    (output) => { output.properties.outboundIpAddresses = []; },
+    (output) => { output.identity.extra = {}; },
+    (output) => { delete output.identity.userAssignedIdentities; },
+    (output) => {
+      const identities = output.identity.userAssignedIdentities;
+      const firstId = Object.keys(identities)[0];
+      identities[`${firstId}-extra`] = clone(identities[firstId]);
+    },
+    (output) => {
+      const identities = output.identity.userAssignedIdentities;
+      const firstId = Object.keys(identities)[0];
+      identities[firstId].clientId = "00000000-0000-4000-8000-000000000099";
+    },
+    (output) => {
+      const identities = output.identity.userAssignedIdentities;
+      const firstId = Object.keys(identities)[0];
+      identities[firstId].principalId = "00000000-0000-4000-8000-000000000099";
+    },
+  ];
+  for (const mutate of mutations) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalJobOutputNoOpCoherently(candidate, mutate);
+    }, true);
+  }
+});
+
 test("final-rollout scans exact configuration, planned, prior, relevant, unknown, and sensitive sections", () => {
   const mutations = [
     (candidate) => { candidate.configuration.root_module.resources.push(clone(candidate.configuration.root_module.resources[0])); },
@@ -2095,11 +2228,11 @@ test("final-rollout enforces exact output action, prior, unknown, and sensitivit
     candidate.output_changes.acr_id.extra = true;
   });
   rejectsFinalMutation((candidate) => {
-    delete candidate.output_changes.relay_alert_rule_ids.after_unknown
-      .provider_failures;
+    candidate.output_changes.relay_alert_rule_ids.after.provider_failures =
+      "/foreign/rule";
   });
   rejectsFinalMutation((candidate) => {
-    candidate.output_changes.relay_alert_rule_ids.after_unknown.foreign = true;
+    candidate.output_changes.relay_alert_rule_ids.after_unknown = true;
   });
   rejectsFinalMutation(
     (candidate) => {
@@ -2116,52 +2249,34 @@ test("final-rollout enforces exact output action, prior, unknown, and sensitivit
   );
 });
 
-test("final-rollout permits only the two reviewed unknown check instances", () => {
-  const fixtureUnknowns = finalTransitionFixture.checks.filter(
-    (check) => check.status === "unknown",
-  );
-  assert.equal(fixtureUnknowns.length, 2);
-  assert.deepEqual(
-    fixtureUnknowns.map((check) => check.address.to_display),
-    [
-      "module.container_app_workload.azapi_resource.this",
-      "module.container_app_workload.var.runtime_monitoring_metrics_publisher_role_assignment_id",
-    ],
+test("final-rollout requires all 101 checks to pass with exact envelopes", () => {
+  assert.equal(finalTransitionFixture.checks.length, 101);
+  assert.equal(
+    finalTransitionFixture.checks.every(
+      (check) =>
+        check.status === "pass" &&
+        check.instances.every((instance) => instance.status === "pass"),
+    ),
+    true,
   );
   rejectsFinalMutation((candidate) => {
-    const check = candidate.checks.find((entry) => entry.status === "pass");
-    check.status = "unknown";
-    check.instances[0].status = "unknown";
+    candidate.checks[0].status = "unknown";
   });
   rejectsFinalMutation((candidate) => {
-    const check = candidate.checks.find((entry) => entry.status === "unknown");
-    check.address.to_display += "[0]";
-    check.instances[0].address.to_display += "[0]";
+    candidate.checks[0].instances[0].status = "fail";
   });
   rejectsFinalMutation((candidate) => {
-    const check = clone(candidate.checks.find((entry) => entry.status === "unknown"));
-    check.address.name = "unexpected";
-    check.address.to_display = "module.container_app_workload.var.unexpected";
-    check.instances[0].address.to_display =
-      "module.container_app_workload[0].var.unexpected";
-    candidate.checks.push(check);
+    candidate.checks.push(clone(candidate.checks[0]));
   });
   rejectsFinalMutation((candidate) => {
-    const check = candidate.checks.find((entry) => entry.status === "unknown");
-    check.status = "pass";
-    check.instances[0].status = "pass";
+    candidate.checks.reverse();
   });
   rejectsFinalMutation((candidate) => {
-    for (const check of candidate.checks) {
-      if (check.status === "unknown") check.status = "pass";
-      for (const instance of check.instances ?? []) {
-        if (instance.status === "unknown") instance.status = "pass";
-      }
-    }
+    candidate.checks[0].address.to_display += "[0]";
   });
   rejectsFinalMutation(
     (candidate) => {
-      candidate.checks = clone(finalTransitionFixture.checks);
+      candidate.checks[0].status = "unknown";
     },
     true,
   );
