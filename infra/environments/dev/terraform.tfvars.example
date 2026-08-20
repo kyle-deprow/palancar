@@ -23,9 +23,10 @@ foundry_deployments = {}
 # Do not commit the live principal ID.
 operator_principal_id = "00000000-0000-0000-0000-000000000000"
 
-# Optional relay workload. A deployed workload requires the exact single
-# transcription deployment shown below, three exact immutable images from the
-# same development ACR, and the complete OpenRouter sidecar configuration.
+# Optional relay workload. An enabled workload requires the exact pinned
+# transcription-plus-Luna two-deployment map shown below, three exact immutable
+# images from the same development ACR, and the complete OpenRouter sidecar
+# configuration.
 deploy_relay_workload       = false
 relay_image_digest          = ""
 expiry_cleanup_image_digest = ""
@@ -48,8 +49,8 @@ azure_api_base                 = ""
 azure_api_version              = ""
 
 # Final enabled workload example. Keep the model map exactly as shown; the
-# relay's fixed internal generation alias is palancar-generation and LiteLLM's
-# provider-prefixed upstream model uses the openrouter/openai convention.
+# relay's current runtime generation path remains the OpenRouter/LiteLLM
+# composition for this model-only bootstrap phase.
 # foundry_deployments = {
 #   "gpt-4o-mini-transcribe" = {
 #     model_name             = "gpt-4o-mini-transcribe"
@@ -57,6 +58,14 @@ azure_api_version              = ""
 #     model_format           = "OpenAI"
 #     sku_name               = "GlobalStandard"
 #     capacity               = 1
+#     version_upgrade_option = "NoAutoUpgrade"
+#   }
+#   "gpt-5.6-luna" = {
+#     model_name             = "gpt-5.6-luna"
+#     model_version          = "2026-07-09"
+#     model_format           = "OpenAI"
+#     sku_name               = "GlobalStandard"
+#     capacity               = 1013
 #     version_upgrade_option = "NoAutoUpgrade"
 #   }
 # }

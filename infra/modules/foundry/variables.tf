@@ -37,7 +37,8 @@ variable "deployments" {
   validation {
     condition = alltrue([
       for deployment_name, deployment in var.deployments :
-      can(regex("^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$", deployment_name)) &&
+      length(deployment_name) <= 64 &&
+      can(regex("^[a-z0-9](?:[a-z0-9]*[.-][a-z0-9]+)*[a-z0-9]*$", deployment_name)) &&
       trimspace(deployment.model_name) != "" &&
       trimspace(deployment.model_version) != "" &&
       deployment.model_format == "OpenAI" &&

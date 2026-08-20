@@ -47,5 +47,13 @@ locals {
       capacity               = 1
       version_upgrade_option = "NoAutoUpgrade"
     }
+    "gpt-5.6-luna" = {
+      model_name             = "gpt-5.6-luna"
+      model_version          = "2026-07-09"
+      model_format           = "OpenAI"
+      sku_name               = "GlobalStandard"
+      capacity               = 1013
+      version_upgrade_option = "NoAutoUpgrade"
+    }
   })
 }

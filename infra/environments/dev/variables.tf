@@ -171,6 +171,8 @@ variable "foundry_deployments" {
   validation {
     condition = alltrue([
       for deployment_name, deployment in var.foundry_deployments :
+      length(deployment_name) <= 64 &&
+      can(regex("^[a-z0-9](?:[a-z0-9]*[.-][a-z0-9]+)*[a-z0-9]*$", deployment_name)) &&
       trimspace(deployment_name) != "" &&
       trimspace(deployment.model_name) != "" &&
       trimspace(deployment.model_version) != "" &&
@@ -180,7 +182,7 @@ variable "foundry_deployments" {
       deployment.capacity == floor(deployment.capacity) &&
       deployment.version_upgrade_option == "NoAutoUpgrade"
     ])
-    error_message = "Each deployment requires nonempty names/version, OpenAI format, GlobalStandard SKU, positive integer capacity, and NoAutoUpgrade."
+    error_message = "Each deployment name must be at most 64 characters and use canonical lowercase alphanumeric segments separated only by single dots or hyphens; each deployment also requires nonempty model/version, OpenAI format, GlobalStandard SKU, positive integer capacity, and NoAutoUpgrade."
   }
 }
 

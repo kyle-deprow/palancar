@@ -84,7 +84,7 @@ resource "azurerm_resource_group" "foundation" {
       condition = !var.deploy_relay_workload || (
         var.foundry_deployments == local.required_foundry_deployments
       )
-      error_message = "A deployed relay requires exactly the pinned gpt-4o-mini-transcribe Foundry deployment: version 2025-12-15, OpenAI, GlobalStandard, capacity 1, and NoAutoUpgrade."
+      error_message = "A deployed relay requires var.foundry_deployments to equal exactly the two-entry map of pinned gpt-4o-mini-transcribe and gpt-5.6-luna Foundry deployments: transcription version 2025-12-15 and Luna version 2026-07-09, both OpenAI GlobalStandard with capacities 1 and 1013 respectively, and NoAutoUpgrade."
     }
 
     precondition {

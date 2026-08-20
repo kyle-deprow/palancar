@@ -53,6 +53,333 @@ variables {
   azure_api_version             = ""
 }
 
+run "relay_accepts_exact_foundry_deployments" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1013
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  assert {
+    condition     = local.required_foundry_deployments == var.foundry_deployments
+    error_message = "relay-enabled plans must compare against the exact two-entry Foundry deployment contract"
+  }
+}
+
+run "relay_rejects_missing_luna" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_extra_deployment" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1013
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-4o-mini-transcribe-extra" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 2
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_luna_capacity_1000" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1000
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_luna_capacity_1012" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1012
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_luna_capacity_1014" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1014
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_wrong_luna_version" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-01-01"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1013
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [azurerm_resource_group.foundation]
+}
+
+run "relay_rejects_wrong_luna_sku" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "Standard"
+        capacity               = 1013
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [var.foundry_deployments]
+}
+
+run "relay_rejects_wrong_luna_upgrade_option" {
+  command = plan
+
+  variables {
+    foundry_deployments = {
+      "gpt-4o-mini-transcribe" = {
+        model_name             = "gpt-4o-mini-transcribe"
+        model_version          = "2025-12-15"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1
+        version_upgrade_option = "NoAutoUpgrade"
+      }
+      "gpt-5.6-luna" = {
+        model_name             = "gpt-5.6-luna"
+        model_version          = "2026-07-09"
+        model_format           = "OpenAI"
+        sku_name               = "GlobalStandard"
+        capacity               = 1013
+        version_upgrade_option = "Once"
+      }
+    }
+    deploy_relay_workload         = true
+    relay_image_digest            = "palancardevacrtest1234.azurecr.io/palancar-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    expiry_cleanup_image_digest   = "palancardevacrtest1234.azurecr.io/palancar-expiry-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    enable_litellm_sidecar        = true
+    litellm_image_digest          = "palancardevacrtest1234.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    litellm_backend               = "openrouter"
+    litellm_upstream_model        = "openrouter/openai/gpt-5.6-luna"
+    openrouter_api_key_secret_url = "https://vault.synthetic.invalid/secrets/openrouter-api-key"
+    litellm_master_key_secret_url = "https://vault.synthetic.invalid/secrets/litellm-master-key"
+  }
+
+  expect_failures = [var.foundry_deployments]
+}
+
 run "relay_action_group_contract_is_exact" {
   command = plan
 
