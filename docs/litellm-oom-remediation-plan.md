@@ -74,7 +74,9 @@ fixture. The `relay_latest_revision_name` output becomes unknown. The genuine
 transition has zero resource drift, represented by the omitted
 `resource_drift` envelope. The subsequent idempotent form requires all 39
 resources and all outputs to be no-op, all 101 checks to pass with no unknown
-checks, and zero resource drift.
+checks, and zero resource drift. The transition has `applyable=true`; the
+terminal no-op plan has `applyable=false`, is guard-only verification evidence,
+and must never be applied.
 
 The parent creates a coherent sanitized copy from that genuine plan. A second
 bounded worker may then edit only:
@@ -102,5 +104,6 @@ Terraform gates, immediate verification of the approved saved-binary hash, a
 guard-approved exact saved binary, exact binary apply, a ready Azure revision,
 real deployed OpenRouter inference, cleanup/telemetry/security smoke, and a
 fresh guarded all-no-op plan with 39 no-op resources, zero drift, and 101
-passing checks. Native Azure working-set headroom under the 1.5 GiB bound must
-be measured after rollout.
+passing checks. That terminal plan must have `applyable=false` and must not be
+applied. Native Azure working-set headroom under the 1.5 GiB bound must be
+measured after rollout.

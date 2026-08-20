@@ -232,7 +232,9 @@ four budget notifications. Every alert is bound to that action group and must
 match the committed workspace scope, KQL, threshold, aggregation, severity,
 periods, properties, and provider envelope, with no dimensions. The idempotent
 form requires all 39 resources and all outputs to be no-op, all 101 checks to
-pass, and zero resource drift.
+pass, and zero resource drift. The reviewed transition has `applyable=true`.
+The terminal no-op plan has `applyable=false`; it is verification evidence only
+and must never be applied.
 
 The mode also requires the exact pinned Foundry deployment as a no-op, exact
 development ACR digests for the relay, LiteLLM proxy, and expiry-cleanup Job,
@@ -253,7 +255,8 @@ guarding and again immediately before applying it.
 
 After apply, generate a fresh complete plan and require 39 no-op resources,
 zero resource drift, and all 101 checks passing before treating the rollout as
-idempotent.
+idempotent. Guard that terminal plan, but never apply it: Terraform reports the
+genuine no-op envelope with `applyable=false`.
 
 ## State recovery verification
 

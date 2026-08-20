@@ -46,6 +46,9 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
 - The initial transition contains exactly 39 managed resource changes: 38
   no-ops and one update at
   `module.container_app_workload[0].azapi_resource.this`; there are no creates.
+  Its `applyable` value is exactly `true`. The mutually exclusive terminal
+  idempotent form has 39 no-op actions and `applyable=false`; it is guard-only
+  verification evidence and must never be applied.
   It is relay-image-only: LiteLLM remains exactly 0.75 CPU/1.5Gi, relay
   remains exactly 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
   The Container App before/after recursive differences are exactly
@@ -67,6 +70,9 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   exact committed KQL, threshold, severity, aggregation, periods, action group,
   static properties, and no dimensions. The idempotent form requires all 39
   resources and all outputs to be no-op, all 101 checks to pass, and zero drift.
+- The transition has the exact reviewed 46-entry `relevant_attributes` set.
+  The idempotent form has exactly 45 entries, removing only
+  `azurerm_resource_group.foundation["id"]` from that set.
 - `foundry_deployments` is exactly the one pinned
   `gpt-4o-mini-transcribe` deployment: model/version `2025-12-15`, format
   `OpenAI`, SKU `GlobalStandard`, capacity `1`, and `NoAutoUpgrade`.
@@ -97,6 +103,9 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   deployment slot, managed identity, Application Insights connection string,
   disabled statsbeat flags, browser policy, and localhost LiteLLM alias; exact
   OpenRouter LiteLLM environment; and no helper/OTLP/provider topology.
+  The reviewed update uses the reference `after_sensitive` envelope. Every
+  no-op resource, including the terminal Container App, uses the corresponding
+  reference `before_sensitive` envelope as its exact `after_sensitive` value.
 - The relay Azure Realtime endpoint is canonical WSS on the exact development
   Foundry host and ends exactly in
   `/openai/v1/realtime?intent=transcription`; deployment is exactly
@@ -163,7 +172,8 @@ npm run lint --if-present
 git diff --check
 ```
 
-After apply, require a fresh complete plan with all 39 resources no-op, all
-outputs no-op, zero resource drift, and all 101 checks passing. Report changed
-files, actual command results, residual risks, and `DONE` only when all
+After apply, require a fresh complete plan with `applyable=false`, all 39
+resources no-op, all outputs no-op, zero resource drift, and all 101 checks
+passing. Guard this terminal verification plan and never apply it. Report
+changed files, actual command results, residual risks, and `DONE` only when all
 requirements and tests are complete.

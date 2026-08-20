@@ -2296,14 +2296,21 @@ function finalRelevantAttributeKey(entry) {
   return JSON.stringify([entry.resource, entry.attribute]);
 }
 
-function finalHasExactRelevantAttributes(plan) {
+function finalHasExactRelevantAttributes(plan, transitionActions) {
   if (!Array.isArray(plan.relevant_attributes)) {
     return false;
   }
   const actual = plan.relevant_attributes.map(finalRelevantAttributeKey);
-  const expected = FINAL_REFERENCE_PLAN.relevant_attributes.map(
-    finalRelevantAttributeKey,
-  );
+  const expected = FINAL_REFERENCE_PLAN.relevant_attributes
+    .filter(
+      (entry) =>
+        transitionActions ||
+        !(
+          entry.resource === "azurerm_resource_group.foundation" &&
+          isDeepStrictEqual(entry.attribute, ["id"])
+        ),
+    )
+    .map(finalRelevantAttributeKey);
   return (
     actual.every((entry) => entry !== undefined) &&
     new Set(actual).size === actual.length &&
@@ -3459,8 +3466,11 @@ function finalExpectedAfterUnknown(resourceChange) {
 }
 
 function finalExpectedAfterSensitive(resourceChange) {
+  const reference = FINAL_REFERENCE_CHANGES.get(resourceChange.address).change;
   const expected = structuredClone(
-    FINAL_REFERENCE_CHANGES.get(resourceChange.address).change.after_sensitive,
+    isNoOp(resourceChange.change.actions)
+      ? reference.before_sensitive
+      : reference.after_sensitive,
   );
   if (resourceChange.address === FINAL_ACTION_GROUP_ADDRESS) {
     expected.email_receiver = resourceChange.change.after.email_receiver.map(
@@ -3852,7 +3862,7 @@ function finalHasExactPlanSections(plan) {
     finalExactKeys(plan, Object.keys(FINAL_REFERENCE_PLAN)) &&
     plan.terraform_version === "1.15.8" &&
     plan.complete === true &&
-    plan.applyable === true &&
+    typeof plan.applyable === "boolean" &&
     plan.errored === false &&
     typeof plan.timestamp === "string" &&
     !Number.isNaN(Date.parse(plan.timestamp)) &&
@@ -3867,7 +3877,6 @@ function finalHasExactPlanSections(plan) {
     finalExactKeys(plan.prior_state.values, ["outputs", "root_module"]) &&
     finalExactKeys(plan.configuration, ["provider_config", "root_module"]) &&
     isDeepStrictEqual(plan.configuration, FINAL_REFERENCE_PLAN.configuration) &&
-    finalHasExactRelevantAttributes(plan) &&
     finalHasExactOutputs(plan)
   );
   return result;
@@ -3896,7 +3905,11 @@ function acceptsFinalRolloutV2(plan, changes) {
   const idempotentActions = [...changesByAddress.values()].every((entry) =>
     isNoOp(entry.change.actions),
   );
-  if (!transitionActions && !idempotentActions) {
+  if (
+    transitionActions === idempotentActions ||
+    plan.applyable !== transitionActions ||
+    !finalHasExactRelevantAttributes(plan, transitionActions)
+  ) {
     return false;
   }
   const outputActionsMatch = Object.entries(plan.output_changes).every(

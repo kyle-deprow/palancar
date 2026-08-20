@@ -1134,13 +1134,24 @@ function finalChange(planValue, address) {
   return planValue.resource_changes.find((entry) => entry.address === address);
 }
 
+function isFinalResourceGroupIdReference(entry) {
+  return (
+    entry.resource === "azurerm_resource_group.foundation" &&
+    Array.isArray(entry.attribute) &&
+    entry.attribute.length === 1 &&
+    entry.attribute[0] === "id"
+  );
+}
+
 function finalMakeResourceNoOp(planValue, address, completeAfter) {
   const entry = finalChange(planValue, address);
+  const priorSensitive = clone(entry.change.before_sensitive);
   entry.change.actions = ["no-op"];
   entry.change.after = completeAfter;
   entry.change.before = clone(completeAfter);
   entry.change.after_unknown = {};
-  entry.change.before_sensitive = clone(entry.change.after_sensitive);
+  entry.change.before_sensitive = clone(priorSensitive);
+  entry.change.after_sensitive = clone(priorSensitive);
 
   if (address === finalCleanupJobAddress) {
     const identity = { id: completeAfter.id, type: null };
@@ -1180,6 +1191,11 @@ function finalRolloutPlan({ idempotent = false } = {}) {
   const planValue = clone(finalTransitionFixture);
   if (!idempotent) return planValue;
 
+  planValue.applyable = false;
+  planValue.relevant_attributes = planValue.relevant_attributes.filter(
+    (entry) => !isFinalResourceGroupIdReference(entry),
+  );
+
   const appEntry = finalChange(planValue, containerAppAddress);
   const appAfter = clone(appEntry.change.after);
   appAfter.output = clone(appEntry.change.before.output);
@@ -1205,15 +1221,29 @@ function finalRolloutPlan({ idempotent = false } = {}) {
 }
 
 test("final-rollout accepts the reviewed initial and idempotent plans", () => {
-  assert.equal(acceptsPlan(finalRolloutPlan(), "final-rollout"), true);
+  const transition = finalRolloutPlan();
+  assert.equal(acceptsPlan(transition, "final-rollout"), true);
+  assert.equal(transition.applyable, true);
+  assert.equal(transition.relevant_attributes.length, 46);
   const idempotent = finalRolloutPlan({ idempotent: true });
   assert.equal(acceptsPlan(idempotent, "final-rollout"), true);
+  assert.equal(idempotent.applyable, false);
+  assert.deepEqual(
+    idempotent.relevant_attributes,
+    transition.relevant_attributes.filter(
+      (entry) => !isFinalResourceGroupIdReference(entry),
+    ),
+  );
   assert.equal(idempotent.resource_changes.length, 39);
   assert.equal(
     idempotent.resource_changes.every(
       (entry) => entry.change.actions[0] === "no-op",
     ),
     true,
+  );
+  assert.deepEqual(
+    finalChange(idempotent, containerAppAddress).change.after_sensitive,
+    finalChange(transition, containerAppAddress).change.before_sensitive,
   );
   assert.equal(idempotent.resource_drift, undefined);
 });
@@ -1805,15 +1835,110 @@ test("the final fixture permits only approved synthetic sensitive values", () =>
   );
 });
 
-test("final-rollout requires complete/applyable/non-errored Terraform 1.15.8 plans", () => {
+test("final-rollout binds boolean applyable to transition versus idempotent actions", () => {
+  assert.equal(finalRolloutPlan().applyable, true);
+  assert.equal(finalRolloutPlan({ idempotent: true }).applyable, false);
+
+  rejectsFinalMutation((candidate) => { candidate.applyable = false; });
+  rejectsFinalMutation(
+    (candidate) => { candidate.applyable = true; },
+    true,
+  );
+  for (const value of [null, 0, 1, "false", "true"]) {
+    rejectsFinalMutation((candidate) => { candidate.applyable = value; });
+    rejectsFinalMutation(
+      (candidate) => { candidate.applyable = value; },
+      true,
+    );
+  }
+});
+
+test("final-rollout requires complete/non-errored Terraform 1.15.8 plans", () => {
   for (const mutate of [
     (candidate) => { candidate.complete = false; },
-    (candidate) => { candidate.applyable = false; },
     (candidate) => { candidate.errored = true; },
     (candidate) => { candidate.terraform_version = "1.15.7"; },
     (candidate) => { candidate.deferred_changes = []; },
     (candidate) => { candidate.extra = true; },
   ]) rejectsFinalMutation(mutate);
+});
+
+test("final-rollout binds exact relevant attributes to the action envelope", () => {
+  const transition = finalRolloutPlan();
+  const idempotent = finalRolloutPlan({ idempotent: true });
+  const transitionFoundationIds = transition.relevant_attributes.filter(
+    isFinalResourceGroupIdReference,
+  );
+  assert.equal(transition.relevant_attributes.length, 46);
+  assert.equal(transitionFoundationIds.length, 1);
+  assert.equal(idempotent.relevant_attributes.length, 45);
+  assert.deepEqual(
+    idempotent.relevant_attributes,
+    transition.relevant_attributes.filter(
+      (entry) => !isFinalResourceGroupIdReference(entry),
+    ),
+  );
+
+  rejectsFinalMutation((candidate) => {
+    candidate.relevant_attributes = candidate.relevant_attributes.filter(
+      (entry) => !isFinalResourceGroupIdReference(entry),
+    );
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      candidate.relevant_attributes.push(clone(transitionFoundationIds[0]));
+    },
+    true,
+  );
+});
+
+test("final-rollout binds resource sensitivity to update versus no-op actions", () => {
+  const transition = finalRolloutPlan();
+  const transitionApp = finalChange(transition, containerAppAddress);
+  const idempotent = finalRolloutPlan({ idempotent: true });
+  const idempotentApp = finalChange(idempotent, containerAppAddress);
+  assert.notDeepEqual(
+    transitionApp.change.before_sensitive,
+    transitionApp.change.after_sensitive,
+  );
+  assert.deepEqual(
+    transitionApp.change.after_sensitive,
+    finalChange(finalTransitionFixture, containerAppAddress).change
+      .after_sensitive,
+  );
+  assert.deepEqual(
+    idempotentApp.change.after_sensitive,
+    transitionApp.change.before_sensitive,
+  );
+
+  rejectsFinalMutation((candidate) => {
+    const app = finalChange(candidate, containerAppAddress);
+    app.change.after_sensitive = clone(app.change.before_sensitive);
+    finalValueResource(
+      candidate.planned_values.root_module,
+      containerAppAddress,
+    ).sensitive_values = clone(app.change.after_sensitive);
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      const app = finalChange(candidate, containerAppAddress);
+      const transitionAfterSensitive = clone(
+        finalChange(finalTransitionFixture, containerAppAddress).change
+          .after_sensitive,
+      );
+      app.change.before_sensitive = clone(transitionAfterSensitive);
+      app.change.after_sensitive = clone(transitionAfterSensitive);
+      finalValueResource(
+        candidate.planned_values.root_module,
+        containerAppAddress,
+      ).sensitive_values = clone(transitionAfterSensitive);
+      finalValueResource(
+        candidate.prior_state.values.root_module,
+        containerAppAddress,
+      ).sensitive_values = clone(transitionAfterSensitive);
+    },
+    true,
+  );
 });
 
 test("final-rollout requires the genuine zero-drift transition and idempotent form", () => {
