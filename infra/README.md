@@ -167,6 +167,55 @@ health probes, a single revision, min replicas 0 or 1, max replicas 1,
 `PALANCAR_SECURITY_MODE=azure-table`, mock transcription, localhost LiteLLM on
 port 4000, and the `palancar-generation` alias.
 
+For the reviewed final rollout, after the pinned transcription deployment is
+already present, create a complete saved plan without `-target`, guard its JSON
+view, and apply that exact same file only when the guard exits successfully:
+
+```sh
+terraform -chdir=infra/environments/dev plan \
+  -out=/tmp/palancar-final.tfplan && \
+terraform -chdir=infra/environments/dev show -json /tmp/palancar-final.tfplan \
+  | node infra/scripts/assert-dev-plan.mjs --mode=final-rollout && \
+terraform -chdir=infra/environments/dev apply /tmp/palancar-final.tfplan
+```
+
+Do not run the apply command after a guard rejection, do not substitute a
+newly generated plan file between guard and apply, and do not apply a
+refresh-only plan.
+
+`final-rollout` is a separate fail-closed mode. It requires the complete
+39-resource transition inventory: 29 no-ops, the reviewed Container App update,
+and nine creates comprising the monitoring assignment, cleanup Job, relay
+action group, and six scheduled-query alerts. The action group must use the
+exact deterministic development ARM ID and one common-schema, ordinally named
+email receiver per sorted budget contact. The same contact set must appear in
+all four budget notifications. Every alert is bound to that action group and
+must match the committed workspace scope, KQL, threshold, aggregation,
+severity, periods, properties, and provider envelope, with no dimensions. The
+idempotent form requires the same 39 resources as no-ops and no drift.
+
+The mode also requires the exact pinned Foundry deployment as a no-op, exact
+development ACR digests for the relay, LiteLLM proxy, and expiry-cleanup Job,
+and the complete final Container App and scheduled Job payloads. It permits
+only the reviewed Container App create/update/no-op, Job create/no-op, and
+create-if-absent/no-op-if-present monitoring, action-group, alert, and operator
+resources. The initial transition accepts only the exact reviewed preexisting
+Container App drift represented in the refreshed saved plan and only alongside
+the complete final update. It rejects all other drift, deletes, replacements,
+imports, deferred or unknown security values, extra topology or receivers,
+plaintext credentials, mutable or aliased images, and any second deployment or
+workload resource.
+
+The reviewed transition has exactly two allowed unknown checks: the
+`module.container_app_workload.azapi_resource.this` check and the
+`module.container_app_workload.var.runtime_monitoring_metrics_publisher_role_assignment_id`
+check, each with its exact indexed instance address and unknown status, and
+only while the monitoring-role action is create. The Container App body and the
+monitoring-role create are independently validated against their complete exact
+contracts. Every other unknown check, any altered check envelope, and any
+additional unknown check fails closed; the idempotent plan must report every
+check as passing.
+
 ## State recovery verification
 
 The state account enables blob versioning, change feed with finite 14-day

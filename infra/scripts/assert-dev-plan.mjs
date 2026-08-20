@@ -3,11 +3,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 
 const MODEL_SPIKE_MODE = "model-spike";
 const FULL_DEPLOY_MODE = "full-deploy";
 const RUNTIME_ROLLOUT_MODE = "runtime-rollout";
+const FINAL_ROLLOUT_MODE = "final-rollout";
 const SUPPORTED_PLAN_FORMAT_VERSION = "1.2";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
 const PINNED_MODEL_VERSION = "2025-12-15";
@@ -20,6 +22,140 @@ const MODEL_SPIKE_DEPLOYMENT =
   `module.foundry.azurerm_cognitive_deployment.this["${PINNED_DEPLOYMENT_NAME}"]`;
 const RETIRED_DEPLOYMENT = "gpt-5-6-luna";
 const CONTAINER_APP = "module.container_app_workload[0].azapi_resource.this";
+const EXPIRY_CLEANUP_JOB = "module.expiry_cleanup_job[0].azapi_resource.this";
+const FINAL_SUBSCRIPTION_ID =
+  "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1";
+const FINAL_RESOURCE_GROUP_NAME = "rg-palancar-dev-aeeacd8c";
+const FINAL_RESOURCE_GROUP_ID =
+  `/subscriptions/${FINAL_SUBSCRIPTION_ID}/resourceGroups/${FINAL_RESOURCE_GROUP_NAME}`;
+const FINAL_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
+const FINAL_TABLE_ACCOUNT = "palancardevstateaeeacd8c";
+const FINAL_TABLE_ENDPOINT = `https://${FINAL_TABLE_ACCOUNT}.table.core.windows.net`;
+const FINAL_TABLE_SERVICE_ID =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Storage/storageAccounts/${FINAL_TABLE_ACCOUNT}/tableServices/default`;
+const FINAL_CONTAINER_ENVIRONMENT_ID =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.App/managedEnvironments/cae-palancar-dev-aeeacd8c`;
+const FINAL_CONTAINER_ENVIRONMENT_NAME = "cae-palancar-dev-aeeacd8c";
+const FINAL_CONTAINER_ENVIRONMENT_DEFAULT_DOMAIN =
+  "graysmoke-757a2980.eastus2.azurecontainerapps.io";
+const FINAL_IMAGE_PULL_IDENTITY =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull`;
+const FINAL_RUNTIME_IDENTITY =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-runtime`;
+const FINAL_APPLICATION_INSIGHTS_ID =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Insights/components/appi-palancar-dev-aeeacd8c`;
+const FINAL_APPLICATION_INSIGHTS_NAME = "appi-palancar-dev-aeeacd8c";
+const FINAL_APPLICATION_INSIGHTS_INGESTION_ENDPOINT =
+  "https://eastus2-3.in.applicationinsights.azure.com/";
+const FINAL_APPLICATION_INSIGHTS_LIVE_ENDPOINT =
+  "https://eastus2.livediagnostics.monitor.azure.com/";
+const FINAL_KEY_VAULT_HOST = "kvpalancardevaeeacd8c.vault.azure.net";
+const FINAL_FOUNDRY_REALTIME_ENDPOINT =
+  "wss://palancardevopenaiaeeacd8c.openai.azure.com/openai/v1/realtime?intent=transcription";
+const FINAL_CONTAINER_APP_NAME = "ca-palancar-dev-relay-aeeacd8c";
+const FINAL_RELAY_ORIGIN =
+  `wss://${FINAL_CONTAINER_APP_NAME}.${FINAL_CONTAINER_ENVIRONMENT_DEFAULT_DOMAIN}`;
+const FINAL_ACTION_GROUP_ADDRESS = "azurerm_monitor_action_group.relay";
+const FINAL_ACTION_GROUP_NAME = "ag-palancar-dev-relay-aeeacd8c";
+const FINAL_ACTION_GROUP_ID =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Insights/actionGroups/${FINAL_ACTION_GROUP_NAME}`;
+const FINAL_WORKSPACE_ID =
+  `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.OperationalInsights/workspaces/law-palancar-dev-aeeacd8c`;
+const FINAL_ALERT_API_VERSION = "2023-12-01";
+const FINAL_CLEANUP_JOB_NAME = "caj-palancardev-cleanup-aeeacd8c";
+const FINAL_ROLE_DEFINITION_MONITORING_ID =
+  "3913510d-42f4-4e42-8a64-420c390055eb";
+const FINAL_GENERATION_MODEL = "openrouter/openai/gpt-5.6-luna";
+const FINAL_REFERENCE_PLAN = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/final-rollout-transition.plan-fixture.json", import.meta.url),
+    "utf8",
+  ),
+);
+const FINAL_MONITORING_ROLE_ASSIGNMENT =
+  "module.identities_rbac.azurerm_role_assignment.runtime_application_insights";
+const FINAL_ALERT_CONTRACTS = new Map([
+  [
+    "provider_failures",
+    {
+      displayName: "Relay provider failures",
+      description: "Weighted relay provider failures in the evaluation window.",
+      severity: 1,
+      threshold: 5,
+      aggregation: "Total",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "provider.failure"\n| summarize SignalValue = sum(Sum)\n',
+    },
+  ],
+  [
+    "state_store_failures",
+    {
+      displayName: "Relay state store failures",
+      description:
+        "Weighted relay state store failures in the evaluation window.",
+      severity: 1,
+      threshold: 1,
+      aggregation: "Total",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "state_store.failure"\n| summarize SignalValue = sum(Sum)\n',
+    },
+  ],
+  [
+    "transcription_first_partial_mean",
+    {
+      displayName: "Relay transcription first partial weighted mean latency",
+      description:
+        "Weighted mean first partial transcription latency in milliseconds.",
+      severity: 2,
+      threshold: 1500,
+      aggregation: "Average",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "transcription.first_partial_latency"\n| summarize TotalMs = sum(Sum), SampleCount = sum(ItemCount)\n| where SampleCount > 0\n| project SignalValue = TotalMs / SampleCount\n',
+    },
+  ],
+  [
+    "transcription_final_mean",
+    {
+      displayName: "Relay transcription final weighted mean latency",
+      description: "Weighted mean final transcription latency in milliseconds.",
+      severity: 2,
+      threshold: 1200,
+      aggregation: "Average",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "transcription.final_latency"\n| summarize TotalMs = sum(Sum), SampleCount = sum(ItemCount)\n| where SampleCount > 0\n| project SignalValue = TotalMs / SampleCount\n',
+    },
+  ],
+  [
+    "translation_mean",
+    {
+      displayName: "Relay translation weighted mean latency",
+      description: "Weighted mean translation latency in milliseconds.",
+      severity: 2,
+      threshold: 5000,
+      aggregation: "Average",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "translation.latency"\n| summarize TotalMs = sum(Sum), SampleCount = sum(ItemCount)\n| where SampleCount > 0\n| project SignalValue = TotalMs / SampleCount\n',
+    },
+  ],
+  [
+    "suggestion_mean",
+    {
+      displayName: "Relay suggestion weighted mean latency",
+      description: "Weighted mean suggestion latency in milliseconds.",
+      severity: 2,
+      threshold: 5000,
+      aggregation: "Average",
+      query:
+        'AppMetrics\n| where AppRoleName == "palancar-relay"\n| where Name == "suggestion.latency"\n| summarize TotalMs = sum(Sum), SampleCount = sum(ItemCount)\n| where SampleCount > 0\n| project SignalValue = TotalMs / SampleCount\n',
+    },
+  ],
+]);
+const FINAL_ALERT_ADDRESSES = new Set(
+  [...FINAL_ALERT_CONTRACTS.keys()].map(
+    (key) =>
+      `module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay["${key}"]`,
+  ),
+);
 const ZERO_INSTANCE_DEPLOYMENT_ADDRESS =
   "module.foundry.azurerm_cognitive_deployment.this";
 const CONFIGURED_ZERO_INSTANCE_DEPLOYMENT_ADDRESS =
@@ -73,6 +209,15 @@ const FOUNDATION_NO_OP_ADDRESSES = new Set([
   "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
 ]);
 
+const FINAL_ROLE_ASSIGNMENT_ADDRESSES = new Set([
+  "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+  "module.identities_rbac.azurerm_role_assignment.runtime_table",
+  "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+  FINAL_MONITORING_ROLE_ASSIGNMENT,
+  ...OPERATOR_ROLE_ASSIGNMENTS.keys(),
+  "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+  "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+]);
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -1517,6 +1662,2081 @@ function priorManagedAddresses(plan) {
   return addresses;
 }
 
+function exactFinalImageVariables(plan) {
+  const imageVariables = [
+    ["relay_image_digest", "palancar-relay"],
+    ["litellm_image_digest", "palancar-litellm-proxy"],
+    ["expiry_cleanup_image_digest", "palancar-expiry-cleanup"],
+  ];
+  const images = {};
+
+  for (const [name, repository] of imageVariables) {
+    const descriptor = plan.variables?.[name];
+    const value = descriptor?.value;
+    if (
+      !hasExactKeys(descriptor, ["value"]) ||
+      typeof value !== "string" ||
+      !new RegExp(
+        `^${FINAL_ACR_LOGIN_SERVER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/${repository.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}@sha256:[0-9a-f]{64}$`,
+      ).test(value)
+    ) {
+      return undefined;
+    }
+    images[repository] = value;
+  }
+
+  return new Set(Object.values(images)).size === imageVariables.length
+    ? images
+    : undefined;
+}
+
+function hasExactFinalFoundryDeploymentsVariable(plan) {
+  const descriptor = plan.variables?.foundry_deployments;
+  const deployments = descriptor?.value;
+  if (
+    !hasExactKeys(descriptor, ["value"]) ||
+    !isObject(deployments) ||
+    Object.getPrototypeOf(deployments) !== Object.prototype ||
+    !hasExactKeys(deployments, [PINNED_DEPLOYMENT_NAME])
+  ) {
+    return false;
+  }
+
+  const deployment = deployments[PINNED_DEPLOYMENT_NAME];
+  return (
+    hasExactKeys(deployment, [
+      "model_name",
+      "model_version",
+      "model_format",
+      "sku_name",
+      "capacity",
+      "version_upgrade_option",
+    ]) &&
+    deployment.model_name === PINNED_DEPLOYMENT_NAME &&
+    deployment.model_version === PINNED_MODEL_VERSION &&
+    deployment.model_format === "OpenAI" &&
+    deployment.sku_name === "GlobalStandard" &&
+    deployment.capacity === 1 &&
+    deployment.version_upgrade_option === "NoAutoUpgrade"
+  );
+}
+
+function hasFinalNoUnknowns(resourceChange) {
+  const unknown = resourceChange.change.after_unknown;
+  if (unknown === undefined || unknown === null) {
+    return true;
+  }
+  if (!isObject(unknown)) {
+    return false;
+  }
+
+  return Object.entries(unknown).every(
+    ([key, value]) => key === "id" && value === true,
+  );
+}
+
+function hasExactFinalTags(value) {
+  return (
+    hasExactKeys(value, [
+      "application",
+      "environment",
+      "managed-by",
+      "data-classification",
+    ]) &&
+    value.application === "palancar" &&
+    value.environment === "dev" &&
+    value["managed-by"] === "terraform" &&
+    value["data-classification"] === "operational-metadata"
+  );
+}
+
+function hasExactFinalTcpProbe(probe, expected) {
+  return (
+    hasExactKeys(probe, [
+      "type",
+      "tcpSocket",
+      ...(expected.initialDelaySeconds === undefined
+        ? []
+        : ["initialDelaySeconds"]),
+      "periodSeconds",
+      "timeoutSeconds",
+      "failureThreshold",
+    ]) &&
+    probe.type === expected.type &&
+    hasExactKeys(probe.tcpSocket, ["port"]) &&
+    probe.tcpSocket.port === expected.port &&
+    probe.initialDelaySeconds === expected.initialDelaySeconds &&
+    probe.periodSeconds === expected.periodSeconds &&
+    probe.timeoutSeconds === expected.timeoutSeconds &&
+    probe.failureThreshold === expected.failureThreshold
+  );
+}
+
+function hasExactFinalConnectionString(value) {
+  return (
+    typeof value === "string" &&
+    /^InstrumentationKey=[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12};IngestionEndpoint=https:\/\/[a-z0-9.-]+\.in\.applicationinsights\.azure\.com$/.test(
+      value,
+    )
+  );
+}
+
+function hasExactFinalRelayOrigin(value) {
+  return (
+    typeof value === "string" &&
+    new RegExp(
+      `^wss://${FINAL_CONTAINER_APP_NAME}\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\\.azurecontainerapps\\.io$`,
+    ).test(value)
+  );
+}
+
+function hasExactFinalRelayEnvironment(env, runtimeClientId) {
+  const names = [
+    "NODE_ENV",
+    "PORT",
+    "PALANCAR_GENERATION_PROVIDER",
+    "PALANCAR_RELAY_BIND_HOST",
+    "PALANCAR_RELAY_ENVIRONMENT",
+    "PALANCAR_RELAY_ORIGIN",
+    "PALANCAR_GATE_POLICY_VERSION",
+    "AZURE_CLIENT_ID",
+    "PALANCAR_DEPLOYMENT_SLOT",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
+    "APPLICATION_INSIGHTS_NO_STATSBEAT",
+    "PALANCAR_SECURITY_MODE",
+    "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+    "PALANCAR_SECURITY_STATE_TABLE",
+    "PALANCAR_RATE_STATE_TABLE",
+    "PALANCAR_TRANSCRIPTION_PROVIDER",
+    "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+    "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+    "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+    "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+    "PALANCAR_LITELLM_BASE_URL",
+    "PALANCAR_LITELLM_MODEL",
+    "PALANCAR_LITELLM_API_KEY",
+  ];
+  const entries = valuesByName(env);
+  if (
+    !hasExactNamedEntries(entries, names) ||
+    ![...entries.values()].every((entry) =>
+      entry.name === "PALANCAR_LITELLM_API_KEY"
+        ? hasExactKeys(entry, ["name", "secretRef"])
+        : hasExactKeys(entry, ["name", "value"]),
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    hasEnvValue(entries, "NODE_ENV", "production") &&
+    hasEnvValue(entries, "PORT", "8787") &&
+    hasEnvValue(entries, "PALANCAR_GENERATION_PROVIDER", "litellm") &&
+    hasEnvValue(entries, "PALANCAR_RELAY_BIND_HOST", "0.0.0.0") &&
+    hasEnvValue(entries, "PALANCAR_RELAY_ENVIRONMENT", "dev") &&
+    hasExactFinalRelayOrigin(entries.get("PALANCAR_RELAY_ORIGIN")?.value) &&
+    hasEnvValue(entries, "PALANCAR_GATE_POLICY_VERSION", "1.0.0") &&
+    hasEnvValue(entries, "AZURE_CLIENT_ID", runtimeClientId) &&
+    hasEnvValue(entries, "PALANCAR_DEPLOYMENT_SLOT", "dev") &&
+    hasExactFinalConnectionString(
+      entries.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value,
+    ) &&
+    hasEnvValue(entries, "APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "true") &&
+    hasEnvValue(entries, "APPLICATION_INSIGHTS_NO_STATSBEAT", "true") &&
+    hasEnvValue(entries, "PALANCAR_SECURITY_MODE", "azure-table") &&
+    hasEnvValue(entries, "PALANCAR_WORKLOAD_TABLE_ENDPOINT", FINAL_TABLE_ENDPOINT) &&
+    hasEnvValue(entries, "PALANCAR_SECURITY_STATE_TABLE", "SecurityState") &&
+    hasEnvValue(entries, "PALANCAR_RATE_STATE_TABLE", "RateState") &&
+    hasEnvValue(entries, "PALANCAR_TRANSCRIPTION_PROVIDER", "azure-realtime") &&
+    hasEnvValue(
+      entries,
+      "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+      FINAL_FOUNDRY_REALTIME_ENDPOINT,
+    ) &&
+    hasEnvValue(
+      entries,
+      "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+      PINNED_DEPLOYMENT_NAME,
+    ) &&
+    hasExactFailClosedBrowserOriginPolicy(entries) &&
+    hasEnvValue(entries, "PALANCAR_LITELLM_BASE_URL", "http://127.0.0.1:4000") &&
+    hasEnvValue(entries, "PALANCAR_LITELLM_MODEL", "palancar-generation") &&
+    hasEnvSecret(entries, "PALANCAR_LITELLM_API_KEY", "litellm-master-key")
+  );
+}
+
+function hasExactFinalSidecarEnvironment(env) {
+  const entries = valuesByName(env);
+  return (
+    hasExactNamedEntries(entries, [
+      "PALANCAR_LITELLM_BACKEND",
+      "PALANCAR_LITELLM_UPSTREAM_MODEL",
+      "LITELLM_MASTER_KEY",
+      "OPENROUTER_API_KEY",
+    ]) &&
+    [...entries.values()].every((entry) =>
+      ["LITELLM_MASTER_KEY", "OPENROUTER_API_KEY"].includes(entry.name)
+        ? hasExactKeys(entry, ["name", "secretRef"])
+        : hasExactKeys(entry, ["name", "value"]),
+    ) &&
+    hasEnvValue(entries, "PALANCAR_LITELLM_BACKEND", "openrouter") &&
+    hasEnvValue(
+      entries,
+      "PALANCAR_LITELLM_UPSTREAM_MODEL",
+      FINAL_GENERATION_MODEL,
+    ) &&
+    hasEnvSecret(entries, "LITELLM_MASTER_KEY", "litellm-master-key") &&
+    hasEnvSecret(entries, "OPENROUTER_API_KEY", "openrouter-api-key")
+  );
+}
+
+function hasExactFinalContainerApp(change, images, runtimeClientId) {
+  if (
+    !hasFinalNoUnknowns(change) ||
+    hasUnknownValue(change.change.after_sensitive?.body) ||
+    hasUnknownValue(change.change.after_sensitive?.identity)
+  ) {
+    return false;
+  }
+
+  const after = change.change.after;
+  const body = after?.body;
+  const properties = body?.properties;
+  const configuration = properties?.configuration;
+  const template = properties?.template;
+  const identities = after?.identity;
+  const identityIds = identities?.[0]?.identity_ids;
+  const identitySettings = configuration?.identitySettings;
+  const registry = configuration?.registries?.[0];
+  const secrets = valuesByName(configuration?.secrets);
+  const masterSecret = secrets?.get("litellm-master-key");
+  const openRouterSecret = secrets?.get("openrouter-api-key");
+
+  if (
+    !isObject(after) ||
+    !hasExactKeys(after, [
+      "body",
+      "identity",
+      "location",
+      "name",
+      "parent_id",
+      "response_export_values",
+      "retry",
+      "tags",
+      "type",
+    ]) ||
+    after.type !== "Microsoft.App/containerApps@2026-01-01" ||
+    after.name !== FINAL_CONTAINER_APP_NAME ||
+    after.location !== "eastus2" ||
+    after.parent_id !== FINAL_RESOURCE_GROUP_ID ||
+    !hasExactFinalTags(after.tags) ||
+    !Array.isArray(after.response_export_values) ||
+    after.response_export_values.length !== 3 ||
+    after.response_export_values[0] !== "properties.configuration.ingress.fqdn" ||
+    after.response_export_values[1] !== "properties.latestRevisionName" ||
+    after.response_export_values[2] !== "properties.runningStatus" ||
+    !hasExactKeys(after.retry, [
+      "error_message_regex",
+      "interval_seconds",
+      "max_interval_seconds",
+    ]) ||
+    !Array.isArray(after.retry.error_message_regex) ||
+    after.retry.error_message_regex.length !== 1 ||
+    after.retry.error_message_regex[0] !== "IdentityDoesNotExist" ||
+    after.retry.interval_seconds !== 10 ||
+    after.retry.max_interval_seconds !== 30 ||
+    !hasExactKeys(body, ["properties"]) ||
+    !hasExactKeys(properties, [
+      "managedEnvironmentId",
+      "configuration",
+      "template",
+    ]) ||
+    properties.managedEnvironmentId !== FINAL_CONTAINER_ENVIRONMENT_ID ||
+    !hasExactKeys(configuration, [
+      "activeRevisionsMode",
+      "ingress",
+      "registries",
+      "identitySettings",
+      "secrets",
+    ]) ||
+    configuration.activeRevisionsMode !== "Single" ||
+    !hasExactIngress(configuration.ingress) ||
+    !Array.isArray(identities) ||
+    identities.length !== 1 ||
+    !hasExactKeys(identities[0], ["type", "identity_ids"]) ||
+    identities[0].type !== "UserAssigned" ||
+    !Array.isArray(identityIds) ||
+    identityIds.length !== 2 ||
+    identityIds[0] !== FINAL_IMAGE_PULL_IDENTITY ||
+    identityIds[1] !== FINAL_RUNTIME_IDENTITY ||
+    !Array.isArray(configuration.registries) ||
+    configuration.registries.length !== 1 ||
+    !hasExactKeys(registry, ["server", "identity"]) ||
+    registry.server !== FINAL_ACR_LOGIN_SERVER ||
+    registry.identity !== FINAL_IMAGE_PULL_IDENTITY ||
+    !Array.isArray(identitySettings) ||
+    identitySettings.length !== 2 ||
+    !hasExactKeys(identitySettings[0], ["identity", "lifecycle"]) ||
+    identitySettings[0].identity !==
+      FINAL_IMAGE_PULL_IDENTITY.replace("resourceGroups", "resourcegroups") ||
+    identitySettings[0].lifecycle !== "None" ||
+    !hasExactKeys(identitySettings[1], ["identity", "lifecycle"]) ||
+    identitySettings[1].identity !==
+      FINAL_RUNTIME_IDENTITY.replace("resourceGroups", "resourcegroups") ||
+    identitySettings[1].lifecycle !== "Main" ||
+    !hasExactKeys(template, ["containers", "scale"]) ||
+    !hasExactKeys(template.scale, ["minReplicas", "maxReplicas"]) ||
+    template.scale.minReplicas !== 1 ||
+    template.scale.maxReplicas !== 1 ||
+    !hasExactNamedEntries(
+      secrets,
+      ["litellm-master-key", "openrouter-api-key"],
+    ) ||
+    !hasExactKeys(masterSecret, ["name", "keyVaultUrl", "identity"]) ||
+    !hasExactKeys(openRouterSecret, ["name", "keyVaultUrl", "identity"]) ||
+    masterSecret.name !== "litellm-master-key" ||
+    openRouterSecret.name !== "openrouter-api-key" ||
+    masterSecret.identity !== FINAL_RUNTIME_IDENTITY ||
+    openRouterSecret.identity !== FINAL_RUNTIME_IDENTITY ||
+    masterSecret.keyVaultUrl !==
+      `https://${FINAL_KEY_VAULT_HOST}/secrets/litellm-master-key` ||
+    openRouterSecret.keyVaultUrl !==
+      `https://${FINAL_KEY_VAULT_HOST}/secrets/openrouter-api-key`
+  ) {
+    return false;
+  }
+
+  const containers = valuesByName(template.containers);
+  const relay = containers?.get("relay");
+  const litellm = containers?.get("litellm");
+  return (
+    hasExactNamedEntries(containers, ["relay", "litellm"]) &&
+    hasExactKeys(relay, ["name", "image", "resources", "env", "probes"]) &&
+    hasExactKeys(litellm, ["name", "image", "resources", "env", "probes"]) &&
+    relay.image === images["palancar-relay"] &&
+    litellm.image === images["palancar-litellm-proxy"] &&
+    hasExactKeys(relay.resources, ["cpu", "memory"]) &&
+    hasExactKeys(litellm.resources, ["cpu", "memory"]) &&
+    relay.resources.cpu === 0.25 &&
+    relay.resources.memory === "0.5Gi" &&
+    litellm.resources.cpu === 0.25 &&
+    litellm.resources.memory === "0.5Gi" &&
+    Array.isArray(relay.probes) &&
+    relay.probes.length === 2 &&
+    Array.isArray(litellm.probes) &&
+    litellm.probes.length === 3 &&
+    hasExactFinalTcpProbe(relay.probes[0], {
+      type: "Liveness",
+      port: 8787,
+      initialDelaySeconds: 10,
+      periodSeconds: 10,
+      timeoutSeconds: 3,
+      failureThreshold: 3,
+    }) &&
+    hasExactProbes(relay.probes.slice(1), [
+      {
+        type: "Readiness",
+        path: "/readyz",
+        port: 8787,
+        initialDelaySeconds: 5,
+        periodSeconds: 10,
+        timeoutSeconds: 7,
+        failureThreshold: 3,
+      },
+    ]) &&
+    hasExactFinalTcpProbe(litellm.probes[0], {
+      type: "Liveness",
+      port: 4000,
+      initialDelaySeconds: 10,
+      periodSeconds: 30,
+      timeoutSeconds: 3,
+      failureThreshold: 3,
+    }) &&
+    hasExactProbes(litellm.probes.slice(1), [
+      {
+        type: "Readiness",
+        path: "/health/readiness",
+        port: 4000,
+        periodSeconds: 10,
+        timeoutSeconds: 7,
+        failureThreshold: 3,
+      },
+      {
+        type: "Startup",
+        path: "/health/liveliness",
+        port: 4000,
+        periodSeconds: 10,
+        timeoutSeconds: 3,
+        failureThreshold: 10,
+      },
+    ]) &&
+    hasExactFinalRelayEnvironment(relay.env, runtimeClientId) &&
+    hasExactFinalSidecarEnvironment(litellm.env)
+  );
+}
+
+function hasExactFinalCleanupJob(change, images, runtimeClientId, relayOrigin) {
+  if (
+    !hasFinalNoUnknowns(change) ||
+    hasUnknownValue(change.change.after_sensitive?.body) ||
+    hasUnknownValue(change.change.after_sensitive?.identity)
+  ) {
+    return false;
+  }
+
+  const after = change.change.after;
+  const body = after?.body;
+  const properties = body?.properties;
+  const configuration = properties?.configuration;
+  const template = properties?.template;
+  const identities = after?.identity;
+  const identityIds = identities?.[0]?.identity_ids;
+  const registry = configuration?.registries?.[0];
+  const containers = template?.containers;
+  const container = containers?.[0];
+
+  return (
+    isObject(after) &&
+    hasExactKeys(after, [
+      "body",
+      "identity",
+      "location",
+      "name",
+      "parent_id",
+      "tags",
+      "type",
+    ]) &&
+    after.type === "Microsoft.App/jobs@2026-01-01" &&
+    after.name === FINAL_CLEANUP_JOB_NAME &&
+    after.location === "eastus2" &&
+    after.parent_id === FINAL_RESOURCE_GROUP_ID &&
+    hasExactFinalTags(after.tags) &&
+    !Object.hasOwn(after, "retry") &&
+    !Object.hasOwn(after, "response_export_values") &&
+    hasExactKeys(body, ["properties"]) &&
+    hasExactKeys(properties, ["environmentId", "configuration", "template"]) &&
+    properties.environmentId === FINAL_CONTAINER_ENVIRONMENT_ID &&
+    hasExactKeys(configuration, [
+      "triggerType",
+      "scheduleTriggerConfig",
+      "replicaRetryLimit",
+      "replicaTimeout",
+      "registries",
+      "identitySettings",
+    ]) &&
+    configuration.triggerType === "Schedule" &&
+    hasExactKeys(configuration.scheduleTriggerConfig, [
+      "cronExpression",
+      "replicaCompletionCount",
+      "parallelism",
+    ]) &&
+    configuration.scheduleTriggerConfig.cronExpression === "0 3 * * *" &&
+    configuration.scheduleTriggerConfig.replicaCompletionCount === 1 &&
+    configuration.scheduleTriggerConfig.parallelism === 1 &&
+    configuration.replicaRetryLimit === 0 &&
+    configuration.replicaTimeout === 300 &&
+    Array.isArray(identities) &&
+    identities.length === 1 &&
+    hasExactKeys(identities[0], ["type", "identity_ids"]) &&
+    identities[0].type === "UserAssigned" &&
+    Array.isArray(identityIds) &&
+    identityIds.length === 2 &&
+    identityIds[0] === FINAL_IMAGE_PULL_IDENTITY &&
+    identityIds[1] === FINAL_RUNTIME_IDENTITY &&
+    Array.isArray(configuration.registries) &&
+    configuration.registries.length === 1 &&
+    hasExactKeys(registry, ["server", "identity"]) &&
+    registry.server === FINAL_ACR_LOGIN_SERVER &&
+    registry.identity === FINAL_IMAGE_PULL_IDENTITY &&
+    Array.isArray(configuration.identitySettings) &&
+    configuration.identitySettings.length === 2 &&
+    hasExactKeys(configuration.identitySettings[0], ["identity", "lifecycle"]) &&
+    configuration.identitySettings[0].identity ===
+      FINAL_IMAGE_PULL_IDENTITY.replace("resourceGroups", "resourcegroups") &&
+    configuration.identitySettings[0].lifecycle === "None" &&
+    hasExactKeys(configuration.identitySettings[1], ["identity", "lifecycle"]) &&
+    configuration.identitySettings[1].identity ===
+      FINAL_RUNTIME_IDENTITY.replace("resourceGroups", "resourcegroups") &&
+    configuration.identitySettings[1].lifecycle === "Main" &&
+    hasExactKeys(template, ["containers"]) &&
+    Array.isArray(containers) &&
+    containers.length === 1 &&
+    hasExactKeys(container, ["name", "image", "resources", "env"]) &&
+    container.name === "expiry-cleanup" &&
+    container.image === images["palancar-expiry-cleanup"] &&
+    hasExactKeys(container.resources, ["cpu", "memory"]) &&
+    container.resources.cpu === 0.25 &&
+    container.resources.memory === "0.5Gi" &&
+    (() => {
+      const entries = valuesByName(container.env);
+      return (
+        hasExactNamedEntries(entries, [
+          "AZURE_CLIENT_ID",
+          "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+          "PALANCAR_SECURITY_STATE_TABLE",
+          "PALANCAR_RATE_STATE_TABLE",
+          "PALANCAR_RELAY_ENVIRONMENT",
+          "PALANCAR_RELAY_ORIGIN",
+          "PALANCAR_EXPIRY_CLEANUP_LIMIT",
+          "PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS",
+        ]) &&
+        [...entries.values()].every((entry) =>
+          hasExactKeys(entry, ["name", "value"]),
+        ) &&
+        hasEnvValue(entries, "AZURE_CLIENT_ID", runtimeClientId) &&
+        hasEnvValue(entries, "PALANCAR_WORKLOAD_TABLE_ENDPOINT", FINAL_TABLE_ENDPOINT) &&
+        hasEnvValue(entries, "PALANCAR_SECURITY_STATE_TABLE", "SecurityState") &&
+        hasEnvValue(entries, "PALANCAR_RATE_STATE_TABLE", "RateState") &&
+        hasEnvValue(entries, "PALANCAR_RELAY_ENVIRONMENT", "dev") &&
+        (relayOrigin === undefined
+          ? hasExactFinalRelayOrigin(
+              entries.get("PALANCAR_RELAY_ORIGIN")?.value,
+            )
+          : hasEnvValue(entries, "PALANCAR_RELAY_ORIGIN", relayOrigin)) &&
+        hasEnvValue(entries, "PALANCAR_EXPIRY_CLEANUP_LIMIT", "1000") &&
+        hasEnvValue(entries, "PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS", "240000")
+      );
+    })()
+  );
+}
+
+const FINAL_REFERENCE_CHANGES = new Map(
+  FINAL_REFERENCE_PLAN.resource_changes.map((entry) => [entry.address, entry]),
+);
+const FINAL_INVENTORY = new Set(FINAL_REFERENCE_CHANGES.keys());
+const FINAL_ROLE_DEFINITION_IDS = {
+  acr: "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+  table: STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+  openai: "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
+  monitoring: FINAL_ROLE_DEFINITION_MONITORING_ID,
+  secretsUser: "4633458b-17de-408a-b874-0445c86b69e6",
+  secretsOfficer: "b86a8fe4-44ce-4948-aee5-eccb2c155cd7",
+};
+
+function finalExactKeys(value, keys) {
+  return isObject(value) && hasExactKeys(value, keys);
+}
+
+function finalUuid(value) {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+function finalIsEmptyObject(value) {
+  return finalExactKeys(value, []);
+}
+
+function finalVariableValue(plan, name) {
+  const descriptor = plan.variables?.[name];
+  return finalExactKeys(descriptor, ["value"]) ? descriptor.value : undefined;
+}
+
+function finalHasExactVariables(plan) {
+  if (
+    !isObject(plan.variables) ||
+    !hasExactKeys(plan.variables, Object.keys(FINAL_REFERENCE_PLAN.variables))
+  ) {
+    return false;
+  }
+
+  const dynamicVariables = new Set([
+    "budget_contact_emails",
+    "operator_principal_id",
+    "relay_image_digest",
+    "litellm_image_digest",
+    "expiry_cleanup_image_digest",
+  ]);
+  for (const [name, expected] of Object.entries(FINAL_REFERENCE_PLAN.variables)) {
+    const descriptor = plan.variables[name];
+    if (!finalExactKeys(descriptor, ["value"])) {
+      return false;
+    }
+    if (!dynamicVariables.has(name) && !isDeepStrictEqual(descriptor, expected)) {
+      return false;
+    }
+  }
+
+  const emails = finalVariableValue(plan, "budget_contact_emails");
+  const operator = finalVariableValue(plan, "operator_principal_id");
+  return (
+    Array.isArray(emails) &&
+    emails.length > 0 &&
+    new Set(emails).size === emails.length &&
+    isDeepStrictEqual(emails, emails.slice().sort()) &&
+    emails.every(
+      (email) =>
+        typeof email === "string" &&
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
+    ) &&
+    finalUuid(operator) &&
+    operator !== "00000000-0000-0000-0000-000000000000" &&
+    finalVariableValue(plan, "litellm_upstream_model") ===
+      FINAL_GENERATION_MODEL &&
+    exactFinalImageVariables(plan) !== undefined &&
+    hasExactFinalFoundryDeploymentsVariable(plan)
+  );
+}
+
+function finalRelevantAttributeKey(entry) {
+  if (
+    !finalExactKeys(entry, ["resource", "attribute"]) ||
+    typeof entry.resource !== "string" ||
+    !Array.isArray(entry.attribute) ||
+    !entry.attribute.every((part) => typeof part === "string")
+  ) {
+    return undefined;
+  }
+  return JSON.stringify([entry.resource, entry.attribute]);
+}
+
+function finalHasExactRelevantAttributes(plan) {
+  if (!Array.isArray(plan.relevant_attributes)) {
+    return false;
+  }
+  const actual = plan.relevant_attributes.map(finalRelevantAttributeKey);
+  const expected = FINAL_REFERENCE_PLAN.relevant_attributes.map(
+    finalRelevantAttributeKey,
+  );
+  return (
+    actual.every((entry) => entry !== undefined) &&
+    new Set(actual).size === actual.length &&
+    actual.length === expected.length &&
+    actual.slice().sort().every((entry, index) => entry === expected.sort()[index])
+  );
+}
+
+function finalCollectValueResources(rootModule) {
+  const resources = new Map();
+  const moduleAddresses = new Set();
+  let valid = true;
+
+  function visit(module, expectedAddress, isRoot) {
+    if (!isObject(module)) {
+      valid = false;
+      return;
+    }
+    const keys = [
+      "resources",
+      ...(isRoot ? [] : ["address"]),
+      ...(Object.hasOwn(module, "child_modules") ? ["child_modules"] : []),
+    ];
+    if (!finalExactKeys(module, keys)) {
+      valid = false;
+      return;
+    }
+    if (!isRoot) {
+      if (module.address !== expectedAddress || moduleAddresses.has(module.address)) {
+        valid = false;
+        return;
+      }
+      moduleAddresses.add(module.address);
+    }
+    if (!Array.isArray(module.resources)) {
+      valid = false;
+      return;
+    }
+    for (const resource of module.resources) {
+      if (
+        !isObject(resource) ||
+        typeof resource.address !== "string" ||
+        resources.has(resource.address) ||
+        (!isRoot && !resource.address.startsWith(`${expectedAddress}.`)) ||
+        (isRoot && resource.address.startsWith("module."))
+      ) {
+        valid = false;
+        continue;
+      }
+      resources.set(resource.address, resource);
+    }
+    if (Object.hasOwn(module, "child_modules")) {
+      if (!Array.isArray(module.child_modules)) {
+        valid = false;
+        return;
+      }
+      for (const child of module.child_modules) {
+        visit(child, child?.address, false);
+      }
+    }
+  }
+
+  visit(rootModule, "", true);
+  return valid ? resources : undefined;
+}
+
+function finalValueModuleStructure(rootModule) {
+  const parents = new Map();
+  const resourceModules = new Map();
+  let valid = true;
+
+  function visit(module, parentAddress, isRoot) {
+    if (!isObject(module) || !Array.isArray(module.resources)) {
+      valid = false;
+      return;
+    }
+    const moduleAddress = isRoot ? "" : module.address;
+    if (!isRoot) {
+      if (
+        typeof moduleAddress !== "string" ||
+        parents.has(moduleAddress)
+      ) {
+        valid = false;
+        return;
+      }
+      parents.set(moduleAddress, parentAddress);
+    }
+    for (const resource of module.resources) {
+      if (
+        !isObject(resource) ||
+        typeof resource.address !== "string" ||
+        resourceModules.has(resource.address)
+      ) {
+        valid = false;
+        continue;
+      }
+      resourceModules.set(resource.address, moduleAddress);
+    }
+    for (const child of module.child_modules ?? []) {
+      visit(child, moduleAddress, false);
+    }
+  }
+
+  visit(rootModule, "", true);
+  return valid ? { parents, resourceModules } : undefined;
+}
+
+function finalMapsEqual(actual, expected) {
+  return (
+    actual.size === expected.size &&
+    [...expected].every(([key, value]) => actual.get(key) === value)
+  );
+}
+
+function finalHasExactValueModuleHierarchies(plan, priorResources) {
+  const planned = finalValueModuleStructure(plan.planned_values.root_module);
+  const prior = finalValueModuleStructure(plan.prior_state.values.root_module);
+  const referencePlanned = finalValueModuleStructure(
+    FINAL_REFERENCE_PLAN.planned_values.root_module,
+  );
+  const referencePrior = finalValueModuleStructure(
+    FINAL_REFERENCE_PLAN.prior_state.values.root_module,
+  );
+  if (!planned || !prior || !referencePlanned || !referencePrior) {
+    return false;
+  }
+  if (!finalMapsEqual(planned.parents, referencePlanned.parents)) {
+    return false;
+  }
+
+  const expectedPriorParents = new Map(referencePrior.parents);
+  for (const address of priorResources.keys()) {
+    let moduleAddress =
+      referencePrior.resourceModules.get(address) ??
+      referencePlanned.resourceModules.get(address);
+    if (moduleAddress === undefined) {
+      return false;
+    }
+    while (moduleAddress !== "") {
+      const parentAddress = referencePlanned.parents.get(moduleAddress);
+      if (parentAddress === undefined) {
+        return false;
+      }
+      expectedPriorParents.set(moduleAddress, parentAddress);
+      moduleAddress = parentAddress;
+    }
+  }
+  return finalMapsEqual(prior.parents, expectedPriorParents);
+}
+
+function finalResourceEnvelopeMatches(resource, change, section, sensitive) {
+  const reference =
+    section === "planned"
+      ? finalCollectValueResources(FINAL_REFERENCE_PLAN.planned_values.root_module)?.get(
+          change.address,
+        )
+      : finalCollectValueResources(
+          FINAL_REFERENCE_PLAN.prior_state.values.root_module,
+        )?.get(change.address) ??
+        finalCollectValueResources(
+          FINAL_REFERENCE_PLAN.planned_values.root_module,
+        )?.get(change.address);
+  if (!reference) {
+    return false;
+  }
+
+  const allowedKeys = new Set([
+    "address",
+    "mode",
+    "type",
+    "name",
+    ...(Object.hasOwn(reference, "index") ? ["index"] : []),
+    "provider_name",
+    "schema_version",
+    "values",
+    "sensitive_values",
+    ...(section === "prior" && Object.hasOwn(resource, "depends_on")
+      ? ["depends_on"]
+      : []),
+    ...(Object.hasOwn(change.change, `${section === "prior" ? "before" : "after"}_identity`)
+      ? ["identity_schema_version", "identity"]
+      : []),
+  ]);
+  if (!finalExactKeys(resource, [...allowedKeys])) {
+    return false;
+  }
+  for (const key of ["address", "mode", "type", "name", "provider_name", "schema_version"]) {
+    if (!isDeepStrictEqual(resource[key], reference[key])) {
+      return false;
+    }
+  }
+  if (
+    Object.hasOwn(reference, "index") &&
+    !isDeepStrictEqual(resource.index, reference.index)
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(resource, "depends_on") &&
+    (!Array.isArray(resource.depends_on) ||
+      !resource.depends_on.every((entry) => typeof entry === "string"))
+  ) {
+    return false;
+  }
+  return (
+    isDeepStrictEqual(resource.values, sensitive.values) &&
+    isDeepStrictEqual(resource.sensitive_values, sensitive.map) &&
+    (!Object.hasOwn(resource, "identity") ||
+      (resource.identity_schema_version === 0 &&
+        isDeepStrictEqual(resource.identity, sensitive.identity)))
+  );
+}
+
+function finalRoleDefinitionId(uuid) {
+  return `/subscriptions/${FINAL_SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/${uuid}`;
+}
+
+function finalRoleId(scope, name) {
+  return `${scope}/providers/Microsoft.Authorization/roleAssignments/${name}`;
+}
+
+function finalExpectedRole(address, context) {
+  const acrScope = `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.ContainerRegistry/registries/palancardevacraeeacd8c`;
+  const storageScope = `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Storage/storageAccounts/${FINAL_TABLE_ACCOUNT}`;
+  const keyVaultScope = `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.KeyVault/vaults/kvpalancardevaeeacd8c`;
+  const foundryScope = FOUNDRY_COGNITIVE_ACCOUNT_ID;
+  const tableScope = (name) => `${FINAL_TABLE_SERVICE_ID}/tables/${name}`;
+  const definitions = Object.fromEntries(
+    Object.entries(FINAL_ROLE_DEFINITION_IDS).map(([key, value]) => [
+      key,
+      finalRoleDefinitionId(value),
+    ]),
+  );
+
+  const contracts = {
+    "module.identities_rbac.azurerm_role_assignment.image_pull_acr": {
+      scope: acrScope,
+      role: definitions.acr,
+      roleName: "AcrPull",
+      principal: context.imagePullPrincipal,
+      principalType: "ServicePrincipal",
+      nameInput: `${acrScope}/image-pull/${definitions.acr}`,
+    },
+    "module.identities_rbac.azurerm_role_assignment.runtime_table": {
+      scope: storageScope,
+      role: definitions.table,
+      roleName: "Storage Table Data Contributor",
+      principal: context.runtimePrincipal,
+      principalType: "ServicePrincipal",
+      nameInput: `${storageScope}/runtime/${definitions.table}`,
+    },
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai": {
+      scope: foundryScope,
+      role: definitions.openai,
+      roleName: "Cognitive Services OpenAI User",
+      principal: context.runtimePrincipal,
+      principalType: "ServicePrincipal",
+      nameInput: `${foundryScope}/runtime/${definitions.openai}`,
+    },
+    [FINAL_MONITORING_ROLE_ASSIGNMENT]: {
+      scope: FINAL_APPLICATION_INSIGHTS_ID,
+      role: definitions.monitoring,
+      roleName: "Monitoring Metrics Publisher",
+      principal: context.runtimePrincipal,
+      principalType: "ServicePrincipal",
+      nameInput: `scope=${FINAL_APPLICATION_INSIGHTS_ID}|principal_id=${context.runtimePrincipal}|role_definition_id=${definitions.monitoring}`,
+    },
+    "module.identities_rbac.azurerm_role_assignment.operator_security_table": {
+      scope: tableScope("SecurityState"),
+      role: definitions.table,
+      roleName: "Storage Table Data Contributor",
+      principal: context.operatorPrincipal,
+      principalType: "User",
+      nameInput: `${tableScope("SecurityState")}/operator/${context.operatorPrincipal}/${definitions.table}`,
+    },
+    "module.identities_rbac.azurerm_role_assignment.operator_rate_table": {
+      scope: tableScope("RateState"),
+      role: definitions.table,
+      roleName: "Storage Table Data Contributor",
+      principal: context.operatorPrincipal,
+      principalType: "User",
+      nameInput: `${tableScope("RateState")}/operator/${context.operatorPrincipal}/${definitions.table}`,
+    },
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user": {
+      scope: keyVaultScope,
+      role: definitions.secretsUser,
+      roleName: "Key Vault Secrets User",
+      principal: context.runtimePrincipal,
+      principalType: "ServicePrincipal",
+      nameInput: `${keyVaultScope}/runtime/${context.runtimePrincipal}/${definitions.secretsUser}`,
+    },
+    "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer": {
+      scope: keyVaultScope,
+      role: definitions.secretsOfficer,
+      roleName: "Key Vault Secrets Officer",
+      principal: context.cliPrincipal,
+      principalType: "User",
+      nameInput: `${keyVaultScope}/terraform-cli/${context.cliPrincipal}/${definitions.secretsOfficer}`,
+    },
+  };
+  return contracts[address];
+}
+
+function finalHasExactRoleChange(resourceChange, context) {
+  const contract = finalExpectedRole(resourceChange.address, context);
+  if (!contract) {
+    return false;
+  }
+  const after = resourceChange.change.after;
+  const name = uuidV5Url(contract.nameInput);
+  const common = {
+    name,
+    principal_id: contract.principal,
+    principal_type: contract.principalType,
+    role_definition_id: contract.role,
+    scope: contract.scope,
+  };
+  if (!Object.entries(common).every(([key, value]) => after?.[key] === value)) {
+    return false;
+  }
+
+  if (isCreate(resourceChange.change.actions)) {
+    return (
+      finalExactKeys(after, [
+        "condition",
+        "delegated_managed_identity_resource_id",
+        "description",
+        "name",
+        "principal_id",
+        "principal_type",
+        "role_definition_id",
+        "scope",
+        "timeouts",
+      ]) &&
+      after.condition === null &&
+      after.delegated_managed_identity_resource_id === null &&
+      after.description === null &&
+      after.timeouts === null
+    );
+  }
+
+  return (
+    finalExactKeys(after, [
+      "condition",
+      "condition_version",
+      "delegated_managed_identity_resource_id",
+      "description",
+      "id",
+      "name",
+      "principal_id",
+      "principal_type",
+      "role_definition_id",
+      "role_definition_name",
+      "scope",
+      "skip_service_principal_aad_check",
+      "timeouts",
+    ]) &&
+    after.condition === "" &&
+    after.condition_version === "" &&
+    after.delegated_managed_identity_resource_id === "" &&
+    after.description === "" &&
+    after.id === finalRoleId(contract.scope, name) &&
+    after.role_definition_name === contract.roleName &&
+    after.skip_service_principal_aad_check === null &&
+    after.timeouts === null
+  );
+}
+
+function finalAzapiIdentity(after, action) {
+  if (!Array.isArray(after?.identity) || after.identity.length !== 1) {
+    return false;
+  }
+  const identity = after.identity[0];
+  const expectedKeys = isCreate(action)
+    ? ["identity_ids", "type"]
+    : ["identity_ids", "principal_id", "tenant_id", "type"];
+  return (
+    finalExactKeys(identity, expectedKeys) &&
+    identity.type === "UserAssigned" &&
+    isDeepStrictEqual(identity.identity_ids, [
+      FINAL_IMAGE_PULL_IDENTITY,
+      FINAL_RUNTIME_IDENTITY,
+    ]) &&
+    (isCreate(action) ||
+      (identity.principal_id === "" && identity.tenant_id === ""))
+  );
+}
+
+function finalAzapiProviderEnvelope(after, kind, action, defaultDomain) {
+  const referenceChange = FINAL_REFERENCE_CHANGES.get(
+    kind === "app" ? CONTAINER_APP : EXPIRY_CLEANUP_JOB,
+  );
+  const referenceAfter = referenceChange.change.after;
+  const keys = Object.keys(referenceAfter).filter(
+    (key) => !(isCreate(action) && key === "id"),
+  );
+  if (!isCreate(action) && !keys.includes("id")) {
+    keys.push("id");
+  }
+  if (isNoOp(action) && !keys.includes("output")) {
+    keys.push("output");
+  }
+  if (!isNoOp(action)) {
+    const outputIndex = keys.indexOf("output");
+    if (outputIndex !== -1) {
+      keys.splice(outputIndex, 1);
+    }
+  }
+  if (!finalExactKeys(after, keys)) {
+    return false;
+  }
+
+  for (const key of Object.keys(referenceAfter)) {
+    if (["body", "id", "identity", "output"].includes(key)) {
+      continue;
+    }
+    if (!isDeepStrictEqual(after[key], referenceAfter[key])) {
+      return false;
+    }
+  }
+  const expectedId =
+    kind === "app"
+      ? `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.App/containerApps/${FINAL_CONTAINER_APP_NAME}`
+      : `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.App/jobs/${FINAL_CLEANUP_JOB_NAME}`;
+  if (!isCreate(action) && after.id !== expectedId) {
+    return false;
+  }
+  if (!finalAzapiIdentity(after, action)) {
+    return false;
+  }
+  if (isNoOp(action)) {
+    if (
+      !finalExactKeys(after.output, ["properties"]) ||
+      !isObject(after.output.properties)
+    ) {
+      return false;
+    }
+    if (kind === "app") {
+      const output = after.output.properties;
+      if (
+        !finalExactKeys(output, [
+          "configuration",
+          "latestRevisionName",
+          "runningStatus",
+        ]) ||
+        !finalExactKeys(output.configuration, ["ingress"]) ||
+        !finalExactKeys(output.configuration.ingress, ["fqdn"]) ||
+        output.configuration.ingress.fqdn !==
+          `${FINAL_CONTAINER_APP_NAME}.${defaultDomain}` ||
+        typeof output.latestRevisionName !== "string" ||
+        !output.latestRevisionName.startsWith(`${FINAL_CONTAINER_APP_NAME}--`) ||
+        output.runningStatus !== "Running"
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function finalNormalizedAppContractChange(resourceChange) {
+  const after = resourceChange.change.after;
+  return {
+    change: {
+      after: {
+        body: after.body,
+        identity: [
+          {
+            type: after.identity[0].type,
+            identity_ids: after.identity[0].identity_ids,
+          },
+        ],
+        location: after.location,
+        name: after.name,
+        parent_id: after.parent_id,
+        response_export_values: after.response_export_values,
+        retry: {
+          error_message_regex: after.retry.error_message_regex,
+          interval_seconds: after.retry.interval_seconds,
+          max_interval_seconds: after.retry.max_interval_seconds,
+        },
+        tags: after.tags,
+        type: after.type,
+      },
+      after_unknown: {},
+      after_sensitive: {},
+    },
+  };
+}
+
+function finalNormalizedJobContractChange(resourceChange) {
+  const after = resourceChange.change.after;
+  return {
+    change: {
+      after: {
+        body: after.body,
+        identity: [
+          {
+            type: after.identity[0].type,
+            identity_ids: after.identity[0].identity_ids,
+          },
+        ],
+        location: after.location,
+        name: after.name,
+        parent_id: after.parent_id,
+        tags: after.tags,
+        type: after.type,
+      },
+      after_unknown: {},
+      after_sensitive: {},
+    },
+  };
+}
+
+function finalApplicationInsightsConnection(fullConnection) {
+  if (typeof fullConnection !== "string") {
+    return undefined;
+  }
+  const values = new Map();
+  for (const segment of fullConnection.split(";")) {
+    const separator = segment.indexOf("=");
+    if (separator <= 0 || separator === segment.length - 1) {
+      return undefined;
+    }
+    const key = segment.slice(0, separator);
+    if (values.has(key)) {
+      return undefined;
+    }
+    values.set(key, segment.slice(separator + 1));
+  }
+  if (
+    !isDeepStrictEqual([...values.keys()], [
+      "InstrumentationKey",
+      "IngestionEndpoint",
+      "LiveEndpoint",
+      "ApplicationId",
+    ])
+  ) {
+    return undefined;
+  }
+  const instrumentationKey = values.get("InstrumentationKey")?.toLowerCase();
+  const ingestionEndpoint = values.get("IngestionEndpoint");
+  const liveEndpoint = values.get("LiveEndpoint");
+  const applicationId = values.get("ApplicationId")?.toLowerCase();
+  if (
+    !finalUuid(instrumentationKey) ||
+    !finalUuid(applicationId) ||
+    ingestionEndpoint !== FINAL_APPLICATION_INSIGHTS_INGESTION_ENDPOINT ||
+    liveEndpoint !== FINAL_APPLICATION_INSIGHTS_LIVE_ENDPOINT
+  ) {
+    return undefined;
+  }
+  return {
+    applicationId,
+    instrumentationKey,
+    liveEndpoint,
+    relay: `InstrumentationKey=${instrumentationKey};IngestionEndpoint=${ingestionEndpoint.replace(/\/$/, "")}`,
+  };
+}
+
+function finalAlertId(name) {
+  return `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.Insights/scheduledQueryRules/${name}`;
+}
+
+function finalHasExactActionGroup(resourceChange, contacts) {
+  const after = resourceChange?.change?.after;
+  const noOp = isNoOp(resourceChange?.change?.actions);
+  const receiverKeys = [
+    "arm_role_receiver",
+    "automation_runbook_receiver",
+    "azure_app_push_receiver",
+    "azure_function_receiver",
+    "event_hub_receiver",
+    "itsm_receiver",
+    "logic_app_receiver",
+    "sms_receiver",
+    "voice_receiver",
+    "webhook_receiver",
+  ];
+  const expectedKeys = [
+    ...receiverKeys,
+    "email_receiver",
+    "enabled",
+    ...(noOp ? ["id"] : []),
+    "location",
+    "name",
+    "resource_group_name",
+    "short_name",
+    "tags",
+    "timeouts",
+  ];
+  const receivers = after?.email_receiver;
+  return (
+    finalExactKeys(after, expectedKeys) &&
+    receiverKeys.every(
+      (key) => Array.isArray(after[key]) && after[key].length === 0,
+    ) &&
+    Array.isArray(receivers) &&
+    receivers.length === contacts.length &&
+    receivers.every(
+      (receiver, index) =>
+        finalExactKeys(receiver, [
+          "email_address",
+          "name",
+          "use_common_alert_schema",
+        ]) &&
+        receiver.email_address === contacts[index] &&
+        receiver.name === `budget-contact-${String(index + 1).padStart(4, "0")}` &&
+        receiver.use_common_alert_schema === true,
+    ) &&
+    after.enabled === true &&
+    (!noOp || after.id === FINAL_ACTION_GROUP_ID) &&
+    after.location === "global" &&
+    after.name === FINAL_ACTION_GROUP_NAME &&
+    after.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
+    after.short_name === "r-aeeacd8c" &&
+    hasExactFinalTags(after.tags) &&
+    after.timeouts === null
+  );
+}
+
+function finalHasExactAlert(resourceChange) {
+  const key = resourceChange?.index;
+  const contract = FINAL_ALERT_CONTRACTS.get(key);
+  const after = resourceChange?.change?.after;
+  const noOp = isNoOp(resourceChange?.change?.actions);
+  if (!contract) {
+    return false;
+  }
+  const expectedName = `${FINAL_APPLICATION_INSIGHTS_NAME}-${key.replaceAll("_", "-")}`;
+  const action = after?.action?.[0];
+  const criteria = after?.criteria?.[0];
+  const periods = criteria?.failing_periods?.[0];
+  return (
+    finalExactKeys(after, [
+      "action",
+      "auto_mitigation_enabled",
+      ...(noOp
+        ? [
+            "created_with_api_version",
+            "id",
+            "is_a_legacy_log_analytics_rule",
+            "is_workspace_alerts_storage_configured",
+          ]
+        : []),
+      "criteria",
+      "description",
+      "display_name",
+      "enabled",
+      "evaluation_frequency",
+      "identity",
+      "location",
+      "mute_actions_after_alert_duration",
+      "name",
+      "query_time_range_override",
+      "resource_group_name",
+      "scopes",
+      "severity",
+      "skip_query_validation",
+      "tags",
+      "target_resource_types",
+      "timeouts",
+      "window_duration",
+      "workspace_alerts_storage_enabled",
+    ]) &&
+    Array.isArray(after.action) &&
+    after.action.length === 1 &&
+    finalExactKeys(action, [
+      "action_groups",
+      "custom_properties",
+      "email_subject",
+    ]) &&
+    isDeepStrictEqual(action.action_groups, [FINAL_ACTION_GROUP_ID]) &&
+    finalExactKeys(action.custom_properties, ["service", "signal"]) &&
+    action.custom_properties.service === "relay" &&
+    action.custom_properties.signal === key &&
+    action.email_subject === null &&
+    after.auto_mitigation_enabled === true &&
+    Array.isArray(after.criteria) &&
+    after.criteria.length === 1 &&
+    finalExactKeys(criteria, [
+      "dimension",
+      "failing_periods",
+      "metric_measure_column",
+      "operator",
+      "query",
+      "resource_id_column",
+      "threshold",
+      "time_aggregation_method",
+    ]) &&
+    Array.isArray(criteria.dimension) &&
+    criteria.dimension.length === 0 &&
+    Array.isArray(criteria.failing_periods) &&
+    criteria.failing_periods.length === 1 &&
+    finalExactKeys(periods, [
+      "minimum_failing_periods_to_trigger_alert",
+      "number_of_evaluation_periods",
+    ]) &&
+    periods.minimum_failing_periods_to_trigger_alert === 1 &&
+    periods.number_of_evaluation_periods === 1 &&
+    criteria.metric_measure_column === "SignalValue" &&
+    criteria.operator === "GreaterThanOrEqual" &&
+    criteria.query === contract.query &&
+    criteria.resource_id_column === null &&
+    criteria.threshold === contract.threshold &&
+    criteria.time_aggregation_method === contract.aggregation &&
+    after.description === contract.description &&
+    after.display_name === contract.displayName &&
+    after.enabled === true &&
+    after.evaluation_frequency === "PT5M" &&
+    Array.isArray(after.identity) &&
+    after.identity.length === 0 &&
+    after.location === "eastus2" &&
+    after.mute_actions_after_alert_duration === null &&
+    after.name === expectedName &&
+    after.query_time_range_override === null &&
+    after.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
+    isDeepStrictEqual(after.scopes, [FINAL_WORKSPACE_ID]) &&
+    after.severity === contract.severity &&
+    after.skip_query_validation === false &&
+    hasExactFinalTags(after.tags) &&
+    after.target_resource_types === null &&
+    after.timeouts === null &&
+    after.window_duration === "PT15M" &&
+    after.workspace_alerts_storage_enabled === false &&
+    (!noOp ||
+      (after.created_with_api_version === FINAL_ALERT_API_VERSION &&
+        after.id === finalAlertId(expectedName) &&
+        after.is_a_legacy_log_analytics_rule === false &&
+        after.is_workspace_alerts_storage_configured === false))
+  );
+}
+
+function finalHasExactAlertInventory(plan, changesByAddress) {
+  const contacts = finalVariableValue(plan, "budget_contact_emails");
+  const actionGroup = changesByAddress.get(FINAL_ACTION_GROUP_ADDRESS);
+  const budget = changesByAddress.get(
+    "module.budget.azurerm_consumption_budget_resource_group.this",
+  )?.change.after;
+  const notifications = budget?.notification;
+  const configuredActionGroups =
+    plan.configuration?.root_module?.module_calls?.observability?.expressions
+      ?.alert_action_group_ids;
+  const referenceConfiguredActionGroups =
+    FINAL_REFERENCE_PLAN.configuration.root_module.module_calls.observability
+      .expressions.alert_action_group_ids;
+  if (
+    !Array.isArray(contacts) ||
+    !finalHasExactActionGroup(actionGroup, contacts) ||
+    !Array.isArray(notifications) ||
+    notifications.length !== 4 ||
+    notifications.some(
+      (notification) =>
+        !isDeepStrictEqual(notification.contact_emails, contacts),
+    ) ||
+    !isDeepStrictEqual(configuredActionGroups, referenceConfiguredActionGroups) ||
+    plan.planned_values?.outputs?.relay_action_group_id?.value !==
+      FINAL_ACTION_GROUP_ID ||
+    plan.output_changes?.relay_action_group_id?.after !== FINAL_ACTION_GROUP_ID
+  ) {
+    return false;
+  }
+
+  for (const address of FINAL_ALERT_ADDRESSES) {
+    if (!finalHasExactAlert(changesByAddress.get(address))) {
+      return false;
+    }
+  }
+
+  const alertOutput = plan.planned_values?.outputs?.relay_alert_rule_ids;
+  if (Object.hasOwn(alertOutput ?? {}, "value")) {
+    const expectedIds = Object.fromEntries(
+      [...FINAL_ALERT_CONTRACTS.keys()].map((key) => {
+        const name = `${FINAL_APPLICATION_INSIGHTS_NAME}-${key.replaceAll("_", "-")}`;
+        return [key, finalAlertId(name)];
+      }),
+    );
+    if (!isDeepStrictEqual(alertOutput.value, expectedIds)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function finalCriticalBindings(plan, changesByAddress) {
+  const appInsights = changesByAddress.get(
+    "module.observability.azurerm_application_insights.this",
+  )?.change.after;
+  const environment = changesByAddress.get(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+  )?.change.after;
+  const app = changesByAddress.get(CONTAINER_APP)?.change.after;
+  const job = changesByAddress.get(EXPIRY_CLEANUP_JOB)?.change.after;
+  const fullConnection =
+    plan.planned_values?.outputs?.application_insights_connection_string?.value;
+  const defaultDomain =
+    plan.planned_values?.outputs?.container_app_environment_default_domain?.value;
+  const relayOrigin = plan.planned_values?.outputs?.relay_origin?.value;
+  const connection = finalApplicationInsightsConnection(fullConnection);
+  const appContainers = app?.body?.properties?.template?.containers;
+  const relay = Array.isArray(appContainers) ? appContainers[0] : undefined;
+  const relayEnv = valuesByName(relay?.env);
+  const jobEnv = valuesByName(
+    job?.body?.properties?.template?.containers?.[0]?.env,
+  );
+  return (
+    appInsights?.id === FINAL_APPLICATION_INSIGHTS_ID &&
+    appInsights?.name === FINAL_APPLICATION_INSIGHTS_NAME &&
+    appInsights?.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
+    appInsights?.location === "eastus2" &&
+    connection?.instrumentationKey ===
+      appInsights?.instrumentation_key?.toLowerCase() &&
+    connection?.applicationId === appInsights?.app_id?.toLowerCase() &&
+    connection?.liveEndpoint === FINAL_APPLICATION_INSIGHTS_LIVE_ENDPOINT &&
+    environment?.id === FINAL_CONTAINER_ENVIRONMENT_ID &&
+    environment?.name === FINAL_CONTAINER_ENVIRONMENT_NAME &&
+    environment?.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
+    environment?.location === "eastus2" &&
+    defaultDomain === FINAL_CONTAINER_ENVIRONMENT_DEFAULT_DOMAIN &&
+    defaultDomain === environment?.default_domain &&
+    fullConnection === appInsights?.connection_string &&
+    connection?.relay ===
+      relayEnv?.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value &&
+    relayOrigin === FINAL_RELAY_ORIGIN &&
+    relayEnv?.get("PALANCAR_RELAY_ORIGIN")?.value === FINAL_RELAY_ORIGIN &&
+    jobEnv?.get("PALANCAR_RELAY_ORIGIN")?.value === FINAL_RELAY_ORIGIN &&
+    plan.output_changes?.application_insights_connection_string?.after ===
+      fullConnection &&
+    plan.output_changes?.container_app_environment_default_domain?.after ===
+      defaultDomain &&
+    plan.output_changes?.relay_origin?.after === relayOrigin
+  );
+}
+
+function finalHasExactTopology(plan, changesByAddress, context, images) {
+  const deployment = changesByAddress.get(MODEL_SPIKE_DEPLOYMENT);
+  const app = changesByAddress.get(CONTAINER_APP);
+  const job = changesByAddress.get(EXPIRY_CLEANUP_JOB);
+  const deploymentReference = FINAL_REFERENCE_CHANGES.get(
+    MODEL_SPIKE_DEPLOYMENT,
+  ).change.after;
+  const defaultDomain =
+    plan.planned_values?.outputs?.container_app_environment_default_domain?.value;
+  if (
+    !isNoOp(deployment.change.actions) ||
+    !isDeepStrictEqual(deployment.change.after, deploymentReference)
+  ) {
+    return false;
+  }
+
+  if (
+    !finalAzapiProviderEnvelope(
+      app.change.after,
+      "app",
+      app.change.actions,
+      defaultDomain,
+    ) ||
+    !hasExactFinalContainerApp(
+      finalNormalizedAppContractChange(app),
+      images,
+      context.runtimeClient,
+    ) ||
+    !finalAzapiProviderEnvelope(
+      job.change.after,
+      "job",
+      job.change.actions,
+      defaultDomain,
+    ) ||
+    !hasExactFinalCleanupJob(
+      finalNormalizedJobContractChange(job),
+      images,
+      context.runtimeClient,
+      plan.planned_values.outputs.relay_origin.value,
+    )
+  ) {
+    return false;
+  }
+
+  const appContainers = app.change.after.body.properties.template.containers;
+  return (
+    appContainers[0].name === "relay" &&
+    appContainers[1].name === "litellm" &&
+    appContainers[1].env[1]?.name === "PALANCAR_LITELLM_UPSTREAM_MODEL" &&
+    appContainers[1].env[1]?.value === FINAL_GENERATION_MODEL &&
+    finalCriticalBindings(plan, changesByAddress)
+  );
+}
+
+function finalExpectedAfterUnknown(resourceChange) {
+  const action = resourceChange.change.actions;
+  const reference = FINAL_REFERENCE_CHANGES.get(resourceChange.address);
+  if (isNoOp(action)) {
+    return {};
+  }
+  if (isUpdate(action)) {
+    return reference.change.after_unknown;
+  }
+  if (resourceChange.address === EXPIRY_CLEANUP_JOB) {
+    return reference.change.after_unknown;
+  }
+  if (
+    resourceChange.address === FINAL_ACTION_GROUP_ADDRESS
+  ) {
+    const expected = structuredClone(reference.change.after_unknown);
+    expected.email_receiver = resourceChange.change.after.email_receiver.map(
+      () => ({}),
+    );
+    return expected;
+  }
+  if (FINAL_ALERT_ADDRESSES.has(resourceChange.address)) {
+    return reference.change.after_unknown;
+  }
+  if (FINAL_ROLE_ASSIGNMENT_ADDRESSES.has(resourceChange.address)) {
+    return FINAL_REFERENCE_CHANGES.get(
+      FINAL_MONITORING_ROLE_ASSIGNMENT,
+    ).change.after_unknown;
+  }
+  if (resourceChange.address === CONTAINER_APP) {
+    const expected = structuredClone(reference.change.after_unknown);
+    expected.id = true;
+    expected.identity[0].principal_id = true;
+    expected.identity[0].tenant_id = true;
+    return expected;
+  }
+  return undefined;
+}
+
+function finalExpectedAfterSensitive(resourceChange) {
+  const expected = structuredClone(
+    FINAL_REFERENCE_CHANGES.get(resourceChange.address).change.after_sensitive,
+  );
+  if (resourceChange.address === FINAL_ACTION_GROUP_ADDRESS) {
+    expected.email_receiver = resourceChange.change.after.email_receiver.map(
+      () => ({}),
+    );
+  }
+  return expected;
+}
+
+function finalChangeEnvelopeKeys(resourceChange) {
+  const keys = [
+    "actions",
+    "before",
+    "after",
+    "after_unknown",
+    "before_sensitive",
+    "after_sensitive",
+  ];
+  const action = resourceChange.change.actions;
+  const reference = FINAL_REFERENCE_CHANGES.get(resourceChange.address);
+  if (
+    !isCreate(action) &&
+    (Object.hasOwn(reference.change, "before_identity") ||
+      [CONTAINER_APP, EXPIRY_CLEANUP_JOB].includes(resourceChange.address))
+  ) {
+    keys.push("before_identity", "after_identity");
+  }
+  return keys;
+}
+
+function finalExpectedResourceIdentity(resourceChange, side) {
+  const after = resourceChange.change.after;
+  if (resourceChange.type === "azapi_resource") {
+    return {
+      id: after.id,
+      type: null,
+    };
+  }
+  const reference = FINAL_REFERENCE_CHANGES.get(resourceChange.address);
+  return reference.change[`${side}_identity`];
+}
+
+function finalActionAllowed(resourceChange, priorResources) {
+  const action = resourceChange.change.actions;
+  const address = resourceChange.address;
+  if (address === CONTAINER_APP) {
+    return isCreate(action) || isUpdate(action) || isNoOp(action);
+  }
+  if (address === EXPIRY_CLEANUP_JOB) {
+    return isCreate(action) || isNoOp(action);
+  }
+  if (
+    address === FINAL_ACTION_GROUP_ADDRESS ||
+    FINAL_ALERT_ADDRESSES.has(address)
+  ) {
+    return priorResources.has(address) ? isNoOp(action) : isCreate(action);
+  }
+  if (
+    address === FINAL_MONITORING_ROLE_ASSIGNMENT ||
+    OPERATOR_ROLE_ASSIGNMENTS.has(address)
+  ) {
+    return priorResources.has(address) ? isNoOp(action) : isCreate(action);
+  }
+  return isNoOp(action);
+}
+
+function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
+  const plannedResources = finalCollectValueResources(
+    plan.planned_values?.root_module,
+  );
+  const priorResources = finalCollectValueResources(
+    plan.prior_state?.values?.root_module,
+  );
+  if (!plannedResources || !priorResources) {
+    return false;
+  }
+  if (
+    plannedResources.size !== FINAL_INVENTORY.size ||
+    [...FINAL_INVENTORY].some((address) => !plannedResources.has(address))
+  ) {
+    return false;
+  }
+  if (!finalHasExactValueModuleHierarchies(plan, priorResources)) {
+    return false;
+  }
+
+  for (const [address, resourceChange] of changesByAddress) {
+    const change = resourceChange.change;
+    const action = change.actions;
+    const expectedOuter = FINAL_REFERENCE_CHANGES.get(address);
+    if (
+      !finalExactKeys(resourceChange, Object.keys(expectedOuter)) ||
+      !Object.keys(expectedOuter).every(
+        (key) =>
+          key === "change" ||
+          isDeepStrictEqual(resourceChange[key], expectedOuter[key]),
+      ) ||
+      !finalExactKeys(change, finalChangeEnvelopeKeys(resourceChange)) ||
+      !finalActionAllowed(resourceChange, priorResources) ||
+      !isObject(change.after) ||
+      !isDeepStrictEqual(
+        change.after_unknown,
+        finalExpectedAfterUnknown(resourceChange),
+      ) ||
+      !isDeepStrictEqual(
+        change.after_sensitive,
+        finalExpectedAfterSensitive(resourceChange),
+      )
+    ) {
+      return false;
+    }
+
+    const prior = priorResources.get(address);
+    const planned = plannedResources.get(address);
+    if (isCreate(action)) {
+      if (
+        change.before !== null ||
+        change.before_sensitive !== false ||
+        prior !== undefined
+      ) {
+        return false;
+      }
+    } else {
+      if (
+        !prior ||
+        !isObject(change.before) ||
+        !isDeepStrictEqual(prior.values, change.before) ||
+        !isDeepStrictEqual(prior.sensitive_values, change.before_sensitive)
+      ) {
+        return false;
+      }
+      if (isNoOp(action) && !isDeepStrictEqual(change.before, change.after)) {
+        return false;
+      }
+      if (
+        isNoOp(action) &&
+        !isDeepStrictEqual(change.before_sensitive, change.after_sensitive)
+      ) {
+        return false;
+      }
+    }
+
+    if (
+      !finalResourceEnvelopeMatches(planned, resourceChange, "planned", {
+        values: change.after,
+        map: change.after_sensitive,
+        identity: change.after_identity,
+      }) ||
+      (!isCreate(action) &&
+        !finalResourceEnvelopeMatches(prior, resourceChange, "prior", {
+          values: change.before,
+          map: change.before_sensitive,
+          identity: change.before_identity,
+        }))
+    ) {
+      return false;
+    }
+
+    if (!isCreate(action) && Object.hasOwn(change, "before_identity")) {
+      if (
+        !isDeepStrictEqual(
+          change.before_identity,
+          finalExpectedResourceIdentity(resourceChange, "before"),
+        ) ||
+        !isDeepStrictEqual(
+          change.after_identity,
+          finalExpectedResourceIdentity(resourceChange, "after"),
+        )
+      ) {
+        return false;
+      }
+    }
+
+    if (
+      resourceChange.type === "azurerm_role_assignment" &&
+      !finalHasExactRoleChange(resourceChange, context)
+    ) {
+      return false;
+    }
+  }
+
+  const expectedPrior = [...changesByAddress.values()].filter(
+    (entry) => !isCreate(entry.change.actions),
+  );
+  const clientConfig = priorResources.get(
+    "module.workload_key_vault.data.azurerm_client_config.current",
+  );
+  const clientValues = clientConfig?.values;
+  const clientConfigValid =
+    finalExactKeys(clientConfig, [
+      "address",
+      "mode",
+      "type",
+      "name",
+      "provider_name",
+      "schema_version",
+      "values",
+      "sensitive_values",
+    ]) &&
+    clientConfig.mode === "data" &&
+    clientConfig.type === "azurerm_client_config" &&
+    clientConfig.name === "current" &&
+    clientConfig.provider_name === AZURERM_PROVIDER_NAME &&
+    clientConfig.schema_version === 0 &&
+    finalExactKeys(clientValues, [
+      "client_id",
+      "id",
+      "object_id",
+      "subscription_id",
+      "tenant_id",
+      "timeouts",
+    ]) &&
+    finalUuid(clientValues.client_id) &&
+    typeof clientValues.id === "string" &&
+    clientValues.id.length > 0 &&
+    clientValues.object_id === context.cliPrincipal &&
+    clientValues.subscription_id === FINAL_SUBSCRIPTION_ID &&
+    clientValues.tenant_id === finalVariableValue(plan, "tenant_id") &&
+    clientValues.timeouts === null &&
+    finalIsEmptyObject(clientConfig.sensitive_values);
+  const result = (
+    clientConfigValid &&
+    priorResources.size === expectedPrior.length + 1 &&
+    expectedPrior.every((entry) => priorResources.has(entry.address)) &&
+    finalHasExactAlertInventory(plan, changesByAddress)
+  );
+  return result;
+}
+
+function finalHasExactOutputs(plan) {
+  const expectedNames = Object.keys(FINAL_REFERENCE_PLAN.planned_values.outputs);
+  const planned = plan.planned_values?.outputs;
+  const prior = plan.prior_state?.values?.outputs;
+  const changes = plan.output_changes;
+  if (
+    !isObject(planned) ||
+    !isObject(prior) ||
+    !isObject(changes) ||
+    !hasExactKeys(planned, expectedNames) ||
+    !hasExactKeys(changes, expectedNames)
+  ) {
+    return false;
+  }
+
+  const transitionPriorAnomalies = new Set([
+    "expiry_cleanup_job_name",
+    "relay_action_group_id",
+    "runtime_openai_user_role_assignment_id",
+  ]);
+  const expectedPriorNames = [];
+  for (const name of expectedNames) {
+    const descriptor = planned[name];
+    const outputChange = changes[name];
+    const referenceDescriptor = FINAL_REFERENCE_PLAN.planned_values.outputs[name];
+    const referenceChange = FINAL_REFERENCE_PLAN.output_changes[name];
+    const referencePrior = FINAL_REFERENCE_PLAN.prior_state.values.outputs[name];
+    const hasAfter = Object.hasOwn(outputChange, "after");
+    const descriptorHasValue = Object.hasOwn(descriptor, "value");
+    const inferredType =
+      name === "relay_alert_rule_ids"
+        ? [
+            "object",
+            Object.fromEntries(
+              [...FINAL_ALERT_CONTRACTS.keys()].map((key) => [key, "string"]),
+            ),
+          ]
+        : "string";
+    const descriptorKeys = [
+      "sensitive",
+      ...(descriptorHasValue ? ["type", "value"] : []),
+    ];
+    if (
+      !finalExactKeys(descriptor, descriptorKeys) ||
+      descriptor.sensitive !== referenceDescriptor.sensitive ||
+      (Object.hasOwn(referenceDescriptor, "type")
+        ? !isDeepStrictEqual(descriptor.type, referenceDescriptor.type)
+        : descriptorHasValue &&
+          !isDeepStrictEqual(descriptor.type, inferredType)) ||
+      !finalExactKeys(outputChange, [
+        "actions",
+        "before",
+        ...(hasAfter ? ["after"] : []),
+        "after_unknown",
+        "before_sensitive",
+        "after_sensitive",
+      ]) ||
+      !(
+        isDeepStrictEqual(outputChange.actions, referenceChange.actions) ||
+        isNoOp(outputChange.actions)
+      ) ||
+      (!isNoOp(outputChange.actions) &&
+        !isDeepStrictEqual(outputChange, referenceChange)) ||
+      typeof outputChange.before_sensitive !== "boolean" ||
+      typeof outputChange.after_sensitive !== "boolean" ||
+      outputChange.after_sensitive !== descriptor.sensitive ||
+      (isNoOp(outputChange.actions)
+        ? outputChange.after_unknown !== false ||
+          !hasAfter ||
+          !descriptorHasValue ||
+          !isDeepStrictEqual(descriptor.value, outputChange.after)
+        : !isDeepStrictEqual(descriptor, referenceDescriptor))
+    ) {
+      return false;
+    }
+
+    const hasPrior = Object.hasOwn(prior, name);
+    if (hasPrior) {
+      expectedPriorNames.push(name);
+      if (
+        !finalExactKeys(prior[name], ["sensitive", "type", "value"]) ||
+        !isDeepStrictEqual(
+          prior[name].type,
+          descriptor.type ?? referencePrior?.type,
+        )
+      ) {
+        return false;
+      }
+    }
+
+    if (isCreate(outputChange.actions)) {
+      if (
+        outputChange.before !== null ||
+        outputChange.before_sensitive !== false
+      ) {
+        return false;
+      }
+      if (hasPrior) {
+        // Terraform 1.15.8 retained these two output descriptors while their
+        // producing resources were absent. Only the genuine reviewed
+        // transition envelopes receive this narrow compatibility exception.
+        if (
+          !transitionPriorAnomalies.has(name) ||
+          !isDeepStrictEqual(outputChange, referenceChange) ||
+          !isDeepStrictEqual(descriptor, referenceDescriptor) ||
+          !isDeepStrictEqual(prior[name], referencePrior)
+        ) {
+          return false;
+        }
+      }
+    } else {
+      if (
+        !hasPrior ||
+        !isDeepStrictEqual(prior[name].value, outputChange.before) ||
+        prior[name].sensitive !== outputChange.before_sensitive
+      ) {
+        return false;
+      }
+      if (isNoOp(outputChange.actions)) {
+        if (
+          !hasAfter ||
+          outputChange.after_unknown ||
+          !isDeepStrictEqual(outputChange.before, outputChange.after) ||
+          outputChange.before_sensitive !== outputChange.after_sensitive
+        ) {
+          return false;
+        }
+      } else if (isUpdate(outputChange.actions)) {
+        if (
+          (hasAfter &&
+            isDeepStrictEqual(outputChange.before, outputChange.after)) ||
+          (!hasAfter && !outputChange.after_unknown)
+        ) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+    }
+  }
+  return hasExactKeys(prior, expectedPriorNames);
+}
+
+function finalHasExactChecks(checks, monitoringRoleCreate) {
+  const passingChecks = structuredClone(FINAL_REFERENCE_PLAN.checks);
+  for (const check of passingChecks) {
+    if (check.status === "unknown") check.status = "pass";
+    for (const instance of check.instances ?? []) {
+      if (instance.status === "unknown") instance.status = "pass";
+    }
+  }
+  return monitoringRoleCreate
+    ? isDeepStrictEqual(checks, FINAL_REFERENCE_PLAN.checks)
+    : isDeepStrictEqual(checks, passingChecks);
+}
+
+function finalHasExactPlanSections(plan) {
+  const result = (
+    finalExactKeys(plan, Object.keys(FINAL_REFERENCE_PLAN)) &&
+    plan.terraform_version === "1.15.8" &&
+    plan.complete === true &&
+    plan.applyable === true &&
+    plan.errored === false &&
+    typeof plan.timestamp === "string" &&
+    !Number.isNaN(Date.parse(plan.timestamp)) &&
+    finalExactKeys(plan.planned_values, ["outputs", "root_module"]) &&
+    finalExactKeys(plan.prior_state, [
+      "format_version",
+      "terraform_version",
+      "values",
+    ]) &&
+    plan.prior_state.format_version === "1.0" &&
+    plan.prior_state.terraform_version === "1.15.8" &&
+    finalExactKeys(plan.prior_state.values, ["outputs", "root_module"]) &&
+    finalExactKeys(plan.configuration, ["provider_config", "root_module"]) &&
+    isDeepStrictEqual(plan.configuration, FINAL_REFERENCE_PLAN.configuration) &&
+    finalHasExactRelevantAttributes(plan) &&
+    finalHasExactOutputs(plan)
+  );
+  return result;
+}
+
+function acceptsFinalRolloutV2(plan, changes) {
+  if (!finalHasExactPlanSections(plan) || !finalHasExactVariables(plan)) {
+    return false;
+  }
+  const changesByAddress = new Map(changes.map((entry) => [entry.address, entry]));
+  if (
+    changes.length !== 39 ||
+    changesByAddress.size !== 39 ||
+    [...FINAL_INVENTORY].some((address) => !changesByAddress.has(address))
+  ) {
+    return false;
+  }
+
+  const monitoringRoleCreate = isCreate(
+    changesByAddress.get(FINAL_MONITORING_ROLE_ASSIGNMENT)?.change?.actions,
+  );
+  const transitionActions = [...changesByAddress].every(
+    ([address, entry]) =>
+      isDeepStrictEqual(
+        entry.change.actions,
+        FINAL_REFERENCE_CHANGES.get(address).change.actions,
+      ),
+  );
+  const idempotentActions = [...changesByAddress.values()].every((entry) =>
+    isNoOp(entry.change.actions),
+  );
+  if (!transitionActions && !idempotentActions) {
+    return false;
+  }
+  const outputActionsMatch = Object.entries(plan.output_changes).every(
+    ([name, outputChange]) =>
+      transitionActions
+        ? isDeepStrictEqual(
+            outputChange.actions,
+            FINAL_REFERENCE_PLAN.output_changes[name].actions,
+          )
+        : isNoOp(outputChange.actions),
+  );
+  if (!outputActionsMatch) {
+    return false;
+  }
+  if (!finalHasExactChecks(plan.checks, monitoringRoleCreate)) {
+    return false;
+  }
+
+  const drift = plan.resource_drift;
+  if (
+    !Array.isArray(drift) ||
+    (transitionActions
+      ? !isDeepStrictEqual(drift, FINAL_REFERENCE_PLAN.resource_drift)
+      : drift.length !== 0)
+  ) {
+    return false;
+  }
+
+  const runtimeIdentity = changesByAddress.get(
+    "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  ).change.after;
+  const imagePullIdentity = changesByAddress.get(
+    "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+  ).change.after;
+  const priorResources = finalCollectValueResources(
+    plan.prior_state?.values?.root_module,
+  );
+  const cliPrincipal = priorResources?.get(
+    "module.workload_key_vault.data.azurerm_client_config.current",
+  )?.values?.object_id;
+  const context = {
+    operatorPrincipal: finalVariableValue(plan, "operator_principal_id"),
+    cliPrincipal,
+    runtimePrincipal: runtimeIdentity.principal_id,
+    runtimeClient: runtimeIdentity.client_id,
+    imagePullPrincipal: imagePullIdentity.principal_id,
+  };
+  if (
+    !finalUuid(context.runtimePrincipal) ||
+    !finalUuid(context.runtimeClient) ||
+    !finalUuid(context.imagePullPrincipal) ||
+    !finalUuid(context.cliPrincipal) ||
+    new Set([
+      context.operatorPrincipal,
+      context.runtimePrincipal,
+      context.runtimeClient,
+      context.imagePullPrincipal,
+    ]).size !== 4
+  ) {
+    return false;
+  }
+
+  const images = exactFinalImageVariables(plan);
+  return (
+    finalHasCoherentResourceChanges(plan, changesByAddress, context) &&
+    finalHasExactTopology(plan, changesByAddress, context, images)
+  );
+}
+
 function isWellFormedResourceChange(change) {
   return (
     isObject(change) &&
@@ -1679,16 +3899,26 @@ export function acceptsPlan(plan, mode) {
   if (
     !isObject(plan) ||
     plan.format_version !== SUPPORTED_PLAN_FORMAT_VERSION ||
-    ![MODEL_SPIKE_MODE, FULL_DEPLOY_MODE, RUNTIME_ROLLOUT_MODE].includes(mode)
+    ![
+      MODEL_SPIKE_MODE,
+      FULL_DEPLOY_MODE,
+      RUNTIME_ROLLOUT_MODE,
+      FINAL_ROLLOUT_MODE,
+    ].includes(mode)
   ) {
     return false;
   }
 
   const hasInvalidChecks =
-    mode === MODEL_SPIKE_MODE
-      ? hasNonPassingModelSpikeCheck(plan)
-      : hasNonPassingCheck(plan);
-  if (hasInvalidChecks || hasResourceDrift(plan)) {
+    mode === FINAL_ROLLOUT_MODE
+      ? false
+      : mode === MODEL_SPIKE_MODE
+        ? hasNonPassingModelSpikeCheck(plan)
+        : hasNonPassingCheck(plan);
+  if (
+    hasInvalidChecks ||
+    (mode !== FINAL_ROLLOUT_MODE && hasResourceDrift(plan))
+  ) {
     return false;
   }
 
@@ -1745,6 +3975,10 @@ export function acceptsPlan(plan, mode) {
     );
   }
 
+  if (mode === FINAL_ROLLOUT_MODE) {
+    return acceptsFinalRolloutV2(plan, changes);
+  }
+
   return acceptsFullDeploy(changes, requiredNoOpAddresses);
 }
 
@@ -1754,7 +3988,12 @@ function getMode(argv) {
   }
 
   const mode = argv[0].slice("--mode=".length);
-  return [MODEL_SPIKE_MODE, FULL_DEPLOY_MODE, RUNTIME_ROLLOUT_MODE].includes(mode)
+  return [
+    MODEL_SPIKE_MODE,
+    FULL_DEPLOY_MODE,
+    RUNTIME_ROLLOUT_MODE,
+    FINAL_ROLLOUT_MODE,
+  ].includes(mode)
     ? mode
     : undefined;
 }

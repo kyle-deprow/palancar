@@ -1,12 +1,21 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { acceptsPlan, runCli } from "./assert-dev-plan.mjs";
 
 const cliPath = fileURLToPath(new URL("./assert-dev-plan.mjs", import.meta.url));
+const finalFixtureText = readFileSync(
+  new URL(
+    "./fixtures/final-rollout-transition.plan-fixture.json",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const finalTransitionFixture = JSON.parse(finalFixtureText);
 
 const deploymentAddress =
   'module.foundry.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"]';
@@ -648,6 +657,1547 @@ function fullPlan(extraChanges = [], extras = {}) {
   );
 }
 
+const finalSubscriptionId = "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1";
+const finalResourceGroupId =
+  `/subscriptions/${finalSubscriptionId}/resourceGroups/rg-palancar-dev-aeeacd8c`;
+const finalAcrLoginServer = "palancardevacraeeacd8c.azurecr.io";
+const finalTableEndpoint =
+  "https://palancardevstateaeeacd8c.table.core.windows.net";
+const finalTableServiceId =
+  `${finalResourceGroupId}/providers/Microsoft.Storage/storageAccounts/palancardevstateaeeacd8c/tableServices/default`;
+const finalEnvironmentId =
+  `${finalResourceGroupId}/providers/Microsoft.App/managedEnvironments/cae-palancar-dev-aeeacd8c`;
+const finalImagePullIdentity =
+  `${finalResourceGroupId}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull`;
+const finalRuntimeIdentity =
+  `${finalResourceGroupId}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-runtime`;
+const finalRuntimeClientId = "00000000-0000-0000-0000-000000000001";
+const finalRuntimePrincipalId = "11111111-1111-4111-8111-111111111111";
+const finalKeyVaultHost = "kvpalancardevaeeacd8c.vault.azure.net";
+const finalRelayOrigin =
+  "wss://ca-palancar-dev-relay-aeeacd8c.eastus2.azurecontainerapps.io";
+const finalCleanupJobAddress =
+  "module.expiry_cleanup_job[0].azapi_resource.this";
+const finalFoundryRealtimeEndpoint =
+  "wss://palancardevopenaiaeeacd8c.openai.azure.com/openai/v1/realtime?intent=transcription";
+const finalRelayImage =
+  `${finalAcrLoginServer}/palancar-relay@sha256:${"1".repeat(64)}`;
+const finalLitellmImage =
+  `${finalAcrLoginServer}/palancar-litellm-proxy@sha256:${"2".repeat(64)}`;
+const finalCleanupImage =
+  `${finalAcrLoginServer}/palancar-expiry-cleanup@sha256:${"3".repeat(64)}`;
+const finalMonitoringRoleDefinitionId =
+  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/3913510d-42f4-4e42-8a64-420c390055eb`;
+const finalApplicationInsightsId =
+  `${finalResourceGroupId}/providers/Microsoft.Insights/components/appi-palancar-dev-aeeacd8c`;
+const finalActionGroupAddress = "azurerm_monitor_action_group.relay";
+const finalActionGroupId =
+  `${finalResourceGroupId}/providers/Microsoft.Insights/actionGroups/ag-palancar-dev-relay-aeeacd8c`;
+const finalAlertAddresses = finalTransitionFixture.resource_changes
+  .filter(
+    (entry) =>
+      entry.type === "azurerm_monitor_scheduled_query_rules_alert_v2",
+  )
+  .map((entry) => entry.address);
+
+function finalRoleAfter(
+  scope,
+  roleDefinitionId,
+  principalId,
+  principalType = "ServicePrincipal",
+  name = fixtureUuidV5Url(`${scope}/${principalId}/${roleDefinitionId}`),
+) {
+  return {
+    name,
+    scope,
+    role_definition_id: roleDefinitionId,
+    principal_id: principalId,
+    principal_type: principalType,
+  };
+}
+
+function finalOperatorRole(address, tableName, actions = ["create"]) {
+  const scope = `${finalTableServiceId}/tables/${tableName}`;
+  const roleDefinitionId =
+    `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
+  return change(
+    address,
+    actions,
+    finalRoleAfter(
+      scope,
+      roleDefinitionId,
+      operatorPrincipalId,
+      "User",
+      fixtureUuidV5Url(
+        `${scope}/operator/${operatorPrincipalId}/${roleDefinitionId}`,
+      ),
+    ),
+  );
+}
+
+function finalMonitoringRole(actions = ["create"]) {
+  return change(
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+    actions,
+    finalRoleAfter(
+      finalApplicationInsightsId,
+      finalMonitoringRoleDefinitionId,
+      finalRuntimePrincipalId,
+      "ServicePrincipal",
+      fixtureUuidV5Url(
+        `scope=${finalApplicationInsightsId}|principal_id=${finalRuntimePrincipalId}|role_definition_id=${finalMonitoringRoleDefinitionId}`,
+      ),
+    ),
+  );
+}
+
+function finalRoleNoOp(address, scope, roleDefinitionId, principalType = "ServicePrincipal") {
+  return change(
+    address,
+    ["no-op"],
+    finalRoleAfter(scope, roleDefinitionId, finalRuntimePrincipalId, principalType),
+  );
+}
+
+function finalContainerAppAfter() {
+  const tags = {
+    application: "palancar",
+    environment: "dev",
+    "managed-by": "terraform",
+    "data-classification": "operational-metadata",
+  };
+  return {
+    type: "Microsoft.App/containerApps@2026-01-01",
+    name: "ca-palancar-dev-relay-aeeacd8c",
+    location: "eastus2",
+    parent_id: finalResourceGroupId,
+    tags,
+    response_export_values: [
+      "properties.configuration.ingress.fqdn",
+      "properties.latestRevisionName",
+      "properties.runningStatus",
+    ],
+    retry: {
+      error_message_regex: ["IdentityDoesNotExist"],
+      interval_seconds: 10,
+      max_interval_seconds: 30,
+    },
+    identity: [
+      {
+        type: "UserAssigned",
+        identity_ids: [finalImagePullIdentity, finalRuntimeIdentity],
+      },
+    ],
+    body: {
+      properties: {
+        managedEnvironmentId: finalEnvironmentId,
+        configuration: {
+          activeRevisionsMode: "Single",
+          ingress: {
+            external: true,
+            targetPort: 8787,
+            transport: "Http",
+            allowInsecure: false,
+            traffic: [{ latestRevision: true, weight: 100 }],
+          },
+          registries: [
+            { server: finalAcrLoginServer, identity: finalImagePullIdentity },
+          ],
+          identitySettings: [
+            {
+              identity: finalImagePullIdentity.replace(
+                "/resourceGroups/",
+                "/resourcegroups/",
+              ),
+              lifecycle: "None",
+            },
+            {
+              identity: finalRuntimeIdentity.replace(
+                "/resourceGroups/",
+                "/resourcegroups/",
+              ),
+              lifecycle: "Main",
+            },
+          ],
+          secrets: [
+            {
+              name: "litellm-master-key",
+              keyVaultUrl: `https://${finalKeyVaultHost}/secrets/litellm-master-key`,
+              identity: finalRuntimeIdentity,
+            },
+            {
+              name: "openrouter-api-key",
+              keyVaultUrl: `https://${finalKeyVaultHost}/secrets/openrouter-api-key`,
+              identity: finalRuntimeIdentity,
+            },
+          ],
+        },
+        template: {
+          containers: [
+            {
+              name: "relay",
+              image: finalRelayImage,
+              resources: { cpu: 0.25, memory: "0.5Gi" },
+              env: [
+                envValue("NODE_ENV", "production"),
+                envValue("PORT", "8787"),
+                envValue("PALANCAR_GENERATION_PROVIDER", "litellm"),
+                envValue("PALANCAR_RELAY_BIND_HOST", "0.0.0.0"),
+                envValue("PALANCAR_RELAY_ENVIRONMENT", "dev"),
+                envValue("PALANCAR_RELAY_ORIGIN", finalRelayOrigin),
+                envValue("PALANCAR_GATE_POLICY_VERSION", "1.0.0"),
+                envValue("AZURE_CLIENT_ID", finalRuntimeClientId),
+                envValue("PALANCAR_DEPLOYMENT_SLOT", "dev"),
+                envValue(
+                  "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                  "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com",
+                ),
+                envValue("APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "true"),
+                envValue("APPLICATION_INSIGHTS_NO_STATSBEAT", "true"),
+                envValue("PALANCAR_SECURITY_MODE", "azure-table"),
+                envValue("PALANCAR_WORKLOAD_TABLE_ENDPOINT", finalTableEndpoint),
+                envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
+                envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
+                envValue("PALANCAR_TRANSCRIPTION_PROVIDER", "azure-realtime"),
+                envValue(
+                  "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+                  finalFoundryRealtimeEndpoint,
+                ),
+                envValue(
+                  "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+                  "gpt-4o-mini-transcribe",
+                ),
+                envValue(
+                  "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+                  '["https://even-webview.synthetic.invalid"]',
+                ),
+                envValue("PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"),
+                envValue("PALANCAR_LITELLM_BASE_URL", "http://127.0.0.1:4000"),
+                envValue("PALANCAR_LITELLM_MODEL", "palancar-generation"),
+                envSecret("PALANCAR_LITELLM_API_KEY", "litellm-master-key"),
+              ],
+              probes: [
+                {
+                  type: "Liveness",
+                  tcpSocket: { port: 8787 },
+                  initialDelaySeconds: 10,
+                  periodSeconds: 10,
+                  timeoutSeconds: 3,
+                  failureThreshold: 3,
+                },
+                {
+                  type: "Readiness",
+                  httpGet: { path: "/readyz", port: 8787 },
+                  initialDelaySeconds: 5,
+                  periodSeconds: 10,
+                  timeoutSeconds: 7,
+                  failureThreshold: 3,
+                },
+              ],
+            },
+            {
+              name: "litellm",
+              image: finalLitellmImage,
+              resources: { cpu: 0.25, memory: "0.5Gi" },
+              env: [
+                envValue("PALANCAR_LITELLM_BACKEND", "openrouter"),
+                envValue(
+                  "PALANCAR_LITELLM_UPSTREAM_MODEL",
+                  "openrouter/openai/gpt-4o-mini",
+                ),
+                envSecret("LITELLM_MASTER_KEY", "litellm-master-key"),
+                envSecret("OPENROUTER_API_KEY", "openrouter-api-key"),
+              ],
+              probes: [
+                {
+                  type: "Liveness",
+                  tcpSocket: { port: 4000 },
+                  initialDelaySeconds: 10,
+                  periodSeconds: 30,
+                  timeoutSeconds: 3,
+                  failureThreshold: 3,
+                },
+                {
+                  type: "Readiness",
+                  httpGet: { path: "/health/readiness", port: 4000 },
+                  periodSeconds: 10,
+                  timeoutSeconds: 7,
+                  failureThreshold: 3,
+                },
+                {
+                  type: "Startup",
+                  httpGet: { path: "/health/liveliness", port: 4000 },
+                  periodSeconds: 10,
+                  timeoutSeconds: 3,
+                  failureThreshold: 10,
+                },
+              ],
+            },
+          ],
+          scale: { minReplicas: 1, maxReplicas: 1 },
+        },
+      },
+    },
+  };
+}
+
+function finalCleanupJobAfter() {
+  return {
+    type: "Microsoft.App/jobs@2026-01-01",
+    name: "caj-palancardev-cleanup-aeeacd8c",
+    location: "eastus2",
+    parent_id: finalResourceGroupId,
+    tags: {
+      application: "palancar",
+      environment: "dev",
+      "managed-by": "terraform",
+      "data-classification": "operational-metadata",
+    },
+    identity: [
+      {
+        type: "UserAssigned",
+        identity_ids: [finalImagePullIdentity, finalRuntimeIdentity],
+      },
+    ],
+    body: {
+      properties: {
+        environmentId: finalEnvironmentId,
+        configuration: {
+          triggerType: "Schedule",
+          scheduleTriggerConfig: {
+            cronExpression: "0 3 * * *",
+            replicaCompletionCount: 1,
+            parallelism: 1,
+          },
+          replicaRetryLimit: 0,
+          replicaTimeout: 300,
+          registries: [
+            { server: finalAcrLoginServer, identity: finalImagePullIdentity },
+          ],
+          identitySettings: [
+            {
+              identity: finalImagePullIdentity.replace(
+                "/resourceGroups/",
+                "/resourcegroups/",
+              ),
+              lifecycle: "None",
+            },
+            {
+              identity: finalRuntimeIdentity.replace(
+                "/resourceGroups/",
+                "/resourcegroups/",
+              ),
+              lifecycle: "Main",
+            },
+          ],
+        },
+        template: {
+          containers: [
+            {
+              name: "expiry-cleanup",
+              image: finalCleanupImage,
+              resources: { cpu: 0.25, memory: "0.5Gi" },
+              env: [
+                envValue("AZURE_CLIENT_ID", finalRuntimeClientId),
+                envValue("PALANCAR_WORKLOAD_TABLE_ENDPOINT", finalTableEndpoint),
+                envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
+                envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
+                envValue("PALANCAR_RELAY_ENVIRONMENT", "dev"),
+                envValue("PALANCAR_RELAY_ORIGIN", finalRelayOrigin),
+                envValue("PALANCAR_EXPIRY_CLEANUP_LIMIT", "1000"),
+                envValue("PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS", "240000"),
+              ],
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+const finalRoleDefinitionTableId =
+  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
+const finalRoleDefinitionAcrId =
+  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d`;
+const finalRoleDefinitionOpenAiId =
+  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/5e0bd9bd-7b93-4f28-af87-19fc36ad61bd`;
+const finalAcrId = `${finalResourceGroupId}/providers/Microsoft.ContainerRegistry/registries/palancardevacraeeacd8c`;
+const finalStorageAccountId = `${finalResourceGroupId}/providers/Microsoft.Storage/storageAccounts/palancardevstateaeeacd8c`;
+const finalFoundryAccountId = foundryCognitiveAccountId;
+const finalKeyVaultId = `${finalResourceGroupId}/providers/Microsoft.KeyVault/vaults/kvpalancardevaeeacd8c`;
+
+function finalFoundationChanges() {
+  const changes = foundationNoOps.map(clone);
+  const runtimeIndex = changes.findIndex(
+    (item) =>
+      item.address ===
+      "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  );
+  changes[runtimeIndex] = change(
+    changes[runtimeIndex].address,
+    ["no-op"],
+    { client_id: finalRuntimeClientId, principal_id: finalRuntimePrincipalId },
+  );
+  for (const [address, scope, roleDefinitionId] of [
+    [
+      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+      finalKeyVaultId,
+      finalRoleDefinitionOpenAiId,
+    ],
+    [
+      "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+      finalKeyVaultId,
+      finalRoleDefinitionOpenAiId,
+    ],
+  ]) {
+    const index = changes.findIndex((item) => item.address === address);
+    changes[index] = finalRoleNoOp(address, scope, roleDefinitionId);
+  }
+  changes.push(
+    finalRoleNoOp(
+      "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+      finalAcrId,
+      finalRoleDefinitionAcrId,
+    ),
+    finalRoleNoOp(
+      "module.identities_rbac.azurerm_role_assignment.runtime_table",
+      finalStorageAccountId,
+      finalRoleDefinitionTableId,
+    ),
+    finalRoleNoOp(
+      "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+      finalFoundryAccountId,
+      finalRoleDefinitionOpenAiId,
+    ),
+  );
+  return changes;
+}
+
+function finalValueModule(root, address) {
+  if (address === "") return root;
+  for (const child of root.child_modules ?? []) {
+    if (child.address === address) return child;
+    const nested = finalValueModule(child, address);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function finalValueResource(root, address) {
+  for (const resource of root.resources ?? []) {
+    if (resource.address === address) return resource;
+  }
+  for (const child of root.child_modules ?? []) {
+    const resource = finalValueResource(child, address);
+    if (resource) return resource;
+  }
+  return undefined;
+}
+
+function finalChange(planValue, address) {
+  return planValue.resource_changes.find((entry) => entry.address === address);
+}
+
+function finalMakeResourceNoOp(planValue, address, completeAfter) {
+  const entry = finalChange(planValue, address);
+  entry.change.actions = ["no-op"];
+  entry.change.after = completeAfter;
+  entry.change.before = clone(completeAfter);
+  entry.change.after_unknown = {};
+  entry.change.before_sensitive = clone(entry.change.after_sensitive);
+
+  if (address === finalCleanupJobAddress) {
+    const identity = { id: completeAfter.id, type: null };
+    entry.change.before_identity = clone(identity);
+    entry.change.after_identity = clone(identity);
+  }
+
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    address,
+  );
+  planned.values = clone(completeAfter);
+  planned.sensitive_values = clone(entry.change.after_sensitive);
+  if (entry.change.after_identity) {
+    planned.identity_schema_version = 0;
+    planned.identity = clone(entry.change.after_identity);
+  }
+
+  const moduleAddress = entry.module_address ?? "";
+  let module = finalValueModule(
+    planValue.prior_state.values.root_module,
+    moduleAddress,
+  );
+  if (!module) {
+    module = { resources: [], address: moduleAddress };
+    planValue.prior_state.values.root_module.child_modules.push(module);
+  }
+  const prior = clone(planned);
+  const priorIndex = module.resources.findIndex(
+    (resource) => resource.address === address,
+  );
+  if (priorIndex === -1) module.resources.push(prior);
+  else module.resources[priorIndex] = prior;
+}
+
+function finalRolloutPlan({ idempotent = false } = {}) {
+  const planValue = clone(finalTransitionFixture);
+  if (!idempotent) return planValue;
+
+  planValue.resource_drift = [];
+  for (const check of planValue.checks) {
+    if (check.status === "unknown") check.status = "pass";
+    for (const instance of check.instances ?? []) {
+      if (instance.status === "unknown") instance.status = "pass";
+    }
+  }
+
+  const appEntry = finalChange(planValue, containerAppAddress);
+  const appAfter = clone(appEntry.change.after);
+  appAfter.output = clone(appEntry.change.before.output);
+  finalMakeResourceNoOp(planValue, containerAppAddress, appAfter);
+
+  const jobEntry = finalChange(planValue, finalCleanupJobAddress);
+  const jobAfter = clone(jobEntry.change.after);
+  jobAfter.id = `${finalResourceGroupId}/providers/Microsoft.App/jobs/${jobAfter.name}`;
+  jobAfter.identity[0].principal_id = "";
+  jobAfter.identity[0].tenant_id = "";
+  jobAfter.output = { properties: {} };
+  finalMakeResourceNoOp(planValue, finalCleanupJobAddress, jobAfter);
+
+  const monitoringAddress =
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights";
+  const monitoringEntry = finalChange(planValue, monitoringAddress);
+  const monitoringCreate = monitoringEntry.change.after;
+  const monitoringAfter = {
+    condition: "",
+    condition_version: "",
+    delegated_managed_identity_resource_id: "",
+    description: "",
+    id: `${monitoringCreate.scope}/providers/Microsoft.Authorization/roleAssignments/${monitoringCreate.name}`,
+    name: monitoringCreate.name,
+    principal_id: monitoringCreate.principal_id,
+    principal_type: monitoringCreate.principal_type,
+    role_definition_id: monitoringCreate.role_definition_id,
+    role_definition_name: "Monitoring Metrics Publisher",
+    scope: monitoringCreate.scope,
+    skip_service_principal_aad_check: null,
+    timeouts: null,
+  };
+  finalMakeResourceNoOp(planValue, monitoringAddress, monitoringAfter);
+
+  const actionGroupAfter = clone(
+    finalChange(planValue, finalActionGroupAddress).change.after,
+  );
+  actionGroupAfter.id = finalActionGroupId;
+  finalMakeResourceNoOp(planValue, finalActionGroupAddress, actionGroupAfter);
+
+  const alertIds = {};
+  for (const address of finalAlertAddresses) {
+    const entry = finalChange(planValue, address);
+    const alertAfter = clone(entry.change.after);
+    alertAfter.created_with_api_version = "2023-12-01";
+    alertAfter.id =
+      `${finalResourceGroupId}/providers/Microsoft.Insights/scheduledQueryRules/${alertAfter.name}`;
+    alertAfter.is_a_legacy_log_analytics_rule = false;
+    alertAfter.is_workspace_alerts_storage_configured = false;
+    alertIds[entry.index] = alertAfter.id;
+    finalMakeResourceNoOp(planValue, address, alertAfter);
+  }
+
+  const knownOutputs = {
+    expiry_cleanup_job_id: jobAfter.id,
+    relay_alert_rule_ids: alertIds,
+    runtime_application_insights_role_assignment_id: monitoringAfter.id,
+    relay_latest_revision_name: appAfter.output.properties.latestRevisionName,
+  };
+  for (const [name, outputChange] of Object.entries(planValue.output_changes)) {
+    const plannedDescriptor = planValue.planned_values.outputs[name];
+    const value = Object.hasOwn(knownOutputs, name)
+      ? knownOutputs[name]
+      : outputChange.after;
+    outputChange.actions = ["no-op"];
+    outputChange.before = clone(value);
+    outputChange.after = clone(value);
+    outputChange.after_unknown = false;
+    outputChange.before_sensitive = outputChange.after_sensitive;
+    planValue.planned_values.outputs[name] = {
+      sensitive: outputChange.after_sensitive,
+      type:
+        name === "relay_alert_rule_ids"
+          ? [
+              "object",
+              Object.fromEntries(Object.keys(alertIds).map((key) => [key, "string"])),
+            ]
+          : (plannedDescriptor.type ?? "string"),
+      value: clone(value),
+    };
+    planValue.prior_state.values.outputs[name] = clone(
+      planValue.planned_values.outputs[name],
+    );
+  }
+  return planValue;
+}
+
+test("final-rollout accepts the reviewed initial and idempotent plans", () => {
+  assert.equal(acceptsPlan(finalRolloutPlan(), "final-rollout"), true);
+  const idempotent = finalRolloutPlan({ idempotent: true });
+  assert.equal(acceptsPlan(idempotent, "final-rollout"), true);
+  assert.equal(idempotent.resource_changes.length, 39);
+  assert.equal(
+    idempotent.resource_changes.every(
+      (entry) => entry.change.actions[0] === "no-op",
+    ),
+    true,
+  );
+  assert.deepEqual(idempotent.resource_drift, []);
+});
+
+function rejectsFinalMutation(mutate, idempotent = false) {
+  const candidate = finalRolloutPlan({ idempotent });
+  mutate(candidate);
+  assert.equal(acceptsPlan(candidate, "final-rollout"), false);
+}
+
+function finalAfter(planValue, address) {
+  return finalChange(planValue, address).change.after;
+}
+
+function mutateFinalAfterCoherently(planValue, address, mutate) {
+  const entry = finalChange(planValue, address);
+  mutate(entry.change.after);
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    address,
+  );
+  planned.values = clone(entry.change.after);
+  if (entry.change.actions[0] === "no-op") {
+    entry.change.before = clone(entry.change.after);
+    const prior = finalValueResource(
+      planValue.prior_state.values.root_module,
+      address,
+    );
+    prior.values = clone(entry.change.after);
+  }
+}
+
+function setFinalNoOpOutputCoherently(planValue, name, value) {
+  const outputChange = planValue.output_changes[name];
+  assert.deepEqual(outputChange.actions, ["no-op"]);
+  outputChange.before = clone(value);
+  outputChange.after = clone(value);
+  planValue.planned_values.outputs[name].value = clone(value);
+  planValue.prior_state.values.outputs[name].value = clone(value);
+}
+
+function setFinalApplicationInsightsConnectionCoherently(
+  planValue,
+  transform,
+) {
+  let fullConnection;
+  mutateFinalAfterCoherently(
+    planValue,
+    "module.observability.azurerm_application_insights.this",
+    (after) => {
+      after.connection_string = transform(after.connection_string);
+      fullConnection = after.connection_string;
+    },
+  );
+  setFinalNoOpOutputCoherently(
+    planValue,
+    "application_insights_connection_string",
+    fullConnection,
+  );
+
+  const values = Object.fromEntries(
+    fullConnection.split(";").map((segment) => {
+      const separator = segment.indexOf("=");
+      return [segment.slice(0, separator), segment.slice(separator + 1)];
+    }),
+  );
+  // The reviewed relay receives the canonical reduced connection (key plus
+  // ingestion endpoint), so rebuild it from the mutated full provider value.
+  const relayConnection =
+    `InstrumentationKey=${values.InstrumentationKey.toLowerCase()};` +
+    `IngestionEndpoint=${values.IngestionEndpoint.replace(/\/$/, "")}`;
+  mutateFinalAfterCoherently(planValue, containerAppAddress, (after) => {
+    const env = after.body.properties.template.containers[0].env;
+    env.find(
+      (entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    ).value = relayConnection;
+  });
+}
+
+function setFinalContactsCoherently(planValue, contacts) {
+  planValue.variables.budget_contact_emails.value = clone(contacts);
+  mutateFinalAfterCoherently(
+    planValue,
+    "module.budget.azurerm_consumption_budget_resource_group.this",
+    (after) => {
+      for (const notification of after.notification) {
+        notification.contact_emails = clone(contacts);
+      }
+    },
+  );
+  mutateFinalAfterCoherently(planValue, finalActionGroupAddress, (after) => {
+    after.email_receiver = contacts.map((email, index) => ({
+      email_address: email,
+      name: `budget-contact-${String(index + 1).padStart(4, "0")}`,
+      use_common_alert_schema: true,
+    }));
+  });
+  const actionGroup = finalChange(planValue, finalActionGroupAddress);
+  const sensitiveReceivers = contacts.map(() => ({}));
+  actionGroup.change.after_sensitive.email_receiver = clone(sensitiveReceivers);
+  if (actionGroup.change.actions[0] === "create") {
+    actionGroup.change.after_unknown.email_receiver = clone(sensitiveReceivers);
+  } else {
+    actionGroup.change.before_sensitive.email_receiver = clone(
+      sensitiveReceivers,
+    );
+  }
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    finalActionGroupAddress,
+  );
+  planned.sensitive_values.email_receiver = clone(sensitiveReceivers);
+  const prior = finalValueResource(
+    planValue.prior_state.values.root_module,
+    finalActionGroupAddress,
+  );
+  if (prior) prior.sensitive_values.email_receiver = clone(sensitiveReceivers);
+}
+
+test("final-rollout requires the unconditional 39-resource inventory and exact actions", () => {
+  const valid = finalRolloutPlan();
+  assert.equal(valid.resource_changes.length, 39);
+  assert.equal(
+    valid.resource_changes.filter((entry) => entry.change.actions[0] === "no-op")
+      .length,
+    29,
+  );
+  assert.equal(
+    valid.resource_changes.filter((entry) => entry.change.actions[0] === "create")
+      .length,
+    9,
+  );
+  for (const omitted of valid.resource_changes) {
+    rejectsFinalMutation((candidate) => {
+      candidate.resource_changes = candidate.resource_changes.filter(
+        (entry) => entry.address !== omitted.address,
+      );
+    });
+  }
+  for (const actions of [["delete"], ["create", "delete"], ["update", "delete"]]) {
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, containerAppAddress).change.actions = actions;
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_changes.push(clone(candidate.resource_changes[0]));
+  });
+});
+
+test("final-rollout validates and cross-binds the exact relay action group contacts", () => {
+  const coherent = finalRolloutPlan();
+  setFinalContactsCoherently(coherent, [
+    "fixture-contact-0001@redacted.example.net",
+    "fixture-contact-0002@redacted.example.net",
+  ]);
+  assert.equal(acceptsPlan(coherent, "final-rollout"), true);
+
+  rejectsFinalMutation((candidate) => {
+    setFinalContactsCoherently(candidate, [
+      "fixture-contact-0002@redacted.example.net",
+      "fixture-contact-0001@redacted.example.net",
+    ]);
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.variables.budget_contact_emails.value = [
+      "fixture-other@redacted.example.net",
+    ];
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(
+      candidate,
+      "module.budget.azurerm_consumption_budget_resource_group.this",
+      (after) => {
+        after.notification[0].contact_emails = [
+          "fixture-other@redacted.example.net",
+        ];
+      },
+    );
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, finalActionGroupAddress, (after) => {
+      after.email_receiver[0].email_address =
+        "fixture-other@redacted.example.net";
+    });
+  });
+
+  for (const mutate of [
+    (after) => { after.enabled = false; },
+    (after) => { after.location = "eastus2"; },
+    (after) => { after.name += "-other"; },
+    (after) => { after.resource_group_name += "-other"; },
+    (after) => { after.short_name = "other"; },
+    (after) => { after.tags.environment = "prod"; },
+    (after) => { after.email_receiver[0].name = "fixture-contact-0001"; },
+    (after) => { after.email_receiver[0].use_common_alert_schema = false; },
+    (after) => {
+      after.sms_receiver.push({ country_code: "1", name: "x", phone_number: "0" });
+    },
+    (after) => { after.extra_receiver = []; },
+  ]) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalAfterCoherently(candidate, finalActionGroupAddress, mutate);
+    });
+  }
+
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, finalActionGroupAddress).change.after_unknown.extra =
+      true;
+  });
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, finalActionGroupAddress).change.after_sensitive.extra =
+      true;
+  });
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, finalActionGroupAddress).change.actions = ["no-op"];
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      finalChange(candidate, finalActionGroupAddress).change.actions = ["create"];
+    },
+    true,
+  );
+  rejectsFinalMutation(
+    (candidate) => {
+      candidate.output_changes.relay_action_group_id = clone(
+        finalTransitionFixture.output_changes.relay_action_group_id,
+      );
+      candidate.planned_values.outputs.relay_action_group_id = clone(
+        finalTransitionFixture.planned_values.outputs.relay_action_group_id,
+      );
+      candidate.prior_state.values.outputs.relay_action_group_id = clone(
+        finalTransitionFixture.prior_state.values.outputs.relay_action_group_id,
+      );
+    },
+    true,
+  );
+});
+
+test("final-rollout validates every exact scheduled-query alert contract", () => {
+  for (const address of finalAlertAddresses) {
+    for (const mutate of [
+      (after) => { after.enabled = false; },
+      (after) => { after.severity = 4; },
+      (after) => { after.evaluation_frequency = "PT10M"; },
+      (after) => { after.window_duration = "PT30M"; },
+      (after) => { after.criteria[0].query += "| take 1\n"; },
+      (after) => { after.criteria[0].threshold += 1; },
+      (after) => { after.criteria[0].time_aggregation_method = "Maximum"; },
+      (after) => {
+        after.criteria[0].failing_periods[0].minimum_failing_periods_to_trigger_alert =
+          2;
+      },
+      (after) => { after.criteria[0].dimension.push({ name: "SessionId" }); },
+      (after) => { after.action[0].action_groups = ["/foreign/action-group"]; },
+      (after) => { after.action[0].custom_properties.service = "other"; },
+      (after) => { after.action[0].custom_properties.extra = "x"; },
+      (after) => { after.action[0].email_subject = "override"; },
+      (after) => { after.auto_mitigation_enabled = false; },
+      (after) => { after.skip_query_validation = true; },
+      (after) => { after.scopes = [finalResourceGroupId]; },
+      (after) => { after.name += "-other"; },
+      (after) => { after.description += " altered"; },
+      (after) => { after.tags.environment = "prod"; },
+      (after) => { after.extra = null; },
+    ]) {
+      rejectsFinalMutation((candidate) => {
+        mutateFinalAfterCoherently(candidate, address, mutate);
+      });
+    }
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, address).change.after_unknown.extra = true;
+    });
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, address).change.after_sensitive.extra = true;
+    });
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, address).change.actions = ["no-op"];
+    });
+    rejectsFinalMutation(
+      (candidate) => {
+        finalChange(candidate, address).change.actions = ["create"];
+      },
+      true,
+    );
+  }
+});
+
+test("final-rollout cross-binds the deterministic action-group ID everywhere", () => {
+  rejectsFinalMutation((candidate) => {
+    candidate.planned_values.outputs.relay_action_group_id.value += "-other";
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.configuration.root_module.module_calls.observability.expressions.alert_action_group_ids =
+      { references: ["local.foreign_action_group_id"] };
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      const foreignId = `${finalActionGroupId}-other`;
+      mutateFinalAfterCoherently(candidate, finalActionGroupAddress, (after) => {
+        after.name += "-other";
+        after.id = foreignId;
+      });
+      for (const address of finalAlertAddresses) {
+        mutateFinalAfterCoherently(candidate, address, (after) => {
+          after.action[0].action_groups = [foreignId];
+        });
+      }
+      setFinalNoOpOutputCoherently(
+        candidate,
+        "relay_action_group_id",
+        foreignId,
+      );
+      candidate.configuration.root_module.module_calls.observability.expressions.alert_action_group_ids =
+        { references: ["local.foreign_action_group_id"] };
+    },
+    true,
+  );
+});
+
+test("final-rollout rejects action-group and alert address, type, and schema lookalikes", () => {
+  for (const address of [finalActionGroupAddress, finalAlertAddresses[0]]) {
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, address).type += "_lookalike";
+    });
+    rejectsFinalMutation((candidate) => {
+      finalValueResource(candidate.planned_values.root_module, address).schema_version +=
+        1;
+    });
+    rejectsFinalMutation((candidate) => {
+      finalValueResource(candidate.planned_values.root_module, address).provider_name =
+        "registry.terraform.io/hashicorp/lookalike";
+    });
+    rejectsFinalMutation((candidate) => {
+      finalChange(candidate, address).address += "_lookalike";
+      finalValueResource(candidate.planned_values.root_module, address).address +=
+        "_lookalike";
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, finalAlertAddresses[0]).index = "foreign";
+  });
+});
+
+test("the final fixture contains only synthetic contacts and no parent environment secrets", () => {
+  const contacts = finalTransitionFixture.variables.budget_contact_emails.value;
+  assert.deepEqual(contacts, ["fixture-contact-0001@redacted.example.net"]);
+  const actionGroup = finalChange(
+    finalTransitionFixture,
+    finalActionGroupAddress,
+  ).change.after;
+  assert.deepEqual(
+    actionGroup.email_receiver.map((receiver) => receiver.email_address),
+    contacts,
+  );
+  for (const receiver of actionGroup.email_receiver) {
+    assert.match(receiver.name, /^budget-contact-\d{4}$/);
+    assert.equal(receiver.name.includes(receiver.email_address.split("@")[0]), false);
+  }
+
+  const parentEnv = new URL("../../../.env", import.meta.url);
+  if (existsSync(parentEnv)) {
+    const protectedValues = readFileSync(parentEnv, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && line.includes("="))
+      .map((line) => line.replace(/^export\s+/, ""))
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return {
+          key: line.slice(0, separator),
+          value: line
+            .slice(separator + 1)
+            .trim()
+            .replace(/^(?:'([^']*)'|"([^"]*)")$/, "$1$2"),
+        };
+      })
+      .filter(
+        ({ key, value }) =>
+          /(contact|email|secret|token|password|api.?key|principal|client.?id|instrumentation|connection.?string)/i.test(
+            key,
+          ) && value.length >= 8,
+      );
+    const protectedTokens = new Set(
+      protectedValues.flatMap(({ value }) => [
+        value,
+        ...(value.match(/[^\s"'\[\],]+@[^\s"'\[\],]+/g) ?? []),
+      ]),
+    );
+    for (const value of protectedTokens) {
+      assert.equal(
+        finalFixtureText.includes(value),
+        false,
+        "fixture contains a protected parent environment value",
+      );
+    }
+  }
+});
+
+test("final-rollout requires complete/applyable/non-errored Terraform 1.15.8 plans", () => {
+  for (const mutate of [
+    (candidate) => { candidate.complete = false; },
+    (candidate) => { candidate.applyable = false; },
+    (candidate) => { candidate.errored = true; },
+    (candidate) => { candidate.terraform_version = "1.15.7"; },
+    (candidate) => { candidate.deferred_changes = []; },
+    (candidate) => { candidate.extra = true; },
+  ]) rejectsFinalMutation(mutate);
+});
+
+test("final-rollout accepts only the exact reviewed transition drift and no idempotent drift", () => {
+  rejectsFinalMutation((candidate) => { candidate.resource_drift = []; });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift[0].change.after.body.properties.configuration.ingress.transport = "Tcp";
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_drift.push(clone(candidate.resource_drift[0]));
+  });
+  rejectsFinalMutation(
+    (candidate) => { candidate.resource_drift = clone(finalTransitionFixture.resource_drift); },
+    true,
+  );
+});
+
+test("final-rollout rejects import, generated config, deposed state, and malformed action envelopes", () => {
+  for (const [where, key] of [
+    ["change", "importing"],
+    ["change", "generated_config"],
+    ["change", "imported"],
+    ["change", "deposed"],
+    ["resource", "deposed"],
+  ]) {
+    rejectsFinalMutation((candidate) => {
+      const resource = finalChange(candidate, containerAppAddress);
+      (where === "change" ? resource.change : resource)[key] =
+        key === "generated_config" ? "resource {}" : {};
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, finalCleanupJobAddress).change.before = {};
+  });
+  rejectsFinalMutation((candidate) => {
+    finalChange(candidate, containerAppAddress).change.before = null;
+  });
+});
+
+test("final-rollout treats the exact ACR and all image repositories literally", () => {
+  const substitutions = [
+    ["relay_image_digest", "palancardevacraeeacd8cXazurecrYio/palancar-relay"],
+    ["litellm_image_digest", "palancardevacraeeacd8c.azurecrXio/palancar-litellm-proxy"],
+    ["expiry_cleanup_image_digest", "palancardevacraeeacd8c.azurecr.ioX/palancar-expiry-cleanup"],
+  ];
+  for (const [name, prefix] of substitutions) {
+    rejectsFinalMutation((candidate) => {
+      const image = `${prefix}@sha256:${"d".repeat(64)}`;
+      candidate.variables[name].value = image;
+      if (name === "expiry_cleanup_image_digest") {
+        mutateFinalAfterCoherently(candidate, finalCleanupJobAddress, (after) => {
+          after.body.properties.template.containers[0].image = image;
+        });
+      } else {
+        const index = name === "relay_image_digest" ? 0 : 1;
+        mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+          after.body.properties.template.containers[index].image = image;
+        });
+      }
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    candidate.variables.litellm_image_digest.value =
+      candidate.variables.relay_image_digest.value;
+  });
+  rejectsFinalMutation((candidate) => {
+    finalAfter(candidate, containerAppAddress).body.properties.template.containers[0].image =
+      candidate.variables.litellm_image_digest.value;
+  });
+  rejectsFinalMutation((candidate) => {
+    finalAfter(candidate, finalCleanupJobAddress).body.properties.template.containers[0].image =
+      candidate.variables.relay_image_digest.value;
+  });
+});
+
+test("final-rollout validates every deterministic role assignment contract", () => {
+  const roleAddresses = [
+    "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+    "module.identities_rbac.azurerm_role_assignment.runtime_table",
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+    operatorSecurityRoleAddress,
+    operatorRateRoleAddress,
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+    "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+  ];
+  for (const address of roleAddresses) {
+    for (const field of ["name", "scope", "role_definition_id", "principal_id", "principal_type"]) {
+      rejectsFinalMutation((candidate) => {
+        mutateFinalAfterCoherently(candidate, address, (after) => {
+          after[field] = `${after[field]}-wrong`;
+        });
+      });
+    }
+  }
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, operatorSecurityRoleAddress, (after) => {
+      after.scope = finalAfter(candidate, operatorRateRoleAddress).scope;
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    finalAfter(candidate, "module.identities_rbac.azurerm_role_assignment.runtime_table").extra = null;
+  });
+});
+
+test("final-rollout requires exact ordered identities, probes, ingress, containers, and scale", () => {
+  const mutations = [
+    (after) => { after.identity[0].identity_ids.reverse(); },
+    (after) => { after.body.properties.configuration.identitySettings.reverse(); },
+    (after) => { after.body.properties.configuration.identitySettings[0].lifecycle = "Main"; },
+    (after) => { after.body.properties.configuration.ingress.allowInsecure = true; },
+    (after) => { after.body.properties.configuration.ingress.transport = "http"; },
+    (after) => { after.body.properties.configuration.ingress.targetPort = 4000; },
+    (after) => { after.body.properties.template.containers.reverse(); },
+    (after) => { after.body.properties.template.containers[0].probes.reverse(); },
+    (after) => { after.body.properties.template.containers[0].probes[0].tcpSocket.port = 4000; },
+    (after) => { after.body.properties.template.containers[0].probes[0].httpGet = { path: "/", port: 8787 }; },
+    (after) => { after.body.properties.template.containers[0].probes[1].timeoutSeconds = 3; },
+    (after) => { after.body.properties.template.containers[1].probes.reverse(); },
+    (after) => { after.body.properties.template.containers[1].probes[0].initialDelaySeconds = 11; },
+    (after) => { after.body.properties.template.containers[1].probes[0].httpGet = { path: "/", port: 4000 }; },
+    (after) => { after.body.properties.template.containers[1].probes[1].timeoutSeconds = 3; },
+    (after) => { after.body.properties.template.containers[1].probes[1].httpGet.path = "/always-ready"; },
+    (after) => { after.body.properties.template.containers[1].probes[2].httpGet.path = "/health/readiness"; },
+    (after) => { after.body.properties.template.scale.minReplicas = 0; },
+    (after) => { after.body.properties.template.scale.maxReplicas = 2; },
+  ];
+  for (const mutate of mutations) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalAfterCoherently(candidate, containerAppAddress, mutate);
+    });
+  }
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.configuration.identitySettings[0].lifecycle = "Main";
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.template.containers[0].probes[1].httpGet.path =
+        "/always-ready";
+    });
+  });
+});
+
+test("final-rollout requires the complete relay and LiteLLM environments", () => {
+  const envMutation = (name, value) => (candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      const env = after.body.properties.template.containers[0].env;
+      env.find((entry) => entry.name === name).value = value;
+    });
+  };
+  for (const mutate of [
+    envMutation("PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT", `${finalFoundryRealtimeEndpoint}/extra`),
+    envMutation("PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT", finalFoundryRealtimeEndpoint.replace("?intent=transcription", "?intent=translation")),
+    envMutation("PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT", "other"),
+    envMutation("PALANCAR_TRANSCRIPTION_PROVIDER", "mock"),
+    envMutation("PALANCAR_SECURITY_MODE", "memory"),
+    envMutation("APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "false"),
+    envMutation("PALANCAR_LITELLM_BASE_URL", "http://localhost:4001"),
+  ]) rejectsFinalMutation(mutate);
+  rejectsFinalMutation((candidate) => {
+    candidate.variables.litellm_upstream_model.value = "openrouter/openai/gpt-4o-mini";
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.template.containers[1].env[1].value =
+        "openrouter/openai/gpt-4o-mini";
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      after.body.properties.configuration.secrets[0].value = "plaintext";
+    });
+  });
+});
+
+test("final-rollout binds observability and Container Apps outputs exactly", () => {
+  const rotatedKeyPlan = finalRolloutPlan();
+  const rotatedKey = "11111111-1111-4111-8111-111111111111";
+  let originalKey;
+  let rotatedConnection;
+  mutateFinalAfterCoherently(
+    rotatedKeyPlan,
+    "module.observability.azurerm_application_insights.this",
+    (after) => {
+      originalKey = after.instrumentation_key;
+      after.instrumentation_key = rotatedKey;
+      after.connection_string = after.connection_string.replace(
+        originalKey,
+        rotatedKey,
+      );
+      rotatedConnection = after.connection_string;
+    },
+  );
+  setFinalNoOpOutputCoherently(
+    rotatedKeyPlan,
+    "application_insights_connection_string",
+    rotatedConnection,
+  );
+  mutateFinalAfterCoherently(
+    rotatedKeyPlan,
+    containerAppAddress,
+    (after) => {
+      const env = after.body.properties.template.containers[0].env;
+      const connection = env.find(
+        (entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING",
+      );
+      connection.value = connection.value.replace(originalKey, rotatedKey);
+    },
+  );
+  assert.equal(acceptsPlan(rotatedKeyPlan, "final-rollout"), true);
+
+  rejectsFinalMutation((candidate) => {
+    setFinalApplicationInsightsConnectionCoherently(candidate, (connection) =>
+      connection.replace(
+        "https://eastus2.livediagnostics.monitor.azure.com/",
+        "https://westus2.livediagnostics.monitor.azure.com/",
+      ),
+    );
+  });
+
+  for (const mutate of [
+    (candidate) => { candidate.planned_values.outputs.application_insights_connection_string.value += ";X=1"; },
+    (candidate) => { candidate.output_changes.application_insights_connection_string.after += ";X=1"; },
+    (candidate) => {
+      const env = finalAfter(candidate, containerAppAddress).body.properties.template.containers[0].env;
+      env.find((entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING").value += "/";
+    },
+    (candidate) => { candidate.planned_values.outputs.container_app_environment_default_domain.value = "other.azurecontainerapps.io"; },
+    (candidate) => { candidate.planned_values.outputs.relay_origin.value = "wss://other.azurecontainerapps.io"; },
+    (candidate) => {
+      const env = finalAfter(candidate, finalCleanupJobAddress).body.properties.template.containers[0].env;
+      env.find((entry) => entry.name === "PALANCAR_RELAY_ORIGIN").value = "wss://other.azurecontainerapps.io";
+    },
+  ]) rejectsFinalMutation(mutate);
+
+  rejectsFinalMutation((candidate) => {
+    const oldHost = "eastus2-3.in.applicationinsights.azure.com";
+    const newHost = "other.in.applicationinsights.azure.com";
+    let fullConnection;
+    mutateFinalAfterCoherently(
+      candidate,
+      "module.observability.azurerm_application_insights.this",
+      (after) => {
+        after.connection_string = after.connection_string.replace(oldHost, newHost);
+        fullConnection = after.connection_string;
+      },
+    );
+    setFinalNoOpOutputCoherently(
+      candidate,
+      "application_insights_connection_string",
+      fullConnection,
+    );
+    mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+      const env = after.body.properties.template.containers[0].env;
+      const connection = env.find(
+        (entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING",
+      );
+      connection.value = connection.value.replace(oldHost, newHost);
+    });
+  });
+
+  rejectsFinalMutation((candidate) => {
+    const otherDomain = "other.eastus2.azurecontainerapps.io";
+    const appName = finalAfter(candidate, containerAppAddress).name;
+    const otherOrigin = `wss://${appName}.${otherDomain}`;
+    mutateFinalAfterCoherently(
+      candidate,
+      "module.container_app_environment.azurerm_container_app_environment.this",
+      (after) => { after.default_domain = otherDomain; },
+    );
+    setFinalNoOpOutputCoherently(
+      candidate,
+      "container_app_environment_default_domain",
+      otherDomain,
+    );
+    setFinalNoOpOutputCoherently(candidate, "relay_origin", otherOrigin);
+    for (const address of [containerAppAddress, finalCleanupJobAddress]) {
+      mutateFinalAfterCoherently(candidate, address, (after) => {
+        const env = after.body.properties.template.containers[0].env;
+        env.find((entry) => entry.name === "PALANCAR_RELAY_ORIGIN").value =
+          otherOrigin;
+      });
+    }
+  });
+
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(
+      candidate,
+      "module.observability.azurerm_application_insights.this",
+      (after) => { after.name = "appi-palancar-dev-lookalike"; },
+    );
+  });
+
+  rejectsFinalMutation((candidate) => {
+    mutateFinalAfterCoherently(
+      candidate,
+      "module.container_app_environment.azurerm_container_app_environment.this",
+      (after) => { after.name = "cae-palancar-dev-lookalike"; },
+    );
+  });
+});
+
+test("final-rollout requires the exact expiry cleanup Job contract", () => {
+  const mutations = [
+    (after) => { after.type = "Microsoft.App/jobs@2025-01-01"; },
+    (after) => { after.identity[0].identity_ids.reverse(); },
+    (after) => { after.body.properties.configuration.identitySettings.reverse(); },
+    (after) => { after.body.properties.configuration.scheduleTriggerConfig.cronExpression = "0 * * * *"; },
+    (after) => { after.body.properties.configuration.scheduleTriggerConfig.parallelism = 2; },
+    (after) => { after.body.properties.configuration.scheduleTriggerConfig.replicaCompletionCount = 2; },
+    (after) => { after.body.properties.configuration.replicaRetryLimit = 1; },
+    (after) => { after.body.properties.configuration.replicaTimeout = 301; },
+    (after) => { after.body.properties.template.containers[0].resources.cpu = 0.5; },
+    (after) => { after.body.properties.template.containers[0].env.push({ name: "EXTRA", value: "x" }); },
+    (after) => { after.body.properties.template.containers[0].env[6].value = "1001"; },
+    (after) => { after.body.properties.template.containers[0].env[7].value = "240001"; },
+    (after) => { after.body.properties.configuration.secrets = []; },
+  ];
+  for (const mutate of mutations) {
+    rejectsFinalMutation((candidate) => {
+      mutateFinalAfterCoherently(candidate, finalCleanupJobAddress, mutate);
+    });
+  }
+});
+
+test("final-rollout scans exact configuration, planned, prior, relevant, unknown, and sensitive sections", () => {
+  const mutations = [
+    (candidate) => { candidate.configuration.root_module.resources.push(clone(candidate.configuration.root_module.resources[0])); },
+    (candidate) => { candidate.configuration.root_module.module_calls.extra = clone(candidate.configuration.root_module.module_calls.foundry); },
+    (candidate) => { candidate.planned_values.root_module.instances = []; },
+    (candidate) => { candidate.planned_values.root_module.child_modules[0].resources[0].instances = []; },
+    (candidate) => { candidate.prior_state.values.root_module.child_modules[0].resources.push({ address: "module.extra.azapi_resource.this", mode: "managed" }); },
+    (candidate) => { candidate.relevant_attributes.push(clone(candidate.relevant_attributes[0])); },
+    (candidate) => { candidate.relevant_attributes[0].extra = true; },
+    (candidate) => { candidate.checks[0].instances.push(clone(candidate.checks[0].instances[0])); },
+    (candidate) => { finalChange(candidate, containerAppAddress).change.after_unknown.extra = true; },
+    (candidate) => { finalChange(candidate, containerAppAddress).change.after_sensitive.extra = true; },
+    (candidate) => { finalChange(candidate, deploymentAddress).change.after_unknown.model = true; },
+  ];
+  for (const mutate of mutations) rejectsFinalMutation(mutate);
+});
+
+test("final-rollout requires the genuine child-module hierarchy in planned and prior values", () => {
+  rejectsFinalMutation((candidate) => {
+    candidate.planned_values.root_module.child_modules.push({
+      address: "module.unexpected",
+      resources: [],
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    const observability = finalValueModule(
+      candidate.planned_values.root_module,
+      "module.observability",
+    );
+    observability.child_modules = [
+      { address: "module.observability.module.empty", resources: [] },
+    ];
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      candidate.prior_state.values.root_module.child_modules.push({
+        address: "module.unexpected",
+        resources: [],
+      });
+    },
+    true,
+  );
+  rejectsFinalMutation(
+    (candidate) => {
+      const root = candidate.prior_state.values.root_module;
+      const index = root.child_modules.findIndex(
+        (module) => module.address === "module.container_app_workload[0]",
+      );
+      const [reparented] = root.child_modules.splice(index, 1);
+      const observability = finalValueModule(root, "module.observability");
+      observability.child_modules = [reparented];
+    },
+    true,
+  );
+});
+
+test("final-rollout enforces exact output action, prior, unknown, and sensitivity coherence", () => {
+  rejectsFinalMutation((candidate) => {
+    candidate.prior_state.values.outputs.expiry_cleanup_job_id = {
+      sensitive: false,
+      type: "string",
+      value: "unexpected-prior-id",
+    };
+  });
+  rejectsFinalMutation((candidate) => {
+    delete candidate.prior_state.values.outputs.acr_id;
+  });
+  rejectsFinalMutation((candidate) => {
+    const change = candidate.output_changes.acr_id;
+    change.after = `${change.after}-changed`;
+    candidate.planned_values.outputs.acr_id.value = change.after;
+  });
+  rejectsFinalMutation((candidate) => {
+    const change = candidate.output_changes.relay_latest_revision_name;
+    change.after = change.before;
+    change.after_unknown = false;
+    candidate.planned_values.outputs.relay_latest_revision_name = {
+      sensitive: false,
+      type: "string",
+      value: change.after,
+    };
+  });
+  rejectsFinalMutation((candidate) => {
+    delete candidate.prior_state.values.outputs.relay_latest_revision_name;
+  });
+  rejectsFinalMutation((candidate) => {
+    const value = "known-too-early";
+    const change = candidate.output_changes.expiry_cleanup_job_id;
+    change.after = value;
+    change.after_unknown = false;
+    candidate.planned_values.outputs.expiry_cleanup_job_id = {
+      sensitive: false,
+      type: "string",
+      value,
+    };
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.prior_state.values.outputs.expiry_cleanup_job_name.value +=
+      "-altered";
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.output_changes.acr_id.after_unknown = {};
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.output_changes.acr_id.after_sensitive = true;
+    candidate.output_changes.acr_id.before_sensitive = true;
+    candidate.planned_values.outputs.acr_id.sensitive = true;
+    candidate.prior_state.values.outputs.acr_id.sensitive = true;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.output_changes.acr_id.extra = true;
+  });
+  rejectsFinalMutation((candidate) => {
+    delete candidate.output_changes.relay_alert_rule_ids.after_unknown
+      .provider_failures;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.output_changes.relay_alert_rule_ids.after_unknown.foreign = true;
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      delete candidate.planned_values.outputs.relay_alert_rule_ids.value
+        .provider_failures;
+      delete candidate.output_changes.relay_alert_rule_ids.before
+        .provider_failures;
+      delete candidate.output_changes.relay_alert_rule_ids.after
+        .provider_failures;
+      delete candidate.prior_state.values.outputs.relay_alert_rule_ids.value
+        .provider_failures;
+    },
+    true,
+  );
+});
+
+test("final-rollout permits only the two reviewed unknown check instances", () => {
+  const fixtureUnknowns = finalTransitionFixture.checks.filter(
+    (check) => check.status === "unknown",
+  );
+  assert.equal(fixtureUnknowns.length, 2);
+  assert.deepEqual(
+    fixtureUnknowns.map((check) => check.address.to_display),
+    [
+      "module.container_app_workload.azapi_resource.this",
+      "module.container_app_workload.var.runtime_monitoring_metrics_publisher_role_assignment_id",
+    ],
+  );
+  rejectsFinalMutation((candidate) => {
+    const check = candidate.checks.find((entry) => entry.status === "pass");
+    check.status = "unknown";
+    check.instances[0].status = "unknown";
+  });
+  rejectsFinalMutation((candidate) => {
+    const check = candidate.checks.find((entry) => entry.status === "unknown");
+    check.address.to_display += "[0]";
+    check.instances[0].address.to_display += "[0]";
+  });
+  rejectsFinalMutation((candidate) => {
+    const check = clone(candidate.checks.find((entry) => entry.status === "unknown"));
+    check.address.name = "unexpected";
+    check.address.to_display = "module.container_app_workload.var.unexpected";
+    check.instances[0].address.to_display =
+      "module.container_app_workload[0].var.unexpected";
+    candidate.checks.push(check);
+  });
+  rejectsFinalMutation((candidate) => {
+    const check = candidate.checks.find((entry) => entry.status === "unknown");
+    check.status = "pass";
+    check.instances[0].status = "pass";
+  });
+  rejectsFinalMutation((candidate) => {
+    for (const check of candidate.checks) {
+      if (check.status === "unknown") check.status = "pass";
+      for (const instance of check.instances ?? []) {
+        if (instance.status === "unknown") instance.status = "pass";
+      }
+    }
+  });
+  rejectsFinalMutation(
+    (candidate) => {
+      candidate.checks = clone(finalTransitionFixture.checks);
+    },
+    true,
+  );
+});
+
+test("final-rollout rejects extra deployments, workloads, saved-search omissions, and alert configuration changes", () => {
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_changes.push({
+      ...clone(finalChange(candidate, deploymentAddress)),
+      address: 'module.foundry.azurerm_cognitive_deployment.this["other"]',
+      index: "other",
+    });
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_changes.push({
+      ...clone(finalChange(candidate, finalCleanupJobAddress)),
+      address: "module.expiry_cleanup_job[1].azapi_resource.this",
+      module_address: "module.expiry_cleanup_job[1]",
+    });
+  });
+  const savedSearch = finalTransitionFixture.resource_changes.find((entry) =>
+    entry.address.includes('azurerm_log_analytics_saved_search.relay["provider_failures"]'),
+  );
+  rejectsFinalMutation((candidate) => {
+    candidate.resource_changes = candidate.resource_changes.filter(
+      (entry) => entry.address !== savedSearch.address,
+    );
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.configuration.root_module.module_calls.observability.module.resources =
+      candidate.configuration.root_module.module_calls.observability.module.resources.filter(
+        (entry) => entry.type !== "azurerm_monitor_scheduled_query_rules_alert_v2",
+      );
+  });
+});
+
 test("model-spike accepts the exact pinned deployment create", () => {
   assert.equal(acceptsPlan(plan([miniCreate]), "model-spike"), true);
   assert.equal(
@@ -829,6 +2379,7 @@ test("all modes require the supported Terraform JSON plan format", () => {
     [plan([miniCreate]), "model-spike"],
     [fullPlan(), "full-deploy"],
     [runtimePlan(), "runtime-rollout"],
+    [finalRolloutPlan(), "final-rollout"],
   ];
 
   for (const [validPlan, mode] of validPlans) {
@@ -2314,6 +3865,12 @@ test("CLI accepts JSON stdin and uses no plan values in its result", () => {
     JSON.stringify(runtimePlan()),
   );
   assert.equal(runtimeAccepted, 0);
+
+  const finalAccepted = runCli(
+    ["--mode=final-rollout"],
+    JSON.stringify(finalRolloutPlan()),
+  );
+  assert.equal(finalAccepted, 0);
 });
 
 test("CLI rejection output is fixed and content-free", () => {
