@@ -1,111 +1,208 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync as defaultSpawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
+import { setTimeout as defaultDelay } from 'node:timers/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const imageName = 'palancar-relay:local';
-const containerPort = 8787;
+const localImageName = 'palancar-relay:local';
 const healthTimeoutMs = 30_000;
+const cleanupTimeoutMs = 10_000;
 const pollIntervalMs = 250;
+const immutableImageReferencePattern = /^(?=.{1,255}$)(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?\/)*[a-z0-9]+(?:[._-][a-z0-9]+)*@sha256:[a-f0-9]{64}$/;
 
-function runDocker(args) {
+function smokeError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function isTimeoutResult(result) {
+  return result.error?.code === 'ETIMEDOUT' ||
+    (result.status === null && result.signal !== null && result.signal !== undefined);
+}
+
+export function isImmutableImageReference(value) {
+  return typeof value === 'string' && immutableImageReferencePattern.test(value);
+}
+
+export function parseSmokeArguments(args) {
+  if (args.length === 0) {
+    return Object.freeze({ image: localImageName, shouldBuild: true });
+  }
+  if (args.length === 1 && isImmutableImageReference(args[0])) {
+    return Object.freeze({ image: args[0], shouldBuild: false });
+  }
+  throw smokeError('invalid_image_reference');
+}
+
+function remainingDeadlineMs(deadline, clock) {
+  const remainingMs = deadline - clock();
+  if (remainingMs <= 0) {
+    throw smokeError('healthcheck_timeout');
+  }
+  return remainingMs;
+}
+
+export function runDocker(args, {
+  deadline,
+  clock = Date.now,
+  spawnSync = defaultSpawnSync,
+  timeoutMs = cleanupTimeoutMs
+} = {}) {
+  const timeout = deadline === undefined
+    ? timeoutMs
+    : remainingDeadlineMs(deadline, clock);
   const result = spawnSync('docker', args, {
     cwd: repositoryRoot,
     encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout
   });
+  if (isTimeoutResult(result)) {
+    throw smokeError('docker_command_timeout');
+  }
   if (result.error !== undefined || result.status !== 0) {
-    throw new Error('docker_command_failed');
+    throw smokeError('docker_command_failed');
+  }
+  if (deadline !== undefined && deadline <= clock()) {
+    throw smokeError('docker_command_timeout');
   }
   return result.stdout.trim();
 }
 
-function buildImage() {
+function buildImage(spawnSync) {
   const result = spawnSync('docker', [
     'build',
     '-f',
     'apps/relay/Dockerfile',
     '-t',
-    imageName,
+    localImageName,
     '.'
   ], {
     cwd: repositoryRoot,
-    stdio: 'inherit'
+    stdio: ['ignore', 'ignore', 'ignore']
   });
   if (result.error !== undefined || result.status !== 0) {
-    throw new Error('docker_build_failed');
+    throw smokeError('docker_build_failed');
   }
 }
 
-function hostPortFor(containerId) {
-  const binding = runDocker(['port', containerId, `${containerPort}/tcp`]);
-  const lastLine = binding.split(/\r?\n/).filter(Boolean).at(-1);
-  const separator = lastLine?.lastIndexOf(':') ?? -1;
-  const port = Number(separator === -1 ? undefined : lastLine.slice(separator + 1));
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new Error('docker_port_lookup_failed');
+export function parseContainerState(output) {
+  let state;
+  try {
+    state = JSON.parse(output);
+  } catch {
+    throw smokeError('docker_inspect_failed');
   }
-  return port;
+  return Object.freeze({
+    running: state?.Running === true,
+    healthStatus: state?.Health?.Status
+  });
 }
 
-async function waitForHealth(port) {
-  const deadline = Date.now() + healthTimeoutMs;
-  const url = `http://127.0.0.1:${port}/healthz`;
-  while (Date.now() < deadline) {
+function inspectContainerState(containerId, options) {
+  const output = runDocker([
+    'inspect',
+    '--format',
+    '{{json .State}}',
+    containerId
+  ], options);
+  return parseContainerState(output);
+}
+
+export async function waitForHealth(containerId, {
+  clock = Date.now,
+  deadline = clock() + healthTimeoutMs,
+  delay = defaultDelay,
+  inspect = (id, options) => inspectContainerState(id, options),
+  spawnSync = defaultSpawnSync
+} = {}) {
+  while (clock() < deadline) {
+    let state;
     try {
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(Math.min(1_000, deadline - Date.now()))
-      });
-      if (response.status === 200) {
-        const body = await response.json();
-        if (body?.ok === true) {
-          return;
-        }
+      state = inspect(containerId, { clock, deadline, spawnSync });
+    } catch (error) {
+      if (error?.code === 'docker_command_timeout' || error?.code === 'healthcheck_timeout') {
+        throw error;
       }
-    } catch {
-      // The container may still be starting.
     }
-    const remainingMs = deadline - Date.now();
+    if (state?.running !== true) {
+      if (state !== undefined) {
+        throw smokeError('container_not_running');
+      }
+    } else if (state.healthStatus === 'healthy') {
+      return;
+    } else if (state.healthStatus === 'unhealthy') {
+      throw smokeError('healthcheck_failed');
+    }
+
+    const remainingMs = deadline - clock();
     if (remainingMs > 0) {
       await delay(Math.min(pollIntervalMs, remainingMs));
     }
   }
-  throw new Error('healthcheck_timeout');
+  throw smokeError('healthcheck_timeout');
 }
 
-let containerId;
-let failed = false;
-try {
-  buildImage();
-  containerId = runDocker([
-    'run',
-    '--detach',
-    '--publish',
-    `127.0.0.1::${containerPort}`,
-    imageName
-  ]);
-  const hostPort = hostPortFor(containerId);
-  await waitForHealth(hostPort);
-  console.log('container smoke passed');
-} catch {
-  failed = true;
-} finally {
-  if (containerId !== undefined) {
-    try {
-      runDocker(['stop', '--time', '5', containerId]);
-    } catch {
-      failed = true;
+export async function runSmoke(args = process.argv.slice(2), {
+  clock = Date.now,
+  delay = defaultDelay,
+  spawnSync = defaultSpawnSync
+} = {}) {
+  let image;
+  let shouldBuild;
+  let containerId;
+  let failed = false;
+  try {
+    ({ image, shouldBuild } = parseSmokeArguments(args));
+    if (shouldBuild) {
+      buildImage(spawnSync);
     }
-    try {
-      runDocker(['rm', '--force', containerId]);
-    } catch {
-      failed = true;
+    containerId = runDocker([
+      'run',
+      '--detach',
+      '--env',
+      'PALANCAR_SECURITY_MODE=local-mock',
+      '--env',
+      'PALANCAR_GENERATION_PROVIDER=mock',
+      '--env',
+      'PALANCAR_TRANSCRIPTION_PROVIDER=mock',
+      '--env',
+      'PALANCAR_RELAY_BIND_HOST=127.0.0.1',
+      image
+    ], { clock, spawnSync });
+    if (containerId.length === 0) {
+      throw smokeError('docker_run_failed');
+    }
+    await waitForHealth(containerId, { clock, delay, spawnSync });
+  } catch {
+    failed = true;
+  } finally {
+    if (containerId !== undefined) {
+      try {
+        runDocker(['stop', '--time', '5', containerId], { clock, spawnSync });
+      } catch {
+        failed = true;
+      }
+      try {
+        runDocker(['rm', '--force', containerId], { clock, spawnSync });
+      } catch {
+        failed = true;
+      }
     }
   }
+  return !failed;
 }
 
-if (failed) {
-  console.error('container smoke failed');
-  process.exitCode = 1;
+const isMainModule = process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  const passed = await runSmoke();
+  if (passed) {
+    console.log('container smoke passed');
+  } else {
+    console.error('container smoke failed');
+    process.exitCode = 1;
+  }
 }

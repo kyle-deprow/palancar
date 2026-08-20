@@ -55,6 +55,7 @@ ENV NODE_ENV=production \
     PALANCAR_GATE_POLICY_VERSION=1.0.0
 
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/apps/relay/node_modules apps/relay/node_modules
 COPY --from=builder --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=builder --chown=node:node /app/apps/relay/package.json apps/relay/package.json
 COPY --from=builder --chown=node:node /app/apps/relay/dist apps/relay/dist
