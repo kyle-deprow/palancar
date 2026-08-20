@@ -16,6 +16,40 @@ const finalFixtureText = readFileSync(
   "utf8",
 );
 const finalTransitionFixture = JSON.parse(finalFixtureText);
+const FIXTURE_LOG_ANALYTICS_PRIMARY_SHARED_KEY =
+  "EREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREQ==";
+const FIXTURE_LOG_ANALYTICS_SECONDARY_SHARED_KEY =
+  "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg==";
+const FIXTURE_STORAGE_PRIMARY_ACCESS_KEY =
+  "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw==";
+const FIXTURE_STORAGE_SECONDARY_ACCESS_KEY =
+  "RERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERA==";
+const FIXTURE_APP_INSIGHTS_INSTRUMENTATION_KEY =
+  "00000000-0000-4000-8000-000000000099";
+const FIXTURE_APP_INSIGHTS_APPLICATION_ID =
+  "00000000-0000-4000-8000-000000000098";
+const FIXTURE_APP_INSIGHTS_FULL_CONNECTION =
+  `InstrumentationKey=${FIXTURE_APP_INSIGHTS_INSTRUMENTATION_KEY};` +
+  "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com/;" +
+  "LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;" +
+  `ApplicationId=${FIXTURE_APP_INSIGHTS_APPLICATION_ID}`;
+const FIXTURE_APP_INSIGHTS_RELAY_CONNECTION =
+  `InstrumentationKey=${FIXTURE_APP_INSIGHTS_INSTRUMENTATION_KEY};` +
+  "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com";
+const FIXTURE_SYNTHETIC_KEYS = [
+  FIXTURE_LOG_ANALYTICS_PRIMARY_SHARED_KEY,
+  FIXTURE_LOG_ANALYTICS_SECONDARY_SHARED_KEY,
+  FIXTURE_STORAGE_PRIMARY_ACCESS_KEY,
+  FIXTURE_STORAGE_SECONDARY_ACCESS_KEY,
+];
+const APPROVED_FIXTURE_SENSITIVE_VALUES = new Set([
+  null,
+  "",
+  ...FIXTURE_SYNTHETIC_KEYS,
+  FIXTURE_APP_INSIGHTS_INSTRUMENTATION_KEY,
+  FIXTURE_APP_INSIGHTS_FULL_CONNECTION,
+  FIXTURE_APP_INSIGHTS_RELAY_CONNECTION,
+]);
 
 const deploymentAddress =
   'module.foundry.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"]';
@@ -1146,8 +1180,6 @@ function finalRolloutPlan({ idempotent = false } = {}) {
   const planValue = clone(finalTransitionFixture);
   if (!idempotent) return planValue;
 
-  planValue.resource_drift = [];
-
   const appEntry = finalChange(planValue, containerAppAddress);
   const appAfter = clone(appEntry.change.after);
   appAfter.output = clone(appEntry.change.before.output);
@@ -1183,13 +1215,69 @@ test("final-rollout accepts the reviewed initial and idempotent plans", () => {
     ),
     true,
   );
-  assert.deepEqual(idempotent.resource_drift, []);
+  assert.equal(idempotent.resource_drift, undefined);
 });
 
 function rejectsFinalMutation(mutate, idempotent = false) {
   const candidate = finalRolloutPlan({ idempotent });
   mutate(candidate);
   assert.equal(acceptsPlan(candidate, "final-rollout"), false);
+}
+
+function approvedFixtureSensitiveLeaves(planValue) {
+  const leaves = [];
+
+  function collect(mask, values, path) {
+    if (mask === true) {
+      leaves.push({ path, value: values });
+      return;
+    }
+    if (Array.isArray(mask)) {
+      mask.forEach((entry, index) => {
+        collect(entry, values?.[index], `${path}[${index}]`);
+      });
+      return;
+    }
+    if (!mask || typeof mask !== "object") return;
+    for (const [key, child] of Object.entries(mask)) {
+      collect(child, values?.[key], path ? `${path}.${key}` : key);
+    }
+  }
+
+  function visit(value, path = "") {
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (Object.hasOwn(value, "before_sensitive")) {
+      collect(value.before_sensitive, value.before, `${path}.before`);
+    }
+    if (Object.hasOwn(value, "after_sensitive")) {
+      collect(value.after_sensitive, value.after, `${path}.after`);
+    }
+    if (Object.hasOwn(value, "sensitive_values")) {
+      collect(value.sensitive_values, value.values, `${path}.values`);
+    }
+    for (const [key, child] of Object.entries(value)) {
+      visit(child, path ? `${path}.${key}` : key);
+    }
+  }
+
+  visit(planValue);
+  for (const { path, value } of leaves) {
+    const storageConnectionPlaceholder =
+      /\.(?:primary|secondary)(?:_blob)?_connection_string$/.test(path) &&
+      typeof value === "string" &&
+      /^fixture-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
+    assert.equal(
+      APPROVED_FIXTURE_SENSITIVE_VALUES.has(value) ||
+        storageConnectionPlaceholder,
+      true,
+      `unapproved sensitive fixture value at ${path}`,
+    );
+  }
+  return leaves;
 }
 
 function finalAfter(planValue, address) {
@@ -1223,6 +1311,15 @@ function mutateFinalTransitionPriorCoherently(planValue, mutate) {
     containerAppAddress,
   );
   prior.values = clone(entry.change.before);
+}
+
+function setFinalPriorRevisionCoherently(planValue, revision) {
+  mutateFinalTransitionPriorCoherently(planValue, (before) => {
+    before.output.properties.latestRevisionName = revision;
+  });
+  planValue.prior_state.values.outputs.relay_latest_revision_name.value =
+    revision;
+  planValue.output_changes.relay_latest_revision_name.before = revision;
 }
 
 function mutateFinalJobOutputNoOpCoherently(planValue, mutate) {
@@ -1578,7 +1675,7 @@ test("final-rollout rejects action-group and alert address, type, and schema loo
   });
 });
 
-test("the final fixture contains only synthetic contacts and no parent environment secrets", () => {
+test("the final fixture contains only synthetic contacts and credential-free placeholders", () => {
   const contacts = finalTransitionFixture.variables.budget_contact_emails.value;
   assert.deepEqual(contacts, ["fixture-contact-0001@redacted.example.net"]);
   const actionGroup = finalChange(
@@ -1592,6 +1689,19 @@ test("the final fixture contains only synthetic contacts and no parent environme
   for (const receiver of actionGroup.email_receiver) {
     assert.match(receiver.name, /^budget-contact-\d{4}$/);
     assert.equal(receiver.name.includes(receiver.email_address.split("@")[0]), false);
+  }
+
+  assert.match(
+    finalFixtureText,
+    /palancar-relay@sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170/,
+  );
+  for (const pattern of [
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
+    /\b(?:Bearer|Basic)\s+[A-Za-z0-9+/=]{16,}\b/i,
+    /(?:password|api[_-]?key)\s*[:=]\s*[A-Za-z0-9+/=_-]{16,}/i,
+  ]) {
+    assert.doesNotMatch(finalFixtureText, pattern);
   }
 
   const parentEnv = new URL("../../../.env", import.meta.url);
@@ -1631,6 +1741,68 @@ test("the final fixture contains only synthetic contacts and no parent environme
       );
     }
   }
+
+  const syntheticUuid = (value) => {
+    if (!/^[0-9a-f-]{36}$/.test(value)) return false;
+    const counts = new Map();
+    for (const character of value.replaceAll("-", "")) {
+      counts.set(character, (counts.get(character) ?? 0) + 1);
+    }
+    return Math.max(...counts.values()) >= 20;
+  };
+  const taggedValues = [];
+  const visit = (value, key = "") => {
+    if (Array.isArray(value)) {
+      value.forEach((entry) => visit(entry, key));
+      return;
+    }
+    if (!value || typeof value !== "object") {
+      if (
+        typeof value === "string" &&
+        /^(?:principal_id|principalId|object_id|client_id|clientId)$/.test(key)
+      ) {
+        taggedValues.push(value);
+      }
+      return;
+    }
+    for (const [childKey, childValue] of Object.entries(value)) {
+      visit(childValue, childKey);
+    }
+  };
+  visit(finalTransitionFixture);
+  assert.equal(
+    taggedValues.every((value) => value === "" || syntheticUuid(value)),
+    true,
+  );
+});
+
+test("the final fixture permits only approved synthetic sensitive values", () => {
+  assert.equal(new Set(FIXTURE_SYNTHETIC_KEYS).size, 4);
+  for (const value of FIXTURE_SYNTHETIC_KEYS) {
+    assert.match(value, /^[A-Za-z0-9+/]{86}==$/);
+  }
+
+  const leaves = approvedFixtureSensitiveLeaves(finalTransitionFixture);
+  assert.equal(leaves.length, 66);
+  for (const syntheticKey of FIXTURE_SYNTHETIC_KEYS) {
+    assert.equal(
+      leaves.filter(({ value }) => value === syntheticKey).length,
+      4,
+    );
+  }
+
+  const unknownBase64Key = Buffer.alloc(64, 0x55).toString("base64");
+  assert.match(unknownBase64Key, /^[A-Za-z0-9+/]{86}==$/);
+  assert.equal(FIXTURE_SYNTHETIC_KEYS.includes(unknownBase64Key), false);
+  const candidate = clone(finalTransitionFixture);
+  finalChange(
+    candidate,
+    "module.observability.azurerm_log_analytics_workspace.this",
+  ).change.after.primary_shared_key = unknownBase64Key;
+  assert.throws(
+    () => approvedFixtureSensitiveLeaves(candidate),
+    /unapproved sensitive fixture value/,
+  );
 });
 
 test("final-rollout requires complete/applyable/non-errored Terraform 1.15.8 plans", () => {
@@ -1644,44 +1816,14 @@ test("final-rollout requires complete/applyable/non-errored Terraform 1.15.8 pla
   ]) rejectsFinalMutation(mutate);
 });
 
-test("final-rollout accepts only the exact reviewed transition drift and no idempotent drift", () => {
-  assert.equal(finalTransitionFixture.resource_drift.length, 6);
-  assert.equal(
-    finalTransitionFixture.resource_drift.every(
-      (entry) =>
-        entry.change.actions[0] === "update" &&
-        entry.change.before.target_resource_types === null &&
-        Array.isArray(entry.change.after.target_resource_types) &&
-        entry.change.after.target_resource_types.length === 0,
-    ),
-    true,
-  );
+test("final-rollout requires the genuine zero-drift transition and idempotent form", () => {
+  assert.equal(finalTransitionFixture.resource_drift, undefined);
+  assert.equal(finalRolloutPlan().resource_drift, undefined);
+  assert.equal(finalRolloutPlan({ idempotent: true }).resource_drift, undefined);
   rejectsFinalMutation((candidate) => { candidate.resource_drift = []; });
   rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.after.criteria[0].threshold += 1;
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.before.target_resource_types = [];
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.after.target_resource_types = null;
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.after.extra = null;
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift[0].change.actions = ["no-op"];
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift.push(clone(candidate.resource_drift[0]));
-  });
-  rejectsFinalMutation((candidate) => {
-    candidate.resource_drift.reverse();
-  });
-  rejectsFinalMutation(
-    (candidate) => { candidate.resource_drift = clone(finalTransitionFixture.resource_drift); },
-    true,
-  );
+    candidate.resource_drift = [clone(candidate.resource_changes[0])];
+  }, true);
 });
 
 test("final-rollout rejects import, generated config, deposed state, and malformed action envelopes", () => {
@@ -1731,6 +1873,10 @@ test("final-rollout treats the exact ACR and all image repositories literally", 
   rejectsFinalMutation((candidate) => {
     candidate.variables.litellm_image_digest.value =
       candidate.variables.relay_image_digest.value;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.variables.relay_image_digest.value =
+      `${finalAcrLoginServer}/palancar-relay@sha256:${"d".repeat(64)}`;
   });
   rejectsFinalMutation((candidate) => {
     finalAfter(candidate, containerAppAddress).body.properties.template.containers[0].image =
@@ -1879,20 +2025,27 @@ test("final-rollout pins the remediation resources and aggregate exactly", () =>
 
 test("final-rollout pins the complete prior Container App transition", () => {
   const mutations = [
-    (before) => { before.body.properties.template.containers[1].resources.cpu = 0.5; },
-    (before) => { before.body.properties.template.containers[1].resources.memory = "1Gi"; },
+    (before) => { before.body.properties.template.containers[1].resources.cpu = 0.25; },
+    (before) => { before.body.properties.template.containers[1].resources.memory = "0.5Gi"; },
     (before) => { before.body.properties.template.containers[0].resources.cpu = 0.5; },
     (before) => { before.body.properties.template.containers[0].resources.memory = "1Gi"; },
+    (before) => { before.body.properties.template.containers[0].image = finalRelayImage; },
     (before) => { before.body.properties.template.containers[0].probes[0].periodSeconds = 11; },
-    (before) => { before.body.properties.template.containers[0].image = "foreign.example.invalid/relay@sha256:" + "a".repeat(64); },
     (before) => { before.body.properties.template.containers[0].env.push({ name: "EXTRA", value: "unexpected" }); },
     (before) => { before.body.properties.configuration.ingress.targetPort = 4000; },
+    (before) => { before.output.properties.latestRevisionName += "-altered"; },
   ];
   for (const mutate of mutations) {
     rejectsFinalMutation((candidate) => {
       mutateFinalTransitionPriorCoherently(candidate, mutate);
     });
   }
+  rejectsFinalMutation((candidate) => {
+    setFinalPriorRevisionCoherently(
+      candidate,
+      "ca-palancar-dev-relay-aeeacd8c--123456x",
+    );
+  });
 });
 
 test("final-rollout requires the complete relay and LiteLLM environments", () => {
@@ -2199,6 +2352,11 @@ test("final-rollout enforces exact output action, prior, unknown, and sensitivit
   });
   rejectsFinalMutation((candidate) => {
     delete candidate.prior_state.values.outputs.relay_latest_revision_name;
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.prior_state.values.outputs.relay_latest_revision_name.sensitive =
+      true;
+    candidate.output_changes.relay_latest_revision_name.before_sensitive = true;
   });
   rejectsFinalMutation((candidate) => {
     const value = "known-too-early";

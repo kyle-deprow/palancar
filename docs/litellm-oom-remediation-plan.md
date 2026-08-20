@@ -1,5 +1,9 @@
 # LiteLLM OOM remediation
 
+Status: completed. The Phase A sizing change and its original guarded rollout
+are retained below as historical implementation evidence. The active rollout
+is the Phase B parser-fix relay-image transition.
+
 ## Evidence and decision
 
 The exact deployed LiteLLM image succeeds without a memory limit and exits
@@ -18,15 +22,15 @@ Consumption allocation. Although Azure permits an intermediate 0.75 CPU/1.5
 GiB aggregate, it would leave LiteLLM at the empirically headroom-free 1 GiB
 bound.
 
-## Phase A: workload contract
+## Completed Phase A: workload contract
 
-The bounded worker may edit only:
+The bounded worker was limited to:
 
 - `infra/modules/container-app-workload/main.tf`
 - `infra/modules/container-app-workload/tests/runtime-contract.tftest.hcl`
 - `infra/modules/container-app-workload/README.md`
 
-Requirements:
+Completed requirements:
 
 1. Change only the enabled LiteLLM container resources to `cpu = 0.75` and
    `memory = "1.5Gi"`.
@@ -39,7 +43,7 @@ Requirements:
    root wiring or guard files, access Azure, build images, read `.env`, or
    commit.
 
-Verification uses `/home/dev/.local/bin/terraform-1.15.8`:
+Verification used `/home/dev/.local/bin/terraform-1.15.8`:
 
 - `terraform fmt -check` for owned Terraform files
 - module `terraform init -backend=false -input=false`
@@ -50,17 +54,24 @@ Verification uses `/home/dev/.local/bin/terraform-1.15.8`:
 
 ## Phase B: genuine remediation plan and guard repin
 
-After Phase A is reviewed and committed, the parent generates a complete saved
-live plan with the unchanged three image digests and deployment inputs. The
-expected shape is 39 resources: one Container App update and 38 no-ops, with
-no delete, replacement, import, or extra resource. Prior LiteLLM resources
-must be 0.25 CPU/0.5 GiB and planned resources 0.75 CPU/1.5 GiB. The genuine
-transition contains exactly six one-time resource-drift envelopes at the
-scheduled-query alert instances. Each corresponding resource change remains
-no-op, and each drift is pinned to the sole recursive value difference of
-prior `target_resource_types = null` to refreshed `target_resource_types = []`.
-The subsequent idempotent form requires all 39 resources and all outputs to be
-no-op, all 101 checks to pass with no unknown checks, and `resource_drift = []`.
+After Phase A was reviewed and committed, the parent generated a complete saved
+live plan for the parser-fix relay-image-only transition with the deployment
+inputs unchanged. The approved saved binary hash is
+`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4`; verify
+it immediately before guarding and applying that exact file. This is the
+saved-binary hash, not the JSON-view hash. Keep both raw files mode `0600` and
+never commit them. The expected
+shape is 39 resources: one Container App update and 38 no-ops, with no delete,
+replacement, import, or extra resource. LiteLLM remains exactly 0.75 CPU/1.5
+GiB and relay remains exactly 0.25 CPU/0.5 GiB. The Container App transition
+differs recursively only at relay `containers[0].image` and the computed
+provider output: the prior relay digest is the reviewed hard-pinned digest,
+while the planned image equals the immutable same-ACR `var.relay_image_digest`
+and is distinct from prior. The `relay_latest_revision_name` output becomes
+unknown. The genuine transition has zero resource drift, represented by the
+omitted `resource_drift` envelope. The subsequent idempotent form requires all
+39 resources and all outputs to be no-op, all 101 checks to pass with no unknown
+checks, and zero resource drift.
 
 The parent creates a coherent sanitized copy from that genuine plan. A second
 bounded worker may then edit only:
@@ -73,15 +84,20 @@ bounded worker may then edit only:
 - `docs/litellm-oom-remediation-plan.md`
 
 The operational `final-rollout` guard is repinned to this exact one-update
-remediation and its subsequent 39-resource all-no-op state. Historical guard
-modes remain unchanged. Tests must reject old LiteLLM resources, altered relay
-resources, invalid aggregate pairs, prior rollout action vectors, and any
-mutation beyond the reviewed resource-only Container App update.
+relay-image transition and its subsequent 39-resource all-no-op state.
+Historical guard modes remain unchanged. The completed OOM sizing remains
+background evidence, not a current resource transition. Tests must reject old
+LiteLLM resources, altered relay resources, invalid aggregate pairs, prior
+rollout action vectors, alternate prior digests, image-variable mismatches,
+provider-output/revision drift, and any mutation beyond the reviewed
+resource-only Container App update.
 
 ## Completion
 
 Completion requires a Sol review after each phase, all repository and
-Terraform gates, a guard-approved exact saved binary, Sol plan approval, exact
-binary apply, a ready Azure revision, real deployed OpenRouter inference,
-cleanup/telemetry/security smoke, and a guarded all-no-op plan. Native Azure
-working-set headroom under the 1.5 GiB bound must be measured after rollout.
+Terraform gates, immediate verification of the approved saved-binary hash, a
+guard-approved exact saved binary, exact binary apply, a ready Azure revision,
+real deployed OpenRouter inference, cleanup/telemetry/security smoke, and a
+fresh guarded all-no-op plan with 39 no-op resources, zero drift, and 101
+passing checks. Native Azure working-set headroom under the 1.5 GiB bound must
+be measured after rollout.

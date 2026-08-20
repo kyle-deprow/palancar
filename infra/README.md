@@ -172,15 +172,32 @@ port 4000, and the `palancar-generation` alias.
 
 For the reviewed final rollout, after the pinned transcription deployment is
 already present, create a complete saved plan without `-target`, guard its JSON
-view, and apply that exact same file only when the guard exits successfully:
+view, and apply that exact same file only when the guard exits successfully.
+Keep the binary and JSON view mode `0600`; neither may be committed. For the
+current parser-fix rollout:
 
 ```sh
-terraform -chdir=infra/environments/dev plan \
-  -out=/tmp/palancar-final.tfplan && \
-terraform -chdir=infra/environments/dev show -json /tmp/palancar-final.tfplan \
-  | node infra/scripts/assert-dev-plan.mjs --mode=final-rollout && \
-terraform -chdir=infra/environments/dev apply /tmp/palancar-final.tfplan
+set -eu
+umask 077
+PALANCAR_TERRAFORM=/home/dev/.local/bin/terraform-1.15.8
+PALANCAR_PLAN=/tmp/palancar-realtime-parser-v2.tfplan
+PALANCAR_PLAN_JSON=/tmp/palancar-realtime-parser-v2.tfplan.json
+PALANCAR_PLAN_SHA=f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4
+
+chmod 600 "$PALANCAR_PLAN"
+test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
+"$PALANCAR_TERRAFORM" -chdir=infra/environments/dev show -json \
+  "$PALANCAR_PLAN" > "$PALANCAR_PLAN_JSON"
+chmod 600 "$PALANCAR_PLAN_JSON"
+node infra/scripts/assert-dev-plan.mjs --mode=final-rollout \
+  < "$PALANCAR_PLAN_JSON"
+test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
+chmod 600 "$PALANCAR_PLAN" "$PALANCAR_PLAN_JSON"
+"$PALANCAR_TERRAFORM" -chdir=infra/environments/dev apply "$PALANCAR_PLAN"
 ```
+
+The approved SHA is for the saved binary, not its deterministic JSON view;
+the two files normally have different hashes.
 
 Do not run the apply command after a guard rejection, do not substitute a
 newly generated plan file between guard and apply, and do not apply a
@@ -189,36 +206,46 @@ refresh-only plan.
 `final-rollout` is a separate fail-closed mode. It requires the complete
 39-resource transition inventory: 38 no-ops and the reviewed resource-only
 Container App update at
-`module.container_app_workload[0].azapi_resource.this`. Only the LiteLLM
-containers change from 0.25 CPU/0.5Gi to 0.75 CPU/1.5Gi; relay remains 0.25
-CPU/0.5Gi and the aggregate is exactly 1 CPU/2Gi. The transition has exactly
-six one-time scheduled-query alert drift envelopes; each corresponding alert
-resource change remains no-op and its sole recursive value difference is
-`target_resource_types` changing from prior `null` to refreshed `[]`. The
-action group, cleanup Job, alerts, and all other resources are already deployed
-and no-op. The action group must use the exact deterministic development ARM ID
-and one common-schema, ordinally named email receiver per sorted budget
-contact. The same contact set must appear in all four budget notifications.
-Every alert is bound to that action group and must match the committed
-workspace scope, KQL, threshold, aggregation, severity, periods, properties,
-and provider envelope, with no dimensions. The idempotent form requires all 39
-resources and all outputs to be no-op, all 101 checks to pass, and
-`resource_drift` to be empty.
+`module.container_app_workload[0].azapi_resource.this`. This is the
+post-remediation parser-fix transition: LiteLLM remains at 0.75 CPU/1.5Gi,
+relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
+The only recursive Container App differences are relay
+`containers[0].image` and the provider output. The prior relay image is pinned
+to the reviewed digest
+`sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170`;
+the planned image must equal `var.relay_image_digest`, remain immutable in the
+same ACR/repository, and be distinct from that prior digest. The
+`relay_latest_revision_name` output becomes provider-unknown. There is zero
+resource drift. The action group, cleanup Job, alerts, and all other resources
+are already deployed and no-op. The action group must use the exact
+deterministic development ARM ID and one common-schema, ordinally named email
+receiver per sorted budget contact. The same contact set must appear in all
+four budget notifications. Every alert is bound to that action group and must
+match the committed workspace scope, KQL, threshold, aggregation, severity,
+periods, properties, and provider envelope, with no dimensions. The idempotent
+form requires all 39 resources and all outputs to be no-op, all 101 checks to
+pass, and zero resource drift.
 
 The mode also requires the exact pinned Foundry deployment as a no-op, exact
 development ACR digests for the relay, LiteLLM proxy, and expiry-cleanup Job,
 and the complete final Container App and scheduled Job payloads. In the initial
 transition every resource is no-op except the single Container App update; the
-idempotent form requires all 39 resources to be no-op. The initial transition
-accepts only the exact six one-time provider normalizations alongside that
-resource-only update. It rejects all other drift, deletes, replacements,
+idempotent form requires all 39 resources to be no-op. The transition accepts
+only the exact relay-image/output update described above. It rejects all other
+drift, deletes, replacements,
 imports, deferred or unknown security values, extra topology or receivers,
 plaintext credentials, mutable or aliased images, and any second deployment or
 workload resource.
 
 The transition requires exactly 101 passing checks and no unknown checks. Any
-altered, failed, unknown, or additional check fails closed. The idempotent plan
-must report the same 101 checks as passing and contain no drift.
+altered, failed, unknown, or additional check fails closed. The completed OOM
+sizing change is background history; it is not an additional current
+transition. The commands above verify the exact binary immediately before
+guarding and again immediately before applying it.
+
+After apply, generate a fresh complete plan and require 39 no-op resources,
+zero resource drift, and all 101 checks passing before treating the rollout as
+idempotent.
 
 ## State recovery verification
 

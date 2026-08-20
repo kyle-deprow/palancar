@@ -30,6 +30,8 @@ const FINAL_RESOURCE_GROUP_NAME = "rg-palancar-dev-aeeacd8c";
 const FINAL_RESOURCE_GROUP_ID =
   `/subscriptions/${FINAL_SUBSCRIPTION_ID}/resourceGroups/${FINAL_RESOURCE_GROUP_NAME}`;
 const FINAL_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
+const FINAL_RELAY_PRIOR_IMAGE =
+  `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:4f34ec6d08c6fd67f08e829c4665020af28fea307de4a17bbf2150abab049170`;
 const FINAL_TABLE_ACCOUNT = "palancardevstateaeeacd8c";
 const FINAL_TABLE_ENDPOINT = `https://${FINAL_TABLE_ACCOUNT}.table.core.windows.net`;
 const FINAL_TABLE_SERVICE_ID =
@@ -54,6 +56,8 @@ const FINAL_KEY_VAULT_HOST = "kvpalancardevaeeacd8c.vault.azure.net";
 const FINAL_FOUNDRY_REALTIME_ENDPOINT =
   "wss://palancardevopenaiaeeacd8c.openai.azure.com/openai/v1/realtime?intent=transcription";
 const FINAL_CONTAINER_APP_NAME = "ca-palancar-dev-relay-aeeacd8c";
+const FINAL_PRIOR_RELAY_REVISION_NAME =
+  /^ca-palancar-dev-relay-aeeacd8c--[0-9]{7}$/;
 const FINAL_RELAY_ORIGIN =
   `wss://${FINAL_CONTAINER_APP_NAME}.${FINAL_CONTAINER_ENVIRONMENT_DEFAULT_DOMAIN}`;
 const FINAL_ACTION_GROUP_ADDRESS = "azurerm_monitor_action_group.relay";
@@ -2692,6 +2696,31 @@ function finalAzapiIdentity(after, action) {
   );
 }
 
+function finalHasExactContainerAppProviderOutput(output, defaultDomain) {
+  if (
+    !isObject(output) ||
+    !finalExactKeys(output, ["properties"]) ||
+    !isObject(output.properties)
+  ) {
+    return false;
+  }
+  const properties = output.properties;
+  return (
+    finalExactKeys(properties, [
+      "configuration",
+      "latestRevisionName",
+      "runningStatus",
+    ]) &&
+    finalExactKeys(properties.configuration, ["ingress"]) &&
+    finalExactKeys(properties.configuration.ingress, ["fqdn"]) &&
+    properties.configuration.ingress.fqdn ===
+      `${FINAL_CONTAINER_APP_NAME}.${defaultDomain}` &&
+    typeof properties.latestRevisionName === "string" &&
+    FINAL_PRIOR_RELAY_REVISION_NAME.test(properties.latestRevisionName) &&
+    properties.runningStatus === "Running"
+  );
+}
+
 function finalHasExactJobProviderOutput(output, after, context) {
   const referenceOutput =
     FINAL_REFERENCE_CHANGES.get(EXPIRY_CLEANUP_JOB).change.after.output;
@@ -2830,25 +2859,10 @@ function finalAzapiProviderEnvelope(
   if (isNoOp(action)) {
     if (kind === "app") {
       if (
-        !finalExactKeys(after.output, ["properties"]) ||
-        !isObject(after.output.properties)
-      ) {
-        return false;
-      }
-      const output = after.output.properties;
-      if (
-        !finalExactKeys(output, [
-          "configuration",
-          "latestRevisionName",
-          "runningStatus",
-        ]) ||
-        !finalExactKeys(output.configuration, ["ingress"]) ||
-        !finalExactKeys(output.configuration.ingress, ["fqdn"]) ||
-        output.configuration.ingress.fqdn !==
-          `${FINAL_CONTAINER_APP_NAME}.${defaultDomain}` ||
-        typeof output.latestRevisionName !== "string" ||
-        !output.latestRevisionName.startsWith(`${FINAL_CONTAINER_APP_NAME}--`) ||
-        output.runningStatus !== "Running"
+        !finalHasExactContainerAppProviderOutput(
+          after.output,
+          defaultDomain,
+        )
       ) {
         return false;
       }
@@ -2886,15 +2900,19 @@ function finalRecursiveDifferencePaths(before, after, path = "") {
   return [path];
 }
 
-function finalHasExactTransitionContainerAppPrior(resourceChange) {
+function finalHasExactTransitionContainerAppPrior(
+  resourceChange,
+  images,
+  defaultDomain,
+  plan,
+) {
   if (!isUpdate(resourceChange.change.actions)) {
     return true;
   }
   const before = resourceChange.change.before;
   const after = resourceChange.change.after;
   const expectedDifferences = [
-    "body.properties.template.containers[1].resources.cpu",
-    "body.properties.template.containers[1].resources.memory",
+    "body.properties.template.containers[0].image",
     "output",
   ];
   if (
@@ -2923,7 +2941,24 @@ function finalHasExactTransitionContainerAppPrior(resourceChange) {
   const afterRelay = afterContainers[0];
   const beforeLiteLLM = beforeContainers[1];
   const afterLiteLLM = afterContainers[1];
+  const priorRevision =
+    plan.prior_state?.values?.outputs?.relay_latest_revision_name?.value;
+  const revisionChange = plan.output_changes?.relay_latest_revision_name;
   return (
+    finalHasExactContainerAppProviderOutput(
+      before.output,
+      defaultDomain,
+    ) &&
+    FINAL_PRIOR_RELAY_REVISION_NAME.test(priorRevision) &&
+    before.output.properties.latestRevisionName === priorRevision &&
+    revisionChange?.before === priorRevision &&
+    beforeRelay?.name === "relay" &&
+    afterRelay?.name === "relay" &&
+    beforeLiteLLM?.name === "litellm" &&
+    afterLiteLLM?.name === "litellm" &&
+    beforeRelay.image === FINAL_RELAY_PRIOR_IMAGE &&
+    afterRelay.image === images["palancar-relay"] &&
+    afterRelay.image !== FINAL_RELAY_PRIOR_IMAGE &&
     hasExactKeys(beforeRelay?.resources, ["cpu", "memory"]) &&
     hasExactKeys(afterRelay?.resources, ["cpu", "memory"]) &&
     beforeRelay.resources.cpu === 0.25 &&
@@ -2932,8 +2967,8 @@ function finalHasExactTransitionContainerAppPrior(resourceChange) {
     afterRelay.resources.memory === "0.5Gi" &&
     hasExactKeys(beforeLiteLLM?.resources, ["cpu", "memory"]) &&
     hasExactKeys(afterLiteLLM?.resources, ["cpu", "memory"]) &&
-    beforeLiteLLM.resources.cpu === 0.25 &&
-    beforeLiteLLM.resources.memory === "0.5Gi" &&
+    beforeLiteLLM.resources.cpu === 0.75 &&
+    beforeLiteLLM.resources.memory === "1.5Gi" &&
     afterLiteLLM.resources.cpu === 0.75 &&
     afterLiteLLM.resources.memory === "1.5Gi"
   );
@@ -3344,7 +3379,12 @@ function finalHasExactTopology(plan, changesByAddress, context, images) {
     images,
     context.runtimeClient,
   );
-  const appPriorContract = finalHasExactTransitionContainerAppPrior(app);
+  const appPriorContract = finalHasExactTransitionContainerAppPrior(
+    app,
+    images,
+    defaultDomain,
+    plan,
+  );
   const jobProvider = finalAzapiProviderEnvelope(
     job.change.after,
     "job",
@@ -3720,9 +3760,11 @@ function finalHasExactOutputs(plan) {
         isNoOp(outputChange.actions)
       ) ||
       (!isNoOp(outputChange.actions) &&
-        !isDeepStrictEqual(outputChange, referenceChange)) ||
+        (name !== "relay_latest_revision_name" ||
+          !isDeepStrictEqual(outputChange.actions, referenceChange.actions))) ||
       typeof outputChange.before_sensitive !== "boolean" ||
       typeof outputChange.after_sensitive !== "boolean" ||
+      outputChange.before_sensitive !== descriptor.sensitive ||
       outputChange.after_sensitive !== descriptor.sensitive ||
       (isNoOp(outputChange.actions)
         ? outputChange.after_unknown !== false ||
@@ -3787,9 +3829,9 @@ function finalHasExactOutputs(plan) {
         }
       } else if (isUpdate(outputChange.actions)) {
         if (
-          (hasAfter &&
-            isDeepStrictEqual(outputChange.before, outputChange.after)) ||
-          (!hasAfter && !outputChange.after_unknown)
+          name !== "relay_latest_revision_name" ||
+          hasAfter ||
+          outputChange.after_unknown !== true
         ) {
           return false;
         }
@@ -3873,13 +3915,7 @@ function acceptsFinalRolloutV2(plan, changes) {
     return false;
   }
 
-  const drift = plan.resource_drift;
-  if (
-    !Array.isArray(drift) ||
-    (transitionActions
-      ? !isDeepStrictEqual(drift, FINAL_REFERENCE_PLAN.resource_drift)
-      : drift.length !== 0)
-  ) {
+  if (Object.hasOwn(plan, "resource_drift")) {
     return false;
   }
 
@@ -3920,10 +3956,18 @@ function acceptsFinalRolloutV2(plan, changes) {
   }
 
   const images = exactFinalImageVariables(plan);
-  return (
-    finalHasCoherentResourceChanges(plan, changesByAddress, context) &&
-    finalHasExactTopology(plan, changesByAddress, context, images)
+  const coherentResources = finalHasCoherentResourceChanges(
+    plan,
+    changesByAddress,
+    context,
   );
+  const exactTopology = finalHasExactTopology(
+    plan,
+    changesByAddress,
+    context,
+    images,
+  );
+  return coherentResources && exactTopology;
 }
 
 function isWellFormedResourceChange(change) {
