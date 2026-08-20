@@ -1771,7 +1771,7 @@ test("the final fixture contains only synthetic contacts and credential-free pla
 
   assert.match(
     finalFixtureText,
-    /palancar-relay@sha256:39ce99758799a82e19adf68ce1a60f6dd334b9994565c8f70e37dba9183b3e23/,
+    /palancar-relay@sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df/,
   );
   for (const pattern of [
     /\bsk-[A-Za-z0-9_-]{20,}\b/,
@@ -2304,6 +2304,7 @@ test("final-rollout pins the complete prior Container App transition", () => {
     });
   }
   for (const staleDigest of [
+    "39ce99758799a82e19adf68ce1a60f6dd334b9994565c8f70e37dba9183b3e23",
     "1a884f3cf463b91323a41d4b6ddab7b6a5163dff4bc4f745e7e0b76c1232acbf",
     "d98f53283c4e3209a9bc8b9916b4062f2385c58542f64737700f8a549528185d",
     "7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1",

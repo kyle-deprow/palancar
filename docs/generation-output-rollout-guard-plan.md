@@ -10,7 +10,7 @@ image digest variable-bound.
 ## Transition contract
 
 - The currently deployed predecessor relay image is
-  `sha256:39ce99758799a82e19adf68ce1a60f6dd334b9994565c8f70e37dba9183b3e23`.
+  `sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`.
 - The replacement image is supplied only through `var.relay_image_digest`.
   Its reviewed digest must not be hard-coded in the guard, tests, fixture, or
   documentation.
