@@ -140,7 +140,7 @@ containers, environments, secrets, registries, identities, probes, ports,
 resources, role assignments, model deployments, or mutable/foreign images are
 rejected. Unknowns fail closed.
 
-The transition requires exactly 101 passing checks and no unknown checks. Any
+The transition requires exactly 102 passing checks and no unknown checks. Any
 failed, unknown, altered, duplicated, omitted, or additional check rejects;
 the idempotent form requires the same all-pass check envelope.
 

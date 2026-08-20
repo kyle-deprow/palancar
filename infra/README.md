@@ -275,7 +275,7 @@ imports, deferred or unknown security values, extra topology or receivers,
 plaintext credentials, mutable or aliased images, and any second deployment or
 workload resource.
 
-The transition requires exactly 101 passing checks and no unknown checks. Any
+The transition requires exactly 102 passing checks and no unknown checks. Any
 altered, failed, unknown, or additional check fails closed. The completed OOM
 sizing change is background history; it is not an additional current
 transition. Any future approved procedure must verify the exact reviewed binary

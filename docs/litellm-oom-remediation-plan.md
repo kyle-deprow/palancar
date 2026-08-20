@@ -108,7 +108,7 @@ Completion requires a Sol review after each phase, all repository and
 Terraform gates, immediate verification of the approved saved-binary hash, a
 guard-approved exact saved binary, exact binary apply, a ready Azure revision,
 real deployed OpenRouter inference, cleanup/telemetry/security smoke, and a
-fresh guarded all-no-op plan with 39 no-op resources, zero drift, and 101
+fresh guarded all-no-op plan with 39 no-op resources, zero drift, and 102
 passing checks. That terminal plan must have `applyable=false` and must not be
 applied. Native Azure working-set headroom under the 1.5 GiB bound must be
 measured after rollout.
