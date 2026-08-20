@@ -4,11 +4,13 @@ import {
   DEFAULT_NEGOTIATED_LIMITS,
   MAX_CONTROL_MESSAGE_BYTES,
   assertServerControlMessage,
+  assertSuggestionsReady,
   assertSessionStart,
   assertSessionEnd,
   assertUtteranceCancel,
   assertUtteranceCommit,
   assertUtteranceStart,
+  assertTranslationReady,
   decodeAudioFrame,
   type ErrorCode,
   type ErrorScope,
@@ -22,7 +24,8 @@ import {
 import { RelayOrderedFrameAcceptor } from '@palancar/audio';
 import {
   createAcceptedTargetTurn,
-  type GenerationService,
+  GenerationError,
+  GenerationService,
   type GenerationCompletion
 } from '@palancar/generation';
 import {
@@ -57,7 +60,8 @@ import type {
   RelayAsyncEvent,
   RelayLanguageBoundaryMode,
   RelayMetricSink,
-  RelayProductionMetricInput
+  RelayProductionMetricInput,
+  GenerationCompletedMessages
 } from './types.js';
 
 function snapshotRelayClassifierEvidence(
@@ -104,7 +108,7 @@ interface ActiveUtterance {
   languageDecisionMetricRecorded: boolean;
   terminalMetricRecorded: boolean;
   generationMetricsRecorded: boolean;
-  generationStateFailure: boolean;
+  generationFailureMetricRecorded: boolean;
   providerFailureMetricRecorded: boolean;
 }
 
@@ -121,6 +125,150 @@ interface GenerationSecurityOperation {
 
 const TRANSCRIPTION_ADAPTER_CONFIGURATION_ERROR =
   'Invalid relay transcription adapter configuration.';
+
+type GenerationFailureMetricName =
+  | 'generation.failure.provider_response'
+  | 'generation.failure.invalid_generated_language'
+  | 'generation.failure.language_validation'
+  | 'generation.failure.internal';
+
+const GENERATION_SERVICE_PROVIDER_GETTER = Object.getOwnPropertyDescriptor(
+  GenerationService.prototype,
+  'provider'
+)?.get;
+
+function generationFailureMetricName(error: unknown): GenerationFailureMetricName {
+  try {
+    if (
+      typeof error !== 'object' ||
+      error === null ||
+      utilTypes.isProxy(error) ||
+      Object.getPrototypeOf(error) !== GenerationError.prototype
+    ) {
+      return 'generation.failure.internal';
+    }
+    const categoryDescriptor = Object.getOwnPropertyDescriptor(error, 'category');
+    if (
+      categoryDescriptor === undefined ||
+      !Object.hasOwn(categoryDescriptor, 'value') ||
+      typeof categoryDescriptor.value !== 'string'
+    ) {
+      return 'generation.failure.internal';
+    }
+    switch (categoryDescriptor.value) {
+      case 'provider-failure':
+      case 'invalid-provider-result':
+        return 'generation.failure.provider_response';
+      case 'invalid-generated-language':
+        return 'generation.failure.invalid_generated_language';
+      case 'language-validation-failure':
+        return 'generation.failure.language_validation';
+      default:
+        return 'generation.failure.internal';
+    }
+  } catch {
+    return 'generation.failure.internal';
+  }
+}
+
+function boundedProviderIdentity(
+  value: unknown
+): Readonly<{ readonly id: string; readonly version: string }> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const descriptorFor = (key: 'id' | 'version'): unknown => {
+    const visited = new Set<object>();
+    let current: object | null = value;
+    while (current !== null) {
+      if (utilTypes.isProxy(current) || visited.has(current)) {
+        return undefined;
+      }
+      visited.add(current);
+      let descriptors: Record<PropertyKey, PropertyDescriptor>;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(current) as Record<
+          PropertyKey,
+          PropertyDescriptor
+        >;
+      } catch {
+        return undefined;
+      }
+      const descriptor = descriptors[key];
+      if (descriptor !== undefined) {
+        if (!Object.hasOwn(descriptor, 'value')) {
+          return undefined;
+        }
+        return descriptor.value;
+      }
+      try {
+        current = Object.getPrototypeOf(current) as object | null;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  };
+
+  try {
+    if (utilTypes.isProxy(value)) {
+      return undefined;
+    }
+    const id = descriptorFor('id');
+    const version = descriptorFor('version');
+    if (
+      typeof id !== 'string' ||
+      typeof version !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(id) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(version)
+    ) {
+      return undefined;
+    }
+    return Object.freeze({ id, version });
+  } catch {
+    return undefined;
+  }
+}
+
+function providerValueForTelemetry(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  try {
+    if (utilTypes.isProxy(value)) {
+      return undefined;
+    }
+    if (GENERATION_SERVICE_PROVIDER_GETTER !== undefined) {
+      try {
+        return Reflect.apply(GENERATION_SERVICE_PROVIDER_GETTER, value, []);
+      } catch {
+        // Plain test doubles do not carry GenerationService's private brand.
+      }
+    }
+
+    const visited = new Set<object>();
+    let current: object | null = value;
+    while (current !== null) {
+      if (utilTypes.isProxy(current) || visited.has(current)) {
+        return undefined;
+      }
+      visited.add(current);
+      const descriptors = Object.getOwnPropertyDescriptors(current) as Record<
+        PropertyKey,
+        PropertyDescriptor
+      >;
+      const descriptor = descriptors.provider;
+      if (descriptor !== undefined) {
+        return Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
 
 function invalidTranscriptionAdapterConfiguration(): never {
   throw new TypeError(TRANSCRIPTION_ADAPTER_CONFIGURATION_ERROR);
@@ -758,7 +906,7 @@ export class RelaySessionCore {
         generationClaim,
         'failed'
       ).catch(() => this.#recordStateStoreFailure());
-      this.#recordProviderFailure(active, 'provider');
+      this.#recordGenerationFailure(active, undefined);
       outgoing.push(this.#error('provider_unavailable', 'server', true));
       this.#finishActive(false);
       return this.#result(outgoing);
@@ -789,18 +937,50 @@ export class RelaySessionCore {
     let completion: Promise<GenerationCompletion>;
     try {
       completion = this.#generationService.complete(turn, { signal: controller.signal });
-    } catch {
+    } catch (error: unknown) {
       if (!this.#isCurrent(active, token)) {
         return this.#result(outgoing);
       }
-      completion = Promise.reject(new Error('generation_start_failed'));
+      completion = Promise.reject(error);
     }
 
     void completion.then(
       async (result) => {
-        if (!controller.signal.aborted) {
-          this.#recordGenerationOutcome(active, token, 'success');
+        if (controller.signal.aborted) {
+          try {
+            await this.#completeGenerationSecurityOperation(
+              generationOperation,
+              token.generationClaim,
+              'completed'
+            );
+          } catch {
+            this.#recordStateStoreFailure();
+          }
+          return;
         }
+
+        let messages: GenerationCompletedMessages;
+        try {
+          messages = this.#generationMessages(result);
+        } catch {
+          this.#recordGenerationFailure(active, undefined);
+          this.#recordGenerationOutcome(active, token, 'failure');
+          try {
+            await this.#completeGenerationSecurityOperation(
+              generationOperation,
+              token.generationClaim,
+              'failed'
+            );
+          } catch {
+            this.#recordStateStoreFailure();
+          }
+          if (this.#isCurrent(active, token) && !controller.signal.aborted) {
+            this.#appendAsyncEvent({ kind: 'generation.failed', token });
+          }
+          return;
+        }
+
+        this.#recordGenerationOutcome(active, token, 'success');
         try {
           await this.#completeGenerationSecurityOperation(
             generationOperation,
@@ -808,18 +988,18 @@ export class RelaySessionCore {
             'completed'
           );
           if (this.#isCurrent(active, token) && !controller.signal.aborted) {
-            this.#appendAsyncEvent({ kind: 'generation.completed', token, result });
+            this.#appendAsyncEvent({ kind: 'generation.completed', token, result: messages });
           }
         } catch {
-          active.generationStateFailure = true;
           this.#recordStateStoreFailure();
           if (this.#isCurrent(active, token) && !controller.signal.aborted) {
             this.#appendAsyncEvent({ kind: 'generation.failed', token });
           }
         }
       },
-      async () => {
+      async (error: unknown) => {
         if (!controller.signal.aborted) {
+          this.#recordGenerationFailure(active, error);
           this.#recordGenerationOutcome(active, token, 'failure');
         }
         try {
@@ -829,7 +1009,6 @@ export class RelaySessionCore {
             'failed'
           );
         } catch {
-          active.generationStateFailure = true;
           this.#recordStateStoreFailure();
           // The public result is the same for provider and durable-state loss.
         }
@@ -1235,7 +1414,7 @@ export class RelaySessionCore {
         languageDecisionMetricRecorded: false,
         terminalMetricRecorded: false,
         generationMetricsRecorded: false,
-        generationStateFailure: false,
+        generationFailureMetricRecorded: false,
         providerFailureMetricRecorded: false
       };
       callbacksActivated = true;
@@ -1618,14 +1797,31 @@ export class RelaySessionCore {
       operation: 'suggestion',
       outcome
     });
-    if (outcome === 'failure') {
-      this.#recordProviderFailure(active, 'provider');
+  }
+
+  #recordGenerationFailure(active: ActiveUtterance, error: unknown): void {
+    if (active.generationFailureMetricRecorded) return;
+    active.generationFailureMetricRecorded = true;
+    const name = generationFailureMetricName(error);
+    const provider = this.#providerIdentitySnapshot();
+    this.#recordMetric({
+      name,
+      count: 1,
+      operation: 'generation',
+      outcome: 'failure',
+      ...(provider === undefined
+        ? {}
+        : { providerId: provider.id, providerVersion: provider.version })
+    });
+    if (name === 'generation.failure.provider_response') {
+      this.#recordProviderFailure(active, 'provider', provider);
     }
   }
 
   #recordProviderFailure(
     active: ActiveUtterance | undefined,
-    operation: 'transcription' | 'provider'
+    operation: 'transcription' | 'provider',
+    generationProvider?: Readonly<{ readonly id: string; readonly version: string }>
   ): void {
     if (active?.providerFailureMetricRecorded) return;
     if (active !== undefined) {
@@ -1634,7 +1830,7 @@ export class RelaySessionCore {
     let provider: Readonly<{ readonly id: string; readonly version: string }> | undefined;
     try {
       if (operation === 'provider') {
-        provider = this.#generationService.provider;
+        provider = generationProvider;
       } else {
         const identity = this.#selectedTranscriptionAdapter?.capabilities.identity;
         if (identity !== undefined) {
@@ -1653,6 +1849,22 @@ export class RelaySessionCore {
       providerId: provider.id,
       providerVersion: provider.version
     });
+  }
+
+  #providerIdentitySnapshot():
+    | Readonly<{ readonly id: string; readonly version: string }>
+    | undefined {
+    if (this.#recordingMetric) return undefined;
+    this.#recordingMetric = true;
+    try {
+      return boundedProviderIdentity(
+        providerValueForTelemetry(this.#generationService)
+      );
+    } catch {
+      return undefined;
+    } finally {
+      this.#recordingMetric = false;
+    }
   }
 
   #recordStateStoreFailure(): void {
@@ -1795,8 +2007,8 @@ export class RelaySessionCore {
     return this.#result([decision]);
   }
 
-  #translationReady(translation: GenerationCompletion): ServerControlMessage {
-    return assertServerControlMessage({
+  #translationReady(translation: GenerationCompletion) {
+    const message = Object.freeze({
       type: 'translation.ready',
       sessionId: translation.sessionId,
       sessionEpoch: translation.sessionEpoch,
@@ -1805,18 +2017,30 @@ export class RelaySessionCore {
       acceptedFinalRevision: translation.acceptedFinalRevision,
       englishTranslation: translation.englishTranslation
     });
+    return Object.freeze(assertTranslationReady(message));
   }
 
-  #suggestionsReady(suggestions: GenerationCompletion): ServerControlMessage {
-    return assertServerControlMessage({
+  #suggestionsReady(suggestions: GenerationCompletion) {
+    const pairs = suggestions.suggestions.map((pair) => Object.freeze({
+      englishText: pair.englishText,
+      selectedTargetText: pair.selectedTargetText
+    }));
+    const message = Object.freeze({
       type: 'suggestions.ready',
       sessionId: suggestions.sessionId,
       sessionEpoch: suggestions.sessionEpoch,
       utteranceId: suggestions.utteranceId,
       segmentId: suggestions.segmentId,
       acceptedFinalRevision: suggestions.acceptedFinalRevision,
-      suggestions: suggestions.suggestions
+      suggestions: Object.freeze(pairs)
     });
+    return Object.freeze(assertSuggestionsReady(message));
+  }
+
+  #generationMessages(completion: GenerationCompletion): GenerationCompletedMessages {
+    const translation = this.#translationReady(completion);
+    const suggestions = this.#suggestionsReady(completion);
+    return Object.freeze({ translation, suggestions });
   }
 
   async #handleAsyncEvent(event: RelayAsyncEvent): Promise<RelayStepResult> {
@@ -1842,28 +2066,13 @@ export class RelaySessionCore {
       return this.#result([]);
     }
     if (event.kind === 'generation.failed') {
-      if (!active.generationStateFailure) {
-        this.#recordProviderFailure(active, 'provider');
-      }
       const outgoing = [this.#error('provider_unavailable', 'server', true)];
       this.#finishActive(false);
       return this.#result(outgoing);
     }
 
-    let translation: ServerControlMessage;
-    let suggestions: ServerControlMessage;
-    try {
-      translation = this.#translationReady(event.result);
-      suggestions = this.#suggestionsReady(event.result);
-    } catch {
-      // The result is all-or-nothing: do not emit either generated event.
-      this.#recordProviderFailure(active, 'provider');
-      const outgoing = [this.#error('provider_unavailable', 'server', true)];
-      this.#finishActive(false);
-      return this.#result(outgoing);
-    }
     this.#finishActive(false);
-    return this.#result([translation, suggestions]);
+    return this.#result([event.result.translation, event.result.suggestions]);
   }
 
   #queueLength(): number {

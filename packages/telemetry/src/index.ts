@@ -28,6 +28,11 @@ export const TELEMETRY_METRIC_NAMES = Object.freeze({
   TRANSLATION_RESULT: 'translation.result',
   SUGGESTION_LATENCY: 'suggestion.latency',
   SUGGESTION_RESULT: 'suggestion.result',
+  GENERATION_FAILURE_PROVIDER_RESPONSE: 'generation.failure.provider_response',
+  GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE:
+    'generation.failure.invalid_generated_language',
+  GENERATION_FAILURE_LANGUAGE_VALIDATION: 'generation.failure.language_validation',
+  GENERATION_FAILURE_INTERNAL: 'generation.failure.internal',
   PROVIDER_FAILURE: 'provider.failure',
   STATE_STORE_FAILURE: 'state_store.failure'
 } as const);
@@ -52,6 +57,13 @@ export const TRANSLATION_LATENCY = TELEMETRY_METRIC_NAMES.TRANSLATION_LATENCY;
 export const TRANSLATION_RESULT = TELEMETRY_METRIC_NAMES.TRANSLATION_RESULT;
 export const SUGGESTION_LATENCY = TELEMETRY_METRIC_NAMES.SUGGESTION_LATENCY;
 export const SUGGESTION_RESULT = TELEMETRY_METRIC_NAMES.SUGGESTION_RESULT;
+export const GENERATION_FAILURE_PROVIDER_RESPONSE =
+  TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE;
+export const GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE =
+  TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE;
+export const GENERATION_FAILURE_LANGUAGE_VALIDATION =
+  TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_LANGUAGE_VALIDATION;
+export const GENERATION_FAILURE_INTERNAL = TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_INTERNAL;
 export const PROVIDER_FAILURE = TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE;
 export const STATE_STORE_FAILURE = TELEMETRY_METRIC_NAMES.STATE_STORE_FAILURE;
 
@@ -87,6 +99,7 @@ export const TELEMETRY_OPERATIONS = Object.freeze({
   LANGUAGE: 'language',
   TRANSLATION: 'translation',
   SUGGESTION: 'suggestion',
+  GENERATION: 'generation',
   PROVIDER: 'provider',
   STATE_STORE: 'state_store'
 } as const);
@@ -602,7 +615,7 @@ const EXPORT_PROVIDER_VERSIONS = new Map<string, string>([
   ['deterministic-mock', '1.0.0'],
   ['deterministic-mock-generation', '1.0.0'],
   ['azure-realtime', 'ga-transcription-websocket'],
-  ['litellm-chat', '1.0.0']
+  ['litellm-chat', '1.1.0']
 ]);
 
 const EXPORT_ERROR_IDS = new Map<TelemetryErrorCategory, string>([

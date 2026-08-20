@@ -1,6 +1,11 @@
 import type { WEBSOCKET_SUBPROTOCOL } from '@palancar/contracts';
-import type { NegotiatedLimits, ServerControlMessage } from '@palancar/contracts';
-import type { GenerationCompletion, GenerationService } from '@palancar/generation';
+import type {
+  NegotiatedLimits,
+  ServerControlMessage,
+  SuggestionsReady,
+  TranslationReady
+} from '@palancar/contracts';
+import type { GenerationService } from '@palancar/generation';
 import type {
   ProvisionalLanguageReason,
   TargetLanguage,
@@ -77,6 +82,10 @@ export const RELAY_METRIC_NAMES = Object.freeze([
   'translation.result',
   'suggestion.latency',
   'suggestion.result',
+  'generation.failure.provider_response',
+  'generation.failure.invalid_generated_language',
+  'generation.failure.language_validation',
+  'generation.failure.internal',
   'provider.failure',
   'state_store.failure'
 ] as const);
@@ -92,6 +101,7 @@ export type RelayMetricOperation =
   | 'language'
   | 'translation'
   | 'suggestion'
+  | 'generation'
   | 'provider'
   | 'state_store';
 
@@ -229,6 +239,11 @@ export interface FinalProcessingToken {
   readonly generationClaim: GenerationClaim;
 }
 
+export interface GenerationCompletedMessages {
+  readonly translation: TranslationReady;
+  readonly suggestions: SuggestionsReady;
+}
+
 export type RelayAsyncEvent =
   | { readonly kind: 'transcription'; readonly event: NormalizedTranscriptionEvent }
   | {
@@ -237,7 +252,11 @@ export type RelayAsyncEvent =
       readonly sessionEpoch: number;
       readonly utteranceId: string;
     }
-  | { readonly kind: 'generation.completed'; readonly token: FinalProcessingToken; readonly result: GenerationCompletion }
+  | {
+      readonly kind: 'generation.completed';
+      readonly token: FinalProcessingToken;
+      readonly result: GenerationCompletedMessages;
+    }
   | { readonly kind: 'generation.failed'; readonly token: FinalProcessingToken };
 
 export type RelayCloseCode =

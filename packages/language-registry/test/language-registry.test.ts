@@ -3,7 +3,9 @@ import {
   CONTROLLED_FIXTURE_CALIBRATION_VERSION,
   CONTROLLED_FIXTURE_DETECTOR_VERSION,
   DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+  DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+  countSubstantiveCharacters,
   createLanguageRegistry,
   evaluateLanguageGate,
   getLanguageDefinition,
@@ -28,7 +30,7 @@ const DEVELOPMENT_PROFILE = {
   profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
-  minimumTextCharacters: 12,
+  minimumTextCharacters: DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   minimumWindowCharacters: 1,
   maximumInputCodePoints: 512,
   minimumSlidingWindowWords: 1,
@@ -71,6 +73,16 @@ function oppositeTarget(selectedLanguage: TargetLanguage): TargetLanguage {
 const TARGETS = ['es', 'tr'] as const;
 
 describe('language registry', () => {
+  it('exports the shared substantive-character invariant for built-in profiles', () => {
+    expect(DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS).toBe(12);
+    expect(listLanguageDefinitions().map((definition) =>
+      definition.developmentProvisional?.minimumTextCharacters
+    )).toEqual([12, 12]);
+    expect(countSubstantiveCharacters('!? \t\n')).toBe(0);
+    expect(countSubstantiveCharacters('ñáéíóúÑÁÉÍÓÚ')).toBe(12);
+    expect(countSubstantiveCharacters('çğıİöşüÇĞÖŞÜ')).toBe(12);
+  });
+
   it('contains equal Spanish and Turkish target definitions without partial profiles', () => {
     expect(listLanguageDefinitions()).toEqual([
       {

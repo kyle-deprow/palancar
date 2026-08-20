@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_NEGOTIATED_LIMITS, encodeAudioFrame } from '@palancar/contracts';
 import {
   DeterministicFixtureLanguageValidator,
+  GenerationError,
   GenerationService,
   type GenerationProvider,
   type GenerationProviderCompletion
@@ -350,6 +351,19 @@ function generationService(provider: GenerationProvider): GenerationService {
     provider,
     validator: new DeterministicFixtureLanguageValidator()
   });
+}
+
+function failingGenerationService(
+  error: unknown,
+  synchronous = false
+): GenerationService {
+  const complete = synchronous
+    ? (): never => { throw error; }
+    : async (): Promise<never> => { throw error; };
+  return {
+    provider: { id: 'deterministic-mock-generation', version: '1.0.0' },
+    complete
+  } as unknown as GenerationService;
 }
 
 function recordingMetricSink(): {
@@ -1075,6 +1089,566 @@ describe('relay session core', () => {
       close: { code: 1000, reason: 'closed' }
     });
     expect(providerSignal?.aborted).toBe(true);
+  });
+
+  it('classifies generation failures exactly once and keeps the public error generic', async () => {
+    const cases = [
+      {
+        name: 'generation.failure.provider_response',
+        error: new GenerationError('provider-failure'),
+        synchronous: false,
+        providerFailure: true
+      },
+      {
+        name: 'generation.failure.provider_response',
+        error: new GenerationError('invalid-provider-result'),
+        synchronous: true,
+        providerFailure: true
+      },
+      {
+        name: 'generation.failure.invalid_generated_language',
+        error: new GenerationError('invalid-generated-language'),
+        synchronous: false,
+        providerFailure: false
+      },
+      {
+        name: 'generation.failure.language_validation',
+        error: new GenerationError('language-validation-failure'),
+        synchronous: true,
+        providerFailure: false
+      },
+      {
+        name: 'generation.failure.internal',
+        error: new Error('private generation failure canary'),
+        synchronous: false,
+        providerFailure: false
+      },
+      {
+        name: 'generation.failure.internal',
+        error: new Error('private synchronous generation failure canary'),
+        synchronous: true,
+        providerFailure: false
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      const metrics = recordingMetricSink();
+      const { core } = openNew(recordingAdapter(), 'es', {
+        metricSink: metrics.sink,
+        generationService: failingGenerationService(
+          testCase.error,
+          testCase.synchronous
+        )
+      });
+      core.handleText(utteranceStartText());
+      const accepted = await core.handleTranscriptionEvent(finalEvent());
+      expect(accepted.outgoing.map((message) => message.type)).toEqual([
+        'transcript.final',
+        'language.decision'
+      ]);
+      await flushAsyncEvents();
+      await flushAsyncEvents();
+
+      const failed = await core.drainAsyncEvents();
+      expect(failed.outgoing).toEqual([
+        expect.objectContaining({
+          type: 'error',
+          code: 'provider_unavailable',
+          recoverable: true
+        })
+      ]);
+      expect(JSON.stringify(failed)).not.toContain('private generation failure');
+      expect(await core.drainAsyncEvents()).toEqual({ outgoing: [] });
+
+      const detailed = metrics.records.filter((record) =>
+        record.name.startsWith('generation.failure.')
+      );
+      expect(detailed).toEqual([
+        expect.objectContaining({
+          name: testCase.name,
+          count: 1,
+          targetLanguage: 'es',
+          operation: 'generation',
+          outcome: 'failure',
+          providerId: 'deterministic-mock-generation',
+          providerVersion: '1.0.0'
+        })
+      ]);
+      expect(detailed[0]).not.toHaveProperty('errorCategory');
+      expect(detailed[0]).not.toHaveProperty('errorId');
+      expect(JSON.stringify(detailed)).not.toContain('private generation failure');
+      expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+        .toHaveLength(testCase.providerFailure ? 1 : 0);
+      expect(metrics.records.filter((record) => record.name === 'translation.result'))
+        .toEqual([expect.objectContaining({ outcome: 'failure', count: 1 })]);
+      expect(metrics.records.filter((record) => record.name === 'suggestion.result'))
+        .toEqual([expect.objectContaining({ outcome: 'failure', count: 1 })]);
+
+      const sanitized = sanitizeTelemetryForExport(
+        { ...detailed[0], deploymentSlot: 'dev' },
+        'dev'
+      );
+      expect({ ...sanitized }).toEqual({ ...detailed[0], deploymentSlot: 'dev' });
+    }
+  });
+
+  it('emits no generation-failure or provider metric for caller cancellation', async () => {
+    let rejectCompletion: ((error: unknown) => void) | undefined;
+    const generationService = {
+      provider: { id: 'deterministic-mock-generation', version: '1.0.0' },
+      complete: async (_turn: unknown, context: { readonly signal: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          rejectCompletion = reject;
+          context.signal.addEventListener('abort', () => {
+            reject(new Error('private cancellation canary'));
+          }, { once: true });
+        })
+    } as unknown as GenerationService;
+    const metrics = recordingMetricSink();
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      generationService
+    });
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    expect(rejectCompletion).toBeDefined();
+
+    expect(core.handleText(utteranceCancelText())).toMatchObject({
+      outgoing: [{ type: 'utterance.aborted', category: 'cancellation' }]
+    });
+    await flushAsyncEvents();
+    await flushAsyncEvents();
+    expect(await core.drainAsyncEvents()).toEqual({ outgoing: [] });
+    expect(metrics.records.filter((record) => record.name.startsWith('generation.failure.')))
+      .toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'provider.failure')).toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'translation.result')).toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'suggestion.result')).toHaveLength(0);
+  });
+
+  it('classifies a durable completion-state loss without generation or provider failure', async () => {
+    const metrics = recordingMetricSink();
+    const baseSecurity = createTestSecurityRuntime();
+    const completeGeneration = vi.fn(async () => {
+      throw new Error('durable state canary');
+    });
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      clock: monotonicClock(100, 250, 300, 450),
+      securityRuntime: createTestSecurityRuntime({
+        authorizeGeneration: baseSecurity.authorizeGeneration,
+        providerStart: baseSecurity.providerStart,
+        completeGeneration
+      }),
+      generationService: generationService({
+        id: 'durable-state-generation',
+        version: '1.0.0',
+        complete: async () => ({
+          englishTranslation: 'Where is the station?',
+          suggestions: [
+            { englishText: 'Could you help me?', selectedTargetText: '¿Puedes ayudarme?' },
+            { englishText: 'Please help me.', selectedTargetText: 'Ayúdame, por favor.' }
+          ]
+        })
+      })
+    });
+
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    const failed = await core.drainAsyncEvents();
+
+    expect(failed.outgoing).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        code: 'provider_unavailable',
+        recoverable: true
+      })
+    ]);
+    expect(completeGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'completed' })
+    );
+    expect(metrics.records.filter((record) => record.name === 'state_store.failure'))
+      .toHaveLength(1);
+    expect(metrics.records.filter((record) => record.name.startsWith('generation.failure.')))
+      .toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+      .toHaveLength(0);
+    expect(metrics.records.filter((record) => [
+      'translation.latency',
+      'translation.result',
+      'suggestion.latency',
+      'suggestion.result',
+      'state_store.failure'
+    ].includes(record.name))).toEqual([
+      expect.objectContaining({
+        name: 'translation.latency',
+        durationMs: 150,
+        operation: 'translation',
+        outcome: 'success'
+      }),
+      expect.objectContaining({
+        name: 'translation.result',
+        count: 1,
+        operation: 'translation',
+        outcome: 'success'
+      }),
+      expect.objectContaining({
+        name: 'suggestion.latency',
+        durationMs: 150,
+        operation: 'suggestion',
+        outcome: 'success'
+      }),
+      expect.objectContaining({
+        name: 'suggestion.result',
+        count: 1,
+        operation: 'suggestion',
+        outcome: 'success'
+      }),
+      expect.objectContaining({
+        name: 'state_store.failure',
+        count: 1,
+        operation: 'state_store',
+        outcome: 'failure'
+      })
+    ]);
+  });
+
+  it('constructs both generated messages before failing an invalid protocol result', async () => {
+    const metrics = recordingMetricSink();
+    const baseSecurity = createTestSecurityRuntime();
+    const completeGeneration = vi.fn(baseSecurity.completeGeneration);
+    const service = {
+      provider: { id: 'protocol-construction-generation', version: '1.0.0' },
+      complete: async () => ({
+        sessionId: TEST_SESSION_ID,
+        sessionEpoch: 1,
+        utteranceId: TEST_UTTERANCE_ID,
+        segmentId: 'segment-1',
+        acceptedFinalRevision: 1,
+        selectedTargetLanguage: 'es',
+        gatePolicyVersion: TEST_GATE_POLICY_VERSION,
+        englishTranslation: '',
+        suggestions: [
+          { englishText: 'Could you help me?', selectedTargetText: '¿Puedes ayudarme?' },
+          { englishText: 'Please help me.', selectedTargetText: 'Ayúdame, por favor.' }
+        ]
+      })
+    } as unknown as GenerationService;
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      securityRuntime: createTestSecurityRuntime({ completeGeneration }),
+      generationService: service
+    });
+
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    const failed = await core.drainAsyncEvents();
+
+    expect(failed.outgoing).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        code: 'provider_unavailable',
+        recoverable: true
+      })
+    ]);
+    expect(failed.outgoing.some((message) =>
+      message.type === 'translation.ready' || message.type === 'suggestions.ready'
+    )).toBe(false);
+    expect(completeGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed' })
+    );
+    expect(metrics.records.filter(
+      (record) => record.name === 'generation.failure.internal'
+    )).toHaveLength(1);
+    expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+      .toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'translation.result'))
+      .toEqual([expect.objectContaining({ outcome: 'failure', count: 1 })]);
+    expect(metrics.records.filter((record) => record.name === 'suggestion.result'))
+      .toEqual([expect.objectContaining({ outcome: 'failure', count: 1 })]);
+    expect(metrics.records.some((record) => record.outcome === 'success' && (
+      record.name === 'translation.result' || record.name === 'suggestion.result'
+    ))).toBe(false);
+  });
+
+  it('deep-snapshots generated messages before source mutation can affect queued output', async () => {
+    const metrics = recordingMetricSink();
+    const sourcePairs = [
+      { englishText: 'Could you help me?', selectedTargetText: '¿Puedes ayudarme?' },
+      { englishText: 'Please help me.', selectedTargetText: 'Ayúdame, por favor.' }
+    ];
+    const sourceCompletion = {
+      sessionId: TEST_SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: TEST_UTTERANCE_ID,
+      segmentId: 'segment-1',
+      acceptedFinalRevision: 1,
+      selectedTargetLanguage: 'es' as const,
+      gatePolicyVersion: TEST_GATE_POLICY_VERSION,
+      englishTranslation: 'Where is the station?',
+      suggestions: sourcePairs
+    };
+    const service = {
+      provider: { id: 'snapshot-generation', version: '1.0.0' },
+      complete: async () => sourceCompletion
+    } as unknown as GenerationService;
+    const { core } = openNew(recordingAdapter(), 'es', {
+      metricSink: metrics.sink,
+      generationService: service
+    });
+
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+
+    sourceCompletion.englishTranslation = 'mutated after resolution';
+    sourcePairs[0]!.englishText = 'mutated English';
+    sourcePairs[0]!.selectedTargetText = 'mutated target';
+    sourcePairs.push({ englishText: 'third', selectedTargetText: 'tercero' });
+
+    const released = await core.drainAsyncEvents();
+    const translation = released.outgoing.find((message) => message.type === 'translation.ready');
+    const suggestions = released.outgoing.find((message) => message.type === 'suggestions.ready');
+    expect(translation).toEqual(expect.objectContaining({
+      englishTranslation: 'Where is the station?'
+    }));
+    expect(suggestions).toEqual(expect.objectContaining({
+      suggestions: [
+        { englishText: 'Could you help me?', selectedTargetText: '¿Puedes ayudarme?' },
+        { englishText: 'Please help me.', selectedTargetText: 'Ayúdame, por favor.' }
+      ]
+    }));
+    expect(Object.isFrozen(translation)).toBe(true);
+    expect(Object.isFrozen(suggestions)).toBe(true);
+    if (suggestions?.type === 'suggestions.ready') {
+      expect(Object.isFrozen(suggestions.suggestions)).toBe(true);
+      for (const pair of suggestions.suggestions) {
+        expect(Object.isFrozen(pair)).toBe(true);
+      }
+    }
+    expect(metrics.records.filter((record) => record.name === 'translation.result'))
+      .toEqual([expect.objectContaining({ count: 1, outcome: 'success' })]);
+    expect(metrics.records.filter((record) => record.name === 'suggestion.result'))
+      .toEqual([expect.objectContaining({ count: 1, outcome: 'success' })]);
+    expect(metrics.records.some((record) => record.name.startsWith('generation.failure.')))
+      .toBe(false);
+  });
+
+  it.each(['accessor', 'proxy', 'revoked-proxy', 'invalid-token'] as const)(
+    'does not observe hostile generation provider identity: %s',
+    async (kind) => {
+      const metrics = recordingMetricSink();
+      let accessorCalls = 0;
+      let proxyTrapCalls = 0;
+      let provider: object;
+      if (kind === 'accessor') {
+        provider = Object.defineProperties({}, {
+          id: {
+            get: () => {
+              accessorCalls += 1;
+              return 'changing-provider';
+            }
+          },
+          version: {
+            get: () => {
+              accessorCalls += 1;
+              return '1.0.0';
+            }
+          }
+        });
+      } else if (kind === 'proxy') {
+        provider = new Proxy(
+          { id: 'proxied-provider', version: '1.0.0' },
+          {
+            get: () => {
+              proxyTrapCalls += 1;
+              throw new Error('proxy get canary');
+            },
+            ownKeys: () => {
+              proxyTrapCalls += 1;
+              throw new Error('proxy keys canary');
+            },
+            getOwnPropertyDescriptor: () => {
+              proxyTrapCalls += 1;
+              throw new Error('proxy descriptor canary');
+            }
+          }
+        );
+      } else if (kind === 'revoked-proxy') {
+        const revocable = Proxy.revocable(
+          { id: 'revoked-provider', version: '1.0.0' },
+          {}
+        );
+        provider = revocable.proxy;
+        revocable.revoke();
+      } else {
+        provider = { id: 'provider identity canary must not leak', version: 'bad version!' };
+      }
+      const service = {
+        provider,
+        complete: async (): Promise<never> => {
+          throw new GenerationError('provider-failure');
+        }
+      } as unknown as GenerationService;
+      const { core } = openNew(recordingAdapter(), 'es', {
+        metricSink: metrics.sink,
+        generationService: service
+      });
+
+      core.handleText(utteranceStartText());
+      await core.handleTranscriptionEvent(finalEvent());
+      await flushAsyncEvents();
+      const failed = await core.drainAsyncEvents();
+
+      expect(failed.outgoing).toEqual([
+        expect.objectContaining({ type: 'error', code: 'provider_unavailable' })
+      ]);
+      expect(metrics.records.filter((record) =>
+        record.name === 'generation.failure.provider_response'
+      )).toHaveLength(1);
+      expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+        .toHaveLength(0);
+      expect(JSON.stringify(metrics.records)).not.toContain('provider identity canary');
+      expect(accessorCalls).toBe(0);
+      expect(proxyTrapCalls).toBe(0);
+    }
+  );
+
+  it('uses the cached genuine provider getter for subclasses and own-shadowed services', async () => {
+    let accessorCalls = 0;
+    const provider = {
+      id: 'stable-genuine-provider',
+      version: '1.0.0',
+      complete: async (): Promise<never> => {
+        throw new Error('provider failure canary');
+      }
+    };
+    class GenuineSubclass extends GenerationService {
+      override get provider(): Readonly<{ readonly id: string; readonly version: string }> {
+        accessorCalls += 1;
+        throw new Error('subclass provider accessor canary');
+      }
+    }
+    const subclassService = new GenuineSubclass({
+      provider,
+      validator: new DeterministicFixtureLanguageValidator()
+    });
+    const shadowedService = generationService(provider);
+    Object.defineProperty(shadowedService, 'provider', {
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        throw new Error('own provider accessor canary');
+      }
+    });
+
+    for (const service of [subclassService, shadowedService]) {
+      const metrics = recordingMetricSink();
+      const { core } = openNew(recordingAdapter(), 'es', {
+        metricSink: metrics.sink,
+        generationService: service
+      });
+      core.handleText(utteranceStartText());
+      await core.handleTranscriptionEvent(finalEvent());
+      await flushAsyncEvents();
+      await core.drainAsyncEvents();
+
+      expect(metrics.records.filter((record) => record.name === 'generation.failure.provider_response'))
+        .toEqual([expect.objectContaining({
+          providerId: 'stable-genuine-provider',
+          providerVersion: '1.0.0'
+        })]);
+      expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+        .toEqual([expect.objectContaining({
+          providerId: 'stable-genuine-provider',
+          providerVersion: '1.0.0'
+        })]);
+      expect(JSON.stringify(metrics.records)).not.toContain('provider accessor canary');
+    }
+    expect(accessorCalls).toBe(0);
+  });
+
+  it('treats GenerationError subclasses and category accessors as internal without observing them', async () => {
+    class DerivedGenerationError extends GenerationError {}
+    let accessorCalls = 0;
+    const accessorError = new GenerationError('provider-failure');
+    Object.defineProperty(accessorError, 'category', {
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        throw new Error('category accessor canary');
+      }
+    });
+    for (const error of [
+      new DerivedGenerationError('provider-failure'),
+      accessorError
+    ]) {
+      const metrics = recordingMetricSink();
+      const { core } = openNew(recordingAdapter(), 'es', {
+        metricSink: metrics.sink,
+        generationService: failingGenerationService(error)
+      });
+      core.handleText(utteranceStartText());
+      await core.handleTranscriptionEvent(finalEvent());
+      await flushAsyncEvents();
+      await core.drainAsyncEvents();
+
+      expect(metrics.records.filter((record) => record.name === 'generation.failure.internal'))
+        .toHaveLength(1);
+      expect(metrics.records.filter((record) => record.name === 'provider.failure'))
+        .toHaveLength(0);
+    }
+    expect(accessorCalls).toBe(0);
+  });
+
+  it('reuses one safe provider snapshot through a reentrant metric sink', async () => {
+    const records: RelayProductionMetricInput[] = [];
+    const provider = { id: 'stable-generation-provider', version: '1.0.0' };
+    const holder: { core?: RelaySessionCore } = {};
+    let nested: ReturnType<RelaySessionCore['handleText']> | undefined;
+    const metricSink: RelayMetricSink = {
+      record: (record) => {
+        records.push(record);
+        if (record.name === 'generation.failure.provider_response') {
+          provider.id = 'changed-generation-provider';
+          nested = holder.core?.handleText(sessionEndText());
+        }
+      }
+    };
+    const service = {
+      provider,
+      complete: async (): Promise<never> => {
+        throw new GenerationError('provider-failure');
+      }
+    } as unknown as GenerationService;
+    const core = openNew(recordingAdapter(), 'es', {
+      metricSink,
+      generationService: service
+    }).core;
+    holder.core = core;
+
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    const failed = await core.drainAsyncEvents();
+
+    expect(nested).toEqual({ outgoing: [] });
+    expect(failed.outgoing).toEqual([
+      expect.objectContaining({ type: 'error', code: 'provider_unavailable' })
+    ]);
+    expect(records.filter((record) => record.name === 'generation.failure.provider_response'))
+      .toEqual([expect.objectContaining({
+        providerId: 'stable-generation-provider',
+        providerVersion: '1.0.0'
+      })]);
+    expect(records.filter((record) => record.name === 'provider.failure'))
+      .toEqual([expect.objectContaining({
+        providerId: 'stable-generation-provider',
+        providerVersion: '1.0.0'
+      })]);
   });
 
   it('cancels pending generation on a terminal utterance conflict', async () => {
@@ -2182,7 +2756,7 @@ describe('relay session core', () => {
     }
   );
 
-  it('publishes only the closed 19-name metadata vocabulary', () => {
+  it('publishes only the closed 23-name metadata vocabulary', () => {
     expect(RELAY_METRIC_NAMES).toEqual([
       'session.start',
       'session.reject',
@@ -2201,10 +2775,14 @@ describe('relay session core', () => {
       'translation.result',
       'suggestion.latency',
       'suggestion.result',
+      'generation.failure.provider_response',
+      'generation.failure.invalid_generated_language',
+      'generation.failure.language_validation',
+      'generation.failure.internal',
       'provider.failure',
       'state_store.failure'
     ]);
-    expect(new Set(RELAY_METRIC_NAMES).size).toBe(19);
+    expect(new Set(RELAY_METRIC_NAMES).size).toBe(23);
   });
 
   it('records exact metadata-only lifecycle values once for a suppressed final', async () => {
@@ -2699,6 +3277,22 @@ describe('relay session core', () => {
     await flushAsyncEvents();
     await generationFailure.drainAsyncEvents();
     generationFailure.close();
+
+    for (const error of [
+      new GenerationError('invalid-generated-language'),
+      new GenerationError('language-validation-failure'),
+      new Error('internal generation canary')
+    ]) {
+      const classifiedFailure = openNew(recordingAdapter(), 'es', {
+        metricSink: metrics.sink,
+        generationService: failingGenerationService(error)
+      }).core;
+      classifiedFailure.handleText(utteranceStartText());
+      await classifiedFailure.handleTranscriptionEvent(finalEvent());
+      await flushAsyncEvents();
+      await classifiedFailure.drainAsyncEvents();
+      classifiedFailure.close();
+    }
 
     const stateFailure = openNew(recordingAdapter(), 'es', {
       metricSink: metrics.sink,

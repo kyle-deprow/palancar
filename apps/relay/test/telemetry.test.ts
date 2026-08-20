@@ -314,23 +314,23 @@ describe('production relay metric sink construction', () => {
     });
   });
 
-  it('creates exactly 19 closed instruments with only four histograms', () => {
+  it('creates exactly 23 closed instruments with only four histograms', () => {
     const harness = createHarness();
     createProductionRelayMetricSink(validConfig(), harness.runtime);
 
     const names = Object.values(TELEMETRY_METRIC_NAMES);
-    expect(names).toHaveLength(19);
+    expect(names).toHaveLength(23);
     expect(new Set([...harness.counters.keys(), ...harness.histograms.keys()])).toEqual(
       new Set(names)
     );
     expect(new Set(harness.histograms.keys())).toEqual(LATENCY_NAMES);
     expect(harness.histograms.size).toBe(4);
-    expect(harness.counters.size).toBe(15);
+    expect(harness.counters.size).toBe(19);
     expect([...harness.histograms.values()]).toEqual(
       Array.from({ length: 4 }, () => ({ unit: 'ms' }))
     );
     expect([...harness.counters.values()]).toEqual(
-      Array.from({ length: 15 }, () => ({ unit: '1' }))
+      Array.from({ length: 19 }, () => ({ unit: '1' }))
     );
   });
 
@@ -655,7 +655,7 @@ describe('record', () => {
       sink.record(recordFor(name));
     }
 
-    expect(harness.measurements).toHaveLength(19);
+    expect(harness.measurements).toHaveLength(23);
     for (const measurement of harness.measurements) {
       const name = measurement.name as TelemetryMetricName;
       expect(measurement.kind).toBe(LATENCY_NAMES.has(name) ? 'histogram' : 'counter');

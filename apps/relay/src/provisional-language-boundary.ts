@@ -11,6 +11,7 @@ import {
   type GeneratedLanguageValidator
 } from '@palancar/generation';
 import {
+  countSubstantiveCharacters,
   getLanguageDefinition,
   isTargetLanguage,
   type ClassifiedLanguageEvidence,
@@ -223,10 +224,6 @@ function normalizedText(
   }
 }
 
-function substantiveCharacters(text: string): number {
-  return Array.from(text.matchAll(/[\p{L}\p{N}]/gu)).length;
-}
-
 function detect(detector: EldDetector, text: string): Detection {
   const result = detector.detect(text);
   if (typeof result !== 'object' || result === null || utilTypes.isProxy(result)) {
@@ -327,7 +324,7 @@ function analysisWindows(
   const addCandidate = (candidate: string): void => {
     const trimmed = candidate.trim();
     if (
-      substantiveCharacters(trimmed) >= settings.minimumWindowCharacters
+      countSubstantiveCharacters(trimmed) >= settings.minimumWindowCharacters
     ) {
       candidates.push(trimmed);
     }
@@ -404,7 +401,7 @@ function classify(
   }
   if (
     normalized.status === 'empty' ||
-    substantiveCharacters(normalized.text) < settings.minimumTextCharacters
+    countSubstantiveCharacters(normalized.text) < settings.minimumTextCharacters
   ) {
     return evidence(settings, {
       detectedLanguage: UNKNOWN_LANGUAGE,

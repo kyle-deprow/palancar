@@ -86,6 +86,34 @@ const EXACT_METRIC_MAPPING = [
     monotonic: false
   },
   { name: 'suggestion.result', kind: 'sum', unit: '1', valueField: 'asInt', monotonic: true },
+  {
+    name: 'generation.failure.provider_response',
+    kind: 'sum',
+    unit: '1',
+    valueField: 'asInt',
+    monotonic: true
+  },
+  {
+    name: 'generation.failure.invalid_generated_language',
+    kind: 'sum',
+    unit: '1',
+    valueField: 'asInt',
+    monotonic: true
+  },
+  {
+    name: 'generation.failure.language_validation',
+    kind: 'sum',
+    unit: '1',
+    valueField: 'asInt',
+    monotonic: true
+  },
+  {
+    name: 'generation.failure.internal',
+    kind: 'sum',
+    unit: '1',
+    valueField: 'asInt',
+    monotonic: true
+  },
   { name: 'provider.failure', kind: 'sum', unit: '1', valueField: 'asInt', monotonic: true },
   { name: 'state_store.failure', kind: 'sum', unit: '1', valueField: 'asInt', monotonic: true }
 ] as const satisfies ReadonlyArray<{
@@ -213,19 +241,19 @@ describe('OTLP JSON construction', () => {
     });
   });
 
-  it('maps the exact fixed 19-name vocabulary to its complete OTLP contract', () => {
+  it('maps the exact fixed 23-name vocabulary to its complete OTLP contract', () => {
     const instance = exporter();
     expect(Object.values(TELEMETRY_METRIC_NAMES)).toEqual(
       EXACT_METRIC_MAPPING.map((mapping) => mapping.name)
     );
-    expect(new Set(EXACT_METRIC_MAPPING.map((mapping) => mapping.name)).size).toBe(19);
+    expect(new Set(EXACT_METRIC_MAPPING.map((mapping) => mapping.name)).size).toBe(23);
     for (const mapping of EXACT_METRIC_MAPPING) {
       instance.enqueue(input(mapping.name));
     }
 
     const metrics = parsedBody(requiredRequest(instance)).resourceMetrics[0]
       ?.scopeMetrics[0]?.metrics;
-    expect(metrics).toHaveLength(19);
+    expect(metrics).toHaveLength(23);
     for (const [index, expected] of EXACT_METRIC_MAPPING.entries()) {
       const metric = metrics?.[index];
       expect(metric?.name).toBe(expected.name);
@@ -401,7 +429,7 @@ describe('strict enqueue boundary', () => {
       ['deterministic-mock', '1.0.0'],
       ['deterministic-mock-generation', '1.0.0'],
       ['azure-realtime', 'ga-transcription-websocket'],
-      ['litellm-chat', '1.0.0']
+      ['litellm-chat', '1.1.0']
     ] as const;
     const errorPairs = [
       ['unknown', 'unknown_failure'],

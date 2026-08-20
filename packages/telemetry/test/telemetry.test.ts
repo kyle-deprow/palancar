@@ -4,6 +4,10 @@ import {
   DEFAULT_TELEMETRY_SINK_CAPACITY,
   DEPLOYMENT_SLOTS,
   ERROR_CATEGORIES,
+  GENERATION_FAILURE_INTERNAL,
+  GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE,
+  GENERATION_FAILURE_LANGUAGE_VALIDATION,
+  GENERATION_FAILURE_PROVIDER_RESPONSE,
   GATE_DECISIONS,
   InMemoryTelemetrySink,
   MAX_TELEMETRY_SINK_CAPACITY,
@@ -157,6 +161,53 @@ describe('telemetry vocabulary and record sanitization', () => {
       const record = sanitizeTelemetry({ ...MINIMAL_RECORD, name });
       expect(record.name).toBe(name);
       expect(record.timestamp).toBe(TIMESTAMP);
+    }
+  });
+
+  it('accepts the fixed generation failure vocabulary and aliases', () => {
+    const names = [
+      TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE,
+      TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE,
+      TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_LANGUAGE_VALIDATION,
+      TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_INTERNAL
+    ] as const;
+    expect(names).toEqual([
+      'generation.failure.provider_response',
+      'generation.failure.invalid_generated_language',
+      'generation.failure.language_validation',
+      'generation.failure.internal'
+    ]);
+    expect([
+      GENERATION_FAILURE_PROVIDER_RESPONSE,
+      GENERATION_FAILURE_INVALID_GENERATED_LANGUAGE,
+      GENERATION_FAILURE_LANGUAGE_VALIDATION,
+      GENERATION_FAILURE_INTERNAL
+    ]).toEqual(names);
+
+    for (const name of names) {
+      const record = sanitizeTelemetry({
+        ...MINIMAL_RECORD,
+        name,
+        count: 1,
+        targetLanguage: TARGET_LANGUAGES.ES,
+        operation: TELEMETRY_OPERATIONS.GENERATION,
+        outcome: TELEMETRY_OUTCOMES.FAILURE,
+        providerId: 'litellm-chat',
+        providerVersion: '1.1.0'
+      });
+      expect(record).toMatchObject({
+        name,
+        count: 1,
+        operation: TELEMETRY_OPERATIONS.GENERATION,
+        outcome: TELEMETRY_OUTCOMES.FAILURE,
+        providerId: 'litellm-chat',
+        providerVersion: '1.1.0'
+      });
+      expect(record).not.toHaveProperty('errorCategory');
+      expect(record).not.toHaveProperty('errorId');
+      for (const field of CORRELATION_FIELDS) {
+        expect(record).not.toHaveProperty(field);
+      }
     }
   });
 

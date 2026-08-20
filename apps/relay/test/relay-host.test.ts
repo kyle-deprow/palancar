@@ -1354,7 +1354,7 @@ describe('relay host configuration and readiness', () => {
   it('creates LiteLLM provider identity without exposing its API key', () => {
     const config = parseRelayHostConfig(litellmEnvironment());
 
-    expect(config.generationService?.provider).toEqual({ id: 'litellm-chat', version: '1.0.0' });
+    expect(config.generationService?.provider).toEqual({ id: 'litellm-chat', version: '1.1.0' });
     expect(JSON.stringify(config)).not.toContain(LITELLM_API_KEY);
   });
 

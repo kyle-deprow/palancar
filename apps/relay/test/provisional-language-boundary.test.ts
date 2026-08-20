@@ -13,6 +13,10 @@ import {
   isDevelopmentProvisionalGeneratedLanguageValidator,
   isDevelopmentProvisionalTextLanguageClassifier
 } from '../src/provisional-language-boundary.js';
+import {
+  countSubstantiveCharacters,
+  DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS
+} from '@palancar/language-registry';
 
 const TEXT = Object.freeze({
   en: 'Good morning. Where is the train station?',
@@ -163,6 +167,43 @@ afterEach(() => {
 });
 
 describe('development provisional ELD-small boundary', () => {
+  it.each([
+    ['es', 'ñáéíóúÑÁÉÍÓÚ'],
+    ['tr', 'çğıİöşüÇĞÖŞÜ']
+  ] as const)(
+    'uses the shared substantive-character invariant for %s Unicode text',
+    async (target, text) => {
+      const oneShort = Array.from(text).slice(0, -1).join('');
+      expect(countSubstantiveCharacters(text)).toBe(
+        DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS
+      );
+      expect(countSubstantiveCharacters(oneShort)).toBe(
+        DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS - 1
+      );
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((candidate) => {
+          const substantive = candidate.match(/[\p{L}\p{N}]/gu)?.join('') ?? '';
+          return substantive === text || substantive === oneShort
+            ? target
+            : tokenLanguage(candidate);
+        })
+      });
+
+      await expect(
+        boundary.classifier.classify(`  ${text} !!!  `, target)
+      ).resolves.toMatchObject({
+        decision: 'accept',
+        reason: 'MATCH'
+      });
+      await expect(
+        boundary.classifier.classify(`  ${oneShort} !!!  `, target)
+      ).resolves.toMatchObject({
+        decision: 'uncertain',
+        reason: 'TOO_SHORT'
+      });
+    }
+  );
+
   it.each([
     ['es', TEXT.es],
     ['tr', TEXT.tr]
