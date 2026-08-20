@@ -123,6 +123,10 @@ module "observability" {
   location                  = var.location
   retention_in_days         = var.retention_in_days
   tags                      = local.tags
+  alerts_enabled            = true
+  alert_action_group_ids    = [local.relay_action_group_id]
+
+  depends_on = [azurerm_monitor_action_group.relay]
 }
 
 module "workload_state" {

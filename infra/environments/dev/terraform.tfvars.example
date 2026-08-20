@@ -9,7 +9,7 @@ environment     = "dev"
 state_suffix = "REPLACE_WITH_STABLE_SUFFIX_OR_auto"
 
 budget_amount             = 100
-# Replace owner@example.com before plan; live validation rejects reserved domains.
+# Replace the placeholder before plan; these contacts also receive relay operational alerts, and live validation rejects reserved domains.
 budget_start_date         = "2026-08-01T00:00:00Z"
 budget_end_date           = "2027-08-01T00:00:00Z"
 budget_contact_emails     = ["owner@example.com"]

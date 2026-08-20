@@ -8,6 +8,16 @@ output "resource_group_id" {
   value       = azurerm_resource_group.foundation.id
 }
 
+output "relay_action_group_id" {
+  description = "Azure Monitor action group ID for relay operational alerts."
+  value       = local.relay_action_group_id
+}
+
+output "relay_alert_rule_ids" {
+  description = "Scheduled query alert IDs keyed by relay operational signal."
+  value       = module.observability.relay_alert_rule_ids
+}
+
 output "region" {
   description = "Development foundation region."
   value       = var.location

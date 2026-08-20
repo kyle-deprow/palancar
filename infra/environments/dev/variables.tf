@@ -103,14 +103,28 @@ variable "budget_end_date" {
 variable "budget_contact_emails" {
   description = "Required live budget contacts; reserved example/test domains are rejected."
   type        = list(string)
+  nullable    = false
 
   validation {
-    condition = length(var.budget_contact_emails) > 0 && alltrue([
-      for email in var.budget_contact_emails :
-      can(regex("^[^@ ]+@[^@ ]+\\.[^@ ]+$", trimspace(email))) &&
-      !can(regex("@(example\\.com|[^@]+\\.(invalid|test|example))$", lower(trimspace(email))))
-    ])
-    error_message = "budget_contact_emails must contain at least one plausible live address and must not use example.com, .invalid, .test, or .example."
+    condition = try(
+      length(var.budget_contact_emails) >= 1 &&
+      length(var.budget_contact_emails) <= 1000 &&
+      alltrue([
+        for email in var.budget_contact_emails :
+        try(
+          length(email) <= 64 &&
+          trimspace(email) == email &&
+          can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", trimspace(email))) &&
+          !can(regex("@(example\\.com|[^@]+\\.(invalid|test|example))$", lower(trimspace(email)))),
+          false,
+        )
+      ]) &&
+      length(var.budget_contact_emails) == length(toset([
+        for email in var.budget_contact_emails : lower(trimspace(email))
+      ])),
+      false,
+    )
+    error_message = "budget_contact_emails must contain 1-1000 trimmed, whitespace-free, unique plausible live addresses of at most 64 characters and must not use example.com, .invalid, .test, or .example."
   }
 }
 

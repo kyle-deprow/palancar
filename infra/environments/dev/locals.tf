@@ -18,9 +18,16 @@ locals {
     application_insights  = "appi-${var.prefix}-${var.environment}-${local.suffix}"
     container_environment = "cae-${var.prefix}-${var.environment}-${local.suffix}"
     relay_container_app   = "ca-${var.prefix}-${var.environment}-relay-${local.suffix}"
+    relay_action_group    = "ag-${var.prefix}-${var.environment}-relay-${local.suffix}"
     expiry_cleanup_job    = substr("caj-${local.name_seed}-cleanup-${local.suffix}", 0, 32)
     foundry               = substr("${local.name_seed}openai${local.suffix}", 0, 64)
   }
+
+  relay_contact_emails = sort([
+    for email in var.budget_contact_emails : trimspace(email)
+  ])
+
+  relay_action_group_id = "/subscriptions/${var.subscription_id}/resourceGroups/${local.names.resource_group}/providers/Microsoft.Insights/actionGroups/${local.names.relay_action_group}"
 
   relay_origin = "wss://${local.names.relay_container_app}.${module.container_app_environment.default_domain}"
 
