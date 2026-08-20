@@ -11,9 +11,21 @@ const MODEL_SPIKE_MODE = "model-spike";
 const FULL_DEPLOY_MODE = "full-deploy";
 const RUNTIME_ROLLOUT_MODE = "runtime-rollout";
 const FINAL_ROLLOUT_MODE = "final-rollout";
+const LUNA_MODEL_BOOTSTRAP_MODE = "luna-model-bootstrap";
 const SUPPORTED_PLAN_FORMAT_VERSION = "1.2";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
 const PINNED_MODEL_VERSION = "2025-12-15";
+const LUNA_DEPLOYMENT_NAME = "gpt-5.6-luna";
+const LUNA_MODEL_VERSION = "2026-07-09";
+const LUNA_MODEL_CAPACITY = 1013;
+const BOOTSTRAP_ROLE_DEFINITION_IDS = Object.freeze({
+  acr: "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+  table: "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+  openai: "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
+  monitoring: "3913510d-42f4-4e42-8a64-420c390055eb",
+  secretsUser: "4633458b-17de-408a-b874-0445c86b69e6",
+  secretsOfficer: "b86a8fe4-44ce-4948-aee5-eccb2c155cd7",
+});
 const FOUNDRY_COGNITIVE_ACCOUNT_ID =
   "/subscriptions/a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1/resourceGroups/rg-palancar-dev-aeeacd8c/providers/Microsoft.CognitiveServices/accounts/palancardevopenaiaeeacd8c";
 const AZURERM_PROVIDER_NAME = "registry.terraform.io/hashicorp/azurerm";
@@ -32,7 +44,7 @@ const FINAL_RESOURCE_GROUP_ID =
   `/subscriptions/${FINAL_SUBSCRIPTION_ID}/resourceGroups/${FINAL_RESOURCE_GROUP_NAME}`;
 const FINAL_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
 const FINAL_RELAY_PRIOR_IMAGE =
-  `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`;
+  `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`;
 const FINAL_TABLE_ACCOUNT = "palancardevstateaeeacd8c";
 const FINAL_TABLE_ENDPOINT = `https://${FINAL_TABLE_ACCOUNT}.table.core.windows.net`;
 const FINAL_TABLE_SERVICE_ID =
@@ -76,6 +88,17 @@ const FINAL_REFERENCE_PLAN = JSON.parse(
     new URL("./fixtures/final-rollout-transition.plan-fixture.json", import.meta.url),
     "utf8",
   ),
+);
+const MODEL_BOOTSTRAP_REFERENCE_PLAN = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/luna-model-bootstrap.plan-fixture.json", import.meta.url),
+    "utf8",
+  ),
+);
+const LUNA_DEPLOYMENT =
+  `module.foundry.azurerm_cognitive_deployment.this["${LUNA_DEPLOYMENT_NAME}"]`;
+const MODEL_BOOTSTRAP_RESOURCE_ADDRESSES = new Set(
+  MODEL_BOOTSTRAP_REFERENCE_PLAN.resource_changes.map((entry) => entry.address),
 );
 const FINAL_MONITORING_ROLE_ASSIGNMENT =
   "module.identities_rbac.azurerm_role_assignment.runtime_application_insights";
@@ -3751,6 +3774,1710 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
   return result;
 }
 
+function bootstrapChangeMetadata(resourceChange) {
+  const metadata = { ...resourceChange };
+  delete metadata.change;
+  return metadata;
+}
+
+const BOOTSTRAP_DYNAMIC_KEYS = new Set([
+  "client_id",
+  "connection_string",
+  "fqdn",
+  "id",
+  "instrumentation_key",
+  "latestRevisionName",
+  "object_id",
+  "parent_id",
+  "principal_id",
+  "subscription_id",
+  "tenant_id",
+]);
+
+function bootstrapIsDynamicLeaf(reference, path) {
+  const key = path.at(-1);
+  return (
+    (key === "value" && path.includes("outputs") && typeof reference === "string") ||
+    (typeof reference === "string" &&
+      (reference.startsWith("/subscriptions/") ||
+        reference.includes("/subscriptions/") ||
+        /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(reference) ||
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reference) ||
+        reference.includes(".azurecontainerapps.io") ||
+        reference.includes(".table.core.windows.net") ||
+        reference.includes(".openai.azure.com") ||
+        reference.includes(".vault.azure.net") ||
+        reference.includes(".applicationinsights.azure.com") ||
+        reference.includes(".livediagnostics.monitor.azure.com") ||
+        /^ca-[a-z0-9-]+--[0-9]{7}$/.test(reference) ||
+        reference.startsWith("InstrumentationKey="))) ||
+    (typeof reference === "string" &&
+      (BOOTSTRAP_DYNAMIC_KEYS.has(key) ||
+        (key !== undefined && key.endsWith("_id"))))
+  );
+}
+
+function bootstrapHasStructuralEnvelope(
+  actual,
+  reference,
+  {
+    allowDynamicLeaves = false,
+  } = {},
+  path = [],
+) {
+  if (
+    allowDynamicLeaves &&
+    bootstrapIsDynamicLeaf(reference, path)
+  ) {
+    if (typeof reference !== "string") {
+      return isDeepStrictEqual(actual, reference);
+    }
+    if (typeof actual !== typeof reference || actual === undefined) {
+      return false;
+    }
+    if (actual === reference) {
+      return true;
+    }
+    const key = path.at(-1);
+    if (
+      [
+        "client_id",
+        "object_id",
+        "principal_id",
+        "subscription_id",
+        "tenant_id",
+      ].includes(key)
+    ) {
+      return finalUuid(actual);
+    }
+    if (key === "id" || (key !== undefined && key.endsWith("_id"))) {
+      return typeof reference === "string" &&
+        reference.startsWith("/subscriptions/")
+        ? bootstrapCanonicalDynamicAzureId(actual)
+        : actual === reference;
+    }
+    if (typeof actual === "string" && actual.includes("@")) {
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(actual);
+    }
+    return true;
+  }
+
+  if (Array.isArray(reference)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === reference.length &&
+      reference.every((child, index) =>
+        bootstrapHasStructuralEnvelope(
+          actual[index],
+          child,
+          { allowDynamicLeaves },
+          [...path, String(index)],
+        ),
+      )
+    );
+  }
+
+  if (isObject(reference)) {
+    const referenceKeys = Object.keys(reference);
+    const actualKeys = isObject(actual) ? Object.keys(actual) : [];
+    const dynamicKeyMap =
+      allowDynamicLeaves &&
+      referenceKeys.length === actualKeys.length &&
+      referenceKeys.every(bootstrapCanonicalDynamicAzureId) &&
+      actualKeys.every(bootstrapCanonicalDynamicAzureId);
+    return (
+      isObject(actual) &&
+      (hasExactKeys(actual, referenceKeys) || dynamicKeyMap) &&
+      Object.entries(reference).every(([key, child], index) => {
+        const actualKey = dynamicKeyMap ? actualKeys[index] : key;
+        const childResult = bootstrapHasStructuralEnvelope(
+          actual[actualKey],
+          child,
+          { allowDynamicLeaves },
+          [...path, actualKey],
+        );
+        return childResult;
+      })
+    );
+  }
+
+  return actual === reference;
+}
+
+function bootstrapHasCanonicalTimestamp(value) {
+  const match =
+    typeof value === "string" &&
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/.exec(value);
+  if (!match) {
+    return false;
+  }
+
+  const [, year, month, day, hour, minute, second] = match.map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day &&
+    date.getUTCHours() === hour &&
+    date.getUTCMinutes() === minute &&
+    date.getUTCSeconds() === second
+  );
+}
+
+function bootstrapHasExactResourceMetadata(resourceChange) {
+  const reference = MODEL_BOOTSTRAP_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === resourceChange.address,
+  );
+  return (
+    reference !== undefined &&
+    isDeepStrictEqual(
+      bootstrapChangeMetadata(resourceChange),
+      bootstrapChangeMetadata(reference),
+    )
+  );
+}
+
+function bootstrapValueResourceMetadata(resource) {
+  const metadata = { ...resource };
+  delete metadata.values;
+  delete metadata.sensitive_values;
+  return metadata;
+}
+
+function collectBootstrapResourceEntries(
+  value,
+  moduleAddress = "",
+  resources = new Map(),
+) {
+  if (!isObject(value)) {
+    return resources;
+  }
+
+  if (
+    value.mode === "managed" &&
+    typeof value.address === "string" &&
+    Object.hasOwn(value, "values")
+  ) {
+    if (resources.has(value.address)) {
+      resources.set(value.address, undefined);
+    } else {
+      resources.set(value.address, { resource: value, moduleAddress });
+    }
+  }
+
+  for (const resource of value.resources ?? []) {
+    collectBootstrapResourceEntries(resource, moduleAddress, resources);
+  }
+  for (const childModule of value.child_modules ?? []) {
+    if (isObject(childModule) && typeof childModule.address === "string") {
+      collectBootstrapResourceEntries(childModule, childModule.address, resources);
+    } else {
+      collectBootstrapResourceEntries(childModule, undefined, resources);
+    }
+  }
+  return resources;
+}
+
+function bootstrapStateResourceMetadataMatchesChange(
+  entry,
+  resourceChange,
+) {
+  if (entry === undefined) {
+    return isCreate(resourceChange.change.actions) && resourceChange.change.before === null;
+  }
+  if (!entry || !bootstrapHasExactResourceMetadata(resourceChange)) {
+    return false;
+  }
+
+  const stateMetadata = bootstrapValueResourceMetadata(entry.resource);
+  const changeMetadata = bootstrapChangeMetadata(resourceChange);
+  for (const key of [
+    "address",
+    "mode",
+    "type",
+    "name",
+    "index",
+    "provider_name",
+  ]) {
+    if (Object.hasOwn(changeMetadata, key) &&
+      (!Object.hasOwn(stateMetadata, key) ||
+        !isDeepStrictEqual(stateMetadata[key], changeMetadata[key]))) {
+      return false;
+    }
+  }
+
+  const hasModuleAddress = entry.moduleAddress !== "";
+  const expectedIdentity = resourceChange.change.after_identity;
+  if (Object.hasOwn(stateMetadata, "identity")) {
+    if (
+      !Object.hasOwn(resourceChange.change, "after_identity") ||
+      !isDeepStrictEqual(stateMetadata.identity, expectedIdentity)
+    ) {
+      return false;
+    }
+  } else if (Object.hasOwn(resourceChange.change, "after_identity")) {
+    return false;
+  }
+  return (
+    hasModuleAddress === Object.hasOwn(changeMetadata, "module_address") &&
+    (!hasModuleAddress || changeMetadata.module_address === entry.moduleAddress)
+  );
+}
+
+function bootstrapHasExactStateResourceMetadata(plan) {
+  const resourceMetadata = collectBootstrapResourceEntries(
+    plan.planned_values?.root_module,
+  );
+  const referenceMetadata = collectBootstrapResourceEntries(
+    MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values?.root_module,
+  );
+  const resourceGroup = resourceMetadata.get("azurerm_resource_group.foundation")
+    ?.resource?.values;
+  const subscriptionId = plan.variables?.subscription_id?.value;
+  const resourceGroupName = resourceGroup?.name;
+  const identityMatches = (resource, reference) => {
+    if (!Object.hasOwn(reference, "identity")) {
+      return !Object.hasOwn(resource, "identity");
+    }
+    if (!isObject(resource.identity) || !isObject(reference.identity)) {
+      return false;
+    }
+    if (!hasExactKeys(resource.identity, Object.keys(reference.identity))) {
+      return false;
+    }
+    for (const [key, expected] of Object.entries(reference.identity)) {
+      const actual = resource.identity[key];
+      if (key === "subscription_id") {
+        if (actual !== subscriptionId) return false;
+      } else if (key === "resource_group_name") {
+        if (actual !== resourceGroupName) return false;
+      } else if (key === "id") {
+        if (!bootstrapCanonicalArmId(actual)) return false;
+        if (resource.values?.id !== undefined && actual !== resource.values.id) {
+          return false;
+        }
+      } else if (key === "name") {
+        if (typeof actual !== "string" || actual.length === 0) return false;
+        if (resource.values?.name !== undefined && actual !== resource.values.name) {
+          return false;
+        }
+      } else if (!isDeepStrictEqual(actual, expected)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const actualSections = [
+    [
+      collectBootstrapResourceEntries(plan.prior_state?.values?.root_module),
+      collectBootstrapResourceEntries(
+        MODEL_BOOTSTRAP_REFERENCE_PLAN.prior_state?.values?.root_module,
+      ),
+    ],
+    [
+      collectBootstrapResourceEntries(plan.planned_values?.root_module),
+      collectBootstrapResourceEntries(
+        MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values?.root_module,
+      ),
+    ],
+  ];
+
+  return actualSections.every(([actual, reference]) => {
+    if (actual.size !== reference.size) {
+      return false;
+    }
+    return [...actual.entries()].every(([address, entry]) => {
+      const expected = reference.get(address);
+      return (
+        entry !== undefined &&
+        expected !== undefined &&
+        entry.moduleAddress === expected.moduleAddress &&
+        hasExactKeys(
+          bootstrapValueResourceMetadata(entry.resource),
+          Object.keys(bootstrapValueResourceMetadata(expected.resource)),
+        ) &&
+        Object.entries(bootstrapValueResourceMetadata(expected.resource)).every(
+          ([key, expectedValue]) =>
+            key === "identity"
+              ? identityMatches(entry.resource, expected.resource)
+              : isDeepStrictEqual(entry.resource[key], expectedValue),
+        )
+      );
+    });
+  });
+}
+
+function bootstrapHasStructuralResourceChange(resourceChange, reference) {
+  if (
+    !hasExactKeys(resourceChange, Object.keys(reference)) ||
+    !bootstrapHasExactResourceMetadata(resourceChange) ||
+    !hasExactKeys(resourceChange.change, Object.keys(reference.change))
+  ) {
+    return false;
+  }
+
+  const actualChange = resourceChange.change;
+  const referenceChange = reference.change;
+  for (const key of Object.keys(referenceChange)) {
+    if (key === "before" || key === "after") {
+      if (
+        !bootstrapHasStructuralEnvelope(
+          actualChange[key],
+          referenceChange[key],
+          { allowDynamicLeaves: true },
+          ["resource_changes", resourceChange.address, "change", key],
+        )
+      ) {
+        return false;
+      }
+      continue;
+    }
+
+    if (
+      !bootstrapHasStructuralEnvelope(
+        actualChange[key],
+        referenceChange[key],
+        { allowDynamicLeaves: true },
+        ["resource_changes", resourceChange.address, "change", key],
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function bootstrapHasExactResourceChanges(changes) {
+  const references = MODEL_BOOTSTRAP_REFERENCE_PLAN.resource_changes;
+  return (
+    Array.isArray(changes) &&
+    changes.length === references.length &&
+    changes.every((resourceChange, index) =>
+      resourceChange.address === references[index].address &&
+      bootstrapHasStructuralResourceChange(resourceChange, references[index]),
+    )
+  );
+}
+
+function bootstrapHasExactLunaAfter(after, plan) {
+  const foundryId = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  ).get("module.foundry.azurerm_cognitive_account.this")?.values?.id;
+  return (
+    hasExactKeys(after, [
+      "cognitive_account_id",
+      "dynamic_throttling_enabled",
+      "model",
+      "name",
+      "sku",
+      "timeouts",
+      "version_upgrade_option",
+    ]) &&
+    typeof foundryId === "string" &&
+    after.cognitive_account_id === foundryId &&
+    after.dynamic_throttling_enabled === null &&
+    after.name === LUNA_DEPLOYMENT_NAME &&
+    Array.isArray(after.model) &&
+    after.model.length === 1 &&
+    hasExactKeys(after.model[0], ["format", "name", "version"]) &&
+    after.model[0].format === "OpenAI" &&
+    after.model[0].name === LUNA_DEPLOYMENT_NAME &&
+    after.model[0].version === LUNA_MODEL_VERSION &&
+    Array.isArray(after.sku) &&
+    after.sku.length === 1 &&
+    hasExactKeys(after.sku[0], ["capacity", "family", "name", "size", "tier"]) &&
+    after.sku[0].capacity === LUNA_MODEL_CAPACITY &&
+    after.sku[0].family === null &&
+    after.sku[0].name === "GlobalStandard" &&
+    after.sku[0].size === null &&
+    after.sku[0].tier === null &&
+    after.timeouts === null &&
+    after.version_upgrade_option === "NoAutoUpgrade"
+  );
+}
+
+function bootstrapHasExactLunaCreate(resourceChange, plan) {
+  const change = resourceChange.change;
+  return (
+    bootstrapHasExactResourceMetadata(resourceChange) &&
+    hasExactKeys(change, [
+      "actions",
+      "before",
+      "after",
+      "after_unknown",
+      "before_sensitive",
+      "after_sensitive",
+    ]) &&
+    isCreate(change.actions) &&
+    change.before === null &&
+    change.before_sensitive === false &&
+    bootstrapHasExactLunaAfter(change.after, plan) &&
+    isDeepStrictEqual(change.after_unknown, {
+      id: true,
+      model: [{}],
+      rai_policy_name: true,
+      sku: [{}],
+    }) &&
+    isDeepStrictEqual(change.after_sensitive, {
+      model: [{}],
+      sku: [{}],
+    })
+  );
+}
+
+function hasBootstrapForbiddenPlanStructure(value) {
+  const forbiddenKeys = new Set([
+    "deposed",
+    "generated_config",
+    "import",
+    "imports",
+    "replace_paths",
+    "target",
+    "targets",
+  ]);
+  function visit(candidate) {
+    if (Array.isArray(candidate)) {
+      return candidate.some(visit);
+    }
+    if (!isObject(candidate)) {
+      return false;
+    }
+    return Object.entries(candidate).some(([key, child]) => {
+      if (forbiddenKeys.has(key)) {
+        return true;
+      }
+      if (
+        typeof child === "string" &&
+        /(?:^|\s)(?:-target|--target|replace|destroy)(?:\s|$)/.test(child)
+      ) {
+        return true;
+      }
+      return visit(child);
+    });
+  }
+  return visit(value);
+}
+
+function collectBootstrapManagedResources(value, resources = new Map()) {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      collectBootstrapManagedResources(child, resources);
+    }
+    return resources;
+  }
+  if (!isObject(value)) {
+    return resources;
+  }
+  if (
+    value.mode === "managed" &&
+    typeof value.address === "string" &&
+    Object.hasOwn(value, "values")
+  ) {
+    if (resources.has(value.address)) {
+      resources.set(value.address, undefined);
+    } else {
+      resources.set(value.address, value);
+    }
+  }
+  for (const child of Object.values(value)) {
+    collectBootstrapManagedResources(child, resources);
+  }
+  return resources;
+}
+
+function bootstrapHasCoherentState(plan, changesByAddress) {
+  const prior = plan.prior_state;
+  const planned = plan.planned_values;
+  if (
+    !isObject(prior) ||
+    prior.format_version !== "1.0" ||
+    !isObject(prior.values) ||
+    !isObject(planned) ||
+    !isObject(planned.root_module) ||
+    !isObject(prior.values.root_module)
+  ) {
+    return false;
+  }
+
+  const priorStructure = bootstrapHasStructuralEnvelope(
+      prior,
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.prior_state,
+      { allowDynamicLeaves: true },
+    );
+  const plannedStructure = bootstrapHasStructuralEnvelope(
+      planned,
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values,
+      { allowDynamicLeaves: true },
+    );
+  const stateMetadata = bootstrapHasExactStateResourceMetadata(plan);
+  if (!priorStructure || !plannedStructure || !stateMetadata) {
+    return false;
+  }
+
+  const priorResources = collectBootstrapManagedResources(
+    prior.values.root_module,
+  );
+  const plannedResources = collectBootstrapManagedResources(
+    planned.root_module,
+  );
+  const priorEntries = collectBootstrapResourceEntries(prior.values.root_module);
+  const plannedEntries = collectBootstrapResourceEntries(planned.root_module);
+  const expectedPrior = new Set(
+    [...MODEL_BOOTSTRAP_RESOURCE_ADDRESSES].filter(
+      (address) => address !== LUNA_DEPLOYMENT,
+    ),
+  );
+  const expectedPlanned = new Set(MODEL_BOOTSTRAP_RESOURCE_ADDRESSES);
+  if (
+    priorResources.size !== expectedPrior.size ||
+    plannedResources.size !== expectedPlanned.size ||
+    [...expectedPrior].some((address) => !priorResources.has(address)) ||
+    [...expectedPlanned].some((address) => !plannedResources.has(address)) ||
+    [...priorResources.values()].some((resource) => resource === undefined) ||
+    [...plannedResources.values()].some((resource) => resource === undefined)
+  ) {
+    return false;
+  }
+
+  for (const [address, resourceChange] of changesByAddress) {
+    const change = resourceChange.change;
+    const priorResource = priorResources.get(address);
+    const plannedResource = plannedResources.get(address);
+    const priorEntry = priorEntries.get(address);
+    const plannedEntry = plannedEntries.get(address);
+    if (!plannedResource) {
+      return false;
+    }
+    if (isCreate(change.actions)) {
+      if (priorResource !== undefined || change.before !== null) {
+        return false;
+      }
+    } else if (!priorResource) {
+      return false;
+    } else if (
+      !isDeepStrictEqual(change.before, change.after) ||
+      !isDeepStrictEqual(change.before_sensitive, change.after_sensitive) ||
+      !isDeepStrictEqual(change.before_identity, change.after_identity)
+    ) {
+      return false;
+    }
+    const plannedMetadataMatch = bootstrapStateResourceMetadataMatchesChange(
+      plannedEntry,
+      resourceChange,
+    );
+    const priorMetadataMatch = isCreate(change.actions) ||
+      bootstrapStateResourceMetadataMatchesChange(priorEntry, resourceChange);
+    if (!plannedMetadataMatch || !priorMetadataMatch) {
+      return false;
+    }
+    const plannedValuesMatch = bootstrapPlannedValuesMatchChange(
+      plannedResource.values,
+      change.after,
+      address,
+    );
+    const plannedSensitiveExpected = structuredClone(change.after_sensitive);
+    if (address === CONTAINER_APP) {
+      delete plannedSensitiveExpected.output;
+    }
+    const plannedSensitiveMatch = isDeepStrictEqual(
+      plannedResource.sensitive_values,
+      plannedSensitiveExpected,
+    );
+    const priorValuesMatch = isCreate(change.actions) ||
+      isDeepStrictEqual(priorResource.values, change.before);
+    const priorSensitiveMatch = isCreate(change.actions) ||
+      isDeepStrictEqual(priorResource.sensitive_values, change.before_sensitive);
+    if (
+      !plannedValuesMatch ||
+      !plannedSensitiveMatch ||
+      !priorValuesMatch ||
+      !priorSensitiveMatch
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function bootstrapHasExactConfiguration(plan) {
+  const appCall =
+    plan.configuration?.root_module?.module_calls?.container_app_workload;
+  const referenceAppCall =
+    MODEL_BOOTSTRAP_REFERENCE_PLAN.configuration.root_module.module_calls
+      .container_app_workload;
+  return (
+    bootstrapHasStructuralEnvelope(
+      plan.configuration,
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.configuration,
+      { allowDynamicLeaves: true },
+    ) &&
+    hasExactKeys(appCall, Object.keys(referenceAppCall)) &&
+    appCall.expressions.image_digest.references.length === 1 &&
+    appCall.expressions.image_digest.references[0] ===
+      "var.relay_image_digest"
+  );
+}
+
+function bootstrapHasExactVariables(plan) {
+  const referenceVariables = MODEL_BOOTSTRAP_REFERENCE_PLAN.variables;
+  if (
+    !isObject(plan.variables) ||
+    !hasExactKeys(plan.variables, Object.keys(referenceVariables))
+  ) {
+    return false;
+  }
+
+  const canonicalUuid = (value) =>
+    typeof value === "string" &&
+    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
+  const canonicalDate = (value) =>
+    typeof value === "string" &&
+    bootstrapHasCanonicalTimestamp(value) &&
+    value.endsWith("T00:00:00Z");
+  const canonicalContact = (value) =>
+    typeof value === "string" &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(value);
+  const canonicalAcrImage = (value) =>
+    typeof value === "string" &&
+    /^[a-z0-9-]+\.azurecr\.io\/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$/.test(
+      value,
+    );
+  const canonicalSecretUrl = (value, secretName) =>
+    typeof value === "string" &&
+    new RegExp(
+      `^https://[a-z0-9-]+\\.vault\\.azure\\.net/secrets/${secretName}$`,
+    ).test(value);
+  const deployments = plan.variables.foundry_deployments?.value;
+  const deploymentsValid =
+    isObject(deployments) &&
+    hasExactKeys(deployments, [PINNED_DEPLOYMENT_NAME, LUNA_DEPLOYMENT_NAME]) &&
+    hasExactKeys(deployments[PINNED_DEPLOYMENT_NAME], [
+      "model_name",
+      "model_version",
+      "model_format",
+      "sku_name",
+      "capacity",
+      "version_upgrade_option",
+    ]) &&
+    hasExactKeys(deployments[LUNA_DEPLOYMENT_NAME], [
+      "model_name",
+      "model_version",
+      "model_format",
+      "sku_name",
+      "capacity",
+      "version_upgrade_option",
+    ]) &&
+    isDeepStrictEqual(deployments, {
+      [PINNED_DEPLOYMENT_NAME]: {
+        model_name: PINNED_DEPLOYMENT_NAME,
+        model_version: PINNED_MODEL_VERSION,
+        model_format: "OpenAI",
+        sku_name: "GlobalStandard",
+        capacity: 1,
+        version_upgrade_option: "NoAutoUpgrade",
+      },
+      [LUNA_DEPLOYMENT_NAME]: {
+        model_name: LUNA_DEPLOYMENT_NAME,
+        model_version: LUNA_MODEL_VERSION,
+        model_format: "OpenAI",
+        sku_name: "GlobalStandard",
+        capacity: LUNA_MODEL_CAPACITY,
+        version_upgrade_option: "NoAutoUpgrade",
+      },
+    });
+  if (!deploymentsValid) {
+    return false;
+  }
+
+  for (const [name, reference] of Object.entries(referenceVariables)) {
+    const descriptor = plan.variables[name];
+    if (!hasExactKeys(descriptor, ["value"])) {
+      return false;
+    }
+    const value = descriptor.value;
+    const expected = reference.value;
+    const isValid =
+      name === "subscription_id" ||
+      name === "tenant_id" ||
+      name === "operator_principal_id"
+        ? canonicalUuid(value)
+        : name === "budget_contact_emails"
+          ? Array.isArray(value) &&
+            value.length > 0 &&
+            value.every(canonicalContact)
+          : name === "budget_start_date" || name === "budget_end_date"
+            ? canonicalDate(value)
+            : name === "litellm_master_key_secret_url"
+              ? canonicalSecretUrl(value, "litellm-master-key")
+              : name === "openrouter_api_key_secret_url"
+                ? canonicalSecretUrl(value, "openrouter-api-key")
+                : name === "relay_image_digest"
+                  ? value === FINAL_RELAY_PRIOR_IMAGE
+                  : name === "litellm_image_digest" ||
+                      name === "expiry_cleanup_image_digest"
+                    ? canonicalAcrImage(value)
+                    : name === "foundry_deployments"
+                      ? deploymentsValid
+                      : isDeepStrictEqual(value, expected);
+    if (!isValid) {
+      return false;
+    }
+  }
+
+  const start = plan.variables.budget_start_date.value;
+  const end = plan.variables.budget_end_date.value;
+  return new Date(start).getTime() < new Date(end).getTime();
+}
+
+function bootstrapHasExactContactBindings(plan) {
+  const expected = new Set(plan.variables?.budget_contact_emails?.value ?? []);
+  if (
+    expected.size === 0 ||
+    [...expected].some((value) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(value))
+  ) {
+    return false;
+  }
+  const observed = new Set();
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (!isObject(value)) {
+      if (
+        typeof value === "string" &&
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(value)
+      ) {
+        observed.add(value);
+      }
+      return;
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(plan);
+  return observed.size > 0 && [...observed].every((value) => expected.has(value));
+}
+
+function bootstrapHasTerraformValueType(value, type) {
+  if (type === "string") return typeof value === "string";
+  if (type === "bool") return typeof value === "boolean";
+  if (type === "number") return typeof value === "number";
+  if (!Array.isArray(type) || type.length !== 2) return false;
+  if (type[0] === "object") {
+    return (
+      isObject(value) &&
+      isObject(type[1]) &&
+      hasExactKeys(value, Object.keys(type[1])) &&
+      Object.entries(type[1]).every(([key, childType]) =>
+        bootstrapHasTerraformValueType(value[key], childType),
+      )
+    );
+  }
+  if (!(type[0] === "list" || type[0] === "set")) return false;
+  return Array.isArray(value) && value.every((entry) =>
+    bootstrapHasTerraformValueType(entry, type[1]),
+  );
+}
+
+function bootstrapCanonicalArmId(value) {
+  return (
+    typeof value === "string" &&
+    /^\/subscriptions\/[0-9a-f-]{36}\/resourceGroups\/[^/]+(?:\/providers\/[^/]+\/.+)?$/i.test(
+      value,
+    )
+  );
+}
+
+function bootstrapCanonicalDynamicAzureId(value) {
+  return (
+    typeof value === "string" &&
+    /^\/subscriptions\/[0-9a-f-]{36}(?:\/[^\s/]+)*$/i.test(value)
+  );
+}
+
+function bootstrapCanonicalOutputValue(name, value, referenceValue) {
+  if (
+    typeof referenceValue === "string" &&
+    referenceValue.startsWith("fixture-")
+  ) {
+    if (value === referenceValue) return true;
+  }
+  if (name === "foundry_deployment_names") {
+    return isDeepStrictEqual(value, [
+      PINNED_DEPLOYMENT_NAME,
+      LUNA_DEPLOYMENT_NAME,
+    ]);
+  }
+  if (name === "relay_alert_rule_ids") {
+    return (
+      isObject(value) &&
+      hasExactKeys(value, [
+        "provider_failures",
+        "state_store_failures",
+        "suggestion_mean",
+        "transcription_final_mean",
+        "transcription_first_partial_mean",
+        "translation_mean",
+      ]) &&
+      Object.values(value).every((entry) => bootstrapCanonicalArmId(entry))
+    );
+  }
+  if (name === "runtime_identity_client_id") {
+    return finalUuid(value);
+  }
+  if (name.endsWith("_id")) {
+    return bootstrapCanonicalArmId(value);
+  }
+  if (name.endsWith("_name") || name === "region") {
+    return (
+      typeof value === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$/.test(value)
+    );
+  }
+  if (name === "acr_login_server") {
+    return typeof value === "string" && /^[a-z0-9-]+\.azurecr\.io$/.test(value);
+  }
+  if (name === "key_vault_uri") {
+    return (
+      typeof value === "string" &&
+      /^https:\/\/[a-z0-9-]+\.vault\.azure\.net\/$/.test(value)
+    );
+  }
+  if (name === "foundry_endpoint") {
+    return (
+      typeof value === "string" &&
+      /^https:\/\/[a-z0-9-]+\.openai\.azure\.com\/$/.test(value)
+    );
+  }
+  if (name === "relay_origin") {
+    return (
+      typeof value === "string" &&
+      /^wss:\/\/[a-z0-9-]+\.[a-z0-9.-]+\.azurecontainerapps\.io$/.test(value)
+    );
+  }
+  if (name === "container_app_environment_default_domain") {
+    return (
+      typeof value === "string" &&
+      /^[a-z0-9-]+\.[a-z0-9-]+\.azurecontainerapps\.io$/.test(value)
+    );
+  }
+  return typeof value === "string" && value.length > 0;
+}
+
+function bootstrapValueAtPath(value, path) {
+  let current = value;
+  for (const key of path) {
+    if (!isObject(current) && !Array.isArray(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+function bootstrapHasOutputResourceBindings(plan, plannedOutputs) {
+  const resources = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  );
+  const bindings = new Map([
+    ["resource_group_id", ["azurerm_resource_group.foundation", ["id"]]],
+    ["resource_group_name", ["azurerm_resource_group.foundation", ["name"]]],
+    [
+      "foundry_account_id",
+      ["module.foundry.azurerm_cognitive_account.this", ["id"]],
+    ],
+    [
+      "foundry_endpoint",
+      ["module.foundry.azurerm_cognitive_account.this", ["endpoint"]],
+    ],
+    [
+      "relay_container_app_id",
+      [CONTAINER_APP, ["id"]],
+    ],
+    [
+      "relay_container_app_name",
+      [CONTAINER_APP, ["name"]],
+    ],
+    [
+      "expiry_cleanup_job_id",
+      [EXPIRY_CLEANUP_JOB, ["id"]],
+    ],
+    [
+      "expiry_cleanup_job_name",
+      [EXPIRY_CLEANUP_JOB, ["name"]],
+    ],
+    [
+      "image_pull_identity_id",
+      [
+        "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+        ["id"],
+      ],
+    ],
+    [
+      "runtime_identity_id",
+      [
+        "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+        ["id"],
+      ],
+    ],
+    [
+      "runtime_identity_client_id",
+      [
+        "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+        ["client_id"],
+      ],
+    ],
+  ]);
+
+  return [...bindings].every(([name, [address, path]]) => {
+    const resource = resources.get(address);
+    if (!resource) {
+      return false;
+    }
+    const expected = bootstrapValueAtPath(resource.values, path);
+    const actual = plannedOutputs[name]?.value;
+    return expected !== undefined && isDeepStrictEqual(actual, expected);
+  });
+}
+
+function bootstrapHasExactOutputs(plan) {
+  const referencePlanned = MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values.outputs;
+  const referencePrior = MODEL_BOOTSTRAP_REFERENCE_PLAN.prior_state.values.outputs;
+  const referenceChanges = MODEL_BOOTSTRAP_REFERENCE_PLAN.output_changes;
+  const planned = plan.planned_values?.outputs;
+  const prior = plan.prior_state?.values?.outputs;
+  const changes = plan.output_changes;
+  const expectedNames = Object.keys(referenceChanges);
+  const shapeChecks = {
+    plannedKeys: hasExactKeys(planned, expectedNames),
+    priorKeys: hasExactKeys(prior, expectedNames),
+    changeKeys: hasExactKeys(changes, expectedNames),
+    plannedStructure: bootstrapHasStructuralEnvelope(planned, referencePlanned, {
+      allowDynamicLeaves: true,
+    }),
+    priorStructure: bootstrapHasStructuralEnvelope(prior, referencePrior, {
+      allowDynamicLeaves: true,
+    }),
+    changesStructure: bootstrapHasStructuralEnvelope(changes, referenceChanges, {
+      allowDynamicLeaves: true,
+    }),
+  };
+  if (Object.values(shapeChecks).some((value) => !value)) {
+    return false;
+  }
+
+  for (const name of expectedNames) {
+    const descriptor = planned[name];
+    const priorDescriptor = prior[name];
+    const outputChange = changes[name];
+    const referenceChange = referenceChanges[name];
+    const referenceValue = referencePlanned[name].value;
+    const valueTypeIsValid =
+      name === "foundry_deployment_names"
+        ? Array.isArray(descriptor.value) &&
+          descriptor.value.every((entry) => typeof entry === "string")
+        : bootstrapHasTerraformValueType(descriptor.value, descriptor.type);
+    const priorValueTypeIsValid =
+      name === "foundry_deployment_names"
+        ? Array.isArray(priorDescriptor.value) &&
+          priorDescriptor.value.every((entry) => typeof entry === "string")
+        : bootstrapHasTerraformValueType(
+            priorDescriptor.value,
+            priorDescriptor.type,
+          );
+    if (
+      !hasExactKeys(descriptor, Object.keys(referencePlanned[name])) ||
+      !hasExactKeys(priorDescriptor, Object.keys(referencePrior[name])) ||
+      !hasExactKeys(outputChange, Object.keys(referenceChange)) ||
+      descriptor.sensitive !== priorDescriptor.sensitive ||
+      !isDeepStrictEqual(descriptor.type, priorDescriptor.type) ||
+      !valueTypeIsValid ||
+      !priorValueTypeIsValid ||
+      !bootstrapCanonicalOutputValue(name, descriptor.value, referenceValue) ||
+      !isDeepStrictEqual(outputChange.before, priorDescriptor.value) ||
+      !isDeepStrictEqual(outputChange.after, descriptor.value) ||
+      outputChange.after_unknown !== false ||
+      outputChange.before_sensitive !== priorDescriptor.sensitive ||
+      outputChange.after_sensitive !== descriptor.sensitive ||
+      !isDeepStrictEqual(outputChange.actions, referenceChange.actions)
+    ) {
+      return false;
+    }
+
+    if (name === "foundry_deployment_names") {
+      if (
+        !isDeepStrictEqual(outputChange.before, [PINNED_DEPLOYMENT_NAME]) ||
+        !isDeepStrictEqual(outputChange.after, [
+          PINNED_DEPLOYMENT_NAME,
+          LUNA_DEPLOYMENT_NAME,
+        ]) ||
+        !isDeepStrictEqual(priorDescriptor.value, [PINNED_DEPLOYMENT_NAME])
+      ) {
+        return false;
+      }
+    } else if (
+      !isNoOp(outputChange.actions) ||
+      !isDeepStrictEqual(outputChange.before, outputChange.after)
+    ) {
+      return false;
+    }
+  }
+
+  const bindingsValid = bootstrapHasOutputResourceBindings(plan, planned);
+  return bindingsValid;
+}
+
+function bootstrapHasResourceGroupPayload(value, plan) {
+  const subscriptionId = plan.variables?.subscription_id?.value;
+  const expectedName = FINAL_RESOURCE_GROUP_NAME;
+  return (
+    hasExactKeys(value, [
+      "id",
+      "location",
+      "managed_by",
+      "name",
+      "tags",
+      "timeouts",
+    ]) &&
+    value.id === `/subscriptions/${subscriptionId}/resourceGroups/${value.name}` &&
+    value.location === plan.variables?.location?.value &&
+    value.managed_by === "" &&
+    value.name === expectedName &&
+    hasExactFinalTags(value.tags) &&
+    value.timeouts === null
+  );
+}
+
+function bootstrapHasResourceGroupIdentity(identity, plan) {
+  return (
+    hasExactKeys(identity, ["name", "subscription_id"]) &&
+    identity.name === FINAL_RESOURCE_GROUP_NAME &&
+    identity.subscription_id === plan.variables?.subscription_id?.value
+  );
+}
+
+function bootstrapHasExactResourceGroupNoOp(plan, changesByAddress) {
+  const resourceChange = changesByAddress.get("azurerm_resource_group.foundation");
+  const planned = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  ).get("azurerm_resource_group.foundation");
+  const prior = collectBootstrapManagedResources(
+    plan.prior_state?.values?.root_module,
+  ).get("azurerm_resource_group.foundation");
+  const change = resourceChange?.change;
+  return (
+    resourceChange !== undefined &&
+    isNoOp(change.actions) &&
+    bootstrapHasResourceGroupPayload(change.before, plan) &&
+    bootstrapHasResourceGroupPayload(change.after, plan) &&
+    bootstrapHasResourceGroupPayload(planned?.values, plan) &&
+    bootstrapHasResourceGroupPayload(prior?.values, plan) &&
+    bootstrapHasResourceGroupIdentity(change.before_identity, plan) &&
+    bootstrapHasResourceGroupIdentity(change.after_identity, plan)
+  );
+}
+
+function bootstrapHasExactRelayImageCrossBinding(plan, changesByAddress) {
+  const relayImageValue = plan.variables?.relay_image_digest?.value;
+  const relayImage = FINAL_RELAY_PRIOR_IMAGE;
+  const appCall =
+    plan.configuration?.root_module?.module_calls?.container_app_workload;
+  const imageReference = appCall?.expressions?.image_digest?.references;
+  if (
+    relayImageValue !== relayImage ||
+    !Array.isArray(imageReference) ||
+    imageReference.length !== 1 ||
+    imageReference[0] !== "var.relay_image_digest"
+  ) {
+    return false;
+  }
+
+  const appChange = changesByAddress.get(CONTAINER_APP)?.change;
+  const appPlanned = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  ).get(CONTAINER_APP);
+  const appPrior = collectBootstrapManagedResources(
+    plan.prior_state?.values?.root_module,
+  ).get(CONTAINER_APP);
+  const images = [
+    appChange?.before,
+    appChange?.after,
+    appPrior?.values,
+  ].map((value) =>
+    value?.body?.properties?.template?.containers?.find(
+      (container) => container.name === "relay",
+    )?.image,
+  );
+  const plannedImage = appPlanned?.values?.body?.properties?.template?.containers?.find(
+    (container) => container.name === "relay",
+  )?.image;
+  return (
+    images.every((image) => image === relayImage) &&
+    plannedImage === relayImage
+  );
+}
+
+function bootstrapPlannedValuesMatchChange(resourceValues, changeValues, address) {
+  if (isDeepStrictEqual(resourceValues, changeValues)) {
+    return true;
+  }
+  if (
+    address !== CONTAINER_APP ||
+    !isObject(resourceValues) ||
+    !isObject(changeValues)
+  ) {
+    return false;
+  }
+  const actual = structuredClone(resourceValues);
+  const expected = structuredClone(changeValues);
+  delete expected.output;
+  return isDeepStrictEqual(actual, expected);
+}
+
+function bootstrapNormalizeSubscription(value, subscriptionId) {
+  const referenceSubscription =
+    MODEL_BOOTSTRAP_REFERENCE_PLAN.variables.subscription_id.value;
+  const normalized = structuredClone(value);
+  const visit = (candidate) => {
+    if (Array.isArray(candidate)) {
+      candidate.forEach((child, index) => {
+        if (typeof child === "string") {
+          candidate[index] = child.replaceAll(subscriptionId, referenceSubscription);
+        } else {
+          visit(child);
+        }
+      });
+      return;
+    }
+    if (!isObject(candidate)) {
+      return;
+    }
+    for (const [key, child] of Object.entries(candidate)) {
+      if (typeof child === "string") {
+        candidate[key] = child.replaceAll(subscriptionId, referenceSubscription);
+      } else {
+        visit(child);
+      }
+    }
+  };
+  visit(normalized);
+  return normalized;
+}
+
+function bootstrapHasExactFixedNoOpContracts(plan, changesByAddress) {
+  const relayImageValue = plan.variables?.relay_image_digest?.value;
+  const litellmImage = plan.variables?.litellm_image_digest?.value;
+  const expiryImage = plan.variables?.expiry_cleanup_image_digest?.value;
+  const images = {
+    "palancar-relay": FINAL_RELAY_PRIOR_IMAGE,
+    "palancar-litellm-proxy": litellmImage,
+    "palancar-expiry-cleanup": expiryImage,
+  };
+  const app = changesByAddress.get(CONTAINER_APP);
+  const cleanupJob = changesByAddress.get(EXPIRY_CLEANUP_JOB);
+  const subscriptionId = plan.variables?.subscription_id?.value;
+  const normalizedApp = app && {
+    change: {
+      ...app.change,
+      after: bootstrapNormalizeSubscription(app.change.after, subscriptionId),
+    },
+  };
+  const normalizedCleanupJob = cleanupJob && {
+    change: {
+      ...cleanupJob.change,
+      after: bootstrapNormalizeSubscription(
+        cleanupJob.change.after,
+        subscriptionId,
+      ),
+    },
+  };
+  const normalizedAppContract =
+    app && finalNormalizedAppContractChange(normalizedApp);
+  const normalizedCleanupJobContract =
+    cleanupJob && finalNormalizedJobContractChange(normalizedCleanupJob);
+  const runtimeClientId = app?.change?.after?.body?.properties?.template?.containers
+    ?.find((container) => container.name === "relay")
+    ?.env?.find((entry) => entry.name === "AZURE_CLIENT_ID")?.value;
+  const result = (
+    relayImageValue === FINAL_RELAY_PRIOR_IMAGE &&
+    isImmutableAcrImage(images["palancar-litellm-proxy"]) &&
+    isImmutableAcrImage(images["palancar-expiry-cleanup"]) &&
+    finalUuid(runtimeClientId) &&
+    app !== undefined &&
+    cleanupJob !== undefined &&
+    hasExactFinalContainerApp(
+      normalizedAppContract,
+      images,
+      runtimeClientId,
+    ) &&
+    hasExactFinalCleanupJob(
+      normalizedCleanupJobContract,
+      images,
+      runtimeClientId,
+    )
+  );
+  return result;
+}
+
+function bootstrapRuntimeClientId(value) {
+  return value?.body?.properties?.template?.containers
+    ?.find((container) =>
+      ["relay", "expiry-cleanup"].includes(container.name),
+    )
+    ?.env?.find((entry) => entry.name === "AZURE_CLIENT_ID")?.value;
+}
+
+function bootstrapHasExactRuntimeIdentityBinding(plan, changesByAddress) {
+  const plannedResources = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  );
+  const priorResources = collectBootstrapManagedResources(
+    plan.prior_state?.values?.root_module,
+  );
+  const appChange = changesByAddress.get(CONTAINER_APP)?.change;
+  const cleanupChange = changesByAddress.get(EXPIRY_CLEANUP_JOB)?.change;
+  const ids = [
+    bootstrapRuntimeClientId(appChange?.before),
+    bootstrapRuntimeClientId(appChange?.after),
+    bootstrapRuntimeClientId(plannedResources.get(CONTAINER_APP)?.values),
+    bootstrapRuntimeClientId(priorResources.get(CONTAINER_APP)?.values),
+    bootstrapRuntimeClientId(cleanupChange?.before),
+    bootstrapRuntimeClientId(cleanupChange?.after),
+    bootstrapRuntimeClientId(
+      plannedResources.get(EXPIRY_CLEANUP_JOB)?.values,
+    ),
+    bootstrapRuntimeClientId(priorResources.get(EXPIRY_CLEANUP_JOB)?.values),
+  ];
+  if (!ids.every(finalUuid) || !ids.every((id) => id === ids[0])) {
+    return false;
+  }
+
+  const outputValues = [
+    plan.planned_values?.outputs?.runtime_identity_client_id?.value,
+    plan.prior_state?.values?.outputs?.runtime_identity_client_id?.value,
+    plan.output_changes?.runtime_identity_client_id?.before,
+    plan.output_changes?.runtime_identity_client_id?.after,
+  ];
+  const referenceOutput =
+    MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values.outputs
+      .runtime_identity_client_id.value;
+  if (outputValues.every((value) => value === referenceOutput)) {
+    const referenceApp = collectBootstrapManagedResources(
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values.root_module,
+    ).get(CONTAINER_APP);
+    return ids[0] === bootstrapRuntimeClientId(referenceApp?.values);
+  }
+  return outputValues.every((value) => value === ids[0]);
+}
+
+function bootstrapHasExactDynamicResourceBindings(plan, changesByAddress) {
+  const subscriptionId = plan.variables?.subscription_id?.value;
+  if (!finalUuid(subscriptionId)) {
+    return false;
+  }
+  const resources = collectBootstrapManagedResources(
+    plan.planned_values?.root_module,
+  );
+  const valueOf = (address) => resources.get(address)?.values;
+  const resourceGroup = valueOf("azurerm_resource_group.foundation");
+  const storage = valueOf("module.workload_state.azurerm_storage_account.this");
+  const rate = valueOf("module.workload_state.azapi_resource.rate");
+  const security = valueOf("module.workload_state.azapi_resource.security");
+  const environment = valueOf(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+  );
+  const app = valueOf(CONTAINER_APP);
+  const job = valueOf(EXPIRY_CLEANUP_JOB);
+  const foundry = valueOf("module.foundry.azurerm_cognitive_account.this");
+  const pinned = valueOf(MODEL_SPIKE_DEPLOYMENT);
+  const resourceGroupId = resourceGroup?.id;
+  const storageId = storage?.id;
+  const tableServiceId = rate?.parent_id;
+  const foundryId = foundry?.id;
+  const environmentId = environment?.id;
+  const resourceGroupName = resourceGroup?.name;
+  const allCanonicalIds = (value) => {
+    if (typeof value === "string") {
+      const match = /\/subscriptions\/([^/]+)/i.exec(value);
+      return match === null || match[1].toLowerCase() === subscriptionId.toLowerCase();
+    }
+    if (Array.isArray(value)) return value.every(allCanonicalIds);
+    return !isObject(value) || Object.values(value).every(allCanonicalIds);
+  };
+  if (
+    !allCanonicalIds(plan.prior_state) ||
+    !allCanonicalIds(plan.planned_values) ||
+    !allCanonicalIds(plan.resource_changes) ||
+    !allCanonicalIds(plan.output_changes)
+  ) {
+    return false;
+  }
+  if (
+    !isObject(resourceGroup) ||
+    !bootstrapCanonicalArmId(resourceGroupId) ||
+    resourceGroupId !==
+      `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroupName}` ||
+    typeof resourceGroupName !== "string" ||
+    !isObject(storage) ||
+    !bootstrapCanonicalArmId(storageId) ||
+    !isObject(rate) ||
+    !isObject(security) ||
+    !isObject(environment) ||
+    !bootstrapCanonicalArmId(environmentId) ||
+    !isObject(app) ||
+    !isObject(job) ||
+    !isObject(foundry) ||
+    !bootstrapCanonicalArmId(foundryId) ||
+    !isObject(pinned)
+  ) {
+    return false;
+  }
+  const resourceIdHasName = (id, kind, name) =>
+    typeof id === "string" &&
+    id.endsWith(`/providers/Microsoft.${kind}/${name}`);
+  if (
+    !resourceIdHasName(environmentId, "App/managedEnvironments", environment.name) ||
+    app.parent_id !== resourceGroupId ||
+    job.parent_id !== resourceGroupId ||
+    app.body?.properties?.managedEnvironmentId !== environmentId ||
+    job.body?.properties?.environmentId !== environmentId ||
+    !resourceIdHasName(app.id, "App/containerApps", app.name) ||
+    !resourceIdHasName(job.id, "App/jobs", job.name) ||
+    !resourceIdHasName(foundryId, "CognitiveServices/accounts", foundry.name) ||
+    foundry.endpoint !== undefined &&
+      (typeof foundry.endpoint !== "string" ||
+        !/^https:\/\/[a-z0-9-]+\.openai\.azure\.com\/$/.test(foundry.endpoint)) ||
+    pinned.id !== `${foundryId}/deployments/${PINNED_DEPLOYMENT_NAME}` ||
+    !bootstrapCanonicalArmId(storageId) ||
+    !isObject(rate.body) ||
+    !isObject(security.body) ||
+    rate.id !== `${tableServiceId}/tables/RateState` ||
+    security.id !== `${tableServiceId}/tables/SecurityState` ||
+    !bootstrapCanonicalArmId(tableServiceId)
+  ) {
+    return false;
+  }
+  const outputValues = plan.planned_values?.outputs;
+  const outputBindings = new Map([
+    ["resource_group_id", resourceGroupId],
+    ["resource_group_name", resourceGroupName],
+    ["foundry_account_id", foundryId],
+    ["foundry_endpoint", foundry.endpoint],
+    ["relay_container_app_id", app.id],
+    ["relay_container_app_name", app.name],
+    ["expiry_cleanup_job_id", job.id],
+    ["expiry_cleanup_job_name", job.name],
+    [
+      "image_pull_identity_id",
+      valueOf("module.identities_rbac.azurerm_user_assigned_identity.image_pull")?.id,
+    ],
+    [
+      "runtime_identity_id",
+      valueOf("module.identities_rbac.azurerm_user_assigned_identity.runtime")?.id,
+    ],
+    [
+      "runtime_identity_client_id",
+      valueOf("module.identities_rbac.azurerm_user_assigned_identity.runtime")
+        ?.client_id,
+    ],
+  ]);
+  return [...outputBindings].every(
+    ([name, expected]) =>
+      expected !== undefined &&
+      isDeepStrictEqual(outputValues?.[name]?.value, expected),
+  );
+}
+
+function collectBootstrapAllStateResources(value, resources = new Map()) {
+  if (!isObject(value)) return resources;
+  if (
+    typeof value.address === "string" &&
+    (value.mode === "managed" || value.mode === "data") &&
+    Object.hasOwn(value, "values")
+  ) {
+    if (resources.has(value.address)) {
+      resources.set(value.address, undefined);
+    } else {
+      resources.set(value.address, value);
+    }
+  }
+  for (const child of value.resources ?? []) {
+    collectBootstrapAllStateResources(child, resources);
+  }
+  for (const child of value.child_modules ?? []) {
+    collectBootstrapAllStateResources(child, resources);
+  }
+  return resources;
+}
+
+function bootstrapHasExactRoleAssignments(plan, changesByAddress) {
+  const variables = plan.variables;
+  const sub = variables?.subscription_id?.value;
+  const planned = collectBootstrapAllStateResources(
+    plan.planned_values?.root_module,
+  );
+  const prior = collectBootstrapAllStateResources(
+    plan.prior_state?.values?.root_module,
+  );
+  const valueOf = (address) => planned.get(address)?.values;
+  const imagePrincipal = valueOf(
+    "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+  )?.principal_id;
+  const runtimePrincipal = valueOf(
+    "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  )?.principal_id;
+  const cliPrincipal = valueOf(
+    "module.workload_key_vault.data.azurerm_client_config.current",
+  )?.object_id ??
+    prior.get("module.workload_key_vault.data.azurerm_client_config.current")
+      ?.values?.object_id;
+  const scopes = {
+    acr: valueOf("module.container_registry.azurerm_container_registry.this")?.id,
+    storage: valueOf("module.workload_state.azurerm_storage_account.this")?.id,
+    foundry: valueOf("module.foundry.azurerm_cognitive_account.this")?.id,
+    monitoring: valueOf("module.observability.azurerm_application_insights.this")?.id,
+    securityTable: valueOf("module.workload_state.azapi_resource.security")?.id,
+    rateTable: valueOf("module.workload_state.azapi_resource.rate")?.id,
+    keyVault: valueOf("module.workload_key_vault.azurerm_key_vault.this")?.id,
+  };
+  const roleDefinition = (variableName, expectedGuid) => {
+    const value = variables?.[variableName]?.value;
+    return value === expectedGuid
+      ? `/subscriptions/${sub}/providers/Microsoft.Authorization/roleDefinitions/${value}`
+      : undefined;
+  };
+  const definitions = {
+    acr: roleDefinition("acr_pull_role_definition_id", BOOTSTRAP_ROLE_DEFINITION_IDS.acr),
+    table: roleDefinition(
+      "table_data_contributor_role_definition_id",
+      BOOTSTRAP_ROLE_DEFINITION_IDS.table,
+    ),
+    openai: roleDefinition(
+      "openai_user_role_definition_id",
+      BOOTSTRAP_ROLE_DEFINITION_IDS.openai,
+    ),
+    monitoring: `/subscriptions/${sub}/providers/Microsoft.Authorization/roleDefinitions/${BOOTSTRAP_ROLE_DEFINITION_IDS.monitoring}`,
+    secretsUser: `/subscriptions/${sub}/providers/Microsoft.Authorization/roleDefinitions/${BOOTSTRAP_ROLE_DEFINITION_IDS.secretsUser}`,
+    secretsOfficer: `/subscriptions/${sub}/providers/Microsoft.Authorization/roleDefinitions/${BOOTSTRAP_ROLE_DEFINITION_IDS.secretsOfficer}`,
+  };
+  if (
+    !finalUuid(sub) ||
+    !finalUuid(imagePrincipal) ||
+    !finalUuid(runtimePrincipal) ||
+    !finalUuid(cliPrincipal) ||
+    Object.values(scopes).some((value) => !bootstrapCanonicalArmId(value)) ||
+    Object.values(definitions).some((value) => value === undefined)
+  ) {
+    return false;
+  }
+  const contracts = new Map([
+    [
+      "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+      {
+        scope: scopes.acr,
+        role: definitions.acr,
+        roleName: "AcrPull",
+        principal: imagePrincipal,
+        principalType: "ServicePrincipal",
+        nameInput: `${scopes.acr}/image-pull/${definitions.acr}`,
+      },
+    ],
+    [
+      "module.identities_rbac.azurerm_role_assignment.runtime_table",
+      {
+        scope: scopes.storage,
+        role: definitions.table,
+        roleName: "Storage Table Data Contributor",
+        principal: runtimePrincipal,
+        principalType: "ServicePrincipal",
+        nameInput: `${scopes.storage}/runtime/${definitions.table}`,
+      },
+    ],
+    [
+      "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+      {
+        scope: scopes.foundry,
+        role: definitions.openai,
+        roleName: "Cognitive Services OpenAI User",
+        principal: runtimePrincipal,
+        principalType: "ServicePrincipal",
+        nameInput: `${scopes.foundry}/runtime/${definitions.openai}`,
+      },
+    ],
+    [
+      FINAL_MONITORING_ROLE_ASSIGNMENT,
+      {
+        scope: scopes.monitoring,
+        role: definitions.monitoring,
+        roleName: "Monitoring Metrics Publisher",
+        principal: runtimePrincipal,
+        principalType: "ServicePrincipal",
+        nameInput: `scope=${scopes.monitoring}|principal_id=${runtimePrincipal}|role_definition_id=${definitions.monitoring}`,
+      },
+    ],
+    [
+      "module.identities_rbac.azurerm_role_assignment.operator_security_table",
+      {
+        scope: scopes.securityTable,
+        role: definitions.table,
+        roleName: "Storage Table Data Contributor",
+        principal: variables.operator_principal_id.value,
+        principalType: "User",
+        nameInput: `${scopes.securityTable}/operator/${variables.operator_principal_id.value}/${definitions.table}`,
+      },
+    ],
+    [
+      "module.identities_rbac.azurerm_role_assignment.operator_rate_table",
+      {
+        scope: scopes.rateTable,
+        role: definitions.table,
+        roleName: "Storage Table Data Contributor",
+        principal: variables.operator_principal_id.value,
+        principalType: "User",
+        nameInput: `${scopes.rateTable}/operator/${variables.operator_principal_id.value}/${definitions.table}`,
+      },
+    ],
+    [
+      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+      {
+        scope: scopes.keyVault,
+        role: definitions.secretsUser,
+        roleName: "Key Vault Secrets User",
+        principal: runtimePrincipal,
+        principalType: "ServicePrincipal",
+        nameInput: `${scopes.keyVault}/runtime/${runtimePrincipal}/${definitions.secretsUser}`,
+      },
+    ],
+    [
+      "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+      {
+        scope: scopes.keyVault,
+        role: definitions.secretsOfficer,
+        roleName: "Key Vault Secrets Officer",
+        principal: cliPrincipal,
+        principalType: "User",
+        nameInput: `${scopes.keyVault}/terraform-cli/${cliPrincipal}/${definitions.secretsOfficer}`,
+      },
+    ],
+  ]);
+  for (const [address, contract] of contracts) {
+    const resourceChange = changesByAddress.get(address);
+    if (
+      resourceChange === undefined ||
+      !isNoOp(resourceChange.change.actions) ||
+      !finalUuid(contract.principal) ||
+      !finalUuid(contract.scope.match(/\/subscriptions\/([^/]+)/i)?.[1])
+    ) {
+      return false;
+    }
+    const expectedName = uuidV5Url(contract.nameInput);
+    const expectedId = `${contract.scope}/providers/Microsoft.Authorization/roleAssignments/${expectedName}`;
+    const referenceAfter = resourceChange.change.after;
+    const values = [
+      resourceChange.change.before,
+      resourceChange.change.after,
+      prior.get(address)?.values,
+      planned.get(address)?.values,
+    ];
+    for (const value of values) {
+      if (
+        !isObject(value) ||
+        !hasExactKeys(value, Object.keys(referenceAfter)) ||
+        value.name !== expectedName ||
+        value.id !== expectedId ||
+        value.scope !== contract.scope ||
+        value.role_definition_id !== contract.role ||
+        value.role_definition_name !== contract.roleName ||
+        value.principal_id !== contract.principal ||
+        value.principal_type !== contract.principalType ||
+        value.condition !== "" ||
+        value.condition_version !== "" ||
+        value.delegated_managed_identity_resource_id !== "" ||
+        value.description !== "" ||
+        value.skip_service_principal_aad_check !== null ||
+        value.timeouts !== null
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function acceptsLunaModelBootstrap(plan, changes) {
+  if (
+    !hasExactKeys(plan, Object.keys(MODEL_BOOTSTRAP_REFERENCE_PLAN)) ||
+    plan.terraform_version !== "1.15.8" ||
+    plan.applyable !== true ||
+    plan.complete !== true ||
+    plan.errored !== false ||
+    typeof plan.timestamp !== "string" ||
+    !bootstrapHasCanonicalTimestamp(plan.timestamp) ||
+    hasBootstrapForbiddenPlanStructure(plan) ||
+    hasRetiredDeployment(plan) ||
+    !bootstrapHasExactVariables(plan) ||
+    !bootstrapHasExactContactBindings(plan) ||
+    !bootstrapHasExactConfiguration(plan) ||
+    !isDeepStrictEqual(
+      plan.relevant_attributes,
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.relevant_attributes,
+    ) ||
+    !Array.isArray(plan.checks) ||
+    hasNonPassingCheck(plan) ||
+    !bootstrapHasStructuralEnvelope(
+      plan.checks,
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.checks,
+      { allowDynamicLeaves: true },
+    ) ||
+    !bootstrapHasExactOutputs(plan) ||
+    !bootstrapHasCoherentState(
+      plan,
+      new Map(changes.map((change) => [change.address, change])),
+    ) ||
+    !bootstrapHasExactResourceChanges(changes)
+  ) {
+    return false;
+  }
+
+  const changesByAddress = new Map(
+    changes.map((change) => [change.address, change]),
+  );
+  if (
+    !bootstrapHasExactResourceGroupNoOp(plan, changesByAddress) ||
+    !bootstrapHasExactRelayImageCrossBinding(plan, changesByAddress) ||
+    !bootstrapHasExactFixedNoOpContracts(plan, changesByAddress) ||
+    !bootstrapHasExactRuntimeIdentityBinding(plan, changesByAddress) ||
+    !bootstrapHasExactDynamicResourceBindings(plan, changesByAddress) ||
+    !bootstrapHasExactRoleAssignments(plan, changesByAddress)
+  ) {
+    return false;
+  }
+
+  let lunaCreates = 0;
+  for (const resourceChange of changes) {
+    if (
+      !MODEL_BOOTSTRAP_RESOURCE_ADDRESSES.has(resourceChange.address) ||
+      !bootstrapHasExactResourceMetadata(resourceChange)
+    ) {
+      return false;
+    }
+    if (resourceChange.address === LUNA_DEPLOYMENT) {
+      if (!bootstrapHasExactLunaCreate(resourceChange, plan)) {
+        return false;
+      }
+      lunaCreates += 1;
+      continue;
+    }
+
+    if (!isNoOp(resourceChange.change.actions)) {
+      return false;
+    }
+  }
+
+  return (
+    changes.length === MODEL_BOOTSTRAP_RESOURCE_ADDRESSES.size &&
+    lunaCreates === 1
+  );
+}
+
 function finalHasExactOutputs(plan) {
   const expectedNames = Object.keys(FINAL_REFERENCE_PLAN.planned_values.outputs);
   const planned = plan.planned_values?.outputs;
@@ -4198,6 +5925,7 @@ export function acceptsPlan(plan, mode) {
       FULL_DEPLOY_MODE,
       RUNTIME_ROLLOUT_MODE,
       FINAL_ROLLOUT_MODE,
+      LUNA_MODEL_BOOTSTRAP_MODE,
     ].includes(mode)
   ) {
     return false;
@@ -4231,6 +5959,10 @@ export function acceptsPlan(plan, mode) {
 
   if (mode === MODEL_SPIKE_MODE) {
     return acceptsModelSpike(changes);
+  }
+
+  if (mode === LUNA_MODEL_BOOTSTRAP_MODE) {
+    return acceptsLunaModelBootstrap(plan, changes);
   }
 
   const requiredNoOpAddresses = new Set(FOUNDATION_NO_OP_ADDRESSES);
@@ -4287,6 +6019,7 @@ function getMode(argv) {
     FULL_DEPLOY_MODE,
     RUNTIME_ROLLOUT_MODE,
     FINAL_ROLLOUT_MODE,
+    LUNA_MODEL_BOOTSTRAP_MODE,
   ].includes(mode)
     ? mode
     : undefined;

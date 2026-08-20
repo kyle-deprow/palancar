@@ -16,6 +16,20 @@ const finalFixtureText = readFileSync(
   "utf8",
 );
 const finalTransitionFixture = JSON.parse(finalFixtureText);
+const lunaFixtureText = readFileSync(
+  new URL(
+    "./fixtures/luna-model-bootstrap.plan-fixture.json",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const lunaModelBootstrapFixture = JSON.parse(lunaFixtureText);
+const lunaDeploymentAddress =
+  'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]';
+const lunaTranscriptionAddress =
+  'module.foundry.azurerm_cognitive_deployment.this["gpt-4o-mini-transcribe"]';
+const lunaContainerAppAddress =
+  "module.container_app_workload[0].azapi_resource.this";
 const FIXTURE_LOG_ANALYTICS_PRIMARY_SHARED_KEY =
   "EREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREQ==";
 const FIXTURE_LOG_ANALYTICS_SECONDARY_SHARED_KEY =
@@ -1771,7 +1785,7 @@ test("the final fixture contains only synthetic contacts and credential-free pla
 
   assert.match(
     finalFixtureText,
-    /palancar-relay@sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df/,
+    /palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd/,
   );
   for (const pattern of [
     /\bsk-[A-Za-z0-9_-]{20,}\b/,
@@ -1852,6 +1866,30 @@ test("the final fixture contains only synthetic contacts and credential-free pla
     taggedValues.every((value) => value === "" || syntheticUuid(value)),
     true,
   );
+});
+
+test("final-rollout rejects the historical stale predecessor digest", () => {
+  const candidate = finalRolloutPlan();
+  const liveDigest =
+    "e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd";
+  const staleDigest =
+    "af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df";
+  function replaceDigest(value) {
+    if (typeof value === "string") {
+      return value.replaceAll(liveDigest, staleDigest);
+    }
+    if (Array.isArray(value)) {
+      return value.map(replaceDigest);
+    }
+    if (value !== null && typeof value === "object") {
+      for (const [key, child] of Object.entries(value)) {
+        value[key] = replaceDigest(child);
+      }
+    }
+    return value;
+  }
+  replaceDigest(candidate);
+  assert.equal(acceptsPlan(candidate, "final-rollout"), false);
 });
 
 test("the final fixture permits only approved synthetic sensitive values", () => {
@@ -4598,6 +4636,761 @@ test("runtime-rollout requires versionless same-vault Key Vault refs and no plai
   }
 });
 
+function lunaBootstrapPlan() {
+  return clone(lunaModelBootstrapFixture);
+}
+
+function lunaBootstrapChange(candidate, address) {
+  const entry = candidate.resource_changes.find(
+    (changeEntry) => changeEntry.address === address,
+  );
+  assert.ok(entry, `missing Luna bootstrap fixture change: ${address}`);
+  return entry;
+}
+
+function lunaBootstrapValueResource(root, address) {
+  for (const resource of root?.resources ?? []) {
+    if (resource.address === address) {
+      return resource;
+    }
+  }
+  for (const childModule of root?.child_modules ?? []) {
+    const resource = lunaBootstrapValueResource(childModule, address);
+    if (resource) {
+      return resource;
+    }
+  }
+  return undefined;
+}
+
+function lunaBootstrapWalk(value, visit) {
+  visit(value);
+  if (Array.isArray(value)) {
+    value.forEach((child) => lunaBootstrapWalk(child, visit));
+  } else if (value && typeof value === "object") {
+    Object.values(value).forEach((child) => lunaBootstrapWalk(child, visit));
+  }
+}
+
+function lunaBootstrapReplaceString(value, from, to) {
+  lunaBootstrapWalk(value, (child) => {
+    if (!child || typeof child !== "object") return;
+    for (const [key, nested] of Object.entries(child)) {
+      if (typeof nested === "string" && nested.includes(from)) {
+        child[key] = nested.replaceAll(from, to);
+      }
+    }
+  });
+}
+
+function lunaBootstrapRoleValues(candidate, address, mutate) {
+  const change = lunaBootstrapChange(candidate, address);
+  for (const value of [change.change.before, change.change.after]) {
+    mutate(value);
+  }
+  for (const root of [
+    candidate.prior_state.values.root_module,
+    candidate.planned_values.root_module,
+  ]) {
+    mutate(lunaBootstrapValueResource(root, address).values);
+  }
+}
+
+const lunaBootstrapRoleOutputNames = new Map([
+  [
+    "module.identities_rbac.azurerm_role_assignment.operator_security_table",
+    "operator_security_table_role_assignment_id",
+  ],
+  [
+    "module.identities_rbac.azurerm_role_assignment.operator_rate_table",
+    "operator_rate_table_role_assignment_id",
+  ],
+  [
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+    "runtime_application_insights_role_assignment_id",
+  ],
+  [
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+    "runtime_openai_user_role_assignment_id",
+  ],
+]);
+
+function lunaBootstrapRecomputeRoleIdentity(candidate, address) {
+  const change = lunaBootstrapChange(candidate, address);
+  const values = [
+    change.change.before,
+    change.change.after,
+    lunaBootstrapValueResource(candidate.prior_state.values.root_module, address)
+      .values,
+    lunaBootstrapValueResource(candidate.planned_values.root_module, address)
+      .values,
+  ];
+  const nameInput = (value) => {
+    if (address.endsWith("image_pull_acr")) {
+      return `${value.scope}/image-pull/${value.role_definition_id}`;
+    }
+    if (
+      address.endsWith("runtime_table") ||
+      address.endsWith("runtime_openai")
+    ) {
+      return `${value.scope}/runtime/${value.role_definition_id}`;
+    }
+    if (address.endsWith("runtime_application_insights")) {
+      return `scope=${value.scope}|principal_id=${value.principal_id}|role_definition_id=${value.role_definition_id}`;
+    }
+    if (address.includes("operator_")) {
+      return `${value.scope}/operator/${value.principal_id}/${value.role_definition_id}`;
+    }
+    if (address.endsWith("runtime_secrets_user")) {
+      return `${value.scope}/runtime/${value.principal_id}/${value.role_definition_id}`;
+    }
+    return `${value.scope}/terraform-cli/${value.principal_id}/${value.role_definition_id}`;
+  };
+  for (const value of values) {
+    const name = fixtureUuidV5Url(nameInput(value));
+    value.name = name;
+    value.id = `${value.scope}/providers/Microsoft.Authorization/roleAssignments/${name}`;
+  }
+  const outputName = lunaBootstrapRoleOutputNames.get(address);
+  if (outputName) {
+    const id = change.change.after.id;
+    candidate.planned_values.outputs[outputName].value = id;
+    candidate.prior_state.values.outputs[outputName].value = id;
+    candidate.output_changes[outputName].before = id;
+    candidate.output_changes[outputName].after = id;
+  }
+}
+
+function lunaBootstrapSetRuntimeClientId(candidate, clientId) {
+  for (const address of [lunaContainerAppAddress, "module.expiry_cleanup_job[0].azapi_resource.this"]) {
+    const resourceChange = lunaBootstrapChange(candidate, address);
+    for (const value of [resourceChange.change.before, resourceChange.change.after]) {
+      const container = value.body.properties.template.containers.find(
+        (entry) => ["relay", "expiry-cleanup"].includes(entry.name),
+      );
+      container.env.find((entry) => entry.name === "AZURE_CLIENT_ID").value =
+        clientId;
+    }
+    for (const root of [
+      candidate.planned_values.root_module,
+      candidate.prior_state.values.root_module,
+    ]) {
+      const resource = lunaBootstrapValueResource(root, address);
+      const container = resource.values.body.properties.template.containers.find(
+        (entry) => ["relay", "expiry-cleanup"].includes(entry.name),
+      );
+      container.env.find((entry) => entry.name === "AZURE_CLIENT_ID").value =
+        clientId;
+    }
+  }
+  const identityAddress =
+    "module.identities_rbac.azurerm_user_assigned_identity.runtime";
+  const identityChange = lunaBootstrapChange(candidate, identityAddress);
+  for (const value of [identityChange.change.before, identityChange.change.after]) {
+    value.client_id = clientId;
+  }
+  for (const root of [
+    candidate.planned_values.root_module,
+    candidate.prior_state.values.root_module,
+  ]) {
+    lunaBootstrapValueResource(root, identityAddress).values.client_id = clientId;
+  }
+  for (const output of [
+    candidate.planned_values.outputs.runtime_identity_client_id,
+    candidate.prior_state.values.outputs.runtime_identity_client_id,
+  ]) {
+    output.value = clientId;
+  }
+  candidate.output_changes.runtime_identity_client_id.before = clientId;
+  candidate.output_changes.runtime_identity_client_id.after = clientId;
+}
+
+function lunaBootstrapSetRelayImage(candidate, image) {
+  candidate.variables.relay_image_digest.value = image;
+  const resourceChange = lunaBootstrapChange(candidate, lunaContainerAppAddress);
+  for (const value of [resourceChange.change.before, resourceChange.change.after]) {
+    value.body.properties.template.containers.find(
+      (entry) => entry.name === "relay",
+    ).image = image;
+  }
+  for (const root of [
+    candidate.planned_values.root_module,
+    candidate.prior_state.values.root_module,
+  ]) {
+    lunaBootstrapValueResource(root, lunaContainerAppAddress).values.body.properties.template.containers.find(
+      (entry) => entry.name === "relay",
+    ).image = image;
+  }
+}
+
+function rejectsLunaBootstrapMutation(mutate) {
+  const candidate = lunaBootstrapPlan();
+  mutate(candidate);
+  const accepted = acceptsPlan(candidate, "luna-model-bootstrap");
+  assert.equal(accepted, false);
+}
+
+test("luna-model-bootstrap binds the Foundry resource .this declaration", () => {
+  assert.equal(
+    lunaDeploymentAddress,
+    'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]',
+  );
+  assert.ok(
+    lunaBootstrapPlan().resource_changes.some(
+      (entry) => entry.address === lunaDeploymentAddress,
+    ),
+  );
+});
+
+test("luna-model-bootstrap accepts the complete exact Luna transition", () => {
+  const candidate = lunaBootstrapPlan();
+  assert.equal(acceptsPlan(candidate, "luna-model-bootstrap"), true);
+  assert.equal(candidate.resource_changes.length, 40);
+  assert.equal(
+    Object.keys(candidate.configuration.root_module.module_calls).length,
+    10,
+  );
+  assert.ok(
+    candidate.resource_changes.every(
+      (entry) =>
+        typeof entry.provider_name === "string",
+    ),
+  );
+  const stateResources = [];
+  for (const root of [
+    candidate.planned_values.root_module,
+    candidate.prior_state.values.root_module,
+  ]) {
+    lunaBootstrapWalk(root, (value) => {
+      if (value?.mode === "managed" || value?.mode === "data") {
+        stateResources.push(value);
+      }
+    });
+  }
+  assert.ok(
+    stateResources.length > 0 &&
+      stateResources.every(
+        (resource) =>
+          typeof resource.provider_name === "string" &&
+          Number.isInteger(resource.schema_version) &&
+          (resource.identity_schema_version === undefined ||
+            (Number.isInteger(resource.identity_schema_version) &&
+              resource.identity &&
+              typeof resource.identity === "object")),
+      ),
+  );
+  assert.equal(candidate.applyable, true);
+  assert.equal(
+    candidate.resource_changes.filter((entry) =>
+      entry.change.actions.includes("create"),
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    candidate.output_changes.foundry_deployment_names,
+    {
+      actions: ["update"],
+      before: ["gpt-4o-mini-transcribe"],
+      after: ["gpt-4o-mini-transcribe", "gpt-5.6-luna"],
+      after_unknown: false,
+      before_sensitive: false,
+      after_sensitive: false,
+    },
+  );
+});
+
+test("luna-model-bootstrap fixture is complete and contains only synthetic secret material", () => {
+  assert.doesNotMatch(lunaFixtureText, /\b(?:sk|pk)-[A-Za-z0-9_-]{20,}\b/i);
+  assert.doesNotMatch(lunaFixtureText, /\bBearer\s+[A-Za-z0-9._-]{12,}\b/i);
+  assert.doesNotMatch(lunaFixtureText, /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/);
+
+  const sensitiveKeys = new Set([
+    "primary_shared_key",
+    "secondary_shared_key",
+    "primary_access_key",
+    "secondary_access_key",
+    "primary_connection_string",
+    "secondary_connection_string",
+    "primary_blob_connection_string",
+    "secondary_blob_connection_string",
+    "connection_string",
+    "instrumentation_key",
+    "admin_password",
+  ]);
+  lunaBootstrapWalk(lunaBootstrapPlan(), (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (!sensitiveKeys.has(key)) continue;
+      if (child !== null && typeof child !== "string") continue;
+      assert.equal(
+        APPROVED_FIXTURE_SENSITIVE_VALUES.has(child) ||
+          (typeof child === "string" &&
+            /^fixture-[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(child)),
+        true,
+        `unapproved Luna fixture sensitive value at ${key}`,
+      );
+    }
+  });
+});
+
+test("luna-model-bootstrap rejects every Luna identity and contract mutation", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaDeploymentAddress).address =
+      'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna-copy"]';
+  });
+  for (const mutate of [
+    (after) => { after.name = "gpt-5.6-luna-copy"; },
+    (after) => { after.model[0].name = "gpt-5.6-luna-copy"; },
+    (after) => { after.model[0].version = "2026-07-08"; },
+    (after) => { after.model[0].format = "AzureOpenAI"; },
+    (after) => { after.sku[0].name = "Standard"; },
+    (after) => { after.version_upgrade_option = "AutoUpgrade"; },
+    (after) => { after.sku[0].capacity = 1000; },
+    (after) => { after.sku[0].capacity = 1012; },
+    (after) => { after.sku[0].capacity = 1014; },
+  ]) {
+    rejectsLunaBootstrapMutation((candidate) =>
+      mutate(lunaBootstrapChange(candidate, lunaDeploymentAddress).change.after),
+    );
+  }
+});
+
+test("luna-model-bootstrap rejects coordinated structural mutations", () => {
+  const resourceGroupAddress = "azurerm_resource_group.foundation";
+  const mutations = [
+    [
+      "added configuration subtree",
+      (candidate) => {
+        candidate.configuration.root_module.module_calls.unexpected = clone(
+          candidate.configuration.root_module.module_calls.foundry,
+        );
+      },
+    ],
+    [
+      "added variable",
+      (candidate) => {
+        candidate.variables.unexpected = { value: "caller-controlled" };
+      },
+    ],
+    [
+      "added relevant attribute",
+      (candidate) => {
+        candidate.relevant_attributes.push(clone(candidate.relevant_attributes[0]));
+      },
+    ],
+    [
+      "added prior resource field",
+      (candidate) => {
+        lunaBootstrapValueResource(
+          candidate.prior_state.values.root_module,
+          resourceGroupAddress,
+        ).unexpected = true;
+      },
+    ],
+    [
+      "added planned resource field",
+      (candidate) => {
+        lunaBootstrapValueResource(
+          candidate.planned_values.root_module,
+          resourceGroupAddress,
+        ).unexpected = true;
+      },
+    ],
+    [
+      "coordinated planned/prior type mutation",
+      (candidate) => {
+        lunaBootstrapValueResource(
+          candidate.prior_state.values.root_module,
+          resourceGroupAddress,
+        ).type = "terraform_data";
+        lunaBootstrapValueResource(
+          candidate.planned_values.root_module,
+          resourceGroupAddress,
+        ).type = "terraform_data";
+      },
+    ],
+    [
+      "coordinated resource-change and state type mutation",
+      (candidate) => {
+        lunaBootstrapChange(candidate, resourceGroupAddress).type =
+          "terraform_data";
+        lunaBootstrapValueResource(
+          candidate.prior_state.values.root_module,
+          resourceGroupAddress,
+        ).type = "terraform_data";
+        lunaBootstrapValueResource(
+          candidate.planned_values.root_module,
+          resourceGroupAddress,
+        ).type = "terraform_data";
+      },
+    ],
+    [
+      "resource-change provider metadata mutation",
+      (candidate) => {
+        lunaBootstrapChange(candidate, resourceGroupAddress).provider_name =
+          "registry.terraform.io/caller/azurerm";
+      },
+    ],
+    [
+      "resource-change module location mutation",
+      (candidate) => {
+        lunaBootstrapChange(candidate, lunaTranscriptionAddress).module_address =
+          "module.wrapper.module.foundry";
+      },
+    ],
+    [
+      "resource-group identity envelope mutation",
+      (candidate) => {
+        const change = lunaBootstrapChange(candidate, resourceGroupAddress).change;
+        change.before_identity.name = "rg-palancar-dev-attacker";
+        change.after_identity.name = "rg-palancar-dev-attacker";
+      },
+    ],
+    [
+      "prior root structural field",
+      (candidate) => {
+        candidate.prior_state.values.root_module.unexpected = true;
+      },
+    ],
+    [
+      "planned root structural field",
+      (candidate) => {
+        candidate.planned_values.root_module.unexpected = true;
+      },
+    ],
+    [
+      "no-op before/after value mismatch",
+      (candidate) => {
+        lunaBootstrapChange(candidate, resourceGroupAddress).change.before = {
+          unexpected: true,
+        };
+      },
+    ],
+    [
+      "no-op identity envelope mismatch",
+      (candidate) => {
+        lunaBootstrapChange(candidate, resourceGroupAddress).change.after_identity.name =
+          "rg-palancar-dev-aeeacd8c-other";
+      },
+    ],
+  ];
+
+  for (const [reason, mutate] of mutations) {
+    const candidate = lunaBootstrapPlan();
+    mutate(candidate);
+    assert.equal(
+      acceptsPlan(candidate, "luna-model-bootstrap"),
+      false,
+      `${reason} must reject`,
+    );
+  }
+});
+
+test("luna-model-bootstrap accepts genuine Terraform 1.15.8 dynamic no-op values", () => {
+  const candidate = lunaBootstrapPlan();
+  const resourceGroupName = "rg-palancar-dev-aeeacd8c";
+  const subscriptionId = candidate.variables.subscription_id.value;
+  const resourceGroupValues = {
+    id: `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroupName}`,
+    location: candidate.variables.location.value,
+    managed_by: "",
+    name: resourceGroupName,
+    tags: {
+      application: "palancar",
+      environment: "dev",
+      "managed-by": "terraform",
+      "data-classification": "operational-metadata",
+    },
+    timeouts: null,
+  };
+  const resourceGroupChange = lunaBootstrapChange(
+    candidate,
+    "azurerm_resource_group.foundation",
+  );
+  resourceGroupChange.change.before = clone(resourceGroupValues);
+  resourceGroupChange.change.after = clone(resourceGroupValues);
+  for (const root of [
+    candidate.planned_values.root_module,
+    candidate.prior_state.values.root_module,
+  ]) {
+    lunaBootstrapValueResource(root, "azurerm_resource_group.foundation").values =
+      clone(resourceGroupValues);
+  }
+  candidate.planned_values.outputs.resource_group_id.value = resourceGroupValues.id;
+  candidate.prior_state.values.outputs.resource_group_id.value = resourceGroupValues.id;
+  candidate.output_changes.resource_group_id.before = resourceGroupValues.id;
+  candidate.output_changes.resource_group_id.after = resourceGroupValues.id;
+  candidate.planned_values.outputs.resource_group_name.value = resourceGroupName;
+  candidate.prior_state.values.outputs.resource_group_name.value = resourceGroupName;
+  candidate.output_changes.resource_group_name.before = resourceGroupName;
+  candidate.output_changes.resource_group_name.after = resourceGroupName;
+
+  lunaBootstrapSetRuntimeClientId(
+    candidate,
+    "11111111-2222-4333-8444-555555555555",
+  );
+  assert.equal(acceptsPlan(candidate, "luna-model-bootstrap"), true);
+});
+
+test("luna-model-bootstrap accepts coherently rebound live subscription, operator, and contact values", () => {
+  const candidate = lunaBootstrapPlan();
+  const oldSubscription = candidate.variables.subscription_id.value;
+  const liveSubscription = "b7255fdc-572a-4ea3-9d7e-ecb7ee5a87f2";
+  lunaBootstrapReplaceString(candidate, oldSubscription, liveSubscription);
+  for (const address of [
+    "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+    "module.identities_rbac.azurerm_role_assignment.runtime_table",
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+    "module.identities_rbac.azurerm_role_assignment.operator_security_table",
+    "module.identities_rbac.azurerm_role_assignment.operator_rate_table",
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+    "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+  ]) {
+    lunaBootstrapRecomputeRoleIdentity(candidate, address);
+  }
+
+  lunaBootstrapReplaceString(
+    candidate,
+    "fixture-contact-0001@redacted.example.net",
+    "operator@contoso.example",
+  );
+  assert.equal(acceptsPlan(candidate, "luna-model-bootstrap"), true);
+});
+
+test("luna-model-bootstrap accepts a coherently rebound operator principal", () => {
+  const candidate = lunaBootstrapPlan();
+  const oldOperator = candidate.variables.operator_principal_id.value;
+  const liveOperator = "00000000-0000-0000-0000-000000000044";
+  lunaBootstrapReplaceString(candidate, oldOperator, liveOperator);
+  for (const address of [
+    "module.identities_rbac.azurerm_role_assignment.operator_security_table",
+    "module.identities_rbac.azurerm_role_assignment.operator_rate_table",
+  ]) {
+    lunaBootstrapRecomputeRoleIdentity(candidate, address);
+  }
+  assert.equal(acceptsPlan(candidate, "luna-model-bootstrap"), true);
+});
+
+test("luna-model-bootstrap rejects coordinated subscription-wide RBAC scope widening", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    const address =
+      "module.identities_rbac.azurerm_role_assignment.runtime_openai";
+    const subscription = candidate.variables.subscription_id.value;
+    lunaBootstrapRoleValues(candidate, address, (value) => {
+      value.scope = `/subscriptions/${subscription}`;
+    });
+  });
+});
+
+test("luna-model-bootstrap rejects coordinated RBAC role, principal, and name mutations", () => {
+  const address =
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai";
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapRoleValues(candidate, address, (value) => {
+      value.role_definition_id =
+        `/subscriptions/${candidate.variables.subscription_id.value}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
+    });
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapRoleValues(candidate, address, (value) => {
+      value.principal_id = "00000000-0000-0000-0000-000000000044";
+    });
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapRoleValues(candidate, address, (value) => {
+      value.name = fixtureUuidV5Url("wrong-runtime-openai-role");
+    });
+  });
+});
+
+test("luna-model-bootstrap cross-binds the pinned predecessor relay image", () => {
+  const expectedImage = finalTransitionFixture.resource_changes.find(
+    (entry) => entry.address === lunaContainerAppAddress,
+  ).change.before.body.properties.template.containers.find(
+    (entry) => entry.name === "relay",
+  ).image;
+  const positive = lunaBootstrapPlan();
+  assert.equal(positive.variables.relay_image_digest.value, expectedImage);
+  assert.equal(acceptsPlan(positive, "luna-model-bootstrap"), true);
+
+  const [repository, digest] = expectedImage.split("@");
+  for (const invalidImage of [
+    digest,
+    `${repository}:latest`,
+    `otherregistry.azurecr.io/${repository.slice(repository.indexOf("/") + 1)}@${digest}`,
+    `${repository.replace(/\/[^/]+$/, "/other-relay")}@${digest}`,
+    `${repository}@sha256:${"2".repeat(64)}`,
+  ]) {
+    rejectsLunaBootstrapMutation((candidate) => {
+      lunaBootstrapSetRelayImage(candidate, invalidImage);
+    });
+  }
+
+  const alternateImage = `${repository}@sha256:${"2".repeat(64)}`;
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.variables.relay_image_digest.value = alternateImage;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaContainerAppAddress).change.after.body
+      .properties.template.containers.find((entry) => entry.name === "relay")
+      .image = alternateImage;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapValueResource(
+      candidate.planned_values.root_module,
+      lunaContainerAppAddress,
+    ).values.body.properties.template.containers.find(
+      (entry) => entry.name === "relay",
+    ).image = alternateImage;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapValueResource(
+      candidate.prior_state.values.root_module,
+      lunaContainerAppAddress,
+    ).values.body.properties.template.containers.find(
+      (entry) => entry.name === "relay",
+    ).image = alternateImage;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapSetRelayImage(candidate, alternateImage);
+  });
+});
+
+test("luna-model-bootstrap permits only a valid timestamp variation", () => {
+  const candidate = lunaBootstrapPlan();
+  candidate.timestamp = "2026-08-20T03:00:00Z";
+  assert.equal(acceptsPlan(candidate, "luna-model-bootstrap"), true);
+  for (const timestamp of [
+    "0",
+    "2026-08-20",
+    "Thu, 20 Aug 2026 03:00:00 GMT",
+    "2026-02-30T03:00:00Z",
+    "2026-08-20T03:00:00.000Z",
+    "2026-08-20T03:00:00+00:00",
+  ]) {
+    candidate.timestamp = timestamp;
+    assert.equal(
+      acceptsPlan(candidate, "luna-model-bootstrap"),
+      false,
+      `${timestamp} must not be accepted`,
+    );
+  }
+});
+
+test("luna-model-bootstrap rejects extra actions, deployments, and outputs", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaDeploymentAddress).change.actions.push(
+      "update",
+    );
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    const extra = clone(lunaBootstrapChange(candidate, lunaDeploymentAddress));
+    extra.address =
+      'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna-extra"]';
+    extra.index = "gpt-5.6-luna-extra";
+    candidate.resource_changes.push(extra);
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.output_changes.extra = {
+      actions: ["no-op"],
+      before: "fixture",
+      after: "fixture",
+      after_unknown: false,
+      before_sensitive: false,
+      after_sensitive: false,
+    };
+  });
+});
+
+test("luna-model-bootstrap keeps the application, transcription, RBAC, and all other resources no-op", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    const app = lunaBootstrapChange(candidate, lunaContainerAppAddress);
+    app.change.after.body.properties.template.containers[1].env[0].value =
+      "mutated";
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaTranscriptionAddress).change.after.model[0].version =
+      "2025-12-14";
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    const role = candidate.resource_changes.find((entry) =>
+      entry.address.includes("azurerm_role_assignment.runtime_openai"),
+    );
+    role.change.actions = ["update"];
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.resource_changes = candidate.resource_changes.filter(
+      (entry) => entry.address !== lunaTranscriptionAddress,
+    );
+  });
+});
+
+test("luna-model-bootstrap rejects drift, targeting, imports, deposed state, and generated configuration", () => {
+  for (const mutate of [
+    (candidate) => { candidate.resource_drift = []; },
+    (candidate) => { candidate.resource_drift = [{ address: "fixture" }]; },
+    (candidate) => { candidate.configuration.target = "fixture"; },
+    (candidate) => { candidate.resource_changes[0].change.imports = []; },
+    (candidate) => { candidate.resource_changes[0].deposed = "fixture"; },
+    (candidate) => { candidate.configuration.generated_config = {}; },
+  ]) {
+    rejectsLunaBootstrapMutation(mutate);
+  }
+});
+
+test("luna-model-bootstrap rejects failed, unknown, malformed, and security-relevant check envelopes", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.checks[0].status = "fail";
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.checks[0].instances[0].status = "unknown";
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.checks = [{ status: "pass" }];
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaDeploymentAddress).change.after_unknown.model[0].unexpected =
+      true;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    lunaBootstrapChange(candidate, lunaDeploymentAddress).change.after_sensitive.model[0].unexpected =
+      true;
+  });
+});
+
+test("luna-model-bootstrap binds output order, values, sensitivity, and actions", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.output_changes.foundry_deployment_names.after.reverse();
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.prior_state.values.outputs.foundry_deployment_names.value = [];
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.planned_values.outputs.foundry_deployment_names.value = [
+      "gpt-4o-mini-transcribe",
+    ];
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.output_changes.foundry_deployment_names.after_sensitive = true;
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.output_changes.foundry_deployment_names.actions = ["no-op"];
+  });
+});
+
+test("luna-model-bootstrap CLI usage is exact and content-free", () => {
+  const text = JSON.stringify(lunaBootstrapPlan());
+  assert.equal(runCli(["--mode=luna-model-bootstrap"], text), 0);
+  assert.equal(runCli(["--mode=luna-model-bootstrap", "extra"], text), 2);
+  assert.equal(runCli(["--mode=unknown"], text), 2);
+  assert.equal(runCli(["--mode=luna-model-bootstrap"], "{"), 1);
+  assert.equal(
+    runCli(["--mode=luna-model-bootstrap"], JSON.stringify({ format_version: "1.2" })),
+    1,
+  );
+});
+
 test("CLI accepts JSON stdin and uses no plan values in its result", () => {
   const accepted = runCli(
     ["--mode=model-spike"],
@@ -4622,6 +5415,12 @@ test("CLI accepts JSON stdin and uses no plan values in its result", () => {
     JSON.stringify(finalRolloutPlan()),
   );
   assert.equal(finalAccepted, 0);
+
+  const lunaAccepted = runCli(
+    ["--mode=luna-model-bootstrap"],
+    lunaFixtureText,
+  );
+  assert.equal(lunaAccepted, 0);
 });
 
 test("CLI rejection output is fixed and content-free", () => {

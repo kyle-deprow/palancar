@@ -12,9 +12,48 @@ retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
 expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
 transcription model.
 
-The existing `model-spike`, `full-deploy`, and `runtime-rollout` behavior must
+The existing `model-spike`, `full-deploy`, `runtime-rollout`, and
+`luna-model-bootstrap` behavior must
 remain unchanged. `final-rollout` is a new mode, not an alias and not a relaxed
 version of an old mode.
+
+The model-bootstrap guard is the separate normal-refresh guard for recreating
+the already-absent `gpt-5.6-luna` deployment. It is intentionally outside this
+final rollout contract; its exact transition and adversarial coverage live in
+`infra/scripts/assert-dev-plan.test.mjs`. The final guard's live predecessor is
+the reviewed current digest below; the historical predecessor remains only as
+a stale rejection case.
+
+### Luna bootstrap guard boundary
+
+The separate `luna-model-bootstrap` mode is guarded against the complete
+Terraform 1.15.8 plan at
+`infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json`. The fixture
+contains 40 resource changes and all 10 modules with the provider, schema, and
+identity metadata emitted by Terraform; it is sanitized and contains no empty
+resource payloads. The guard accepts canonical live Azure IDs, operator
+principals, and contact values only when their references remain coherently
+cross-bound across changes, prior/planned values, outputs, configuration, and
+checks. It preserves exact structural envelopes and resource inventory, so
+extra or missing resources, modules, metadata, or coordinated type/identity
+changes fail closed.
+
+Its sole transition is creation of
+`module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]` and the
+corresponding sorted `foundry_deployment_names` output update. The
+transcription deployment, Container App, cleanup Job, all RBAC assignments,
+and every other resource must be no-op. Every RBAC payload is checked for its
+address, target scope, full role definition ID/GUID, principal and type,
+deterministic assignment name/ID, and change/prior/planned coherence. A
+subscription-wide `runtime_openai` scope, role/principal/name mutation, image
+cross-binding change, non-canonical timestamp, or wildcard empty payload is
+rejected. This boundary is covered by the Luna tests and does not alter the
+older guard modes or the final-rollout fixture.
+The Luna `relay_image_digest` variable is the full immutable
+`palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`
+reference, cross-bound unchanged through configuration, Container App prior
+and planned state, and resource changes; digest-only, mutable-tag, or
+registry/repository/digest substitutions fail closed.
 
 ## File ownership
 
@@ -63,7 +102,9 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   transition has 25 ordered empty relay `after_unknown.env` descriptors and
   exactly one passing module `language_boundary_mode` variable check. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`;
+  `sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`;
+  the historical `sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`
+  is rejected as stale.
   the planned relay image equals `var.relay_image_digest`, is immutable in the
   same ACR/repository, and is distinct from prior. The reviewed after digest
   remains variable-bound and is not hard-coded in the committed guard or
@@ -177,6 +218,11 @@ coherence, child-module hierarchy, identities, probes, and runtime destination
 bindings. Preserve and run all existing tests for all old modes.
 
 ## Verification
+
+`terraform show -json` proves only the contents of a saved plan; it cannot
+prove the plan command's argv, including whether `-refresh=true` was used.
+The later saved-plan lifecycle manifest must enforce the exact plan argv,
+including `-refresh=true`, before the guard and apply steps.
 
 From the repository root run:
 

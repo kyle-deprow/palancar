@@ -111,6 +111,12 @@ terraform -chdir=infra/environments/dev show -json /tmp/palancar-dev.tfplan \
 terraform -chdir=infra/environments/dev apply /tmp/palancar-dev.tfplan
 ```
 
+`terraform show -json` proves only the contents of the saved plan; it cannot
+prove the plan command's argv, including whether `-refresh=true` was used.
+The later saved-plan lifecycle manifest is authoritative for that provenance
+and must enforce the exact plan argv with `-refresh=true` before the JSON guard
+or apply step. A passing JSON guard is not a substitute for that manifest.
+
 For the isolated Foundry model spike, save a targeted plan and require the
 single pinned transcription deployment create:
 
@@ -131,6 +137,55 @@ the retired `gpt-5-6-luna` deployment, and other mutations. When the saved
 plan includes the Container App scale configuration, the guard requires
 `minReplicas = 0` and `maxReplicas = 1`. Keep saved plans local and apply the
 same file that was inspected.
+
+For the deleted `gpt-5.6-luna` deployment, generate a complete normal-refresh
+plan without `-target`, `-replace`, `-destroy`, or refresh suppression:
+
+```sh
+terraform -chdir=infra/environments/dev plan \
+  -refresh=true -input=false -lock=true -lock-timeout=5m \
+  -out=/tmp/palancar-luna-model-bootstrap.tfplan
+terraform -chdir=infra/environments/dev show -json \
+  /tmp/palancar-luna-model-bootstrap.tfplan \
+  | node infra/scripts/assert-dev-plan.mjs --mode=luna-model-bootstrap
+```
+
+`luna-model-bootstrap` is fail-closed and accepts only the complete Terraform
+1.15.8 plan with exactly one create at
+`module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]`:
+model/version `gpt-5.6-luna`/`2026-07-09`, format `OpenAI`, SKU
+`GlobalStandard`, capacity `1013`, and `NoAutoUpgrade`. The pinned
+`gpt-4o-mini-transcribe` deployment, Foundry account, Container App, cleanup
+Job, all RBAC, and every other managed resource must be exact no-op. The only
+output action is the known, non-sensitive sorted
+`foundry_deployment_names` update from the transcription name to both names.
+The plan must have no drift, imports, generated configuration, deposed state,
+replacement, delete, unknown security-relevant data, or sensitive leakage.
+Apply only the same protected saved plan after the guard passes.
+
+The Luna bootstrap guard is intentionally a full-plan guard, not a leaf-value
+fixture matcher. Its positive fixture is
+`infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json`: a complete
+Terraform 1.15.8 plan with 40 resource changes, all 10 module calls, provider,
+schema, and identity metadata, and no empty resource payloads. Resource IDs,
+operator principal, and contact values may be live-shaped when they are
+canonical and coherently cross-bound through resource changes, prior/planned
+state, outputs, configuration, and checks. Structural envelopes, inventory,
+provider/schema metadata, identities, and all additions/removals remain exact.
+The `relay_image_digest` variable is the full immutable predecessor reference
+`palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`; the same
+reference must appear in configuration bindings and the Container App's
+prior, planned, and resource-change payloads.
+
+The only accepted transition is the Luna deployment create plus the sorted
+`foundry_deployment_names` output update. The transcription deployment, app,
+cleanup Job, every RBAC assignment, and all other resources remain no-op. Each
+RBAC assignment is checked for its exact address, scope relation, full role
+definition ID/GUID, principal binding and type, deterministic UUIDv5 name/ID,
+and coherent change/prior/planned payloads. In particular, a subscription-wide
+scope widening or coordinated role, principal, or name mutation is rejected;
+there is no wildcard empty-object acceptance. Keep the fixture sanitized and
+run `node --test infra/scripts/assert-dev-plan.test.mjs` after guard changes.
 
 For a runtime-only rollout, set `foundry_deployments = {}`, use immutable
 `@sha256` relay and LiteLLM images from the same development ACR, and provide
@@ -249,7 +304,9 @@ one for every planned relay environment entry. The check envelope contains
 exactly one passing module `language_boundary_mode` variable check. The prior
 relay image is pinned
 to the reviewed digest
-`sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`.
+`sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`.
+The historical `sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`
+predecessor remains a stale negative-test case and is rejected.
 The planned image must equal `var.relay_image_digest`, remain immutable in the
 same ACR/repository, and be distinct from the prior digest; its reviewed digest
 is intentionally not hard-coded in the generic guard or fixture. The
