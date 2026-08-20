@@ -174,15 +174,15 @@ For the reviewed final rollout, after the pinned transcription deployment is
 already present, create a complete saved plan without `-target`, guard its JSON
 view, and apply that exact same file only when the guard exits successfully.
 Keep the binary and JSON view mode `0600`; neither may be committed. For the
-active second relay-image correction rollout:
+active telemetry-enrichment relay-image correction rollout:
 
 ```sh
 set -eu
 umask 077
 PALANCAR_TERRAFORM=/home/dev/.local/bin/terraform-1.15.8
-PALANCAR_PLAN=/tmp/palancar-ws-null-callback.tfplan
-PALANCAR_PLAN_JSON=/tmp/palancar-ws-null-callback.tfplan.json
-PALANCAR_PLAN_SHA=423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986
+PALANCAR_PLAN=/tmp/palancar-telemetry-enrichment.tfplan
+PALANCAR_PLAN_JSON=/tmp/palancar-telemetry-enrichment.tfplan.json
+PALANCAR_PLAN_SHA=ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7
 
 chmod 600 "$PALANCAR_PLAN"
 test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
@@ -200,6 +200,11 @@ test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
 The approved SHA is for the saved binary, not its deterministic JSON view;
 the two files normally have different hashes.
 
+The telemetry-predecessor path `/tmp/palancar-ws-null-callback.tfplan` and
+binary SHA-256
+`423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986` are
+historical and non-applicable. Do not guard or apply that old plan.
+
 The superseded parser-plan path
 `/tmp/palancar-realtime-parser-v2.tfplan` and binary SHA-256
 `f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4` are
@@ -213,14 +218,14 @@ refresh-only plan.
 39-resource transition inventory: 38 no-ops and the reviewed resource-only
 Container App update at
 `module.container_app_workload[0].azapi_resource.this`. This is the
-second post-remediation relay-image correction: LiteLLM remains at 0.75
+telemetry-enrichment relay-image correction: LiteLLM remains at 0.75
 CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
 1 CPU/2Gi. The only recursive Container App differences are relay
 `containers[0].image` and the provider output. The prior relay image is pinned
 to the reviewed digest
-`sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
+`sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`;
 the reviewed planned image digest is
-`sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`.
+`sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`.
 The planned image must equal `var.relay_image_digest`, remain immutable in the
 same ACR/repository, and be distinct from the prior digest. The
 `relay_latest_revision_name` output becomes provider-unknown. There is zero

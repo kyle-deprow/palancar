@@ -5,8 +5,9 @@ Date: 2026-08-20
 
 ## Objective
 
-Maintain the fail-closed `final-rollout` mode for the second relay-image-only
-correction after the parser fix and completed LiteLLM OOM remediation. It
+Maintain the fail-closed `final-rollout` mode for the telemetry-enrichment
+relay-image-only correction after the null-callback fix and completed LiteLLM
+OOM remediation. It
 retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
 expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
 transcription model.
@@ -54,11 +55,12 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   The Container App before/after recursive differences are exactly
   `body.properties.template.containers[0].image` and `output`. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
+  `sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
   same ACR/repository, and is distinct from prior. The production after digest
-  remains supplied by the reviewed saved plan and is not hard-coded in the
-  committed guard or sanitized fixture. The provider-computed
+  is the reviewed telemetry-enrichment digest documented in `infra/README.md`;
+  it remains variable-bound and is not hard-coded in the committed guard or
+  sanitized fixture. The provider-computed
   `relay_latest_revision_name` output becomes unknown. The already deployed
   cleanup Job, action group, and six scheduled-query alerts remain no-op.
   The action group is enabled/global/tagged, contains exactly one common-schema
@@ -143,12 +145,14 @@ applyable flags, configuration and child-module trees, prior/planned values,
 nulls, computed values, unknown maps, and sensitivity maps. It must contain no
 live contact, secret, credential, instrumentation key, or personal principal
 identifier; synthetic placeholders must be cross-bound throughout. The
-previous parser-fix binary had SHA-256
-`f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4` and must
-not be reused for this second correction. Record the separately reviewed
-second-correction saved-binary SHA-256 and verify it immediately before guard
-and apply. Verify the binary hash, not the hash of its JSON view. Keep both
-protected with mode `0600`, and never commit either raw artifact. Build the idempotent
+telemetry-predecessor binary `/tmp/palancar-ws-null-callback.tfplan` had SHA-256
+`423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986` and is
+historical and non-applicable. The active telemetry-enrichment binary is
+`/tmp/palancar-telemetry-enrichment.tfplan`, with reviewed SHA-256
+`ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7`.
+Verify it immediately before guard and apply. Verify the binary hash, not the
+hash of its JSON view. Keep both protected with mode `0600`, and never commit
+either raw artifact. Build the idempotent
 fixture from the same genuine schema and prove acceptance
 for the initial transition and idempotent state. Add adversarial mutations covering every
 accepted resource and invariant above, especially omitted inventory entries,

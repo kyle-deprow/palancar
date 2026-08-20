@@ -2,7 +2,8 @@
 
 Status: completed. The Phase A sizing change and its original guarded rollout
 are retained below as historical implementation evidence. The active rollout
-is the second relay-image-only correction after the parser-fix rollout.
+is the telemetry-enrichment relay-image-only correction after the
+null-callback rollout.
 
 ## Evidence and decision
 
@@ -52,14 +53,18 @@ Verification used `/home/dev/.local/bin/terraform-1.15.8`:
 - remove only the generated module-local `.terraform.lock.hcl`
 - `git diff --check`
 
-## Phase B history and second image-correction guard repin
+## Phase B history and telemetry-enrichment guard repin
 
 After Phase A, the first parser-fix relay-image-only transition used the saved
 binary SHA-256
 `f49c0e0c3f15fccebce1a107ce94f01326fb67f52ec2758756b589187d1be2b4`.
-That hash is historical and must not be reused for the active second
-correction. Record and verify the separately reviewed second-correction binary
-SHA-256 immediately before guarding and applying that exact file. Verify the
+That parser-fix hash remains historical. The immediate telemetry-predecessor
+binary `/tmp/palancar-ws-null-callback.tfplan`, with SHA-256
+`423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986`, is also
+historical and non-applicable. The active telemetry-enrichment binary is
+`/tmp/palancar-telemetry-enrichment.tfplan`, with reviewed SHA-256
+`ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7`.
+Verify it immediately before guarding and applying that exact file. Verify the
 saved-binary hash, not the JSON-view hash; keep both raw files mode `0600` and
 never commit them. The expected shape remains 39 resources: one Container App
 update and 38 no-ops, with no delete, replacement, import, or extra resource.
@@ -67,7 +72,7 @@ LiteLLM remains exactly 0.75 CPU/1.5 GiB and relay remains exactly 0.25 CPU/0.5
 GiB. The Container App transition differs recursively only at relay
 `containers[0].image` and the computed provider output. The currently deployed
 prior relay digest is hard-pinned as
-`sha256:f7b759cfbf54fb0fa53250f9d6490eb7b2b66530bb128d4c0383ec31ae89ba3b`;
+`sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`;
 the planned image equals the immutable same-ACR `var.relay_image_digest`, is
 distinct from prior, and is not hard-coded in the committed guard or sanitized
 fixture. The `relay_latest_revision_name` output becomes unknown. The genuine
@@ -89,7 +94,7 @@ bounded worker may then edit only:
 - `docs/litellm-oom-remediation-plan.md`
 
 The operational `final-rollout` guard is repinned to this exact one-update
-second relay-image correction and its subsequent 39-resource all-no-op state.
+telemetry-enrichment correction and its subsequent 39-resource all-no-op state.
 Historical guard modes remain unchanged. The completed OOM sizing remains
 background evidence, not a current resource transition. Tests must reject old
 LiteLLM resources, altered relay resources, invalid aggregate pairs, prior
