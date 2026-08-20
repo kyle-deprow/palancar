@@ -1771,7 +1771,7 @@ test("the final fixture contains only synthetic contacts and credential-free pla
 
   assert.match(
     finalFixtureText,
-    /palancar-relay@sha256:cb4c416309ca190e3b8d230b02693fdb837b72b36ee0052e76669abb16bc5cce/,
+    /palancar-relay@sha256:39ce99758799a82e19adf68ce1a60f6dd334b9994565c8f70e37dba9183b3e23/,
   );
   for (const pattern of [
     /\bsk-[A-Za-z0-9_-]{20,}\b/,
@@ -2309,6 +2309,7 @@ test("final-rollout pins the complete prior Container App transition", () => {
     "7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1",
     "ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045",
     "cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653",
+    "cb4c416309ca190e3b8d230b02693fdb837b72b36ee0052e76669abb16bc5cce",
   ]) {
     rejectsFinalMutation((candidate) => {
       mutateFinalTransitionPriorCoherently(candidate, (before) => {
