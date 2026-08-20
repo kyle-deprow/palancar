@@ -10,8 +10,12 @@ secrets or accept registry credentials.
 
 The workload uses a single revision, exactly one warm replica with a hard
 maximum of one, an Azure-provided external WebSocket origin, a content-free
-TCP liveness probe, and bounded HTTP readiness probes. Both containers use
-exactly 0.25 CPU and 0.5 GiB.
+TCP liveness probe, and bounded HTTP readiness probes. The relay uses exactly
+0.25 CPU and 0.5 GiB; when enabled, the LiteLLM sidecar uses 0.75 CPU and
+1.5 GiB. Together, the two containers use 1 CPU and 2 GiB per replica, the
+smallest defensible allowed Azure Container Apps Consumption allocation.
+Although Azure permits an intermediate 0.75 CPU/1.5 GiB aggregate, it would
+leave LiteLLM at the empirically headroom-free 1 GiB bound.
 Runtime configuration is supplied through environment variables, with the
 live four-field Application Insights connection string accepted only as a
 sensitive input. The relay receives only its canonical lower-case
@@ -21,7 +25,9 @@ managed identities are configured with `None` and `Main` lifecycles for image
 pull and application runtime respectively.
 
 Ingress is external HTTP on target port 8787, disallows insecure HTTP, and
-sends 100 percent of traffic to the latest single revision. `exposedPort` and
+sends 100 percent of traffic to the latest single revision. The 1 GiB LiteLLM
+proof completed real inference but peaked at 99.99% under amd64 emulation,
+providing no defensible headroom for that smaller bound. `exposedPort` and
 additional port mappings are intentionally absent: the
 [2026-01-01 Container Apps schema](https://learn.microsoft.com/azure/templates/microsoft.app/2026-01-01/containerapps)
 defines `exposedPort` for TCP ingress. Readiness probes use a 10-second period

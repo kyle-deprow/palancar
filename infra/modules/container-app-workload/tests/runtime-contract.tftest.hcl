@@ -238,6 +238,43 @@ run "enabled_openrouter_contract" {
   }
 
   assert {
+    condition = jsonencode([
+      for item in azapi_resource.this.body.properties.template.containers : {
+        name      = item.name
+        resources = item.resources
+      }
+      ]) == jsonencode([
+      {
+        name = "relay"
+        resources = {
+          cpu    = 0.25
+          memory = "0.5Gi"
+        }
+      },
+      {
+        name = "litellm"
+        resources = {
+          cpu    = 0.75
+          memory = "1.5Gi"
+        }
+      },
+    ])
+    error_message = "OpenRouter mode must emit relay at 0.25 CPU/0.5 GiB followed by LiteLLM at 0.75 CPU/1.5 GiB"
+  }
+
+  assert {
+    condition = (
+      sum([
+        for item in azapi_resource.this.body.properties.template.containers : item.resources.cpu
+      ]) == 1 &&
+      sum([
+        for item in azapi_resource.this.body.properties.template.containers : tonumber(trimsuffix(item.resources.memory, "Gi"))
+      ]) == 2
+    )
+    error_message = "OpenRouter mode must allocate exactly 1 CPU/2 GiB across relay and LiteLLM"
+  }
+
+  assert {
     condition = jsonencode(azapi_resource.this.body.properties.configuration.secrets) == jsonencode([
       {
         name        = "litellm-master-key"

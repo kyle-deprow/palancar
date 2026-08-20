@@ -220,8 +220,8 @@ resource "azapi_resource" "this" {
               image = var.litellm_image_digest
 
               resources = {
-                cpu    = 0.25
-                memory = "0.5Gi"
+                cpu    = 0.75
+                memory = "1.5Gi"
               }
 
               env = [
