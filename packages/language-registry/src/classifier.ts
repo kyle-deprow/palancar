@@ -33,6 +33,7 @@ export type ProvisionalLanguageDecision = 'accept' | 'reject' | 'uncertain';
 
 export type ProvisionalLanguageReason =
   | 'MATCH'
+  | 'MATCH_IGNORED_SINGLETON'
   | 'ENGLISH'
   | 'UNSELECTED_LANGUAGE'
   | 'MIXED'
@@ -98,6 +99,7 @@ const PROVISIONAL_DECISIONS = new Set<ProvisionalLanguageDecision>([
 
 const PROVISIONAL_REASONS = new Set<ProvisionalLanguageReason>([
   'MATCH',
+  'MATCH_IGNORED_SINGLETON',
   'ENGLISH',
   'UNSELECTED_LANGUAGE',
   'MIXED',

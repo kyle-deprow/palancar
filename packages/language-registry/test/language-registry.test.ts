@@ -461,36 +461,110 @@ describe('classifier contracts', () => {
 describe('final language gate', () => {
   it('authorizes exact selected-target provisional evidence only in development mode', () => {
     for (const selectedLanguage of TARGETS) {
-      const evidence = {
-        status: 'provisional',
-        detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
-        profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
-        detectedLanguage: selectedLanguage,
-        provisionalScore: 0.65,
-        decision: 'accept',
-        reason: 'MATCH'
-      } as const;
-      expect(evaluateLanguageGate({
-        selectedLanguage,
-        evidence,
-        isFinal: true,
-        boundaryMode: 'development-provisional'
-      })).toMatchObject({
-        decision: 'target',
-        displayAllowed: true,
-        generationAllowed: true
-      });
-      expect(evaluateLanguageGate({
-        selectedLanguage,
-        evidence,
-        isFinal: true,
-        boundaryMode: 'production-calibrated'
-      })).toMatchObject({
-        decision: 'uncertain',
-        generationAllowed: false
-      });
+      for (const reason of ['MATCH', 'MATCH_IGNORED_SINGLETON'] as const) {
+        const evidence = {
+          status: 'provisional',
+          detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+          profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+          detectedLanguage: selectedLanguage,
+          provisionalScore: 0.65,
+          decision: 'accept',
+          reason
+        } as const;
+        expect(evaluateLanguageGate({
+          selectedLanguage,
+          evidence,
+          isFinal: true,
+          boundaryMode: 'development-provisional'
+        })).toMatchObject({
+          decision: 'target',
+          displayAllowed: true,
+          generationAllowed: true
+        });
+        expect(evaluateLanguageGate({
+          selectedLanguage,
+          evidence,
+          isFinal: true,
+          boundaryMode: 'production-calibrated'
+        })).toMatchObject({
+          decision: 'uncertain',
+          generationAllowed: false
+        });
+      }
     }
   });
+
+  it('keeps provisional target authorization closed across the full mutation matrix', () => {
+    for (const selectedLanguage of TARGETS) {
+      const opposite = oppositeTarget(selectedLanguage);
+      for (const reason of ['MATCH', 'MATCH_IGNORED_SINGLETON'] as const) {
+        const evidence = {
+          status: 'provisional',
+          detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+          profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+          detectedLanguage: selectedLanguage,
+          provisionalScore: DEVELOPMENT_PROFILE.provisionalScoreThreshold,
+          decision: 'accept',
+          reason
+        } as const;
+        const acceptedInput = {
+          selectedLanguage,
+          evidence,
+          isFinal: true,
+          boundaryMode: 'development-provisional' as const
+        };
+        expect(evaluateLanguageGate(acceptedInput)).toMatchObject({
+          decision: 'target',
+          displayAllowed: true,
+          generationAllowed: true
+        });
+
+        for (const mutatedEvidence of [
+          { ...evidence, detectorVersion: 'wrong-detector' },
+          { ...evidence, profileVersion: 'wrong-profile' },
+          { ...evidence, provisionalScore: DEVELOPMENT_PROFILE.provisionalScoreThreshold - 0.01 },
+          { ...evidence, detectedLanguage: opposite },
+          { ...evidence, decision: 'reject' as const },
+          { ...evidence, decision: 'uncertain' as const }
+        ]) {
+          expect(evaluateLanguageGate({
+            ...acceptedInput,
+            evidence: mutatedEvidence
+          })).toMatchObject({
+            decision: 'uncertain',
+            displayAllowed: false,
+            generationAllowed: false
+          });
+        }
+
+        for (const boundaryMode of ['production-calibrated', 'development-provisional'] as const) {
+          expect(evaluateLanguageGate({
+            ...acceptedInput,
+            boundaryMode,
+            isFinal: false
+          })).toMatchObject({
+            decision: 'provisional',
+            displayAllowed: false,
+            generationAllowed: false
+          });
+        }
+
+        expect(evaluateLanguageGate({
+          ...acceptedInput,
+          boundaryMode: 'production-calibrated'
+        })).toMatchObject({
+          decision: 'uncertain',
+          displayAllowed: false,
+          generationAllowed: false
+        });
+        expect(() => evaluateLanguageGate({
+          ...acceptedInput,
+          boundaryMode: 'invalid-mode' as never
+        })).toThrow(/boundary mode is invalid/);
+      }
+    }
+  });
+
   it('allows transcript display and generation only for a calibrated selected target', () => {
     for (const selectedLanguage of TARGETS) {
       expect(

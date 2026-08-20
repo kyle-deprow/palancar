@@ -40,14 +40,18 @@ language, low confidence, and every non-calibrated status produce only a gate
 decision; both permissions remain false.
 
 The explicit `development-provisional` mode is a dev prototype boundary. It
-accepts only exact selected-target `MATCH` evidence from the symmetric active
-Spanish/Turkish ELD-small profile at or above its raw-score threshold. English,
-the other target, unsupported languages, mixed text, short text, unknowns, and
-detector errors remain closed. The `eld-small-dev-4` profile caps inputs at 512
-Unicode code points and inspects every overlapping one-through-eight-word
-window plus every qualifying clause. A conflicting window counts only when its
-raw score and margin meet the same profile thresholds as a full accepted
-detection; oversized input is uncertain.
+accepts exact selected-target `MATCH` or source-only
+`MATCH_IGNORED_SINGLETON` evidence from the symmetric active Spanish/Turkish
+ELD-small profile at or above its raw-score threshold. English, the other
+target, unsupported languages, mixed text, short text, unknowns, and detector
+errors remain closed. The `eld-small-dev-5` profile caps inputs at 512 Unicode
+code points and inspects every overlapping one-through-eight-word window plus
+every qualifying clause. Source classification removes strictly containing
+same-language intervals before applying the two-word or two-singleton mixed
+thresholds; generated-output validation remains strict for any reliable second
+language, including one conflicting word. A conflicting interval counts only
+when its raw score and margin meet the same profile thresholds as a full
+accepted detection; oversized input is uncertain.
 Production-calibrated mode cannot consume this evidence.
 
 Partials never permit generation. Partial transcript display requires the

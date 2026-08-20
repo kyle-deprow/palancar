@@ -761,6 +761,36 @@ describe('record', () => {
     expect(JSON.stringify(harness.measurements)).not.toContain('Buenos');
   });
 
+  it('exports the singleton exception as the existing language reason dimension', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      targetLanguage: TARGET_LANGUAGES.TR,
+      gateDecision: GATE_DECISIONS.TARGET,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.ACCEPTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'MATCH_IGNORED_SINGLETON',
+      detectedLanguage: 'tr',
+      provisionalScoreBasisPoints: 7_500
+    });
+
+    expect(harness.measurements).toHaveLength(1);
+    expect(harness.measurements[0]?.attributes).toMatchObject({
+      'palancar.language.reason': 'MATCH_IGNORED_SINGLETON',
+      'palancar.language.detected': 'tr',
+      'palancar.language.provisional_score_basis_points': 7_500
+    });
+    expect(Object.keys(harness.measurements[0]?.attributes ?? {})).not.toContain(
+      'palancar.language.singleton'
+    );
+  });
+
   it.each([
     'fixture',
     'deny-all',
@@ -777,6 +807,7 @@ describe('record', () => {
         timestamp: TIMESTAMP,
         deploymentSlot: DEPLOYMENT_SLOTS.DEV,
         count: 1,
+        targetLanguage: TARGET_LANGUAGES.ES,
         gateDecision: GATE_DECISIONS.UNCERTAIN,
         operation: TELEMETRY_OPERATIONS.LANGUAGE,
         outcome: TELEMETRY_OUTCOMES.REJECTED,
@@ -812,6 +843,7 @@ describe('record', () => {
       timestamp: TIMESTAMP,
       deploymentSlot: DEPLOYMENT_SLOTS.DEV,
       count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
       gateDecision: GATE_DECISIONS.UNCERTAIN,
       operation: TELEMETRY_OPERATIONS.LANGUAGE,
       outcome: TELEMETRY_OUTCOMES.REJECTED,
@@ -837,6 +869,10 @@ describe('record', () => {
       timestamp: TIMESTAMP,
       deploymentSlot: DEPLOYMENT_SLOTS.DEV,
       count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
+      gateDecision: GATE_DECISIONS.TARGET,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.ACCEPTED,
       languageBoundaryMode: 'development-provisional',
       languageReason: 'MATCH',
       detectedLanguage: 'es',
@@ -844,6 +880,227 @@ describe('record', () => {
       ...override
     });
     expect(harness.measurements).toHaveLength(0);
+  });
+
+  it.each([
+    [6_499, 0],
+    [6_500, 1]
+  ] as const)('enforces the strong provisional score boundary at %i', (score, count) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
+      gateDecision: GATE_DECISIONS.TARGET,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.ACCEPTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'MATCH',
+      detectedLanguage: 'es',
+      provisionalScoreBasisPoints: score
+    });
+    expect(harness.measurements).toHaveLength(count);
+  });
+
+  it('rejects a nonzero score for an otherwise valid TOO_SHORT tuple', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
+      gateDecision: GATE_DECISIONS.UNCERTAIN,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.REJECTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'TOO_SHORT',
+      detectedLanguage: 'unknown',
+      provisionalScoreBasisPoints: 1
+    });
+    expect(harness.measurements).toHaveLength(0);
+  });
+
+  it.each([
+    { gateDecision: 'uncertain', outcome: 'rejected' },
+    { gateDecision: 'target', outcome: 'rejected' },
+    { gateDecision: 'target', outcome: 'accepted', detectedLanguage: 'en' }
+  ] as const)('drops invalid singleton accepted-target combinations %#', (override) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    const baseRecord = {
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
+      gateDecision: GATE_DECISIONS.TARGET,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.ACCEPTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'MATCH_IGNORED_SINGLETON',
+      detectedLanguage: 'es',
+      provisionalScoreBasisPoints: 8_000
+    } as const;
+    sink.record({ ...baseRecord, ...override });
+    expect(harness.measurements).toHaveLength(0);
+  });
+
+  it('accepts the complete symmetric provisional reason matrix with target metadata', () => {
+    for (const targetLanguage of ['es', 'tr'] as const) {
+      const otherTarget = targetLanguage === 'es' ? 'tr' : 'es';
+      const cases = [
+        ['MATCH', 'target', 'accepted', targetLanguage],
+        ['MATCH_IGNORED_SINGLETON', 'target', 'accepted', targetLanguage],
+        ['ENGLISH', 'english', 'rejected', 'en'],
+        ['UNSELECTED_LANGUAGE', 'supported_unselected', 'rejected', otherTarget],
+        ['UNSELECTED_LANGUAGE', 'unsupported', 'rejected', 'other'],
+        ['MIXED', 'mixed', 'rejected', 'mixed'],
+        ['TOO_SHORT', 'uncertain', 'rejected', 'unknown'],
+        ['UNKNOWN', 'uncertain', 'rejected', 'unknown']
+      ] as const;
+
+      for (const [languageReason, gateDecision, outcome, detectedLanguage] of cases) {
+        const harness = createHarness();
+        const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+        sink.record({
+          name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+          timestamp: TIMESTAMP,
+          deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+          count: 1,
+          targetLanguage,
+          gateDecision,
+          operation: TELEMETRY_OPERATIONS.LANGUAGE,
+          outcome,
+          languageBoundaryMode: 'development-provisional',
+          languageReason,
+          detectedLanguage,
+          provisionalScoreBasisPoints: languageReason === 'TOO_SHORT' ? 0 : 8_000
+        });
+        expect(harness.measurements).toHaveLength(1);
+      }
+
+      const detectorErrorHarness = createHarness();
+      const detectorErrorSink = createProductionRelayMetricSink(
+        validConfig(),
+        detectorErrorHarness.runtime
+      );
+      detectorErrorSink.record({
+        name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+        timestamp: TIMESTAMP,
+        deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+        count: 1,
+        targetLanguage,
+        gateDecision: GATE_DECISIONS.UNCERTAIN,
+        operation: TELEMETRY_OPERATIONS.LANGUAGE,
+        outcome: TELEMETRY_OUTCOMES.REJECTED,
+        languageBoundaryMode: 'development-provisional',
+        languageReason: 'DETECTOR_ERROR'
+      });
+      expect(detectorErrorHarness.measurements).toHaveLength(1);
+    }
+  });
+
+  it('drops target omission and every reason-specific decision, outcome, and detection mutation', () => {
+    for (const targetLanguage of ['es', 'tr'] as const) {
+      const otherTarget = targetLanguage === 'es' ? 'tr' : 'es';
+      const cases = [
+        { languageReason: 'MATCH', gateDecision: 'target', outcome: 'accepted', detectedLanguage: targetLanguage },
+        { languageReason: 'MATCH_IGNORED_SINGLETON', gateDecision: 'target', outcome: 'accepted', detectedLanguage: targetLanguage },
+        { languageReason: 'ENGLISH', gateDecision: 'english', outcome: 'rejected', detectedLanguage: 'en' },
+        { languageReason: 'UNSELECTED_LANGUAGE', gateDecision: 'supported_unselected', outcome: 'rejected', detectedLanguage: otherTarget },
+        { languageReason: 'UNSELECTED_LANGUAGE', gateDecision: 'unsupported', outcome: 'rejected', detectedLanguage: 'other' },
+        { languageReason: 'MIXED', gateDecision: 'mixed', outcome: 'rejected', detectedLanguage: 'mixed' },
+        { languageReason: 'TOO_SHORT', gateDecision: 'uncertain', outcome: 'rejected', detectedLanguage: 'unknown' },
+        { languageReason: 'UNKNOWN', gateDecision: 'uncertain', outcome: 'rejected', detectedLanguage: 'unknown' },
+        { languageReason: 'DETECTOR_ERROR', gateDecision: 'uncertain', outcome: 'rejected', detectedLanguage: undefined }
+      ] as const;
+
+      for (const validCase of cases) {
+        const baseRecord = {
+          name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+          timestamp: TIMESTAMP,
+          deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+          count: 1,
+          targetLanguage,
+          gateDecision: validCase.gateDecision,
+          operation: TELEMETRY_OPERATIONS.LANGUAGE,
+          outcome: validCase.outcome,
+          languageBoundaryMode: 'development-provisional',
+          languageReason: validCase.languageReason,
+          ...(validCase.detectedLanguage === undefined
+            ? {}
+            : {
+                detectedLanguage: validCase.detectedLanguage,
+                provisionalScoreBasisPoints:
+                  validCase.languageReason === 'TOO_SHORT' ? 0 : 8_000
+              })
+        } as const;
+        const overrides = [
+          { gateDecision: validCase.gateDecision === 'target' ? 'uncertain' : 'target' },
+          { outcome: validCase.outcome === 'accepted' ? 'rejected' : 'accepted' },
+          validCase.detectedLanguage === undefined
+            ? { detectedLanguage: 'unknown' }
+            : {
+                detectedLanguage:
+                  validCase.detectedLanguage === 'unknown' ? 'mixed' : 'unknown'
+              }
+        ] as const;
+
+        for (const override of overrides) {
+          const harness = createHarness();
+          const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+          sink.record({ ...baseRecord, ...override });
+          expect(harness.measurements).toHaveLength(0);
+        }
+
+        const harness = createHarness();
+        const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+        const withoutTarget = Object.fromEntries(
+          Object.entries(baseRecord).filter(([key]) => key !== 'targetLanguage')
+        );
+        sink.record(withoutTarget);
+        expect(harness.measurements).toHaveLength(0);
+      }
+    }
+  });
+
+  it('rejects equal and opposite target/detected mismatches for target-dependent reasons', () => {
+    const cases = [
+      { languageReason: 'MATCH', gateDecision: 'target', detectedLanguage: 'es' },
+      { languageReason: 'MATCH_IGNORED_SINGLETON', gateDecision: 'target', detectedLanguage: 'es' },
+      { languageReason: 'UNSELECTED_LANGUAGE', gateDecision: 'supported_unselected', detectedLanguage: 'tr' }
+    ] as const;
+    for (const validCase of cases) {
+      for (const mismatch of [
+        { targetLanguage: 'tr', detectedLanguage: validCase.detectedLanguage },
+        { targetLanguage: 'es', detectedLanguage: validCase.languageReason === 'UNSELECTED_LANGUAGE' ? 'es' : 'tr' }
+      ] as const) {
+        const harness = createHarness();
+        const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+        sink.record({
+          name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+          timestamp: TIMESTAMP,
+          deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+          count: 1,
+          ...mismatch,
+          gateDecision: validCase.gateDecision,
+          operation: TELEMETRY_OPERATIONS.LANGUAGE,
+          outcome: validCase.languageReason.startsWith('MATCH')
+            ? TELEMETRY_OUTCOMES.ACCEPTED
+            : TELEMETRY_OUTCOMES.REJECTED,
+          languageBoundaryMode: 'development-provisional',
+          languageReason: validCase.languageReason,
+          detectedLanguage: mismatch.detectedLanguage,
+          provisionalScoreBasisPoints: 8_000
+        });
+        expect(harness.measurements).toHaveLength(0);
+      }
+    }
   });
 
   it('drops every non-production root key before sanitization instead of stripping it', () => {

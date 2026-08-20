@@ -73,6 +73,7 @@ const BOUNDARY_MODES = new Set([
 ]);
 const PROVISIONAL_REASONS = new Set([
   'MATCH',
+  'MATCH_IGNORED_SINGLETON',
   'ENGLISH',
   'UNSELECTED_LANGUAGE',
   'MIXED',
@@ -109,6 +110,75 @@ type RelayMeter = ReturnType<RelayMeterProvider['getMeter']>;
 type RelayCounter = ReturnType<RelayMeter['createCounter']>;
 type RelayHistogram = ReturnType<RelayMeter['createHistogram']>;
 type MetricExportResult = Parameters<Parameters<PushMetricExporter['export']>[1]>[0];
+
+function validProvisionalLanguageCombination(
+  reason: string,
+  targetLanguage: unknown,
+  gateDecision: unknown,
+  outcome: unknown,
+  detectedLanguage: unknown,
+  provisionalScoreBasisPoints: unknown
+): boolean {
+  if (targetLanguage !== 'es' && targetLanguage !== 'tr') return false;
+  if (outcome !== 'accepted' && outcome !== 'rejected') return false;
+  const validScore =
+    typeof provisionalScoreBasisPoints === 'number' &&
+    Number.isSafeInteger(provisionalScoreBasisPoints) &&
+    provisionalScoreBasisPoints >= 0 &&
+    provisionalScoreBasisPoints <= 10_000;
+  const strongScore =
+    typeof provisionalScoreBasisPoints === 'number' &&
+    Number.isSafeInteger(provisionalScoreBasisPoints) &&
+    provisionalScoreBasisPoints >= 6_500 &&
+    provisionalScoreBasisPoints <= 10_000;
+  switch (reason) {
+    case 'MATCH':
+    case 'MATCH_IGNORED_SINGLETON':
+      return (
+        strongScore &&
+        detectedLanguage === targetLanguage &&
+        gateDecision === 'target' &&
+        outcome === 'accepted'
+      );
+    case 'ENGLISH':
+      return (
+        strongScore &&
+        gateDecision === 'english' &&
+        outcome === 'rejected' &&
+        detectedLanguage === 'en'
+      );
+    case 'UNSELECTED_LANGUAGE':
+      return (
+        strongScore &&
+        ((gateDecision === 'supported_unselected' &&
+          detectedLanguage === (targetLanguage === 'es' ? 'tr' : 'es')) ||
+          (gateDecision === 'unsupported' && detectedLanguage === 'other'))
+      ) && outcome === 'rejected';
+    case 'MIXED':
+      return (
+        strongScore &&
+        gateDecision === 'mixed' &&
+        outcome === 'rejected' &&
+        detectedLanguage === 'mixed'
+      );
+    case 'TOO_SHORT':
+      return (
+        provisionalScoreBasisPoints === 0 &&
+        gateDecision === 'uncertain' &&
+        outcome === 'rejected' &&
+        detectedLanguage === 'unknown'
+      );
+    case 'UNKNOWN':
+      return (
+        validScore &&
+        gateDecision === 'uncertain' &&
+        outcome === 'rejected' &&
+        detectedLanguage === 'unknown'
+      );
+    default:
+      return false;
+  }
+}
 
 interface RelayMetricExporter extends Omit<PushMetricExporter, 'export'> {
   export(
@@ -433,6 +503,7 @@ function recordWithDeploymentSlot(
     const name = valueFor('name');
     const boundaryMode = valueFor('languageBoundaryMode');
     const reason = valueFor('languageReason');
+    const targetLanguage = valueFor('targetLanguage');
     const detectedLanguage = valueFor('detectedLanguage');
     const provisionalScoreBasisPoints = valueFor('provisionalScoreBasisPoints');
     const gateDecision = valueFor('gateDecision');
@@ -455,6 +526,7 @@ function recordWithDeploymentSlot(
       }
       if (reason === 'DETECTOR_ERROR') {
         if (
+          (targetLanguage !== 'es' && targetLanguage !== 'tr') ||
           gateDecision !== 'uncertain' ||
           outcome !== 'rejected' ||
           detectedLanguage !== undefined ||
@@ -474,8 +546,16 @@ function recordWithDeploymentSlot(
           !DETECTED_LANGUAGE_LABELS.has(detectedLanguage) ||
           typeof provisionalScoreBasisPoints !== 'number' ||
           !Number.isSafeInteger(provisionalScoreBasisPoints) ||
-          provisionalScoreBasisPoints < 0 ||
-          provisionalScoreBasisPoints > 10_000
+            provisionalScoreBasisPoints < 0 ||
+            provisionalScoreBasisPoints > 10_000 ||
+            !validProvisionalLanguageCombination(
+              reason,
+              targetLanguage,
+              gateDecision,
+              outcome,
+              detectedLanguage,
+              provisionalScoreBasisPoints
+            )
         ) {
           return undefined;
         }

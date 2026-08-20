@@ -23,6 +23,8 @@ import {
 const UNKNOWN_LANGUAGE = 'unknown';
 const MIXED_LANGUAGE = 'mixed';
 const ENGLISH_LANGUAGE = 'en';
+const SOURCE_MIN_CORE_WORDS = 2;
+const SOURCE_MIN_SINGLETON_CORES = 2;
 const CLASSIFIER_ID = 'eld-small-development-provisional';
 const VALIDATOR_ID = 'eld-small-development-provisional';
 const COMPONENT_VERSION = '1.0.0';
@@ -72,6 +74,16 @@ interface Detection {
   readonly score: number;
   readonly margin: number;
   readonly reliable: boolean;
+}
+
+interface AnalysisInterval {
+  readonly text: string;
+  readonly lexicalStart: number;
+  readonly wordLength: number;
+}
+
+interface StrongConflictInterval extends AnalysisInterval {
+  readonly language: string;
 }
 
 type NormalizedText =
@@ -345,6 +357,71 @@ function analysisWindows(
   return Object.freeze(candidates);
 }
 
+function analysisIntervals(
+  text: string,
+  settings: DevelopmentProvisionalProfile
+): readonly AnalysisInterval[] {
+  const words = [...text.matchAll(/[\p{L}\p{N}]+/gu)].map((match) => ({
+    text: match[0],
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length
+  }));
+  const candidates = new Map<string, AnalysisInterval>();
+  const addCandidate = (
+    candidate: string,
+    lexicalStart: number,
+    wordLength: number
+  ): void => {
+    const trimmed = candidate.trim();
+    if (wordLength < 1) return;
+    if (countSubstantiveCharacters(trimmed) < settings.minimumWindowCharacters) {
+      return;
+    }
+    const key = JSON.stringify([lexicalStart, wordLength, trimmed]);
+    if (!candidates.has(key)) {
+      candidates.set(key, Object.freeze({
+        text: trimmed,
+        lexicalStart,
+        wordLength
+      }));
+    }
+  };
+  for (const clause of text.matchAll(/[^.!?;:\n]+/gu)) {
+    const clauseStart = clause.index ?? 0;
+    const clauseEnd = clauseStart + clause[0].length;
+    const firstWord = words.findIndex(
+      (word) => word.start >= clauseStart && word.end <= clauseEnd
+    );
+    if (firstWord < 0) continue;
+    let lastWord = firstWord;
+    while (
+      lastWord + 1 < words.length &&
+      (words[lastWord + 1]?.start ?? Number.POSITIVE_INFINITY) < clauseEnd
+    ) {
+      lastWord += 1;
+    }
+    addCandidate(
+      clause[0],
+      firstWord,
+      lastWord - firstWord + 1
+    );
+  }
+  for (
+    let windowWords = settings.minimumSlidingWindowWords;
+    windowWords <= settings.maximumSlidingWindowWords;
+    windowWords += 1
+  ) {
+    for (let start = 0; start + windowWords <= words.length; start += 1) {
+      addCandidate(
+        words.slice(start, start + windowWords).map((word) => word.text).join(' '),
+        start,
+        windowWords
+      );
+    }
+  }
+  return Object.freeze([...candidates.values()]);
+}
+
 function hasSubstantiveMix(
   detector: EldDetector,
   text: string,
@@ -372,6 +449,77 @@ function hasSubstantiveMix(
   return strongLanguages.size > 1;
 }
 
+function isStrongDetection(
+  detection: Detection,
+  settings: DevelopmentProvisionalProfile
+): boolean {
+  return (
+    detection.reliable &&
+    detection.score >= settings.provisionalScoreThreshold &&
+    detection.margin >= settings.provisionalMarginThreshold
+  );
+}
+
+function strictlyContains(
+  outer: AnalysisInterval,
+  inner: AnalysisInterval
+): boolean {
+  const outerEnd = outer.lexicalStart + outer.wordLength;
+  const innerEnd = inner.lexicalStart + inner.wordLength;
+  return (
+    outer.lexicalStart <= inner.lexicalStart &&
+    outerEnd >= innerEnd &&
+    (outer.lexicalStart !== inner.lexicalStart || outerEnd !== innerEnd)
+  );
+}
+
+function sourceConflictReason(
+  detector: EldDetector,
+  text: string,
+  settings: DevelopmentProvisionalProfile,
+  selectedLanguage: string
+): 'MIXED' | 'MATCH_IGNORED_SINGLETON' | undefined {
+  const conflicts = new Map<string, StrongConflictInterval>();
+  for (const interval of analysisIntervals(text, settings)) {
+    const detection = detect(detector, interval.text);
+    if (
+      isStrongDetection(detection, settings) &&
+      detection.language !== selectedLanguage
+    ) {
+      const key = `${interval.lexicalStart}:${interval.wordLength}:${detection.language}`;
+      if (!conflicts.has(key)) {
+        conflicts.set(key, Object.freeze({
+          ...interval,
+          language: detection.language
+        }));
+      }
+    }
+  }
+
+  const conflictIntervals = [...conflicts.values()];
+  const minimalCores = conflictIntervals.filter((candidate) =>
+    !conflictIntervals.some((other) =>
+      other.language === candidate.language &&
+      strictlyContains(candidate, other)
+    )
+  );
+  if (minimalCores.some((core) => core.wordLength >= SOURCE_MIN_CORE_WORDS)) {
+    return 'MIXED';
+  }
+  const singletonPositions = new Set(
+    minimalCores
+      .filter((core) => core.wordLength === 1)
+      .map((core) => core.lexicalStart)
+  );
+  if (singletonPositions.size >= SOURCE_MIN_SINGLETON_CORES) {
+    return 'MIXED';
+  }
+  if (singletonPositions.size === 1) {
+    return 'MATCH_IGNORED_SINGLETON';
+  }
+  return undefined;
+}
+
 function evidence(
   settings: DevelopmentProvisionalProfile,
   values: Omit<ProvisionalLanguageEvidence, 'status' | 'detectorVersion' | 'profileVersion'>
@@ -384,7 +532,89 @@ function evidence(
   });
 }
 
-function classify(
+function classifySource(
+  detector: EldDetector,
+  rawText: unknown,
+  expectedLanguage: GeneratedLanguage
+): ProvisionalLanguageEvidence {
+  const settings = profile();
+  const normalized = normalizedText(rawText, settings);
+  if (normalized.status === 'too-long') {
+    return evidence(settings, {
+      detectedLanguage: UNKNOWN_LANGUAGE,
+      provisionalScore: 0,
+      decision: 'uncertain',
+      reason: 'UNKNOWN'
+    });
+  }
+  if (
+    normalized.status === 'empty' ||
+    countSubstantiveCharacters(normalized.text) < settings.minimumTextCharacters
+  ) {
+    return evidence(settings, {
+      detectedLanguage: UNKNOWN_LANGUAGE,
+      provisionalScore: 0,
+      decision: 'uncertain',
+      reason: 'TOO_SHORT'
+    });
+  }
+  const text = normalized.text;
+  try {
+    const full = detect(detector, text);
+    if (
+      !full.reliable ||
+      full.score < settings.provisionalScoreThreshold ||
+      full.margin < settings.provisionalMarginThreshold
+    ) {
+      return evidence(settings, {
+        detectedLanguage: UNKNOWN_LANGUAGE,
+        provisionalScore: full.score,
+        decision: 'uncertain',
+        reason: 'UNKNOWN'
+      });
+    }
+    if (full.language !== expectedLanguage) {
+      return evidence(settings, {
+        detectedLanguage: full.language,
+        provisionalScore: full.score,
+        decision: 'reject',
+        reason:
+          full.language === ENGLISH_LANGUAGE && expectedLanguage !== ENGLISH_LANGUAGE
+            ? 'ENGLISH'
+            : 'UNSELECTED_LANGUAGE'
+      });
+    }
+    const conflictReason = sourceConflictReason(
+      detector,
+      text,
+      settings,
+      expectedLanguage
+    );
+    if (conflictReason === 'MIXED') {
+      return evidence(settings, {
+        detectedLanguage: MIXED_LANGUAGE,
+        provisionalScore: full.score,
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+    }
+    return evidence(settings, {
+      detectedLanguage: full.language,
+      provisionalScore: full.score,
+      decision: 'accept',
+      reason: conflictReason ?? 'MATCH'
+    });
+  } catch {
+    return evidence(settings, {
+      detectedLanguage: UNKNOWN_LANGUAGE,
+      provisionalScore: 0,
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+  }
+}
+
+function classifyGenerated(
   detector: EldDetector,
   rawText: unknown,
   expectedLanguage: GeneratedLanguage
@@ -618,7 +848,7 @@ export function createDevelopmentProvisionalLanguageBoundary(
       }
       try {
         await ready;
-        return classify(await getDetector(), text, selectedLanguage);
+        return classifySource(await getDetector(), text, selectedLanguage);
       } catch {
         return evidence(profile(), {
           detectedLanguage: UNKNOWN_LANGUAGE,
@@ -652,7 +882,7 @@ export function createDevelopmentProvisionalLanguageBoundary(
         });
       }
       const results: GeneratedLanguageValidationEvidenceCheck[] = checks.map((item) => {
-        const result = classify(detector, item.text, item.expectedLanguage);
+        const result = classifyGenerated(detector, item.text, item.expectedLanguage);
         return Object.freeze({
           slot: item.slot,
           expectedLanguage: item.expectedLanguage,

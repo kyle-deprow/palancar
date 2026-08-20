@@ -82,6 +82,19 @@ function detectorWithExactResult(
   });
 }
 
+function detectorWithExactLanguages(
+  fallbackTarget: 'es' | 'tr',
+  overrides: Readonly<Record<string, string>>
+): Readonly<{ detect(text: string): unknown }> {
+  const exact = new Map(Object.entries(overrides));
+  return detectorFor((text) => {
+    const override = exact.get(text);
+    if (override !== undefined) return override;
+    const detected = tokenLanguage(text);
+    return detected === 'zz' ? fallbackTarget : detected;
+  });
+}
+
 function tokenLanguage(text: string): string {
   for (const [language, fixture] of Object.entries(TEXT)) {
     if (text === fixture) return language;
@@ -282,7 +295,7 @@ describe('development provisional ELD-small boundary', () => {
       await expect(boundary.classifier.classify(fullText, target)).resolves.toEqual({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-4',
+        profileVersion: 'eld-small-dev-5',
         detectedLanguage: 'unknown',
         provisionalScore: 0,
         decision: 'uncertain',
@@ -413,8 +426,8 @@ describe('development provisional ELD-small boundary', () => {
     ['other target', 'es', TEXT.tr, 'UNSELECTED_LANGUAGE'],
     ['unsupported', 'es', 'Bonjour. Où se trouve la gare ferroviaire?', 'UNSELECTED_LANGUAGE'],
     ['too short', 'es', 'hola', 'TOO_SHORT'],
-    ['mixed English/Spanish', 'es', `${TEXT.en} ${TEXT.es}`, 'MIXED'],
-    ['mixed Spanish/Turkish', 'tr', `${TEXT.es} ${TEXT.tr}`, 'MIXED']
+    ['mixed English/Spanish', 'es', `${TEXT.en} ${TEXT.es}`, 'UNKNOWN'],
+    ['mixed Spanish/Turkish', 'tr', `${TEXT.es} ${TEXT.tr}`, 'UNSELECTED_LANGUAGE']
   ] as const)('rejects or marks %s source evidence fail-closed', async (
     _name,
     target,
@@ -492,7 +505,7 @@ describe('development provisional ELD-small boundary', () => {
     ).toBe(false);
   });
 
-  it('treats every reliable conflicting label as mixed in both orders and targets', async () => {
+  it('reduces embedded conflicting clauses to minimal source cores in both orders and targets', async () => {
     for (const target of ['es', 'tr'] as const) {
       const targetToken = target === 'es' ? 'castellano sustantivo' : 'türkçe anlamlı metin';
       for (const text of [
@@ -500,14 +513,26 @@ describe('development provisional ELD-small boundary', () => {
         `francophone substantive language. ${targetToken}.`
       ]) {
         const boundary = createDevelopmentProvisionalLanguageBoundary({
-          loadDetector: () => detectorFor(tokenLanguage)
+          loadDetector: () => detectorFor((candidate) => {
+            const language = tokenLanguage(candidate);
+            return language === 'zz' ? target : language;
+          })
         });
-        await expect(boundary.classifier.classify(text, target)).resolves.toMatchObject({
-          status: 'provisional',
-          detectedLanguage: 'mixed',
-          decision: 'reject',
-          reason: 'MIXED'
-        });
+        await expect(boundary.classifier.classify(text, target)).resolves.toMatchObject(
+          text.startsWith(targetToken)
+            ? {
+                status: 'provisional',
+                detectedLanguage: target,
+                decision: 'accept',
+                reason: 'MATCH_IGNORED_SINGLETON'
+              }
+            : {
+                status: 'provisional',
+                detectedLanguage: 'fr',
+                decision: 'reject',
+                reason: 'UNSELECTED_LANGUAGE'
+              }
+        );
 
         const evidence = await boundary.generatedLanguageValidator.validate(
           generatedInput(target, 5, { index: 2, text }),
@@ -525,11 +550,125 @@ describe('development provisional ELD-small boundary', () => {
     }
   });
 
+  it('tracks source containment, overlap, position, Unicode, punctuation, and long-clause intervals', async () => {
+    for (const target of ['es', 'tr'] as const) {
+      const cases = [
+        {
+          text: `${selectedMarker(target)}. outer alpha beta gamma.`,
+          overrides: {
+            'outer alpha beta gamma': 'fr',
+            'alpha beta gamma': 'fr',
+            beta: 'fr'
+          },
+          expected: 'MATCH_IGNORED_SINGLETON'
+        },
+        {
+          text: `${selectedMarker(target)}. left right middle.`,
+          overrides: {
+            'left right': 'fr',
+            'right middle': 'fr'
+          },
+          expected: 'MIXED'
+        },
+        {
+          text: `${selectedMarker(target)}. alpha,beta.`,
+          overrides: {
+            'alpha,beta': 'fr',
+            'alpha beta': 'de'
+          },
+          expected: 'MIXED'
+        },
+        {
+          text: `${selectedMarker(target)}. repeat. gap. repeat.`,
+          overrides: { repeat: 'fr' },
+          expected: 'MIXED'
+        },
+        {
+          text: `${selectedMarker(target)}. café. 東京.`,
+          overrides: { café: 'fr', 東京: 'de' },
+          expected: 'MIXED'
+        },
+        {
+          text: `${selectedMarker(target)}. one two three four five six seven eight nine.`,
+          overrides: {
+            'one two three four five six seven eight nine': 'fr'
+          },
+          expected: 'MIXED'
+        }
+      ] as const;
+
+      for (const testCase of cases) {
+        const boundary = createDevelopmentProvisionalLanguageBoundary({
+          loadDetector: () => detectorWithExactLanguages(target, testCase.overrides)
+        });
+        await expect(boundary.classifier.classify(testCase.text, target)).resolves.toMatchObject({
+          reason: testCase.expected,
+          ...(testCase.expected === 'MIXED'
+            ? { detectedLanguage: 'mixed', decision: 'reject' }
+            : { detectedLanguage: target, decision: 'accept' })
+        });
+      }
+    }
+  });
+
+  it.each(['es', 'tr'] as const)(
+    'counts conflicting detector strings at one lexical singleton position once for %s',
+    async (target) => {
+      const observed = new Set<string>();
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((candidate) => {
+          if (
+            candidate === 'sameposition,' ||
+            candidate === 'sameposition' ||
+            candidate === 'secondposition,' ||
+            candidate === 'secondposition'
+          ) {
+            observed.add(candidate);
+          }
+          if (candidate === 'sameposition,') return 'fr';
+          if (candidate === 'sameposition') return 'de';
+          if (candidate === 'secondposition,') return 'fr';
+          if (candidate === 'secondposition') return 'de';
+          const detected = tokenLanguage(candidate);
+          return detected === 'zz' ? target : detected;
+        })
+      });
+
+      await expect(boundary.classifier.classify(
+        `${selectedMarker(target)}. sameposition,`,
+        target
+      )).resolves.toMatchObject({
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH_IGNORED_SINGLETON'
+      });
+      expect(observed).toEqual(new Set(['sameposition,', 'sameposition']));
+
+      await expect(boundary.classifier.classify(
+        `${selectedMarker(target)}. sameposition,; secondposition,`,
+        target
+      )).resolves.toMatchObject({
+        detectedLanguage: 'mixed',
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+      expect(observed).toEqual(new Set([
+        'sameposition,',
+        'sameposition',
+        'secondposition,',
+        'secondposition'
+      ]));
+    }
+  );
+
   it.each(['tr', 'es'] as const)(
     'detects standalone and embedded one-word English and unsupported conflicts in %s source',
     async (target) => {
       const boundary = createDevelopmentProvisionalLanguageBoundary({
-        loadDetector: () => detectorFor(tokenLanguage)
+        loadDetector: () => detectorFor((text) => {
+          const language = tokenLanguage(text);
+          return language === 'zz' ? target : language;
+        })
       });
       for (const [conflicting, standaloneReason] of [
         ['englishlanguage', 'ENGLISH'],
@@ -547,11 +686,59 @@ describe('development provisional ELD-small boundary', () => {
             target
           )
         ).resolves.toMatchObject({
-          detectedLanguage: 'mixed',
-          decision: 'reject',
-          reason: 'MIXED'
+          detectedLanguage: target,
+          decision: 'accept',
+          reason: 'MATCH_IGNORED_SINGLETON'
         });
       }
+    }
+  );
+
+  it.each(['es', 'tr'] as const)(
+    'applies minimal source conflict cores symmetrically for %s',
+    async (target) => {
+      const singletonCalls: string[] = [];
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((text) => {
+          const known = tokenLanguage(text);
+          if (known !== 'zz') return known;
+          if (text === 'isolatedword') {
+            singletonCalls.push(text);
+            return 'fr';
+          }
+          if (text === 'isolatedone' || text === 'isolatedtwo') return 'fr';
+          if (text === 'coreleft coreright') return 'fr';
+          return target;
+        })
+      });
+
+      await expect(boundary.classifier.classify(
+        `${selectedMarker(target)}. isolatedword.`,
+        target
+      )).resolves.toMatchObject({
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH_IGNORED_SINGLETON'
+      });
+      expect(singletonCalls).toHaveLength(1);
+
+      await expect(boundary.classifier.classify(
+        `${selectedMarker(target)}. isolatedone. isolatedtwo.`,
+        target
+      )).resolves.toMatchObject({
+        detectedLanguage: 'mixed',
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+
+      await expect(boundary.classifier.classify(
+        `${selectedMarker(target)}. coreleft coreright.`,
+        target
+      )).resolves.toMatchObject({
+        detectedLanguage: 'mixed',
+        decision: 'reject',
+        reason: 'MIXED'
+      });
     }
   );
 
@@ -639,6 +826,96 @@ describe('development provisional ELD-small boundary', () => {
           )).toBe(false);
         }
       }
+    }
+  );
+
+  it('keeps generated punctuation, apostrophe, hyphen, and whitespace collisions strict in every slot', async () => {
+    const collisions = [
+      {
+        clause: 'alpha,beta gamma delta epsilon zeta eta theta',
+        canonical: 'alpha beta gamma delta epsilon zeta eta theta'
+      },
+      {
+        clause: "l'amour gamma delta epsilon zeta eta theta",
+        canonical: 'l amour gamma delta epsilon zeta eta theta'
+      },
+      {
+        clause: 'bien-être gamma delta epsilon zeta eta theta',
+        canonical: 'bien être gamma delta epsilon zeta eta theta'
+      },
+      {
+        clause: 'alpha  beta gamma delta epsilon zeta eta theta',
+        canonical: 'alpha beta gamma delta epsilon zeta eta theta'
+      }
+    ] as const;
+
+    for (const target of ['es', 'tr'] as const) {
+      for (const count of [5, 7] as const) {
+        const baseline = generatedInput(target, count);
+        for (let index = 0; index < count; index += 1) {
+          const expected = baseline.checks[index]?.expectedLanguage;
+          if (expected === undefined) throw new Error('missing generated check');
+          for (const collision of collisions) {
+            const boundary = createDevelopmentProvisionalLanguageBoundary({
+              loadDetector: () => detectorFor((text) => {
+                if (text === collision.canonical) {
+                  return expected === 'en' ? target : 'en';
+                }
+                const detected = tokenLanguage(text);
+                return detected === 'zz' ? expected : detected;
+              })
+            });
+            const evidence = await boundary.generatedLanguageValidator.validate(
+              generatedInput(target, count, { index, text: collision.clause }),
+              { signal: new AbortController().signal }
+            );
+            expect(evidence.checks[index]).toMatchObject({
+              detectedLanguage: 'mixed',
+              verdict: 'mismatch'
+            });
+            expect(isAcceptedGeneratedLanguageEvidence(
+              evidence,
+              'development-provisional'
+            )).toBe(false);
+          }
+        }
+      }
+    }
+  });
+
+  it.each(['es', 'tr'] as const)(
+    'preserves generated clause-then-canonical detector order for %s',
+    async (target) => {
+      const text = 'alpha,beta gamma delta epsilon zeta eta theta';
+      const canonical = [
+        'alpha',
+        'beta',
+        'gamma',
+        'delta',
+        'epsilon',
+        'zeta',
+        'eta',
+        'theta'
+      ];
+      const seen: string[] = [];
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((candidate) => {
+          seen.push(candidate);
+          const detected = tokenLanguage(candidate);
+          return detected === 'zz' ? target : detected;
+        })
+      });
+      await boundary.generatedLanguageValidator.validate(
+        generatedInput(target, 5, { index: 2, text }),
+        { signal: new AbortController().signal }
+      );
+      const fullIndex = seen.indexOf(text);
+      expect(fullIndex).toBeGreaterThanOrEqual(0);
+      expect(seen.slice(fullIndex, fullIndex + 10)).toEqual([
+        text,
+        text,
+        ...canonical
+      ]);
     }
   );
 
@@ -777,10 +1054,10 @@ describe('development provisional ELD-small boundary', () => {
   });
 
   it('normalizes NFKC and fails oversized, short, and malformed detector results closed', async () => {
-    let observed = '';
+    const observed: string[] = [];
     const normalizing = createDevelopmentProvisionalLanguageBoundary({
       loadDetector: () => detectorFor((text) => {
-        observed = text;
+        observed.push(text);
         const language = tokenLanguage(text);
         return language === 'zz' ? 'es' : language;
       })

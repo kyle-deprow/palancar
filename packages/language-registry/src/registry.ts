@@ -314,7 +314,7 @@ export const CONTROLLED_FIXTURE_DETECTOR_VERSION =
 export const CONTROLLED_FIXTURE_CALIBRATION_VERSION =
   'controlled-fixture-calibration-1';
 export const DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION = 'eld-small-2.1.0';
-export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-4';
+export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-5';
 export const DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS = 12;
 
 export function countSubstantiveCharacters(text: string): number {

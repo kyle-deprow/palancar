@@ -1858,6 +1858,49 @@ describe('relay session core', () => {
     }
   });
 
+  it('accepts and records the source singleton exception symmetrically', async () => {
+    for (const selectedLanguage of ['es', 'tr'] as const) {
+      const metrics = recordingMetricSink();
+      const { core } = openNew(recordingAdapter(), selectedLanguage, {
+        languageBoundaryMode: 'development-provisional',
+        metricSink: metrics.sink,
+        languageClassifier: {
+          ready: Promise.resolve(),
+          classify: async () => ({
+            status: 'provisional',
+            detectorVersion: 'eld-small-2.1.0',
+            profileVersion: 'eld-small-dev-5',
+            detectedLanguage: selectedLanguage,
+            provisionalScore: 0.8,
+            decision: 'accept',
+            reason: 'MATCH_IGNORED_SINGLETON'
+          })
+        }
+      });
+      core.handleText(utteranceStartText());
+
+      const result = await core.handleTranscriptionEvent(finalEvent(
+        'target',
+        TEST_UTTERANCE_ID,
+        1,
+        selectedLanguage
+      ));
+
+      expect(result.outgoing).toMatchObject([
+        { type: 'transcript.final' },
+        { type: 'language.decision', decision: 'target', detectedLanguage: selectedLanguage }
+      ]);
+      expect(metrics.records).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: 'language.decision',
+          languageReason: 'MATCH_IGNORED_SINGLETON',
+          gateDecision: 'target',
+          outcome: 'accepted'
+        })
+      ]));
+    }
+  });
+
   it('ignores provider language metadata, confidence, logprobs, and raw scores', async () => {
     const { core } = openNew();
     core.handleText(utteranceStartText());
@@ -2046,7 +2089,7 @@ describe('relay session core', () => {
       classify: async () => ({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-4',
+        profileVersion: 'eld-small-dev-5',
         detectedLanguage: 'en',
         provisionalScore: 0.9,
         decision: 'reject',
@@ -2103,7 +2146,7 @@ describe('relay session core', () => {
           classify: async () => ({
             status: 'provisional',
             detectorVersion: 'eld-small-2.1.0',
-            profileVersion: 'eld-small-dev-4',
+            profileVersion: 'eld-small-dev-5',
             detectedLanguage: 'unknown',
             provisionalScore,
             decision: 'uncertain',
@@ -2156,7 +2199,7 @@ describe('relay session core', () => {
         classify: async () => ({
           status: 'provisional',
           detectorVersion: 'eld-small-2.1.0',
-          profileVersion: 'eld-small-dev-4',
+          profileVersion: 'eld-small-dev-5',
           detectedLanguage: 'unknown',
           provisionalScore: 0,
           decision: 'reject',

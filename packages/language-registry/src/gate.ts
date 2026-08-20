@@ -66,7 +66,8 @@ function developmentProvisionalAccepted(
     profile !== undefined &&
     evidence.status === 'provisional' &&
     evidence.decision === 'accept' &&
-    evidence.reason === 'MATCH' &&
+    (evidence.reason === 'MATCH' ||
+      evidence.reason === 'MATCH_IGNORED_SINGLETON') &&
     evidence.detectedLanguage === selectedLanguage &&
     evidence.detectorVersion === profile.detectorVersion &&
     evidence.profileVersion === profile.profileVersion &&
@@ -90,6 +91,7 @@ function provisionalRejectionDecision(
         ? 'unsupported'
         : 'supported_unselected';
     case 'MATCH':
+    case 'MATCH_IGNORED_SINGLETON':
     case 'TOO_SHORT':
     case 'UNKNOWN':
     case 'DETECTOR_ERROR':
