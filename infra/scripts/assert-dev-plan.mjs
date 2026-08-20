@@ -2935,16 +2935,42 @@ function finalHasExactTransitionContainerAppPrior(
   }
   const before = resourceChange.change.before;
   const after = resourceChange.change.after;
+  const referenceChange = FINAL_REFERENCE_CHANGES.get(CONTAINER_APP)?.change;
+  const priorResource = finalCollectValueResources(
+    plan.prior_state?.values?.root_module,
+  )?.get(CONTAINER_APP);
   const expectedDifferences = [
     "body.properties.template.containers[0].image",
     "output",
   ];
+  const expectedSensitivityDifferences = ["output"];
   if (
     !isObject(before) ||
     !isObject(after) ||
+    !referenceChange ||
+    !priorResource ||
     !isDeepStrictEqual(
       finalRecursiveDifferencePaths(before, after),
       expectedDifferences,
+    ) ||
+    !isDeepStrictEqual(
+      resourceChange.change.before_sensitive,
+      referenceChange.before_sensitive,
+    ) ||
+    !isDeepStrictEqual(
+      resourceChange.change.after_sensitive,
+      referenceChange.after_sensitive,
+    ) ||
+    !isDeepStrictEqual(
+      priorResource.sensitive_values,
+      referenceChange.before_sensitive,
+    ) ||
+    !isDeepStrictEqual(
+      finalRecursiveDifferencePaths(
+        resourceChange.change.before_sensitive,
+        resourceChange.change.after_sensitive,
+      ),
+      expectedSensitivityDifferences,
     )
   ) {
     return false;

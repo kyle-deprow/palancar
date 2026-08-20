@@ -1958,6 +1958,44 @@ test("final-rollout binds resource sensitivity to update versus no-op actions", 
     idempotentApp.change.after_sensitive,
     transitionApp.change.before_sensitive,
   );
+  const expectedAfterSensitive = clone(transitionApp.change.before_sensitive);
+  if (Object.hasOwn(transitionApp.change.after_sensitive, "output")) {
+    expectedAfterSensitive.output = clone(
+      transitionApp.change.after_sensitive.output,
+    );
+  } else {
+    delete expectedAfterSensitive.output;
+  }
+  assert.deepEqual(transitionApp.change.after_sensitive, expectedAfterSensitive);
+
+  const transitionPrior = finalValueResource(
+    transition.prior_state.values.root_module,
+    containerAppAddress,
+  );
+  const transitionPlanned = finalValueResource(
+    transition.planned_values.root_module,
+    containerAppAddress,
+  );
+  for (const [values, sensitiveValues] of [
+    [transitionApp.change.before, transitionApp.change.before_sensitive],
+    [transitionApp.change.after, transitionApp.change.after_sensitive],
+    [transitionPrior.values, transitionPrior.sensitive_values],
+    [transitionPlanned.values, transitionPlanned.sensitive_values],
+  ]) {
+    const relayEnv = values.body.properties.template.containers[0].env;
+    const relayEnvMask =
+      sensitiveValues.body.properties.template.containers[0].env;
+    assert.equal(relayEnv.length, 25);
+    assert.equal(relayEnvMask.length, relayEnv.length);
+    for (const [index, entry] of relayEnv.entries()) {
+      assert.deepEqual(
+        relayEnvMask[index],
+        entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING"
+          ? { value: true }
+          : {},
+      );
+    }
+  }
 
   rejectsFinalMutation((candidate) => {
     const app = finalChange(candidate, containerAppAddress);
@@ -1987,6 +2025,58 @@ test("final-rollout binds resource sensitivity to update versus no-op actions", 
     },
     true,
   );
+});
+
+test("final-rollout rejects sensitive or malformed relay environment masks", () => {
+  const sensitivityMaps = (candidate) => {
+    const app = finalChange(candidate, containerAppAddress);
+    const prior = finalValueResource(
+      candidate.prior_state.values.root_module,
+      containerAppAddress,
+    );
+    const planned = finalValueResource(
+      candidate.planned_values.root_module,
+      containerAppAddress,
+    );
+    return [
+      app.change.before_sensitive,
+      app.change.after_sensitive,
+      prior.sensitive_values,
+      planned.sensitive_values,
+    ];
+  };
+  const relayEnvMask = (sensitiveValues) =>
+    sensitiveValues.body.properties.template.containers[0].env;
+
+  for (const boundaryMask of [{ value: true }, { secretRef: true }]) {
+    rejectsFinalMutation((candidate) => {
+      for (const sensitiveValues of sensitivityMaps(candidate)) {
+        relayEnvMask(sensitiveValues)[24] = clone(boundaryMask);
+      }
+    });
+  }
+
+  rejectsFinalMutation((candidate) => {
+    const app = finalChange(candidate, containerAppAddress);
+    const prior = finalValueResource(
+      candidate.prior_state.values.root_module,
+      containerAppAddress,
+    );
+    relayEnvMask(app.change.before_sensitive)[24] = { value: true };
+    relayEnvMask(prior.sensitive_values)[24] = { value: true };
+  });
+
+  for (const mutate of [
+    (mask) => { mask.pop(); },
+    (mask) => { mask.push({}); },
+    (mask) => { mask[0] = { value: true }; },
+  ]) {
+    rejectsFinalMutation((candidate) => {
+      for (const sensitiveValues of sensitivityMaps(candidate)) {
+        mutate(relayEnvMask(sensitiveValues));
+      }
+    });
+  }
 });
 
 test("final-rollout requires the genuine zero-drift transition and idempotent form", () => {
