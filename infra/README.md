@@ -240,7 +240,12 @@ CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
 1 CPU/2Gi. The only recursive Container App differences are the appended relay
 `containers[0].env[24]` entry, `containers[0].image`, and the provider output.
 The prior state omits the new environment entry; planned state adds it exactly
-once. The prior relay image is pinned
+once. The configuration body references preserve Terraform v2's exact order,
+with `var.language_boundary_mode` between the two sidecar-dependent reference
+groups. The update's relay `after_unknown.env` has 25 ordered empty descriptors,
+one for every planned relay environment entry. The check envelope contains
+exactly one passing module `language_boundary_mode` variable check. The prior
+relay image is pinned
 to the reviewed digest
 `sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`.
 The planned image must equal `var.relay_image_digest`, remain immutable in the
@@ -254,7 +259,7 @@ receiver per sorted budget contact. The same contact set must appear in all
 four budget notifications. Every alert is bound to that action group and must
 match the committed workspace scope, KQL, threshold, aggregation, severity,
 periods, properties, and provider envelope, with no dimensions. The idempotent
-form requires all 39 resources and all outputs to be no-op, all 101 checks to
+form requires all 39 resources and all outputs to be no-op, all 102 checks to
 pass, and zero resource drift. The reviewed transition has `applyable=true`.
 The terminal no-op plan has `applyable=false`; it is verification evidence only
 and must never be applied.
@@ -277,7 +282,7 @@ transition. Any future approved procedure must verify the exact reviewed binary
 immediately before guarding and again immediately before applying it.
 
 After apply, generate a fresh complete plan and require 39 no-op resources,
-zero resource drift, and all 101 checks passing before treating the rollout as
+zero resource drift, and all 102 checks passing before treating the rollout as
 idempotent. Guard that terminal plan, but never apply it: Terraform reports the
 genuine no-op envelope with `applyable=false`.
 

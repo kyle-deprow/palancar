@@ -58,7 +58,10 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   no `PALANCAR_LANGUAGE_BOUNDARY_MODE`; planned state appends exactly one plain,
   nonsecret `PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry.
   Terminal plans retain that exact entry. Missing, deny-all, duplicated, or
-  secret-backed forms are rejected. The prior relay
+  secret-backed forms are rejected. Configuration body references retain the
+  exact Terraform v2 order around the boundary and sidecar expressions. The
+  transition has 25 ordered empty relay `after_unknown.env` descriptors and
+  exactly one passing module `language_boundary_mode` variable check. The prior relay
   image is the hard-pinned reviewed digest
   `sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
@@ -75,7 +78,7 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   `budget_contact_emails` contain the same contact set. Every alert has the
   exact committed KQL, threshold, severity, aggregation, periods, action group,
   static properties, and no dimensions. The idempotent form requires all 39
-  resources and all outputs to be no-op, all 101 checks to pass, and zero drift.
+  resources and all outputs to be no-op, all 102 checks to pass, and zero drift.
 - The transition has the exact reviewed 46-entry `relevant_attributes` set.
   The idempotent form has exactly 45 entries, removing only
   `azurerm_resource_group.foundation["id"]` from that set.
@@ -185,7 +188,7 @@ git diff --check
 ```
 
 After apply, require a fresh complete plan with `applyable=false`, all 39
-resources no-op, all outputs no-op, zero resource drift, and all 101 checks
+resources no-op, all outputs no-op, zero resource drift, and all 102 checks
 passing. Guard this terminal verification plan and never apply it. Report
 changed files, actual command results, residual risks, and `DONE` only when all
 requirements and tests are complete.

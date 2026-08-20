@@ -2503,6 +2503,116 @@ test("final-rollout scans exact configuration, planned, prior, relevant, unknown
   for (const mutate of mutations) rejectsFinalMutation(mutate);
 });
 
+test("final-rollout pins the Terraform v2 boundary reference, check, and unknown envelopes", () => {
+  const bodyReferences =
+    finalTransitionFixture.configuration.root_module.module_calls
+      .container_app_workload.module.resources[0].expressions.body.references;
+  assert.deepEqual(bodyReferences, [
+    "var.container_app_environment_id",
+    "var.target_port",
+    "var.acr_login_server",
+    "var.image_pull_identity_id",
+    "var.image_pull_identity_id",
+    "var.runtime_identity_id",
+    "var.enable_litellm_sidecar",
+    "var.litellm_master_key_secret_url",
+    "var.runtime_identity_id",
+    "var.openrouter_api_key_secret_url",
+    "var.runtime_identity_id",
+    "var.image_digest",
+    "var.target_port",
+    "var.enable_litellm_sidecar",
+    "var.environment",
+    "var.relay_origin",
+    "var.gate_policy_version",
+    "var.runtime_identity_client_id",
+    "var.deployment_slot",
+    "local.relay_application_insights_connection_string",
+    "var.security_mode",
+    "var.workload_table_endpoint",
+    "var.security_state_table_name",
+    "var.rate_state_table_name",
+    "var.transcription_provider",
+    "var.transcription_provider",
+    "var.azure_transcription_endpoint",
+    "var.azure_transcription_deployment",
+    "var.browser_allowed_origins",
+    "var.allow_null_browser_origin",
+    "var.enable_litellm_sidecar",
+    "var.language_boundary_mode",
+    "var.enable_litellm_sidecar",
+    "var.litellm_image_digest",
+    "var.litellm_upstream_model",
+    "var.min_replicas",
+  ]);
+
+  const boundaryChecks = finalTransitionFixture.checks.filter(
+    (check) => check.address.name === "language_boundary_mode",
+  );
+  assert.deepEqual(boundaryChecks, [
+    {
+      address: {
+        kind: "var",
+        module: "module.container_app_workload",
+        name: "language_boundary_mode",
+        to_display: "module.container_app_workload.var.language_boundary_mode",
+      },
+      status: "pass",
+      instances: [
+        {
+          address: {
+            module: "module.container_app_workload[0]",
+            to_display:
+              "module.container_app_workload[0].var.language_boundary_mode",
+          },
+          status: "pass",
+        },
+      ],
+    },
+  ]);
+
+  const appChange = finalChange(finalTransitionFixture, containerAppAddress).change;
+  const afterEnv = appChange.after.body.properties.template.containers[0].env;
+  const unknownEnv =
+    appChange.after_unknown.body.properties.template.containers[0].env;
+  assert.equal(afterEnv.length, 25);
+  assert.equal(unknownEnv.length, afterEnv.length);
+  assert.deepEqual(unknownEnv, afterEnv.map(() => ({})));
+
+  rejectsFinalMutation((candidate) => {
+    const references =
+      candidate.configuration.root_module.module_calls.container_app_workload
+        .module.resources[0].expressions.body.references;
+    references.splice(
+      31,
+      4,
+      references[32],
+      references[33],
+      references[34],
+      references[31],
+    );
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.checks = candidate.checks.filter(
+      (check) => check.address.name !== "language_boundary_mode",
+    );
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.checks.push(clone(boundaryChecks[0]));
+  });
+  rejectsFinalMutation((candidate) => {
+    candidate.checks.find(
+      (check) => check.address.name === "language_boundary_mode",
+    ).instances[0].status = "fail";
+  });
+  rejectsFinalMutation((candidate) => {
+    finalChange(
+      candidate,
+      containerAppAddress,
+    ).change.after_unknown.body.properties.template.containers[0].env.pop();
+  });
+});
+
 test("final-rollout requires the genuine child-module hierarchy in planned and prior values", () => {
   rejectsFinalMutation((candidate) => {
     candidate.planned_values.root_module.child_modules.push({
@@ -2625,8 +2735,8 @@ test("final-rollout enforces exact output action, prior, unknown, and sensitivit
   );
 });
 
-test("final-rollout requires all 101 checks to pass with exact envelopes", () => {
-  assert.equal(finalTransitionFixture.checks.length, 101);
+test("final-rollout requires all 102 checks to pass with exact envelopes", () => {
+  assert.equal(finalTransitionFixture.checks.length, 102);
   assert.equal(
     finalTransitionFixture.checks.every(
       (check) =>

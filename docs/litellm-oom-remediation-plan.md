@@ -78,7 +78,7 @@ distinct from prior, and is not hard-coded in the committed guard or sanitized
 fixture. The `relay_latest_revision_name` output becomes unknown. The genuine
 transition has zero resource drift, represented by the omitted
 `resource_drift` envelope. The subsequent idempotent form requires all 39
-resources and all outputs to be no-op, all 101 checks to pass with no unknown
+resources and all outputs to be no-op, all 102 checks to pass with no unknown
 checks, and zero resource drift. The transition has `applyable=true`; the
 terminal no-op plan has `applyable=false`, is guard-only verification evidence,
 and must never be applied.
