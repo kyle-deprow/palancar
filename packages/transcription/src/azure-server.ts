@@ -681,7 +681,7 @@ function validateSessionTranscription(
   )) {
     fail('invalid-field');
   }
-  if (language !== undefined && !isLanguageCode(language)) {
+  if (language !== undefined && language !== null && !isLanguageCode(language)) {
     fail('invalid-field');
   }
   if (languages !== undefined) {
@@ -690,7 +690,7 @@ function validateSessionTranscription(
   if (keywords !== undefined) {
     validateSessionKeywords(keywords);
   }
-  if (prompt !== undefined && !isBoundedString(
+  if (prompt !== undefined && prompt !== null && !isBoundedString(
     prompt,
     MAX_AZURE_REALTIME_SERVER_TEXT_BYTES,
     true
@@ -834,10 +834,13 @@ function validateSessionAudio(value: unknown, expectedDeployment: string): boole
     expectedFormat = validateSessionFormat(valueOf(input, 'format'));
   }
   if (hasTranscription) {
-    expectedModel = validateSessionTranscription(
-      valueOf(input, 'transcription'),
-      expectedDeployment
-    );
+    const transcription = valueOf(input, 'transcription');
+    if (transcription !== null) {
+      expectedModel = validateSessionTranscription(
+        transcription,
+        expectedDeployment
+      );
+    }
   }
 
   if (Object.hasOwn(input, 'noise_reduction')) {

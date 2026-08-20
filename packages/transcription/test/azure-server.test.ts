@@ -580,6 +580,83 @@ describe('Azure Realtime GA server event parser', () => {
     })), 'invalid-field');
   });
 
+  it('accepts the live nullable session transcription response shape', () => {
+    const liveUnconfiguredSession = {
+      ...createdSession,
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: 24_000 },
+          transcription: null,
+          noise_reduction: null,
+          turn_detection: null
+        }
+      },
+      include: null
+    };
+    expect(parseServerEvent(providerEvent({
+      type: 'session.created',
+      event_id: 'event_live_created_null_transcription',
+      session: liveUnconfiguredSession
+    }))).toMatchObject({
+      session: { phase: 'basic', configured: false }
+    });
+    expect(parseServerEvent(providerEvent({
+      type: 'session.updated',
+      event_id: 'event_live_updated_null_transcription',
+      session: liveUnconfiguredSession
+    }))).toMatchObject({
+      session: { phase: 'basic', configured: false }
+    });
+
+    const liveSession = {
+      ...createdSession,
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: 24_000 },
+          transcription: {
+            model: EXPECTED_DEPLOYMENT,
+            language: null,
+            prompt: null
+          },
+          noise_reduction: null,
+          turn_detection: null
+        }
+      },
+      include: null
+    };
+    expect(parseServerEvent(providerEvent({
+      type: 'session.updated',
+      event_id: 'event_live_nullable_transcription',
+      session: liveSession
+    }))).toMatchObject({
+      session: { phase: 'configured', configured: true }
+    });
+
+    for (const [field, value] of [
+      ['language', 'mixed'],
+      ['language', 42],
+      ['prompt', 42],
+      ['prompt', { invalid: true }]
+    ] as const) {
+      expectReason(() => parseServerEvent(providerEvent({
+        type: 'session.updated',
+        event_id: 'event_malformed_non_null_transcription',
+        session: {
+          ...liveSession,
+          audio: {
+            input: {
+              ...liveSession.audio.input,
+              transcription: {
+                ...liveSession.audio.input.transcription,
+                [field]: value
+              }
+            }
+          }
+        }
+      })), 'invalid-field');
+    }
+  });
+
   it('accepts only the dedicated transcription-session GA response shape', () => {
     for (const invalidIdentity of [
       { ...createdSession, object: 'realtime.session' },
@@ -715,10 +792,6 @@ describe('Azure Realtime GA server event parser', () => {
       {
         ...serverVadSession.audio.input,
         transcription: { model: EXPECTED_DEPLOYMENT, language: 'zz' }
-      },
-      {
-        ...serverVadSession.audio.input,
-        transcription: { model: EXPECTED_DEPLOYMENT, language: null }
       },
       {
         ...serverVadSession.audio.input,
