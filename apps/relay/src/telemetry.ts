@@ -344,16 +344,45 @@ function validateConfig(input: RelayMetricSinkConfig): ValidatedConfig {
   }
 }
 
-function hasExactExportRecordKeys(input: unknown): boolean {
+function recordWithDeploymentSlot(
+  input: unknown,
+  deploymentSlot: DeploymentSlot
+): object | undefined {
   if (typeof input !== 'object' || input === null || utilTypes.isProxy(input)) {
-    return false;
+    return undefined;
   }
   try {
-    return Reflect.ownKeys(input).every(
-      (key) => typeof key === 'string' && EXPORT_RECORD_KEYS.has(key)
-    );
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return undefined;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (
+      !Reflect.ownKeys(descriptors).every(
+        (key) => typeof key === 'string' && EXPORT_RECORD_KEYS.has(key)
+      )
+    ) {
+      return undefined;
+    }
+
+    const suppliedSlot = descriptors.deploymentSlot;
+    if (suppliedSlot !== undefined) {
+      return Object.hasOwn(suppliedSlot, 'value') && suppliedSlot.value === deploymentSlot
+        ? input
+        : undefined;
+    }
+
+    const enriched = Object.create(prototype) as object;
+    Object.defineProperties(enriched, descriptors);
+    Object.defineProperty(enriched, 'deploymentSlot', {
+      configurable: true,
+      enumerable: true,
+      value: deploymentSlot,
+      writable: true
+    });
+    return enriched;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -570,10 +599,11 @@ class AzureRelayMetricSink implements RelayMetricSink {
       return;
     }
     try {
-      if (!hasExactExportRecordKeys(input)) {
+      const enriched = recordWithDeploymentSlot(input, this.#deploymentSlot);
+      if (enriched === undefined) {
         return;
       }
-      const record = sanitizeTelemetryForExport(input, this.#deploymentSlot);
+      const record = sanitizeTelemetryForExport(enriched, this.#deploymentSlot);
       const selected = this.#instruments.get(record.name);
       if (selected === undefined) {
         return;

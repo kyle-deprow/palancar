@@ -107,6 +107,25 @@ function recordFor(name: TelemetryMetricName): Record<string, unknown> {
   return record;
 }
 
+function coreSessionRecord(
+  name:
+    | typeof TELEMETRY_METRIC_NAMES.SESSION_START
+    | typeof TELEMETRY_METRIC_NAMES.SESSION_END
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    name,
+    timestamp: TIMESTAMP,
+    count: 1,
+    protocolVersion: TELEMETRY_PROTOCOL_VERSION,
+    targetLanguage: TARGET_LANGUAGES.ES,
+    operation: TELEMETRY_OPERATIONS.SESSION,
+    outcome:
+      name === TELEMETRY_METRIC_NAMES.SESSION_START
+        ? TELEMETRY_OUTCOMES.SUCCESS
+        : TELEMETRY_OUTCOMES.COMPLETED
+  });
+}
+
 function createHarness(options: HarnessOptions = {}): Readonly<{
   runtime: Runtime;
   measurements: Measurement[];
@@ -503,6 +522,112 @@ describe('production relay metric sink construction', () => {
 });
 
 describe('record', () => {
+  it.each([
+    {
+      name: TELEMETRY_METRIC_NAMES.SESSION_START,
+      outcome: TELEMETRY_OUTCOMES.SUCCESS
+    },
+    {
+      name: TELEMETRY_METRIC_NAMES.SESSION_END,
+      outcome: TELEMETRY_OUTCOMES.COMPLETED
+    }
+  ])('adds the trusted deployment slot to exact core $name records', ({ name, outcome }) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+    sink.record(coreSessionRecord(name));
+
+    expect(harness.measurements).toEqual([
+      {
+        kind: 'counter',
+        name,
+        value: 1,
+        attributes: {
+          'palancar.protocol.version': TELEMETRY_PROTOCOL_VERSION,
+          'palancar.target_language': TARGET_LANGUAGES.ES,
+          'palancar.operation': TELEMETRY_OPERATIONS.SESSION,
+          'palancar.outcome': outcome
+        }
+      }
+    ]);
+  });
+
+  it('accepts only an exact matching own deployment-slot data property', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    const matching = {
+      ...coreSessionRecord(TELEMETRY_METRIC_NAMES.SESSION_START),
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV
+    };
+
+    sink.record(matching);
+
+    expect(harness.measurements).toHaveLength(1);
+    expect(harness.measurements[0]).toMatchObject({
+      kind: 'counter',
+      name: TELEMETRY_METRIC_NAMES.SESSION_START,
+      value: 1
+    });
+  });
+
+  it('drops invalid deployment slots and malformed roots without invoking accessors', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    let deploymentSlotReads = 0;
+    let nameReads = 0;
+    const slotAccessor = {
+      ...coreSessionRecord(TELEMETRY_METRIC_NAMES.SESSION_START)
+    };
+    Object.defineProperty(slotAccessor, 'deploymentSlot', {
+      enumerable: true,
+      get() {
+        deploymentSlotReads += 1;
+        return DEPLOYMENT_SLOTS.DEV;
+      }
+    });
+    const nameAccessor = {
+      timestamp: TIMESTAMP,
+      count: 1,
+      protocolVersion: TELEMETRY_PROTOCOL_VERSION,
+      operation: TELEMETRY_OPERATIONS.SESSION,
+      outcome: TELEMETRY_OUTCOMES.SUCCESS
+    };
+    Object.defineProperty(nameAccessor, 'name', {
+      enumerable: true,
+      get() {
+        nameReads += 1;
+        return TELEMETRY_METRIC_NAMES.SESSION_START;
+      }
+    });
+    const symbolKey = {
+      ...coreSessionRecord(TELEMETRY_METRIC_NAMES.SESSION_START)
+    };
+    Object.defineProperty(symbolKey, Symbol('forbidden'), {
+      value: true
+    });
+    const core = coreSessionRecord(TELEMETRY_METRIC_NAMES.SESSION_START);
+    const invalid: readonly unknown[] = [
+      { ...core, deploymentSlot: DEPLOYMENT_SLOTS.STAGING },
+      { ...core, deploymentSlot: null },
+      { ...core, deploymentSlot: undefined },
+      { ...core, deploymentSlot: Symbol('dev') },
+      slotAccessor,
+      nameAccessor,
+      symbolKey,
+      new Proxy(core, {}),
+      { ...core, correlationId: HASH },
+      { name: TELEMETRY_METRIC_NAMES.SESSION_START }
+    ];
+
+    for (const input of invalid) {
+      expect(() => sink.record(input)).not.toThrow();
+    }
+
+    expect(deploymentSlotReads).toBe(0);
+    expect(nameReads).toBe(0);
+    expect(harness.measurements).toHaveLength(0);
+  });
+
   it('records the sanitizer-defined values for every closed metric name', () => {
     const harness = createHarness();
     const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
