@@ -5,9 +5,9 @@ Date: 2026-08-20
 
 ## Objective
 
-Maintain the fail-closed `final-rollout` mode for the telemetry-enrichment
-relay-image-only correction after the null-callback fix and completed LiteLLM
-OOM remediation. It
+Maintain the fail-closed `final-rollout` mode for the GA item-lifecycle
+relay-image-only correction after the telemetry-enrichment fix and completed
+LiteLLM OOM remediation. It
 retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
 expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
 transcription model.
@@ -55,10 +55,10 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   The Container App before/after recursive differences are exactly
   `body.properties.template.containers[0].image` and `output`. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:cab2c5ca0d8ab2d46d71e9079f243f6772e630c753c3c6a7ec04f925b7aae653`;
+  `sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
   same ACR/repository, and is distinct from prior. The production after digest
-  is the reviewed telemetry-enrichment digest documented in `infra/README.md`;
+  is the reviewed GA item-lifecycle digest documented in `infra/README.md`;
   it remains variable-bound and is not hard-coded in the committed guard or
   sanitized fixture. The provider-computed
   `relay_latest_revision_name` output becomes unknown. The already deployed
@@ -145,11 +145,12 @@ applyable flags, configuration and child-module trees, prior/planned values,
 nulls, computed values, unknown maps, and sensitivity maps. It must contain no
 live contact, secret, credential, instrumentation key, or personal principal
 identifier; synthetic placeholders must be cross-bound throughout. The
-telemetry-predecessor binary `/tmp/palancar-ws-null-callback.tfplan` had SHA-256
-`423974333137f7a06d08aa74d30960b35272deae46cae658616d6763770a2986` and is
-historical and non-applicable. The active telemetry-enrichment binary is
-`/tmp/palancar-telemetry-enrichment.tfplan`, with reviewed SHA-256
-`ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7`.
+telemetry-enrichment binary `/tmp/palancar-telemetry-enrichment.tfplan` had
+SHA-256
+`ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7` and is
+historical and non-applicable. The active GA item-lifecycle binary is
+`/tmp/palancar-ga-item-lifecycle-v3.tfplan`, with reviewed SHA-256
+`a4caa91081861c707e07387e4aa2979b3e1cbced0359ee53f19a35d1844b08f8`.
 Verify it immediately before guard and apply. Verify the binary hash, not the
 hash of its JSON view. Keep both protected with mode `0600`, and never commit
 either raw artifact. Build the idempotent
