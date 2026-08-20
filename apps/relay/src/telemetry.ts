@@ -48,12 +48,45 @@ const EXPORT_RECORD_KEYS = new Set([
   'count',
   'targetLanguage',
   'gateDecision',
+  'languageBoundaryMode',
+  'languageReason',
+  'detectedLanguage',
+  'provisionalScoreBasisPoints',
   'operation',
   'outcome',
   'providerId',
   'providerVersion',
   'deploymentSlot',
   'reconnectReason'
+]);
+const APP_LANGUAGE_RECORD_KEYS = new Set([
+  'languageBoundaryMode',
+  'languageReason',
+  'detectedLanguage',
+  'provisionalScoreBasisPoints'
+]);
+const BOUNDARY_MODES = new Set([
+  'fixture',
+  'deny-all',
+  'production-approved',
+  'development-provisional'
+]);
+const PROVISIONAL_REASONS = new Set([
+  'MATCH',
+  'ENGLISH',
+  'UNSELECTED_LANGUAGE',
+  'MIXED',
+  'TOO_SHORT',
+  'UNKNOWN',
+  'DETECTOR_ERROR'
+]);
+const DETECTED_LANGUAGE_LABELS = new Set([
+  'en',
+  'es',
+  'tr',
+  'mixed',
+  'other',
+  'unknown'
 ]);
 const LATENCY_METRIC_NAMES = new Set<TelemetryMetricName>([
   TELEMETRY_METRIC_NAMES.TRANSCRIPTION_FIRST_PARTIAL_LATENCY,
@@ -347,7 +380,15 @@ function validateConfig(input: RelayMetricSinkConfig): ValidatedConfig {
 function recordWithDeploymentSlot(
   input: unknown,
   deploymentSlot: DeploymentSlot
-): object | undefined {
+): Readonly<{
+  record: object;
+  languageAttributes?: Readonly<{
+    boundaryMode: string;
+    reason?: string;
+    detectedLanguage?: string;
+    provisionalScoreBasisPoints?: number;
+  }>;
+}> | undefined {
   if (typeof input !== 'object' || input === null || utilTypes.isProxy(input)) {
     return undefined;
   }
@@ -367,20 +408,98 @@ function recordWithDeploymentSlot(
 
     const suppliedSlot = descriptors.deploymentSlot;
     if (suppliedSlot !== undefined) {
-      return Object.hasOwn(suppliedSlot, 'value') && suppliedSlot.value === deploymentSlot
-        ? input
-        : undefined;
+      if (!Object.hasOwn(suppliedSlot, 'value') || suppliedSlot.value !== deploymentSlot) {
+        return undefined;
+      }
     }
 
+    const appDescriptors = [...APP_LANGUAGE_RECORD_KEYS]
+      .map((key) => descriptors[key])
+      .filter((descriptor): descriptor is PropertyDescriptor => descriptor !== undefined);
+    const hasLanguageAttributes = appDescriptors.length > 0;
+    if (
+      hasLanguageAttributes &&
+      appDescriptors.some((descriptor) => !Object.hasOwn(descriptor, 'value'))
+    ) {
+      return undefined;
+    }
+    const valueFor = (key: string): unknown => {
+      const descriptor = descriptors[key];
+      if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+        return undefined;
+      }
+      return descriptor.value;
+    };
+    const name = valueFor('name');
+    const boundaryMode = valueFor('languageBoundaryMode');
+    const reason = valueFor('languageReason');
+    const detectedLanguage = valueFor('detectedLanguage');
+    const provisionalScoreBasisPoints = valueFor('provisionalScoreBasisPoints');
+    let languageAttributes:
+      | Readonly<{
+          boundaryMode: string;
+          reason?: string;
+          detectedLanguage?: string;
+          provisionalScoreBasisPoints?: number;
+        }>
+      | undefined;
+    if (hasLanguageAttributes) {
+      if (
+        name !== 'language.decision' ||
+        typeof boundaryMode !== 'string' ||
+        !BOUNDARY_MODES.has(boundaryMode)
+      ) {
+        return undefined;
+      }
+      if (boundaryMode === 'development-provisional') {
+        if (
+          typeof reason !== 'string' ||
+          !PROVISIONAL_REASONS.has(reason) ||
+          typeof detectedLanguage !== 'string' ||
+          !DETECTED_LANGUAGE_LABELS.has(detectedLanguage) ||
+          typeof provisionalScoreBasisPoints !== 'number' ||
+          !Number.isSafeInteger(provisionalScoreBasisPoints) ||
+          provisionalScoreBasisPoints < 0 ||
+          provisionalScoreBasisPoints > 10_000
+        ) {
+          return undefined;
+        }
+        languageAttributes = Object.freeze({
+          boundaryMode,
+          reason,
+          detectedLanguage,
+          provisionalScoreBasisPoints
+        });
+      } else {
+        if (
+          reason !== undefined ||
+          detectedLanguage !== undefined ||
+          provisionalScoreBasisPoints !== undefined
+        ) {
+          return undefined;
+        }
+        languageAttributes = Object.freeze({ boundaryMode });
+      }
+    }
+
+    const coreDescriptors: PropertyDescriptorMap = {};
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!APP_LANGUAGE_RECORD_KEYS.has(key) && key !== 'deploymentSlot') {
+        coreDescriptors[key] = descriptor;
+      }
+    }
     const enriched = Object.create(prototype) as object;
-    Object.defineProperties(enriched, descriptors);
+    Object.defineProperties(enriched, coreDescriptors);
     Object.defineProperty(enriched, 'deploymentSlot', {
       configurable: true,
       enumerable: true,
       value: deploymentSlot,
       writable: true
     });
-    return enriched;
+    return Object.freeze({
+      record: enriched,
+      ...(languageAttributes === undefined ? {} : { languageAttributes })
+    });
   } catch {
     return undefined;
   }
@@ -522,7 +641,15 @@ function createTrackingExporter(
   };
 }
 
-function pointAttributes(record: SanitizedTelemetryRecord): MetricAttributes {
+function pointAttributes(
+  record: SanitizedTelemetryRecord,
+  languageAttributes?: Readonly<{
+    boundaryMode: string;
+    reason?: string;
+    detectedLanguage?: string;
+    provisionalScoreBasisPoints?: number;
+  }>
+): MetricAttributes {
   const attributes: Record<string, MetricAttributeValue> = Object.create(null);
   if (record.protocolVersion !== undefined) {
     attributes['palancar.protocol.version'] = record.protocolVersion;
@@ -547,6 +674,19 @@ function pointAttributes(record: SanitizedTelemetryRecord): MetricAttributes {
   }
   if (record.reconnectReason !== undefined) {
     attributes['palancar.reconnect.reason'] = record.reconnectReason;
+  }
+  if (languageAttributes !== undefined) {
+    attributes['palancar.language.boundary_mode'] = languageAttributes.boundaryMode;
+    if (languageAttributes.reason !== undefined) {
+      attributes['palancar.language.reason'] = languageAttributes.reason;
+    }
+    if (languageAttributes.detectedLanguage !== undefined) {
+      attributes['palancar.language.detected'] = languageAttributes.detectedLanguage;
+    }
+    if (languageAttributes.provisionalScoreBasisPoints !== undefined) {
+      attributes['palancar.language.provisional_score_basis_points'] =
+        languageAttributes.provisionalScoreBasisPoints;
+    }
   }
   return attributes;
 }
@@ -603,13 +743,13 @@ class AzureRelayMetricSink implements RelayMetricSink {
       if (enriched === undefined) {
         return;
       }
-      const record = sanitizeTelemetryForExport(enriched, this.#deploymentSlot);
+      const record = sanitizeTelemetryForExport(enriched.record, this.#deploymentSlot);
       const selected = this.#instruments.get(record.name);
       if (selected === undefined) {
         return;
       }
       const value = metricValue(record);
-      const attributes = pointAttributes(record);
+      const attributes = pointAttributes(record, enriched.languageAttributes);
       if (selected.kind === 'histogram') {
         selected.instrument.record(value, attributes);
       } else {

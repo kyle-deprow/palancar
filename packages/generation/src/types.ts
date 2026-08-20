@@ -11,6 +11,7 @@ import type {
 } from '@palancar/contracts';
 import type { TargetLanguage } from '@palancar/language-registry';
 import type {
+  GeneratedLanguageValidationMode,
   GeneratedLanguageValidationStatus,
   GeneratedLanguageValidator
 } from './language-validation.js';
@@ -118,6 +119,7 @@ export interface GenerationEvidenceRecord extends GenerationCorrelation {
 export interface GenerationServiceOptions {
   readonly provider: GenerationProvider;
   readonly validator: GeneratedLanguageValidator;
+  readonly languageValidationMode?: GeneratedLanguageValidationMode;
   readonly languageValidationTimeoutMs?: number;
   readonly evidenceCollector?: MetadataOnlyEvidenceCollectorLike;
   readonly evidence?: MetadataOnlyEvidenceCollectorLike;

@@ -230,6 +230,7 @@ module "container_app_workload" {
   azure_transcription_endpoint                            = local.relay_transcription_endpoint
   azure_transcription_deployment                          = local.relay_transcription_deployment
   deployment_slot                                         = local.relay_deployment_slot
+  language_boundary_mode                                  = "development-provisional"
   application_insights_connection_string                  = module.observability.application_insights_connection_string
   enable_litellm_sidecar                                  = var.enable_litellm_sidecar
   litellm_image_digest                                    = var.litellm_image_digest

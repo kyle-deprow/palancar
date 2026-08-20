@@ -1,3 +1,5 @@
+import { types as utilTypes } from 'node:util';
+
 import {
   DEFAULT_NEGOTIATED_LIMITS,
   MAX_CONTROL_MESSAGE_BYTES,
@@ -26,6 +28,7 @@ import {
 import {
   LANGUAGE_REGISTRY_VERSION,
   evaluateLanguageGate,
+  snapshotClassifiedLanguageEvidence,
   type ClassifiedLanguageEvidence,
   type LanguageGateResult,
   type TextLanguageClassifier,
@@ -56,6 +59,15 @@ import type {
   RelayMetricSink,
   RelayProductionMetricInput
 } from './types.js';
+
+function snapshotRelayClassifierEvidence(
+  value: unknown
+): ClassifiedLanguageEvidence {
+  if (typeof value !== 'object' || value === null || utilTypes.isProxy(value)) {
+    throw new TypeError('Invalid classifier evidence');
+  }
+  return snapshotClassifiedLanguageEvidence(value);
+}
 
 const SESSION_EPOCH = 1;
 const MANUAL_COMMIT_CADENCE_MS = 600;
@@ -118,7 +130,8 @@ function exactLanguageBoundaryMode(value: unknown): RelayLanguageBoundaryMode {
   if (
     value === 'fixture' ||
     value === 'deny-all' ||
-    value === 'production-approved'
+    value === 'production-approved' ||
+    value === 'development-provisional'
   ) {
     return value;
   }
@@ -600,7 +613,12 @@ export class RelaySessionCore {
 
     let evidence: ClassifiedLanguageEvidence;
     try {
-      evidence = await this.#languageClassifier.classify(event.text);
+      evidence = snapshotRelayClassifierEvidence(
+        await this.#languageClassifier.classify(
+          event.text,
+          this.#selectedTargetLanguage
+        )
+      );
     } catch {
       return this.#classifierFailure(active, event);
     }
@@ -613,7 +631,11 @@ export class RelaySessionCore {
       gateResult = evaluateLanguageGate({
         selectedLanguage: this.#selectedTargetLanguage ?? 'es',
         evidence,
-        isFinal: true
+        isFinal: true,
+        boundaryMode:
+          this.#languageBoundaryMode === 'development-provisional'
+            ? 'development-provisional'
+            : 'production-calibrated'
       });
     } catch {
       return this.#classifierFailure(active, event);
@@ -632,7 +654,7 @@ export class RelaySessionCore {
       this.#finishActive(false);
       return this.#result([]);
     }
-    this.#recordLanguageDecision(active, finalDecision);
+    this.#recordLanguageDecision(active, finalDecision, evidence);
     this.#recordUtteranceTerminal(active, 'completed');
     if (
       finalDecision !== 'target' ||
@@ -1508,7 +1530,8 @@ export class RelaySessionCore {
 
   #recordLanguageDecision(
     active: ActiveUtterance,
-    gateDecision: Exclude<LanguageDecisionValue, 'provisional'>
+    gateDecision: Exclude<LanguageDecisionValue, 'provisional'>,
+    evidence?: ClassifiedLanguageEvidence
   ): void {
     if (active.languageDecisionMetricRecorded) return;
     active.languageDecisionMetricRecorded = true;
@@ -1516,6 +1539,23 @@ export class RelaySessionCore {
       name: 'language.decision',
       count: 1,
       gateDecision,
+      languageBoundaryMode: this.#languageBoundaryMode,
+      ...(evidence?.status === 'provisional'
+        ? {
+            languageReason: evidence.reason,
+            detectedLanguage:
+              evidence.detectedLanguage === 'en' ||
+              evidence.detectedLanguage === 'es' ||
+              evidence.detectedLanguage === 'tr' ||
+              evidence.detectedLanguage === 'mixed' ||
+              evidence.detectedLanguage === 'unknown'
+                ? evidence.detectedLanguage
+                : 'other',
+            provisionalScoreBasisPoints: Math.round(
+              evidence.provisionalScore * 10_000
+            )
+          }
+        : {}),
       operation: 'language',
       outcome: gateDecision === 'target' ? 'accepted' : 'rejected'
     });

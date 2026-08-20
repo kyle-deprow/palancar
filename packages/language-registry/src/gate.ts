@@ -1,4 +1,4 @@
-import { validateClassifiedLanguageEvidence } from './classifier.js';
+import { snapshotClassifiedLanguageEvidence } from './classifier.js';
 import {
   languageRegistry,
   type LanguageRegistry
@@ -55,6 +55,48 @@ function finalCalibrationAccepted(
   );
 }
 
+function developmentProvisionalAccepted(
+  input: LanguageGateInput,
+  selectedLanguage: string,
+  selectedDefinition: LanguageDefinition<string>
+): boolean {
+  const evidence = input.evidence;
+  const profile = selectedDefinition.developmentProvisional;
+  return (
+    profile !== undefined &&
+    evidence.status === 'provisional' &&
+    evidence.decision === 'accept' &&
+    evidence.reason === 'MATCH' &&
+    evidence.detectedLanguage === selectedLanguage &&
+    evidence.detectorVersion === profile.detectorVersion &&
+    evidence.profileVersion === profile.profileVersion &&
+    evidence.provisionalScore >= profile.provisionalScoreThreshold
+  );
+}
+
+function provisionalRejectionDecision(
+  input: LanguageGateInput,
+  registry: LanguageRegistry<string>
+): GateDecision {
+  const evidence = input.evidence;
+  if (evidence.status !== 'provisional') return 'uncertain';
+  switch (evidence.reason) {
+    case 'ENGLISH':
+      return 'english';
+    case 'MIXED':
+      return 'mixed';
+    case 'UNSELECTED_LANGUAGE':
+      return registry.get(evidence.detectedLanguage) === undefined
+        ? 'unsupported'
+        : 'supported_unselected';
+    case 'MATCH':
+    case 'TOO_SHORT':
+    case 'UNKNOWN':
+    case 'DETECTOR_ERROR':
+      return 'uncertain';
+  }
+}
+
 function resultFor(
   decision: GateDecision,
   input: LanguageGateInput,
@@ -88,50 +130,79 @@ export function evaluateLanguageGate(
     throw new RangeError(`Unsupported selected target language: ${selectedLanguage}`);
   }
 
-  validateClassifiedLanguageEvidence(input.evidence);
+  const safeInput: LanguageGateInput = Object.freeze({
+    selectedLanguage: input.selectedLanguage,
+    evidence: snapshotClassifiedLanguageEvidence(input.evidence),
+    isFinal: input.isFinal,
+    boundaryMode: input.boundaryMode
+  });
 
-  if (!input.isFinal) {
+  if (
+    safeInput.boundaryMode !== 'production-calibrated' &&
+    safeInput.boundaryMode !== 'development-provisional'
+  ) {
+    throw new TypeError('Language boundary mode is invalid');
+  }
+
+  if (!safeInput.isFinal) {
     return resultFor(
       'provisional',
-      input,
+      safeInput,
       selectedLanguage,
-      partialDisplayAccepted(input, selectedLanguage, selectedDefinition),
+      safeInput.boundaryMode === 'production-calibrated' &&
+        partialDisplayAccepted(safeInput, selectedLanguage, selectedDefinition),
       false
     );
   }
 
-  if (
-    input.evidence.status !== 'calibrated' ||
-    !finalCalibrationAccepted(input, selectedDefinition)
-  ) {
-    return resultFor('uncertain', input, selectedLanguage, false, false);
-  }
 
-  const detectedLanguage = input.evidence.detectedLanguage;
-  if (
-    detectedLanguage === MIXED_LANGUAGE &&
-    selectedDefinition.mixedPolicy === 'reject'
-  ) {
-    return resultFor('mixed', input, selectedLanguage, false, false);
-  }
-
-  if (detectedLanguage === selectedLanguage) {
-    return resultFor('target', input, selectedLanguage, true, true);
-  }
-
-  if (detectedLanguage === ENGLISH_LANGUAGE) {
-    return resultFor('english', input, selectedLanguage, false, false);
-  }
-
-  if (registry.get(detectedLanguage) !== undefined) {
+  if (safeInput.boundaryMode === 'development-provisional') {
+    if (
+      developmentProvisionalAccepted(safeInput, selectedLanguage, selectedDefinition)
+    ) {
+      return resultFor('target', safeInput, selectedLanguage, true, true);
+    }
     return resultFor(
-      'supported_unselected',
-      input,
+      provisionalRejectionDecision(safeInput, registry),
+      safeInput,
       selectedLanguage,
       false,
       false
     );
   }
 
-  return resultFor('unsupported', input, selectedLanguage, false, false);
+  if (
+    safeInput.evidence.status !== 'calibrated' ||
+    !finalCalibrationAccepted(safeInput, selectedDefinition)
+  ) {
+    return resultFor('uncertain', safeInput, selectedLanguage, false, false);
+  }
+
+  const detectedLanguage = safeInput.evidence.detectedLanguage;
+  if (
+    detectedLanguage === MIXED_LANGUAGE &&
+    selectedDefinition.mixedPolicy === 'reject'
+  ) {
+    return resultFor('mixed', safeInput, selectedLanguage, false, false);
+  }
+
+  if (detectedLanguage === selectedLanguage) {
+    return resultFor('target', safeInput, selectedLanguage, true, true);
+  }
+
+  if (detectedLanguage === ENGLISH_LANGUAGE) {
+    return resultFor('english', safeInput, selectedLanguage, false, false);
+  }
+
+  if (registry.get(detectedLanguage) !== undefined) {
+    return resultFor(
+      'supported_unselected',
+      safeInput,
+      selectedLanguage,
+      false,
+      false
+    );
+  }
+
+  return resultFor('unsupported', safeInput, selectedLanguage, false, false);
 }

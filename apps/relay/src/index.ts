@@ -9,4 +9,10 @@ export {
   createFailClosedLanguageClassifier,
   isFailClosedLanguageClassifier
 } from './language-classifier.js';
+export {
+  createDevelopmentProvisionalLanguageBoundary,
+  isDevelopmentProvisionalGeneratedLanguageValidator,
+  isDevelopmentProvisionalTextLanguageClassifier
+} from './provisional-language-boundary.js';
+export type { DevelopmentProvisionalLanguageBoundary } from './provisional-language-boundary.js';
 export type * from './types.js';

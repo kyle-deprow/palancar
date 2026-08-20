@@ -56,7 +56,10 @@ import {
   createTestHostSecurityComposition,
   createTestOptions,
   createRelayHost as createRelayHostProduction,
+  createDevelopmentProvisionalLanguageBoundary,
   createFailClosedDeployedTextLanguageClassifier,
+  isDevelopmentProvisionalGeneratedLanguageValidator,
+  isDevelopmentProvisionalTextLanguageClassifier,
   parseRelayHostConfig,
   type RelayHost,
   type RelayHostConfig,
@@ -964,6 +967,139 @@ describe('relay host configuration and readiness', () => {
     });
   });
 
+  it('enables the branded provisional boundary only through an explicit dev setting', () => {
+    const config = parseRelayHostConfig(litellmEnvironment({
+      PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
+    }));
+    expect(config.languageBoundaryMode).toBe('development-provisional');
+    expect(config.deploymentSlot).toBe('dev');
+    expect(isDevelopmentProvisionalTextLanguageClassifier(config.languageClassifier)).toBe(true);
+    expect(
+      isDevelopmentProvisionalGeneratedLanguageValidator(
+        config.developmentProvisionalGenerationValidator
+      )
+    ).toBe(true);
+    expect(config.generationService?.languageValidationMode).toBe(
+      'development-provisional'
+    );
+    expect(() => createRelayHost(config)).not.toThrow();
+  });
+
+  it.each(['staging', 'production'] as const)(
+    'rejects the provisional boundary in the %s deployment slot',
+    (deploymentSlot) => {
+      expect(() => parseRelayHostConfig(litellmEnvironment({
+        PALANCAR_DEPLOYMENT_SLOT: deploymentSlot,
+        PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
+      }))).toThrow('Invalid relay host configuration.');
+    }
+  );
+
+  it.each(['dev', 'staging', 'production'] as const)(
+    'accepts an exact deny-all boundary in the %s deployment slot',
+    (deploymentSlot) => {
+      const config = parseRelayHostConfig(litellmEnvironment({
+        PALANCAR_DEPLOYMENT_SLOT: deploymentSlot,
+        PALANCAR_LANGUAGE_BOUNDARY_MODE: 'deny-all'
+      }));
+      expect(config.languageBoundaryMode).toBe('deny-all');
+      expect(config.deploymentSlot).toBe(deploymentSlot);
+      expect(() => createRelayHost(config)).not.toThrow();
+    }
+  );
+
+  it.each(['deny-all', 'development-provisional'] as const)(
+    'rejects the explicit %s boundary in local-mock mode',
+    (languageBoundaryMode) => {
+    expect(() => parseRelayHostConfig(mockEnvironment({
+      PALANCAR_LANGUAGE_BOUNDARY_MODE: languageBoundaryMode
+    }))).toThrow('Invalid relay host configuration.');
+    }
+  );
+
+  it('does not invoke the provisional boundary or ELD loader for deny-all host composition', async () => {
+    vi.resetModules();
+    const boundaryFactory = vi.fn(() => {
+      throw new Error('ELD loader must remain unreachable');
+    });
+    vi.doMock('../src/provisional-language-boundary.js', async () => {
+      const actual = await vi.importActual<typeof import('../src/provisional-language-boundary.js')>(
+        '../src/provisional-language-boundary.js'
+      );
+      return {
+        ...actual,
+        createDevelopmentProvisionalLanguageBoundary: boundaryFactory
+      };
+    });
+    try {
+      const isolatedHost = await import('../src/host.js');
+      const config = isolatedHost.parseRelayHostConfig(litellmEnvironment({
+        PALANCAR_LANGUAGE_BOUNDARY_MODE: 'deny-all'
+      }));
+      expect(config.languageBoundaryMode).toBe('deny-all');
+      expect(config.generationService?.validator).toEqual({
+        id: 'fail-closed-generated-language',
+        version: '1.0.0'
+      });
+      expect(boundaryFactory).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('../src/provisional-language-boundary.js');
+      vi.resetModules();
+    }
+  });
+
+  it('requires the exact branded provisional validator identity used by GenerationService', () => {
+    const base = parseRelayHostConfig(litellmEnvironment({
+      PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
+    }));
+    const trusted = base.developmentProvisionalGenerationValidator;
+    if (trusted === undefined) throw new Error('trusted provisional validator required');
+    const counterfeit: GeneratedLanguageValidator = Object.freeze({
+      id: trusted.id,
+      version: trusted.version,
+      validate: trusted.validate
+    });
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-release',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const service = new GenerationService({
+      provider: {
+        id: 'litellm-chat',
+        version: '1.0.0',
+        complete
+      },
+      validator: counterfeit,
+      languageValidationMode: 'development-provisional'
+    });
+    expect(service.usesValidator(counterfeit)).toBe(true);
+    expect(service.usesValidator(trusted)).toBe(false);
+    expect(() => createRelayHost({ ...base, generationService: service })).toThrow(
+      'Invalid relay host configuration.'
+    );
+    expect(complete).not.toHaveBeenCalled();
+
+    const exactBoundary = createDevelopmentProvisionalLanguageBoundary();
+    const exactService = new GenerationService({
+      provider: new DeterministicMockProvider({
+        id: 'litellm-chat',
+        complete: { result: {
+          englishTranslation: 'unused',
+          suggestions: [
+            { englishText: 'one', selectedTargetText: 'uno' },
+            { englishText: 'two', selectedTargetText: 'dos' }
+          ]
+        } }
+      }),
+      validator: exactBoundary.generatedLanguageValidator,
+      languageValidationMode: 'development-provisional'
+    });
+    expect(exactService.usesValidator(exactBoundary.generatedLanguageValidator)).toBe(true);
+  });
+
   it('does not perform fetch or managed-identity token work while parsing', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
     const tokenSpy = vi.spyOn(ManagedIdentityCredential.prototype, 'getToken');
@@ -1530,6 +1666,40 @@ describe('relay host configuration and readiness', () => {
     },
     10_000
   );
+
+  it('fails readiness when lazy provisional detector initialization is malformed', async () => {
+    let loads = 0;
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => {
+        loads += 1;
+        return Object.freeze({
+          detect: () => ({
+            language: 'en',
+            getScores: () => ({ en: Number.NaN }),
+            isReliable: () => true
+          })
+        });
+      }
+    });
+    expect(loads).toBe(0);
+    const host = createRelayHost({
+      environment: 'local-mock',
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      languageClassifier: boundary.classifier
+    });
+    expect(loads).toBe(0);
+    await host.start();
+    try {
+      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+      expect(ready.status).toBe(503);
+      expect(await responseJson(ready)).toEqual({ ready: false });
+      expect(loads).toBe(1);
+    } finally {
+      await host.stop();
+    }
+  });
 
   it('requires an explicit classifier for non-default transcription adapters', () => {
     expect(() => createRelayHost({
@@ -2110,7 +2280,9 @@ describe('relay host configuration and readiness', () => {
           expectedLanguage: check.expectedLanguage,
           detectedLanguage: check.expectedLanguage,
           verdict: 'match' as const,
-          confidenceBasisPoints: 10_000
+          evidenceType: 'calibrated' as const,
+          confidenceBasisPoints: 10_000,
+          provisionalScoreBasisPoints: null
         })) as unknown as GeneratedLanguageValidationEvidence['checks']
       })
     };

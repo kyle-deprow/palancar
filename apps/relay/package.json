@@ -23,6 +23,7 @@
     "@palancar/security-state": "0.1.0",
     "@palancar/telemetry": "0.1.0",
     "@palancar/transcription": "0.1.0",
+    "eld": "2.1.0",
     "ws": "8.21.3"
   },
   "devDependencies": {

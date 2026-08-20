@@ -1,0 +1,784 @@
+import {
+  GenerationError,
+  GenerationService,
+  createAcceptedTargetTurn,
+  isAcceptedGeneratedLanguageEvidence,
+  type GeneratedLanguage,
+  type GeneratedLanguageValidationInput
+} from '@palancar/generation';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  createDevelopmentProvisionalLanguageBoundary,
+  isDevelopmentProvisionalGeneratedLanguageValidator,
+  isDevelopmentProvisionalTextLanguageClassifier
+} from '../src/provisional-language-boundary.js';
+
+const TEXT = Object.freeze({
+  en: 'Good morning. Where is the train station?',
+  es: 'Buenos días. ¿Dónde está la estación?',
+  tr: 'Merhaba. Tren istasyonu nerede?'
+});
+
+interface DetectorSelection {
+  readonly language: string;
+  readonly score: number;
+  readonly secondLanguage: string;
+  readonly secondScore: number;
+  readonly reliable: boolean;
+}
+
+function detectorFor(
+  languageFor: (text: string) => string | DetectorSelection
+): Readonly<{ detect(text: string): unknown }> {
+  return Object.freeze({
+    detect: (text: string) => {
+      const selected = languageFor(text);
+      const detection = typeof selected === 'string'
+        ? {
+            language: selected,
+            score: 0.92,
+            secondLanguage: selected === 'en' ? 'es' : 'en',
+            secondScore: 0.02,
+            reliable: true
+          }
+        : selected;
+      return {
+        language: detection.language,
+        getScores: () => ({
+          [detection.language]: detection.score,
+          [detection.secondLanguage]: detection.secondScore
+        }),
+        isReliable: () => detection.reliable
+      };
+    }
+  });
+}
+
+function tokenLanguage(text: string): string {
+  for (const [language, fixture] of Object.entries(TEXT)) {
+    if (text === fixture) return language;
+  }
+  const labels = [
+    ['es', text.indexOf('castellano')],
+    ['tr', text.indexOf('türkçe')],
+    ['fr', text.indexOf('francophone')],
+    ['en', text.indexOf('english')]
+  ] as const;
+  const labeled = labels
+    .filter((entry) => entry[1] >= 0)
+    .sort((left, right) => left[1] - right[1])[0]?.[0];
+  if (labeled !== undefined) return labeled;
+  const words = new Set(text.toLocaleLowerCase('en-US').match(/\p{L}+/gu) ?? []);
+  for (const [language, fixtureWords] of [
+    ['es', ['buenos', 'días', 'dónde', 'está', 'la', 'estación']],
+    ['tr', ['merhaba', 'tren', 'istasyonu', 'nerede']],
+    ['en', ['good', 'morning', 'where', 'is', 'the', 'train', 'station']]
+  ] as const) {
+    if (fixtureWords.some((word) => words.has(word))) return language;
+  }
+  return 'zz';
+}
+
+function selectedMarker(target: 'es' | 'tr'): string {
+  return target === 'es'
+    ? 'castellano sustantivo completo'
+    : 'türkçe anlamlı metin';
+}
+
+function embeddedPhrase(base: string, conflicting: string): string {
+  return `${base} ${base} ${conflicting} ${base} ${base}`;
+}
+
+function exactCodePointLength(
+  text: string,
+  length: number,
+  padding: string
+): string {
+  const values = Array.from(text);
+  const pad = Array.from(padding);
+  let index = 0;
+  while (values.length < length) {
+    values.push(pad[index % pad.length] as string);
+    index += 1;
+  }
+  return values.slice(0, length).join('');
+}
+
+function generatedInput(
+  target: 'es' | 'tr',
+  count: 5 | 7,
+  override?: Readonly<{ index: number; text: string }>
+): GeneratedLanguageValidationInput {
+  const languages: GeneratedLanguage[] =
+    count === 5
+      ? ['en', 'en', target, 'en', target]
+      : ['en', 'en', target, 'en', target, 'en', target];
+  const slots = [
+    'translation.english',
+    'suggestion[0].english',
+    'suggestion[0].target',
+    'suggestion[1].english',
+    'suggestion[1].target',
+    'suggestion[2].english',
+    'suggestion[2].target'
+  ] as const;
+  return Object.freeze({
+    checks: Object.freeze(languages.map((expectedLanguage, index) => Object.freeze({
+      slot: slots[index] as (typeof slots)[number],
+      text:
+        override?.index === index
+          ? override.text
+          : TEXT[expectedLanguage],
+      expectedLanguage
+    }))) as GeneratedLanguageValidationInput['checks']
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('development provisional ELD-small boundary', () => {
+  it.each([
+    ['es', TEXT.es],
+    ['tr', TEXT.tr]
+  ] as const)('accepts substantive symmetric %s source text', async (target, text) => {
+    const boundary = createDevelopmentProvisionalLanguageBoundary();
+    expect(isDevelopmentProvisionalTextLanguageClassifier(boundary.classifier)).toBe(true);
+    expect(
+      isDevelopmentProvisionalGeneratedLanguageValidator(
+        boundary.generatedLanguageValidator
+      )
+    ).toBe(true);
+    await expect(boundary.classifier.classify(text, target)).resolves.toMatchObject({
+      status: 'provisional',
+      detectedLanguage: target,
+      decision: 'accept',
+      reason: 'MATCH'
+    });
+  });
+
+  it.each([
+    ['English', 'es', TEXT.en, 'ENGLISH'],
+    ['other target', 'es', TEXT.tr, 'UNSELECTED_LANGUAGE'],
+    ['unsupported', 'es', 'Bonjour. Où se trouve la gare ferroviaire?', 'UNSELECTED_LANGUAGE'],
+    ['too short', 'es', 'hola', 'TOO_SHORT'],
+    ['mixed English/Spanish', 'es', `${TEXT.en} ${TEXT.es}`, 'MIXED'],
+    ['mixed Spanish/Turkish', 'tr', `${TEXT.es} ${TEXT.tr}`, 'MIXED']
+  ] as const)('rejects or marks %s source evidence fail-closed', async (
+    _name,
+    target,
+    text,
+    reason
+  ) => {
+    const { classifier } = createDevelopmentProvisionalLanguageBoundary();
+    const result = await classifier.classify(text, target);
+    expect(result).toMatchObject({ status: 'provisional', reason });
+    expect(result.status === 'provisional' && result.decision).not.toBe('accept');
+    expect(result).not.toHaveProperty('confidence');
+    expect(result).not.toHaveProperty('calibrationVersion');
+  });
+
+  it.each([
+    ['es', 5],
+    ['es', 7],
+    ['tr', 5],
+    ['tr', 7]
+  ] as const)('accepts an exact %s %i-check generated-language set', async (target, count) => {
+    const { generatedLanguageValidator } =
+      createDevelopmentProvisionalLanguageBoundary();
+    const input = generatedInput(target, count);
+    const evidence = await generatedLanguageValidator.validate(input, {
+      signal: new AbortController().signal
+    });
+    expect(
+      isAcceptedGeneratedLanguageEvidence(evidence, 'development-provisional')
+    ).toBe(true);
+    expect(evidence.checks.every((check) =>
+      check.evidenceType === 'development-provisional' &&
+      check.confidenceBasisPoints === null &&
+      check.provisionalScoreBasisPoints !== null
+    )).toBe(true);
+    expect(isAcceptedGeneratedLanguageEvidence(evidence)).toBe(false);
+  });
+
+  it.each([
+    ['wrong', TEXT.tr],
+    ['mixed', `${TEXT.en} ${TEXT.es}`],
+    ['unknown', 'zxqv zxqv zxqv zxqv'],
+    ['short', 'hola'],
+    ['empty', '']
+  ] as const)('rejects %s generated target text', async (_name, text) => {
+    const { generatedLanguageValidator } =
+      createDevelopmentProvisionalLanguageBoundary();
+    const input = generatedInput('es', 5, { index: 2, text });
+    const evidence = await generatedLanguageValidator.validate(input, {
+      signal: new AbortController().signal
+    });
+    expect(
+      isAcceptedGeneratedLanguageEvidence(evidence, 'development-provisional')
+    ).toBe(false);
+  });
+
+  it('fails source and generated validation closed when the detector throws', async () => {
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => Object.freeze({
+        detect: () => {
+          throw new Error('detector failed');
+        }
+      })
+    });
+    await expect(boundary.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      status: 'provisional',
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+    const input = generatedInput('es', 5);
+    const evidence = await boundary.generatedLanguageValidator.validate(input, {
+      signal: new AbortController().signal
+    });
+    expect(
+      isAcceptedGeneratedLanguageEvidence(evidence, 'development-provisional')
+    ).toBe(false);
+  });
+
+  it('treats every reliable conflicting label as mixed in both orders and targets', async () => {
+    for (const target of ['es', 'tr'] as const) {
+      const targetToken = target === 'es' ? 'castellano sustantivo' : 'türkçe anlamlı metin';
+      for (const text of [
+        `${targetToken}. francophone substantive language.`,
+        `francophone substantive language. ${targetToken}.`
+      ]) {
+        const boundary = createDevelopmentProvisionalLanguageBoundary({
+          loadDetector: () => detectorFor(tokenLanguage)
+        });
+        await expect(boundary.classifier.classify(text, target)).resolves.toMatchObject({
+          status: 'provisional',
+          detectedLanguage: 'mixed',
+          decision: 'reject',
+          reason: 'MIXED'
+        });
+
+        const evidence = await boundary.generatedLanguageValidator.validate(
+          generatedInput(target, 5, { index: 2, text }),
+          { signal: new AbortController().signal }
+        );
+        expect(isAcceptedGeneratedLanguageEvidence(
+          evidence,
+          'development-provisional'
+        )).toBe(false);
+        expect(evidence.checks[2]).toMatchObject({
+          detectedLanguage: 'mixed',
+          verdict: 'mismatch'
+        });
+      }
+    }
+  });
+
+  it.each(['tr', 'es'] as const)(
+    'detects standalone and embedded one-word English and unsupported conflicts in %s source',
+    async (target) => {
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor(tokenLanguage)
+      });
+      for (const [conflicting, standaloneReason] of [
+        ['englishlanguage', 'ENGLISH'],
+        ['francophoneword', 'UNSELECTED_LANGUAGE']
+      ] as const) {
+        await expect(
+          boundary.classifier.classify(conflicting, target)
+        ).resolves.toMatchObject({
+          decision: 'reject',
+          reason: standaloneReason
+        });
+        await expect(
+          boundary.classifier.classify(
+            embeddedPhrase(selectedMarker(target), conflicting),
+            target
+          )
+        ).resolves.toMatchObject({
+          detectedLanguage: 'mixed',
+          decision: 'reject',
+          reason: 'MIXED'
+        });
+      }
+    }
+  );
+
+  it.each(['tr', 'es'] as const)(
+    'ignores reliable weak one-word conflicts in %s source',
+    async (target) => {
+      const targetLanguage = target;
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((text) => {
+          const readinessOrMarked = tokenLanguage(text);
+          if (readinessOrMarked !== 'zz') return readinessOrMarked;
+          if (text === 'weakzeromargin') {
+            return {
+              language: 'ca',
+              score: 0.58,
+              secondLanguage: targetLanguage,
+              secondScore: 0.58,
+              reliable: true
+            };
+          }
+          if (text === 'weaklowscore') {
+            return {
+              language: 'fr',
+              score: 0.6,
+              secondLanguage: targetLanguage,
+              secondScore: 0.1,
+              reliable: true
+            };
+          }
+          return targetLanguage;
+        })
+      });
+      for (const weakConflict of ['weakzeromargin', 'weaklowscore']) {
+        await expect(boundary.classifier.classify(
+          embeddedPhrase(selectedMarker(target), weakConflict),
+          target
+        )).resolves.toMatchObject({
+          detectedLanguage: target,
+          decision: 'accept',
+          reason: 'MATCH'
+        });
+      }
+    }
+  );
+
+  it.each([
+    ['tr', 5],
+    ['tr', 7],
+    ['es', 5],
+    ['es', 7]
+  ] as const)(
+    'detects embedded one-word conflicts in every %s generated %i-check output direction',
+    async (target, count) => {
+      const baseline = generatedInput(target, count);
+      for (let index = 0; index < count; index += 1) {
+        const expected = baseline.checks[index]?.expectedLanguage;
+        if (expected === undefined) throw new Error('missing generated check');
+        const base = expected === 'en'
+          ? 'english substantive baseline'
+          : selectedMarker(target);
+        const conflicts = expected === 'en'
+          ? [target === 'es' ? 'castellano' : 'türkçe', 'francophoneword']
+          : ['englishlanguage', 'francophoneword'];
+        for (const conflicting of conflicts) {
+          const boundary = createDevelopmentProvisionalLanguageBoundary({
+            loadDetector: () => detectorFor(tokenLanguage)
+          });
+          const evidence = await boundary.generatedLanguageValidator.validate(
+            generatedInput(target, count, {
+              index,
+              text: embeddedPhrase(base, conflicting)
+            }),
+            { signal: new AbortController().signal }
+          );
+          expect(evidence.checks[index]).toMatchObject({
+            detectedLanguage: 'mixed',
+            verdict: 'mismatch'
+          });
+          expect(evidence.checks.every((check, checkIndex) =>
+            checkIndex === index || check.verdict === 'match'
+          )).toBe(true);
+          expect(isAcceptedGeneratedLanguageEvidence(
+            evidence,
+            'development-provisional'
+          )).toBe(false);
+        }
+      }
+    }
+  );
+
+  it('inspects every overlapping profile window from one through eight words', async () => {
+    const seen: string[] = [];
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((text) => {
+        seen.push(text);
+        const language = tokenLanguage(text);
+        return language === 'zz' ? 'es' : language;
+      })
+    });
+    await boundary.classifier.ready;
+    seen.length = 0;
+    const words = [
+      'uno',
+      'dos',
+      'tres',
+      'cuatro',
+      'cinco',
+      'seis',
+      'siete',
+      'ocho',
+      'nueve',
+      'diez'
+    ];
+    await boundary.classifier.classify(words.join(' '), 'es');
+    for (let length = 1; length <= 8; length += 1) {
+      for (let start = 0; start + length <= words.length; start += 1) {
+        expect(seen).toContain(words.slice(start, start + length).join(' '));
+      }
+    }
+  });
+
+  it('inspects every qualifying clause, including the tail', async () => {
+    const head = Array.from(
+      { length: 12 },
+      (_, index) => `castellano sustantivo numero ${index}`
+    ).join('. ');
+    const text = `${head}. francophone substantive language tail.`;
+    for (const target of ['es', 'tr'] as const) {
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor(tokenLanguage)
+      });
+      const sourceText = target === 'es'
+        ? text
+        : text.replaceAll('castellano', 'türkçe');
+      await expect(boundary.classifier.classify(sourceText, target)).resolves.toMatchObject({
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+    }
+  });
+
+  it('fails the prior 4032-code-point interior-conflict probe closed', async () => {
+    for (const target of ['es', 'tr'] as const) {
+      const selected = target === 'es'
+        ? 'castellano sustantivo '
+        : 'türkçe anlamlı metin ';
+      const probe = exactCodePointLength(
+        `${selected.repeat(70)}. francophone substantive interior. ${selected.repeat(70)}`,
+        4_032,
+        selected
+      );
+      expect(Array.from(probe)).toHaveLength(4_032);
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor(tokenLanguage)
+      });
+      await expect(boundary.classifier.classify(probe, target)).resolves.toMatchObject({
+        status: 'provisional',
+        detectedLanguage: 'unknown',
+        decision: 'uncertain',
+        reason: 'UNKNOWN'
+      });
+    }
+  });
+
+  it('finds max-sized interior conflicts in both source and generated target output', async () => {
+    for (const target of ['es', 'tr'] as const) {
+      const selected = target === 'es'
+        ? 'castellano sustantivo '
+        : 'türkçe anlamlı metin ';
+      const source = exactCodePointLength(
+        `${selected.repeat(9)}. francophone substantive interior conflict. ${selected.repeat(9)}`,
+        512,
+        selected
+      );
+      const output = exactCodePointLength(
+        `${selected.repeat(2)}. francophone substantive interior. ${selected.repeat(2)}`,
+        160,
+        selected
+      );
+      expect(Array.from(source)).toHaveLength(512);
+      expect(Array.from(output)).toHaveLength(160);
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor(tokenLanguage)
+      });
+      await expect(boundary.classifier.classify(source, target)).resolves.toMatchObject({
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+      const generated = await boundary.generatedLanguageValidator.validate(
+        generatedInput(target, 5, { index: 2, text: output }),
+        { signal: new AbortController().signal }
+      );
+      expect(generated.checks[2]).toMatchObject({
+        detectedLanguage: 'mixed',
+        verdict: 'mismatch'
+      });
+      expect(isAcceptedGeneratedLanguageEvidence(
+        generated,
+        'development-provisional'
+      )).toBe(false);
+    }
+  });
+
+  it('rejects every wrong generated slot in both directions for 5 and 7 checks', async () => {
+    for (const target of ['es', 'tr'] as const) {
+      for (const count of [5, 7] as const) {
+        const baseline = generatedInput(target, count);
+        for (let index = 0; index < count; index += 1) {
+          const expected = baseline.checks[index]?.expectedLanguage;
+          const text = expected === 'en' ? TEXT[target] : TEXT.en;
+          const boundary = createDevelopmentProvisionalLanguageBoundary();
+          const evidence = await boundary.generatedLanguageValidator.validate(
+            generatedInput(target, count, { index, text }),
+            { signal: new AbortController().signal }
+          );
+          expect(isAcceptedGeneratedLanguageEvidence(
+            evidence,
+            'development-provisional'
+          )).toBe(false);
+        }
+      }
+    }
+  });
+
+  it('normalizes NFKC and fails oversized, short, and malformed detector results closed', async () => {
+    let observed = '';
+    const normalizing = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((text) => {
+        observed = text;
+        const language = tokenLanguage(text);
+        return language === 'zz' ? 'es' : language;
+      })
+    });
+    await normalizing.classifier.classify(
+      'Ｂｕｅｎｏｓ ｄｉａｓ ｅｎ ｃａｓｔｅｌｌａｎｏ',
+      'es'
+    );
+    expect(observed).toContain('Buenos dias en castellano');
+
+    await expect(
+      normalizing.classifier.classify('x'.repeat(513), 'es')
+    ).resolves.toMatchObject({ decision: 'uncertain', reason: 'UNKNOWN' });
+    await expect(
+      normalizing.classifier.classify('hola', 'es')
+    ).resolves.toMatchObject({ decision: 'uncertain', reason: 'TOO_SHORT' });
+
+    for (const malformed of [
+      {
+        language: 'es',
+        getScores: () => ({ tr: 0.9, es: 0.1 }),
+        isReliable: () => true
+      },
+      {
+        language: 'es',
+        getScores: () => ({ es: Number.NaN }),
+        isReliable: () => true
+      },
+      {
+        language: 'es',
+        getScores: null,
+        isReliable: () => true
+      }
+    ]) {
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => Object.freeze({ detect: () => malformed })
+      });
+      await expect(boundary.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+        decision: 'reject',
+        reason: 'DETECTOR_ERROR'
+      });
+    }
+  });
+
+  it('initializes one detector lazily through readiness and contains loader failure', async () => {
+    let loads = 0;
+    let detections = 0;
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => {
+        loads += 1;
+        return detectorFor((text) => {
+          detections += 1;
+          const language = tokenLanguage(text);
+          return language === 'zz' ? 'es' : language;
+        });
+      }
+    });
+    expect(loads).toBe(0);
+    const ready = boundary.classifier.ready;
+    expect(loads).toBe(0);
+    await ready;
+    expect(loads).toBe(1);
+    expect(detections).toBe(3);
+    await boundary.classifier.ready;
+    expect(loads).toBe(1);
+    expect(detections).toBe(3);
+    await boundary.classifier.classify(TEXT.es, 'es');
+    expect(loads).toBe(1);
+    expect(detections).toBeGreaterThan(3);
+    await boundary.generatedLanguageValidator.validate(generatedInput('es', 5), {
+      signal: new AbortController().signal
+    });
+    expect(loads).toBe(1);
+
+    let failedLoads = 0;
+    const unavailable = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => {
+        failedLoads += 1;
+        throw new Error('load failed');
+      }
+    });
+    await expect(unavailable.classifier.ready).rejects.toThrow();
+    await expect(unavailable.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+    const evidence = await unavailable.generatedLanguageValidator.validate(
+      generatedInput('es', 5),
+      { signal: new AbortController().signal }
+    );
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(false);
+    expect(failedLoads).toBe(1);
+  });
+
+  it('rejects readiness for missing or malformed detector behavior', async () => {
+    const missing = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => Object.freeze({})
+    });
+    await expect(missing.classifier.ready).rejects.toThrow();
+
+    const malformed = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => Object.freeze({
+        detect: () => ({
+          language: 'en',
+          getScores: () => ({ en: Number.NaN }),
+          isReliable: () => true
+        })
+      })
+    });
+    await expect(malformed.classifier.ready).rejects.toThrow();
+    await expect(malformed.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+
+    const alwaysSpanish = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor(() => 'es')
+    });
+    await expect(alwaysSpanish.classifier.ready).rejects.toThrow();
+    await expect(alwaysSpanish.classifier.classify(TEXT.es, 'es')).resolves.toMatchObject({
+      decision: 'reject',
+      reason: 'DETECTOR_ERROR'
+    });
+  });
+
+  it('rejects hostile generated-validation input snapshots without invoking accessors', async () => {
+    const validator = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((text) => {
+        const language = tokenLanguage(text);
+        return language === 'zz' ? 'es' : language;
+      })
+    }).generatedLanguageValidator;
+    const ordinary = {
+      checks: generatedInput('es', 5).checks.map((check) => ({ ...check }))
+    } as unknown as GeneratedLanguageValidationInput;
+    await expect(validator.validate(ordinary, {
+      signal: new AbortController().signal
+    })).resolves.toBeDefined();
+
+    const hostile: unknown[] = [];
+    hostile.push(new Proxy(ordinary, {}));
+    hostile.push({ checks: new Proxy([...ordinary.checks], {}) });
+    const wrongPrototype = [...ordinary.checks];
+    Object.setPrototypeOf(wrongPrototype, Object.prototype);
+    hostile.push({ checks: wrongPrototype });
+    const symbolArray = [...ordinary.checks] as unknown[] & Record<PropertyKey, unknown>;
+    symbolArray[Symbol('extra')] = true;
+    hostile.push({ checks: symbolArray });
+    const missingIndex = [...ordinary.checks];
+    delete missingIndex[2];
+    hostile.push({ checks: missingIndex });
+    let accessorCalls = 0;
+    const accessorArray = [...ordinary.checks];
+    Object.defineProperty(accessorArray, '2', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return ordinary.checks[2];
+      }
+    });
+    hostile.push({ checks: accessorArray });
+    const symbolCheck = { ...ordinary.checks[0] } as Record<PropertyKey, unknown>;
+    symbolCheck[Symbol('extra')] = true;
+    hostile.push({ checks: [symbolCheck, ...ordinary.checks.slice(1)] });
+    const nonEnumerableCheck = { ...ordinary.checks[0] };
+    Object.defineProperty(nonEnumerableCheck, 'extra', { value: true });
+    hostile.push({ checks: [nonEnumerableCheck, ...ordinary.checks.slice(1)] });
+    const accessorCheck = { ...ordinary.checks[0] } as Record<string, unknown>;
+    Object.defineProperty(accessorCheck, 'text', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return TEXT.en;
+      }
+    });
+    hostile.push({ checks: [accessorCheck, ...ordinary.checks.slice(1)] });
+
+    for (const input of hostile) {
+      await expect(validator.validate(
+        input as GeneratedLanguageValidationInput,
+        { signal: new AbortController().signal }
+      )).rejects.toEqual(expect.objectContaining<Partial<GenerationError>>({
+        category: 'language-validation-failure'
+      }));
+    }
+    expect(accessorCalls).toBe(0);
+  });
+
+  it('never releases generated content when provisional validation fails closed', async () => {
+    const outputCanary = 'generated-output-canary';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor(tokenLanguage)
+    });
+    const service = new GenerationService({
+      provider: Object.freeze({
+        id: 'provisional-no-release-provider',
+        version: '1.0.0',
+        complete: async () => ({
+          englishTranslation: `english substantive ${outputCanary}`,
+          suggestions: [
+            {
+              englishText: 'english substantive phrase',
+              selectedTargetText:
+                'castellano sustantivo. francophone substantive language.'
+            },
+            {
+              englishText: 'english substantive response',
+              selectedTargetText: 'castellano sustantivo adicional'
+            }
+          ] as const
+        })
+      }),
+      validator: boundary.generatedLanguageValidator,
+      languageValidationMode: 'development-provisional'
+    });
+    const turn = createAcceptedTargetTurn({
+      sessionId: '11111111-1111-4111-8111-111111111111',
+      sessionEpoch: 1,
+      utteranceId: '22222222-2222-4222-8222-222222222222',
+      segmentId: 'segment-1',
+      acceptedFinalRevision: 1,
+      selectedTargetLanguage: 'es',
+      decision: 'target',
+      targetTranscript: 'castellano sustantivo de entrada',
+      gatePolicyVersion: '1.0.0'
+    });
+    let failure: unknown;
+    try {
+      await service.complete(turn);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toEqual(expect.objectContaining({
+      category: 'invalid-generated-language'
+    }));
+    expect(String(failure) + JSON.stringify(failure)).not.toContain(outputCanary);
+    expect(service.evidence).toEqual([
+      expect.objectContaining({
+        status: 'failure',
+        failureCategory: 'invalid-generated-language',
+        languageValidationStatus: 'rejected'
+      })
+    ]);
+  });
+});

@@ -1,4 +1,5 @@
 export {
+  snapshotClassifiedLanguageEvidence,
   validateClassifiedLanguageEvidence,
   validateRawLanguageDetectorOutput
 } from './classifier.js';
@@ -7,6 +8,9 @@ export type {
   ClassifiedLanguageEvidence,
   LanguageClassificationStatus,
   NonCalibratedLanguageEvidence,
+  ProvisionalLanguageDecision,
+  ProvisionalLanguageEvidence,
+  ProvisionalLanguageReason,
   RawLanguageDetectorOutput,
   RawLanguageDetectorScore,
   TextLanguageClassifier
@@ -15,6 +19,8 @@ export { evaluateLanguageGate } from './gate.js';
 export {
   CONTROLLED_FIXTURE_CALIBRATION_VERSION,
   CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+  DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   createLanguageRegistry,
   getLanguageDefinition,
   isTargetLanguage,
@@ -28,10 +34,12 @@ export {
 export type { LanguageRegistry } from './registry.js';
 export type {
   GateDecision,
+  DevelopmentProvisionalProfile,
   LanguageCalibrationProfile,
   LanguageDefinition,
   LanguageEvidenceSource,
   LanguageGateInput,
+  LanguageGateBoundaryMode,
   LanguageGateResult,
   MixedPolicy,
   PartialDisplayCalibrationProfile,

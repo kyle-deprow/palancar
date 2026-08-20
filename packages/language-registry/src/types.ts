@@ -12,6 +12,20 @@ export interface LanguageCalibrationProfile {
 
 export type PartialDisplayCalibrationProfile = LanguageCalibrationProfile;
 
+export interface DevelopmentProvisionalProfile {
+  readonly approvalClass: 'development-provisional';
+  readonly productionApproved: false;
+  readonly detectorVersion: string;
+  readonly profileVersion: string;
+  readonly provisionalScoreThreshold: number;
+  readonly provisionalMarginThreshold: number;
+  readonly minimumTextCharacters: number;
+  readonly minimumWindowCharacters: number;
+  readonly maximumInputCodePoints: number;
+  readonly minimumSlidingWindowWords: number;
+  readonly maximumSlidingWindowWords: number;
+}
+
 export interface LanguageDefinition<TCode extends string = TargetLanguage> {
   readonly code: TCode;
   readonly displayName: string;
@@ -20,6 +34,7 @@ export interface LanguageDefinition<TCode extends string = TargetLanguage> {
   readonly mixedPolicy: MixedPolicy;
   readonly fixtureSuiteIds: readonly string[];
   readonly partialDisplayCalibration?: PartialDisplayCalibrationProfile;
+  readonly developmentProvisional?: DevelopmentProvisionalProfile;
 }
 
 /** Advisory provenance only; it is not accepted by evaluateLanguageGate. */
@@ -41,7 +56,12 @@ export interface LanguageGateInput {
   readonly selectedLanguage: string;
   readonly evidence: ClassifiedLanguageEvidence;
   readonly isFinal: boolean;
+  readonly boundaryMode: LanguageGateBoundaryMode;
 }
+
+export type LanguageGateBoundaryMode =
+  | 'production-calibrated'
+  | 'development-provisional';
 
 export interface LanguageGateResult {
   readonly decision: GateDecision;

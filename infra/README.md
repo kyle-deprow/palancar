@@ -28,6 +28,10 @@ and enabled. This is not a language or physical-hardware production
 promotion. The deployed workload stack also owns the expiry-cleanup Job, the
 relay action group, and its six scheduled-query alerts. Private endpoint,
 custom DNS, CI federation, and placeholder images remain outside this stack.
+The relay language boundary is an explicit required module input: dev sets
+`development-provisional`, while staging and production must set `deny-all`.
+Terraform emits it once as the nonsecret
+`PALANCAR_LANGUAGE_BOUNDARY_MODE` relay environment variable.
 
 ## Bootstrap with local state, then migrate
 
@@ -173,11 +177,13 @@ port 4000, and the `palancar-generation` alias.
 For the reviewed final rollout, after the pinned transcription deployment is
 already present, create a complete saved plan without `-target`, guard its JSON
 view, and apply that exact same file only when the guard exits successfully.
-Keep the binary and JSON view mode `0600`; neither may be committed. For the
-active GA item-lifecycle relay-image correction rollout:
+Keep the binary and JSON view mode `0600`; neither may be committed. The former
+GA item-lifecycle procedure below is retained only as a historical hash record;
+it predates the explicit language-boundary environment and is non-applicable:
 
 ```sh
 set -eu
+exit 1 # Historical procedure: do not guard or apply this superseded binary.
 umask 077
 PALANCAR_TERRAFORM=/home/dev/.local/bin/terraform-1.15.8
 PALANCAR_PLAN=/tmp/palancar-ga-item-lifecycle-v3.tfplan
@@ -194,11 +200,13 @@ node infra/scripts/assert-dev-plan.mjs --mode=final-rollout \
   < "$PALANCAR_PLAN_JSON"
 chmod 600 "$PALANCAR_PLAN" "$PALANCAR_PLAN_JSON"
 test "$(sha256sum "$PALANCAR_PLAN" | awk '{print $1}')" = "$PALANCAR_PLAN_SHA"
-"$PALANCAR_TERRAFORM" -chdir=infra/environments/dev apply "$PALANCAR_PLAN"
+# Historical apply intentionally removed.
 ```
 
 The approved SHA is for the saved binary, not its deterministic JSON view;
-the two files normally have different hashes.
+the two files normally have different hashes. A future activation requires a
+newly generated complete non-targeted plan, separately reviewed binary hash,
+guard pass, and hash recheck immediately before applying the same binary.
 
 The superseded telemetry-enrichment path
 `/tmp/palancar-telemetry-enrichment.tfplan` and binary SHA-256
@@ -219,14 +227,20 @@ Do not run the apply command after a guard rejection, do not substitute a
 newly generated plan file between guard and apply, and do not apply a
 refresh-only plan.
 
-`final-rollout` is a separate fail-closed mode. It requires the complete
+`final-rollout` is a separate fail-closed mode. Newly generated plans require
+the exact plain, nonsecret, unique
+`PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` relay environment.
+It requires the complete
 39-resource transition inventory: 38 no-ops and the reviewed resource-only
 Container App update at
 `module.container_app_workload[0].azapi_resource.this`. This is the
-GA item-lifecycle relay-image correction: LiteLLM remains at 0.75
+relay-image correction plus explicit dev language-boundary activation:
+LiteLLM remains at 0.75
 CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
-1 CPU/2Gi. The only recursive Container App differences are relay
-`containers[0].image` and the provider output. The prior relay image is pinned
+1 CPU/2Gi. The only recursive Container App differences are the appended relay
+`containers[0].env[24]` entry, `containers[0].image`, and the provider output.
+The prior state omits the new environment entry; planned state adds it exactly
+once. The prior relay image is pinned
 to the reviewed digest
 `sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
 the reviewed planned image digest is
@@ -260,8 +274,8 @@ workload resource.
 The transition requires exactly 101 passing checks and no unknown checks. Any
 altered, failed, unknown, or additional check fails closed. The completed OOM
 sizing change is background history; it is not an additional current
-transition. The commands above verify the exact binary immediately before
-guarding and again immediately before applying it.
+transition. Any future approved procedure must verify the exact reviewed binary
+immediately before guarding and again immediately before applying it.
 
 After apply, generate a fresh complete plan and require 39 no-op resources,
 zero resource drift, and all 101 checks passing before treating the rollout as

@@ -12,6 +12,7 @@ import {
 import type {
   GeneratedLanguageValidationEvidence,
   GeneratedLanguageValidationInput,
+  GeneratedLanguageValidationMode,
   GeneratedLanguageValidationStatus,
   GeneratedLanguageValidator
 } from './language-validation.js';
@@ -52,6 +53,7 @@ interface ServiceOptionsSnapshot {
   readonly provider: unknown;
   readonly validator: unknown;
   readonly languageValidationTimeoutMs?: unknown;
+  readonly languageValidationMode?: unknown;
   readonly evidenceCollector?: unknown;
   readonly evidence?: unknown;
 }
@@ -236,6 +238,7 @@ function validatorSnapshot(value: unknown): ValidatorSnapshot {
 const SERVICE_OPTION_KEYS = new Set([
   'provider',
   'validator',
+  'languageValidationMode',
   'languageValidationTimeoutMs',
   'evidenceCollector',
   'evidence'
@@ -271,6 +274,9 @@ function serviceOptionsSnapshot(value: unknown): ServiceOptionsSnapshot {
     return Object.freeze({
       provider: snapshot.provider,
       validator: snapshot.validator,
+      ...(Object.hasOwn(snapshot, 'languageValidationMode')
+        ? { languageValidationMode: snapshot.languageValidationMode }
+        : {}),
       ...(Object.hasOwn(snapshot, 'languageValidationTimeoutMs')
         ? { languageValidationTimeoutMs: snapshot.languageValidationTimeoutMs }
         : {}),
@@ -492,7 +498,9 @@ function now(): number {
 export class GenerationService {
   readonly #provider: ProviderSnapshot;
   readonly #validator: ValidatorSnapshot;
+  readonly #validatorIdentity: object;
   readonly #languageValidationTimeoutMs: number;
+  readonly #languageValidationMode: GeneratedLanguageValidationMode;
   readonly #evidence: MetadataOnlyEvidenceCollectorLike;
   readonly #completionPromises = new Map<string, CompletionEntry>();
 
@@ -519,6 +527,16 @@ export class GenerationService {
       : options.evidenceCollector ?? options.evidence;
     this.#provider = providerSnapshot(provider);
     this.#validator = validatorSnapshot(configuredValidator);
+    this.#validatorIdentity = configuredValidator as object;
+    const configuredMode = options?.languageValidationMode;
+    if (
+      configuredMode !== undefined &&
+      configuredMode !== 'production-calibrated' &&
+      configuredMode !== 'development-provisional'
+    ) {
+      throw new GenerationError('invalid-validator');
+    }
+    this.#languageValidationMode = configuredMode ?? 'production-calibrated';
     const configuredTimeout = options?.languageValidationTimeoutMs;
     this.#languageValidationTimeoutMs = configuredTimeout === undefined
       ? DEFAULT_LANGUAGE_VALIDATION_TIMEOUT_MS
@@ -539,6 +557,14 @@ export class GenerationService {
 
   get validator(): Readonly<{ readonly id: string; readonly version: string }> {
     return Object.freeze({ id: this.#validator.id, version: this.#validator.version });
+  }
+
+  usesValidator(value: unknown): boolean {
+    return this.#validatorIdentity === value;
+  }
+
+  get languageValidationMode(): GeneratedLanguageValidationMode {
+    return this.#languageValidationMode;
   }
 
   get evidence(): readonly GenerationEvidenceRecord[] {
@@ -658,9 +684,20 @@ export class GenerationService {
       languageValidationNonmatchCount = validationEvidence.checks.filter((item) =>
         item.verdict !== 'match' ||
         item.detectedLanguage !== item.expectedLanguage ||
-        item.confidenceBasisPoints === null
+        (this.#languageValidationMode === 'production-calibrated'
+          ? item.evidenceType !== 'calibrated' ||
+            item.confidenceBasisPoints === null ||
+            item.provisionalScoreBasisPoints !== null
+          : item.evidenceType !== 'development-provisional' ||
+            item.confidenceBasisPoints !== null ||
+            item.provisionalScoreBasisPoints === null)
       ).length;
-      if (!isAcceptedGeneratedLanguageEvidence(validationEvidence)) {
+      if (
+        !isAcceptedGeneratedLanguageEvidence(
+          validationEvidence,
+          this.#languageValidationMode
+        )
+      ) {
         languageValidationStatus = 'rejected';
         throw new GenerationError('invalid-generated-language');
       }

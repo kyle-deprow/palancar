@@ -335,7 +335,9 @@ export class DeterministicFixtureLanguageValidator implements GeneratedLanguageV
         expectedLanguage: item.expectedLanguage,
         detectedLanguage: item.expectedLanguage,
         verdict: 'match' as const,
-        confidenceBasisPoints: 10_000
+        evidenceType: 'calibrated' as const,
+        confidenceBasisPoints: 10_000,
+        provisionalScoreBasisPoints: null
       }))) as GeneratedLanguageValidationEvidence['checks']
     });
   }

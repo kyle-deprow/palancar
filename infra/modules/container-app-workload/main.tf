@@ -186,7 +186,13 @@ resource "azapi_resource" "this" {
                     name      = "PALANCAR_LITELLM_API_KEY"
                     secretRef = "litellm-master-key"
                   }
-                ] : []
+                ] : [],
+                [
+                  {
+                    name  = "PALANCAR_LANGUAGE_BOUNDARY_MODE"
+                    value = var.language_boundary_mode
+                  }
+                ]
               )
 
               probes = [
@@ -322,6 +328,14 @@ resource "azapi_resource" "this" {
     precondition {
       condition     = var.security_mode == "azure-table"
       error_message = "deployed relay workloads require security_mode azure-table."
+    }
+
+    precondition {
+      condition = (
+        var.deployment_slot == "dev" ||
+        var.language_boundary_mode == "deny-all"
+      )
+      error_message = "development-provisional language boundary mode is permitted only when deployment_slot is dev; staging and production require deny-all."
     }
 
     precondition {

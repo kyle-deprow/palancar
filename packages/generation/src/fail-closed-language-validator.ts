@@ -274,7 +274,9 @@ function snapshotCheck(
     expectedLanguage: expectedLanguage as GeneratedLanguage,
     detectedLanguage: 'undetermined',
     verdict: 'indeterminate',
-    confidenceBasisPoints: null
+    evidenceType: 'calibrated',
+    confidenceBasisPoints: null,
+    provisionalScoreBasisPoints: null
   });
 }
 

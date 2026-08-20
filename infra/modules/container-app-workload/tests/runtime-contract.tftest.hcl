@@ -19,6 +19,7 @@ variables {
   rate_state_table_name                                   = "RateState"
   environment                                             = "dev"
   deployment_slot                                         = "dev"
+  language_boundary_mode                                  = "development-provisional"
   application_insights_connection_string                  = "LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com/;InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
   relay_origin                                            = "wss://ca-palancar-dev-relay-test.example.azurecontainerapps.io"
   key_vault_uri                                           = "https://palancar-vault.vault.azure.net/"
@@ -67,6 +68,7 @@ run "mock_runtime_contract" {
       "PALANCAR_GATE_POLICY_VERSION",
       "AZURE_CLIENT_ID",
       "PALANCAR_DEPLOYMENT_SLOT",
+      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
       "APPLICATIONINSIGHTS_CONNECTION_STRING",
       "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
       "APPLICATION_INSIGHTS_NO_STATSBEAT",
@@ -94,6 +96,7 @@ run "mock_runtime_contract" {
       PALANCAR_GATE_POLICY_VERSION           = "1.0.0"
       AZURE_CLIENT_ID                        = "00000000-0000-0000-0000-000000000001"
       PALANCAR_DEPLOYMENT_SLOT               = "dev"
+      PALANCAR_LANGUAGE_BOUNDARY_MODE        = "development-provisional"
       APPLICATIONINSIGHTS_CONNECTION_STRING  = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com"
       APPLICATIONINSIGHTS_STATSBEAT_DISABLED = "true"
       APPLICATION_INSIGHTS_NO_STATSBEAT      = "true"
@@ -360,6 +363,7 @@ run "enabled_openrouter_contract" {
       "PALANCAR_GATE_POLICY_VERSION",
       "AZURE_CLIENT_ID",
       "PALANCAR_DEPLOYMENT_SLOT",
+      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
       "APPLICATIONINSIGHTS_CONNECTION_STRING",
       "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
       "APPLICATION_INSIGHTS_NO_STATSBEAT",
@@ -393,6 +397,7 @@ run "enabled_openrouter_contract" {
       PALANCAR_GATE_POLICY_VERSION           = { value = "1.0.0", secret_ref = null }
       AZURE_CLIENT_ID                        = { value = "00000000-0000-0000-0000-000000000001", secret_ref = null }
       PALANCAR_DEPLOYMENT_SLOT               = { value = "dev", secret_ref = null }
+      PALANCAR_LANGUAGE_BOUNDARY_MODE        = { value = "development-provisional", secret_ref = null }
       APPLICATIONINSIGHTS_CONNECTION_STRING  = { value = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com", secret_ref = null }
       APPLICATIONINSIGHTS_STATSBEAT_DISABLED = { value = "true", secret_ref = null }
       APPLICATION_INSIGHTS_NO_STATSBEAT      = { value = "true", secret_ref = null }
@@ -508,6 +513,7 @@ run "azure_realtime_runtime_contract" {
 
   variables {
     deployment_slot                = "staging"
+    language_boundary_mode         = "deny-all"
     transcription_provider         = "azure-realtime"
     azure_transcription_endpoint   = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
     azure_transcription_deployment = "gpt-4o-mini-transcribe"
@@ -538,6 +544,7 @@ run "azure_realtime_runtime_contract" {
       "PALANCAR_GATE_POLICY_VERSION",
       "AZURE_CLIENT_ID",
       "PALANCAR_DEPLOYMENT_SLOT",
+      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
       "APPLICATIONINSIGHTS_CONNECTION_STRING",
       "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
       "APPLICATION_INSIGHTS_NO_STATSBEAT",
@@ -567,6 +574,7 @@ run "azure_realtime_runtime_contract" {
       PALANCAR_GATE_POLICY_VERSION            = "1.0.0"
       AZURE_CLIENT_ID                         = "00000000-0000-0000-0000-000000000001"
       PALANCAR_DEPLOYMENT_SLOT                = "staging"
+      PALANCAR_LANGUAGE_BOUNDARY_MODE         = "deny-all"
       APPLICATIONINSIGHTS_CONNECTION_STRING   = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com"
       APPLICATIONINSIGHTS_STATSBEAT_DISABLED  = "true"
       APPLICATION_INSIGHTS_NO_STATSBEAT       = "true"
@@ -759,6 +767,80 @@ run "reject_hostile_deployment_slot" {
   }
 
   expect_failures = [var.deployment_slot]
+}
+
+run "reject_unknown_language_boundary_mode" {
+  command = plan
+
+  variables {
+    language_boundary_mode = "provisional"
+  }
+
+  expect_failures = [var.language_boundary_mode]
+}
+
+run "reject_uppercase_language_boundary_mode" {
+  command = plan
+
+  variables {
+    language_boundary_mode = "DEVELOPMENT-PROVISIONAL"
+  }
+
+  expect_failures = [var.language_boundary_mode]
+}
+
+run "reject_language_boundary_mode_whitespace" {
+  command = plan
+
+  variables {
+    language_boundary_mode = "development-provisional "
+  }
+
+  expect_failures = [var.language_boundary_mode]
+}
+
+run "reject_provisional_language_boundary_in_staging" {
+  command = plan
+
+  variables {
+    deployment_slot        = "staging"
+    language_boundary_mode = "development-provisional"
+  }
+
+  expect_failures = [azapi_resource.this]
+}
+
+run "reject_provisional_language_boundary_in_production" {
+  command = plan
+
+  variables {
+    deployment_slot        = "production"
+    language_boundary_mode = "development-provisional"
+  }
+
+  expect_failures = [azapi_resource.this]
+}
+
+run "production_deny_all_language_boundary_is_explicit" {
+  command = plan
+
+  variables {
+    deployment_slot        = "production"
+    language_boundary_mode = "deny-all"
+  }
+
+  assert {
+    condition = nonsensitive({
+      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => {
+        value      = try(item.value, null)
+        secret_ref = try(item.secretRef, null)
+      }
+      })["PALANCAR_LANGUAGE_BOUNDARY_MODE"] == {
+      value      = "deny-all"
+      secret_ref = null
+    }
+    error_message = "production must emit exactly one plain deny-all language boundary value"
+  }
 }
 
 run "reject_hostile_telemetry_connection_string" {

@@ -5,9 +5,9 @@ Date: 2026-08-20
 
 ## Objective
 
-Maintain the fail-closed `final-rollout` mode for the GA item-lifecycle
-relay-image-only correction after the telemetry-enrichment fix and completed
-LiteLLM OOM remediation. It
+Maintain the fail-closed `final-rollout` mode for the relay-image correction
+plus explicit dev-only provisional language-boundary activation after the
+telemetry-enrichment fix and completed LiteLLM OOM remediation. It
 retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
 expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
 transcription model.
@@ -50,10 +50,15 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   Its `applyable` value is exactly `true`. The mutually exclusive terminal
   idempotent form has 39 no-op actions and `applyable=false`; it is guard-only
   verification evidence and must never be applied.
-  It is relay-image-only: LiteLLM remains exactly 0.75 CPU/1.5Gi, relay
+  LiteLLM remains exactly 0.75 CPU/1.5Gi, relay
   remains exactly 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
   The Container App before/after recursive differences are exactly
-  `body.properties.template.containers[0].image` and `output`. The prior relay
+  `body.properties.template.containers[0].env[24]`,
+  `body.properties.template.containers[0].image`, and `output`. Prior state has
+  no `PALANCAR_LANGUAGE_BOUNDARY_MODE`; planned state appends exactly one plain,
+  nonsecret `PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry.
+  Terminal plans retain that exact entry. Missing, deny-all, duplicated, or
+  secret-backed forms are rejected. The prior relay
   image is the hard-pinned reviewed digest
   `sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
@@ -148,12 +153,15 @@ identifier; synthetic placeholders must be cross-bound throughout. The
 telemetry-enrichment binary `/tmp/palancar-telemetry-enrichment.tfplan` had
 SHA-256
 `ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7` and is
-historical and non-applicable. The active GA item-lifecycle binary is
+historical and non-applicable. The former GA item-lifecycle binary is
 `/tmp/palancar-ga-item-lifecycle-v3.tfplan`, with reviewed SHA-256
 `a4caa91081861c707e07387e4aa2979b3e1cbced0359ee53f19a35d1844b08f8`.
-Verify it immediately before guard and apply. Verify the binary hash, not the
-hash of its JSON view. Keep both protected with mode `0600`, and never commit
-either raw artifact. Build the idempotent
+It is also historical and non-applicable because it predates the explicit
+language-boundary environment contract; do not guard or apply it. A future
+activation needs a newly reviewed protected binary and hash, verified before
+guard and immediately before applying that same binary. Verify the binary
+hash, not the hash of its JSON view. Keep raw artifacts protected with mode
+`0600`, and never commit them. Build the idempotent
 fixture from the same genuine schema and prove acceptance
 for the initial transition and idempotent state. Add adversarial mutations covering every
 accepted resource and invariant above, especially omitted inventory entries,

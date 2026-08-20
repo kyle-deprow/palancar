@@ -90,7 +90,26 @@ function validLanguageEvidence(
       expectedLanguage: item.expectedLanguage,
       detectedLanguage: index === invalidIndex ? 'other' : item.expectedLanguage,
       verdict: index === invalidIndex ? 'mismatch' : 'match',
-      confidenceBasisPoints: 10_000
+      evidenceType: 'calibrated',
+      confidenceBasisPoints: 10_000,
+      provisionalScoreBasisPoints: null
+    })) as unknown as GeneratedLanguageValidationEvidence['checks']
+  };
+}
+
+function validProvisionalLanguageEvidence(
+  input: GeneratedLanguageValidationInput,
+  invalidIndex?: number
+): GeneratedLanguageValidationEvidence {
+  return {
+    checks: input.checks.map((item, index) => ({
+      slot: item.slot,
+      expectedLanguage: item.expectedLanguage,
+      detectedLanguage: index === invalidIndex ? 'other' : item.expectedLanguage,
+      verdict: index === invalidIndex ? 'mismatch' : 'match',
+      evidenceType: 'development-provisional',
+      confidenceBasisPoints: null,
+      provisionalScoreBasisPoints: 8_500
     })) as unknown as GeneratedLanguageValidationEvidence['checks']
   };
 }
@@ -528,6 +547,69 @@ describe('deterministic mock provider input validation', () => {
 });
 
 describe('mandatory generated-language validation', () => {
+  it('accepts exact provisional evidence only in the trusted development mode', async () => {
+    const validator = languageValidator(async (input) =>
+      validProvisionalLanguageEvidence(input)
+    );
+    const service = new GenerationService({
+      provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator,
+      languageValidationMode: 'development-provisional'
+    });
+    await expect(service.complete(turn())).resolves.toBeDefined();
+    expect(service.languageValidationMode).toBe('development-provisional');
+    expect(service.usesValidator(validator)).toBe(true);
+    expect(service.usesValidator({
+      id: validator.id,
+      version: validator.version,
+      validate: validator.validate
+    })).toBe(false);
+  });
+
+  it('does not accept provisional evidence in the default calibrated mode', async () => {
+    const validator = languageValidator(async (input) =>
+      validProvisionalLanguageEvidence(input)
+    );
+    const service = new GenerationService(
+      new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator
+    );
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'invalid-generated-language'
+    });
+  });
+
+  it('does not accept calibrated evidence in development-provisional mode', async () => {
+    const validator = languageValidator(async (input) => validLanguageEvidence(input));
+    const service = new GenerationService({
+      provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator,
+      languageValidationMode: 'development-provisional'
+    });
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'invalid-generated-language'
+    });
+  });
+
+  it('requires a non-null provisional score on every development check', async () => {
+    const validator = languageValidator(async (input) => {
+      const evidence = validProvisionalLanguageEvidence(input);
+      const checks = [...evidence.checks];
+      checks[0] = {
+        ...checks[0] as GeneratedLanguageValidationEvidence['checks'][number],
+        provisionalScoreBasisPoints: null
+      };
+      return { checks } as unknown as GeneratedLanguageValidationEvidence;
+    });
+    const service = new GenerationService({
+      provider: new DeterministicMockProvider({ complete: { result: completion() } }),
+      validator,
+      languageValidationMode: 'development-provisional'
+    });
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'invalid-generated-language'
+    });
+  });
   it('requires a valid validator and never falls back to permissive validation', () => {
     const provider = new DeterministicMockProvider({ complete: { result: completion() } });
 

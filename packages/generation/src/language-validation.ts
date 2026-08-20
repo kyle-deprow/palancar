@@ -9,7 +9,17 @@ export const MAX_LANGUAGE_VALIDATION_TIMEOUT_MS = 10_000;
 
 export type GeneratedLanguage = 'en' | TargetLanguage;
 
-export type DetectedGeneratedLanguage = GeneratedLanguage | 'other' | 'undetermined';
+export type DetectedGeneratedLanguage =
+  | GeneratedLanguage
+  | 'mixed'
+  | 'other'
+  | 'undetermined';
+export type GeneratedLanguageValidationMode =
+  | 'production-calibrated'
+  | 'development-provisional';
+export type GeneratedLanguageEvidenceType =
+  | 'calibrated'
+  | 'development-provisional';
 export type GeneratedLanguageValidationVerdict = 'match' | 'mismatch' | 'indeterminate';
 export type GeneratedLanguageValidationStatus =
   | 'not-run'
@@ -38,7 +48,9 @@ export interface GeneratedLanguageValidationEvidenceCheck {
   readonly expectedLanguage: GeneratedLanguage;
   readonly detectedLanguage: DetectedGeneratedLanguage;
   readonly verdict: GeneratedLanguageValidationVerdict;
+  readonly evidenceType: GeneratedLanguageEvidenceType;
   readonly confidenceBasisPoints: number | null;
+  readonly provisionalScoreBasisPoints: number | null;
 }
 
 type FiveChecks<T> = readonly [T, T, T, T, T];
@@ -71,12 +83,15 @@ const EVIDENCE_CHECK_KEYS = new Set([
   'expectedLanguage',
   'detectedLanguage',
   'verdict',
-  'confidenceBasisPoints'
+  'evidenceType',
+  'confidenceBasisPoints',
+  'provisionalScoreBasisPoints'
 ]);
 const DETECTED_LANGUAGES: ReadonlySet<DetectedGeneratedLanguage> = new Set([
   'en',
   'es',
   'tr',
+  'mixed',
   'other',
   'undetermined'
 ]);
@@ -85,6 +100,20 @@ const VERDICTS: ReadonlySet<GeneratedLanguageValidationVerdict> = new Set([
   'mismatch',
   'indeterminate'
 ]);
+const EVIDENCE_TYPES: ReadonlySet<GeneratedLanguageEvidenceType> = new Set([
+  'calibrated',
+  'development-provisional'
+]);
+
+function isBasisPoints(value: unknown): value is number | null {
+  return (
+    value === null ||
+    (typeof value === 'number' &&
+      Number.isSafeInteger(value) &&
+      value >= 0 &&
+      value <= 10_000)
+  );
+}
 
 function validationFailure(): never {
   throw new GenerationError('language-validation-failure');
@@ -239,11 +268,14 @@ function validateGeneratedLanguageEvidenceUnchecked(
       !DETECTED_LANGUAGES.has(raw.detectedLanguage as DetectedGeneratedLanguage) ||
       typeof raw.verdict !== 'string' ||
       !VERDICTS.has(raw.verdict as GeneratedLanguageValidationVerdict) ||
-      (raw.confidenceBasisPoints !== null &&
-        (typeof raw.confidenceBasisPoints !== 'number' ||
-          !Number.isSafeInteger(raw.confidenceBasisPoints) ||
-          raw.confidenceBasisPoints < 0 ||
-          raw.confidenceBasisPoints > 10_000))
+      typeof raw.evidenceType !== 'string' ||
+      !EVIDENCE_TYPES.has(raw.evidenceType as GeneratedLanguageEvidenceType) ||
+      !isBasisPoints(raw.confidenceBasisPoints) ||
+      !isBasisPoints(raw.provisionalScoreBasisPoints) ||
+      (raw.evidenceType === 'calibrated' &&
+        raw.provisionalScoreBasisPoints !== null) ||
+      (raw.evidenceType === 'development-provisional' &&
+        raw.confidenceBasisPoints !== null)
     ) {
       validationFailure();
     }
@@ -252,7 +284,9 @@ function validateGeneratedLanguageEvidenceUnchecked(
       expectedLanguage: expected.expectedLanguage,
       detectedLanguage: raw.detectedLanguage as DetectedGeneratedLanguage,
       verdict: raw.verdict as GeneratedLanguageValidationVerdict,
-      confidenceBasisPoints: raw.confidenceBasisPoints as number | null
+      evidenceType: raw.evidenceType as GeneratedLanguageEvidenceType,
+      confidenceBasisPoints: raw.confidenceBasisPoints as number | null,
+      provisionalScoreBasisPoints: raw.provisionalScoreBasisPoints as number | null
     }));
   }
   const result = Object.freeze({
@@ -273,11 +307,18 @@ export function validateGeneratedLanguageEvidence(
 }
 
 export function isAcceptedGeneratedLanguageEvidence(
-  evidence: GeneratedLanguageValidationEvidence
+  evidence: GeneratedLanguageValidationEvidence,
+  mode: GeneratedLanguageValidationMode = 'production-calibrated'
 ): boolean {
   return evidence.checks.every((item) =>
     item.verdict === 'match' &&
     item.detectedLanguage === item.expectedLanguage &&
-    item.confidenceBasisPoints !== null
+    (mode === 'production-calibrated'
+      ? item.evidenceType === 'calibrated' &&
+        item.confidenceBasisPoints !== null &&
+        item.provisionalScoreBasisPoints === null
+      : item.evidenceType === 'development-provisional' &&
+        item.confidenceBasisPoints === null &&
+        item.provisionalScoreBasisPoints !== null)
   );
 }

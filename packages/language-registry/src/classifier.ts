@@ -1,5 +1,6 @@
 export type LanguageClassificationStatus =
   | 'calibrated'
+  | 'provisional'
   | 'insufficient-text'
   | 'uncalibrated'
   | 'conflicting'
@@ -19,8 +20,34 @@ export interface CalibratedLanguageEvidence
 
 export interface NonCalibratedLanguageEvidence
   extends ClassifiedLanguageEvidenceBase {
-  readonly status: Exclude<LanguageClassificationStatus, 'calibrated'>;
+  readonly status: Exclude<
+    LanguageClassificationStatus,
+    'calibrated' | 'provisional'
+  >;
   readonly detectedLanguage?: string;
+  readonly confidence?: never;
+  readonly calibrationVersion?: never;
+}
+
+export type ProvisionalLanguageDecision = 'accept' | 'reject' | 'uncertain';
+
+export type ProvisionalLanguageReason =
+  | 'MATCH'
+  | 'ENGLISH'
+  | 'UNSELECTED_LANGUAGE'
+  | 'MIXED'
+  | 'TOO_SHORT'
+  | 'UNKNOWN'
+  | 'DETECTOR_ERROR';
+
+export interface ProvisionalLanguageEvidence
+  extends ClassifiedLanguageEvidenceBase {
+  readonly status: 'provisional';
+  readonly profileVersion: string;
+  readonly detectedLanguage: string;
+  readonly provisionalScore: number;
+  readonly decision: ProvisionalLanguageDecision;
+  readonly reason: ProvisionalLanguageReason;
   readonly confidence?: never;
   readonly calibrationVersion?: never;
 }
@@ -31,6 +58,7 @@ export interface NonCalibratedLanguageEvidence
  */
 export type ClassifiedLanguageEvidence =
   | CalibratedLanguageEvidence
+  | ProvisionalLanguageEvidence
   | NonCalibratedLanguageEvidence;
 
 /** A detector-native score. It is not a calibrated probability or confidence. */
@@ -47,19 +75,86 @@ export interface RawLanguageDetectorOutput {
 
 export interface TextLanguageClassifier {
   readonly ready: Promise<void>;
-  readonly classify: (text: string) => Promise<ClassifiedLanguageEvidence>;
+  readonly classify: (
+    text: string,
+    selectedLanguage?: string
+  ) => Promise<ClassifiedLanguageEvidence>;
 }
 
 const CLASSIFICATION_STATUSES = new Set<LanguageClassificationStatus>([
   'calibrated',
+  'provisional',
   'insufficient-text',
   'uncalibrated',
   'conflicting',
   'unavailable'
 ]);
 
+const PROVISIONAL_DECISIONS = new Set<ProvisionalLanguageDecision>([
+  'accept',
+  'reject',
+  'uncertain'
+]);
+
+const PROVISIONAL_REASONS = new Set<ProvisionalLanguageReason>([
+  'MATCH',
+  'ENGLISH',
+  'UNSELECTED_LANGUAGE',
+  'MIXED',
+  'TOO_SHORT',
+  'UNKNOWN',
+  'DETECTOR_ERROR'
+]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function snapshotPlainDataObject(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new TypeError('Classified language evidence must be a plain object');
+  }
+  let prototype: object | null;
+  let descriptors: Record<PropertyKey, PropertyDescriptor>;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+      PropertyKey,
+      PropertyDescriptor
+    >;
+  } catch {
+    throw new TypeError('Classified language evidence must be a plain object');
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Classified language evidence must be a plain object');
+  }
+
+  const snapshot: Record<string, unknown> = {};
+  let descriptorMode: 'ordinary' | 'frozen' | undefined;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== 'string') {
+      throw new TypeError('Classified language evidence contains unsupported field');
+    }
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      throw new TypeError('Classified language evidence must use data properties');
+    }
+    const mode = descriptor.enumerable === true &&
+      descriptor.writable === true &&
+      descriptor.configurable === true
+      ? 'ordinary'
+      : descriptor.enumerable === true &&
+          descriptor.writable === false &&
+          descriptor.configurable === false
+        ? 'frozen'
+        : undefined;
+    if (mode === undefined || (descriptorMode !== undefined && descriptorMode !== mode)) {
+      throw new TypeError('Classified language evidence has invalid property descriptors');
+    }
+    descriptorMode = mode;
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
 }
 
 function requireExactKeys(
@@ -101,12 +196,9 @@ function requireFiniteNumber(value: unknown, label: string): number {
   return value;
 }
 
-export function validateClassifiedLanguageEvidence(
-  value: unknown
-): asserts value is ClassifiedLanguageEvidence {
-  if (!isRecord(value)) {
-    throw new TypeError('Classified language evidence must be an object');
-  }
+function validateClassifiedLanguageEvidenceSnapshot(
+  value: Record<string, unknown>
+): void {
 
   if (
     typeof value.status !== 'string' ||
@@ -137,6 +229,44 @@ export function validateClassifiedLanguageEvidence(
     return;
   }
 
+  if (value.status === 'provisional') {
+    requireExactKeys(
+      value,
+      [
+        'status',
+        'detectorVersion',
+        'profileVersion',
+        'detectedLanguage',
+        'provisionalScore',
+        'decision',
+        'reason'
+      ],
+      'Provisional language evidence'
+    );
+    requireExactNonemptyString(value.profileVersion, 'profileVersion');
+    requireLanguageCode(value.detectedLanguage, 'detectedLanguage');
+    const score = requireFiniteNumber(
+      value.provisionalScore,
+      'provisionalScore'
+    );
+    if (score < 0 || score > 1) {
+      throw new RangeError('provisionalScore must be between 0 and 1');
+    }
+    if (
+      typeof value.decision !== 'string' ||
+      !PROVISIONAL_DECISIONS.has(value.decision as ProvisionalLanguageDecision)
+    ) {
+      throw new TypeError('Provisional language evidence has an invalid decision');
+    }
+    if (
+      typeof value.reason !== 'string' ||
+      !PROVISIONAL_REASONS.has(value.reason as ProvisionalLanguageReason)
+    ) {
+      throw new TypeError('Provisional language evidence has an invalid reason');
+    }
+    return;
+  }
+
   requireExactKeys(
     value,
     ['status', 'detectorVersion', 'detectedLanguage'],
@@ -145,6 +275,20 @@ export function validateClassifiedLanguageEvidence(
   if (value.detectedLanguage !== undefined) {
     requireLanguageCode(value.detectedLanguage, 'detectedLanguage');
   }
+}
+
+export function snapshotClassifiedLanguageEvidence(
+  value: unknown
+): ClassifiedLanguageEvidence {
+  const snapshot = snapshotPlainDataObject(value);
+  validateClassifiedLanguageEvidenceSnapshot(snapshot);
+  return Object.freeze(snapshot) as unknown as ClassifiedLanguageEvidence;
+}
+
+export function validateClassifiedLanguageEvidence(
+  value: unknown
+): asserts value is ClassifiedLanguageEvidence {
+  snapshotClassifiedLanguageEvidence(value);
 }
 
 export function validateRawLanguageDetectorOutput(

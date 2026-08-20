@@ -1379,6 +1379,117 @@ describe('relay session core', () => {
     expect(complete).not.toHaveBeenCalled();
   });
 
+  it('rejects hostile classifier evidence at the Node boundary without invoking traps or accessors', async () => {
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-release',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const base = calibratedEvidence('es');
+    let accessorCalls = 0;
+    let proxyTrapCalls = 0;
+    const accessor = { ...base } as Record<string, unknown>;
+    Object.defineProperty(accessor, 'status', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        throw new Error('classifier-accessor-canary');
+      }
+    });
+    const symbol = { ...base } as Record<PropertyKey, unknown>;
+    symbol[Symbol('extra')] = true;
+    const proxy = new Proxy(base, {
+      getOwnPropertyDescriptor: () => {
+        proxyTrapCalls += 1;
+        throw new Error('classifier-proxy-canary');
+      },
+      ownKeys: () => {
+        proxyTrapCalls += 1;
+        throw new Error('classifier-proxy-canary');
+      }
+    });
+    const revoked = Proxy.revocable(base, {});
+    revoked.revoke();
+
+    for (const hostile of [accessor, symbol, proxy, revoked.proxy]) {
+      const { core } = openNew(recordingAdapter(), 'es', {
+        languageClassifier: {
+          ready: Promise.resolve(),
+          classify: async () => hostile as ClassifiedLanguageEvidence
+        },
+        generationService: generationService({
+          id: 'hostile-evidence-must-not-run',
+          version: '1.0.0',
+          complete
+        })
+      });
+      core.handleText(utteranceStartText());
+      const result = await core.handleTranscriptionEvent(finalEvent());
+      expect(result.outgoing).toEqual([
+        expect.objectContaining({
+          type: 'language.decision',
+          decision: 'uncertain'
+        })
+      ]);
+      expect(JSON.stringify(result)).not.toContain('classifier-');
+    }
+    expect(accessorCalls).toBe(0);
+    expect(proxyTrapCalls).toBe(0);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('never calls generation for rejected development-provisional source evidence', async () => {
+    const metrics = recordingMetricSink();
+    const complete = vi.fn(async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'must-not-run',
+      suggestions: [
+        { englishText: 'one', selectedTargetText: 'uno' },
+        { englishText: 'two', selectedTargetText: 'dos' }
+      ]
+    }));
+    const languageClassifier: TextLanguageClassifier = {
+      ready: Promise.resolve(),
+      classify: async () => ({
+        status: 'provisional',
+        detectorVersion: 'eld-small-2.1.0',
+        profileVersion: 'eld-small-dev-4',
+        detectedLanguage: 'en',
+        provisionalScore: 0.9,
+        decision: 'reject',
+        reason: 'ENGLISH'
+      })
+    };
+    const { core } = openNew(recordingAdapter(), 'es', {
+      languageBoundaryMode: 'development-provisional',
+      languageClassifier,
+      metricSink: metrics.sink,
+      generationService: generationService({
+        id: 'must-not-run',
+        version: '1.0.0',
+        complete
+      })
+    });
+    core.handleText(utteranceStartText());
+    const result = await core.handleTranscriptionEvent(finalEvent());
+    expect(result.outgoing).toMatchObject([
+      { type: 'language.decision', decision: 'english' }
+    ]);
+    expect(complete).not.toHaveBeenCalled();
+    expect(metrics.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'language.decision',
+        languageBoundaryMode: 'development-provisional',
+        languageReason: 'ENGLISH',
+        detectedLanguage: 'en',
+        provisionalScoreBasisPoints: 9_000
+      })
+    ]));
+    expect(JSON.stringify(metrics.records)).not.toContain('es-selected-target-final');
+  });
+
   it('suppresses a classifier result that becomes stale during cancellation', async () => {
     let resolveClassification: ((evidence: ClassifiedLanguageEvidence) => void) | undefined;
     const languageClassifier: TextLanguageClassifier = {
@@ -2000,6 +2111,7 @@ describe('relay session core', () => {
         count: 1,
         targetLanguage: 'es',
         gateDecision: 'english',
+        languageBoundaryMode: 'fixture',
         operation: 'language',
         outcome: 'rejected'
       }
@@ -2474,7 +2586,15 @@ describe('relay session core', () => {
       new Set(RELAY_METRIC_NAMES)
     );
     for (const record of metrics.records) {
-      const enriched = { ...record, deploymentSlot: 'dev' as const };
+      const sanitizerRecord = Object.fromEntries(
+        Object.entries(record).filter(([key]) => ![
+          'languageBoundaryMode',
+          'languageReason',
+          'detectedLanguage',
+          'provisionalScoreBasisPoints'
+        ].includes(key))
+      );
+      const enriched = { ...sanitizerRecord, deploymentSlot: 'dev' as const };
       const sanitized = sanitizeTelemetryForExport(enriched, 'dev');
       expect({ ...sanitized }).toEqual(enriched);
       expect(Object.hasOwn(sanitized, 'errorCategory')).toBe(false);

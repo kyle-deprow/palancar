@@ -92,7 +92,9 @@ function expectExactFrozenEvidence(
       expectedLanguage,
       detectedLanguage: 'undetermined',
       verdict: 'indeterminate',
-      confidenceBasisPoints: null
+      evidenceType: 'calibrated',
+      confidenceBasisPoints: null,
+      provisionalScoreBasisPoints: null
     }))
   });
   expect(Reflect.ownKeys(evidence)).toEqual(['checks']);
@@ -104,7 +106,9 @@ function expectExactFrozenEvidence(
       'expectedLanguage',
       'detectedLanguage',
       'verdict',
-      'confidenceBasisPoints'
+      'evidenceType',
+      'confidenceBasisPoints',
+      'provisionalScoreBasisPoints'
     ]);
     expect(Object.isFrozen(check)).toBe(true);
   }

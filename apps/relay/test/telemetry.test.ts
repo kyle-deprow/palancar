@@ -628,6 +628,25 @@ describe('record', () => {
     expect(harness.measurements).toHaveLength(0);
   });
 
+  it('drops provisional metadata accessors without invoking them', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    let reads = 0;
+    const input = {
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      get languageBoundaryMode(): string {
+        reads += 1;
+        return 'development-provisional';
+      }
+    };
+    sink.record(input);
+    expect(reads).toBe(0);
+    expect(harness.measurements).toHaveLength(0);
+  });
+
   it('records the sanitizer-defined values for every closed metric name', () => {
     const harness = createHarness();
     const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
@@ -711,6 +730,59 @@ describe('record', () => {
       'palancar.reconnect.reason': 'network'
     });
     expect(Object.keys(harness.measurements[0]?.attributes ?? {})).toHaveLength(8);
+  });
+
+  it('exports bounded provisional language metadata without source text', () => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      targetLanguage: TARGET_LANGUAGES.ES,
+      gateDecision: GATE_DECISIONS.TARGET,
+      operation: TELEMETRY_OPERATIONS.LANGUAGE,
+      outcome: TELEMETRY_OUTCOMES.ACCEPTED,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'MATCH',
+      detectedLanguage: 'es',
+      provisionalScoreBasisPoints: 8_462
+    });
+
+    expect(harness.measurements).toHaveLength(1);
+    expect(harness.measurements[0]?.attributes).toMatchObject({
+      'palancar.language.boundary_mode': 'development-provisional',
+      'palancar.language.reason': 'MATCH',
+      'palancar.language.detected': 'es',
+      'palancar.language.provisional_score_basis_points': 8_462
+    });
+    expect(JSON.stringify(harness.measurements)).not.toContain('Buenos');
+  });
+
+  it.each([
+    { provisionalScoreBasisPoints: -1 },
+    { provisionalScoreBasisPoints: 10_001 },
+    { provisionalScoreBasisPoints: 1.5 },
+    { languageReason: 'FREE_TEXT' },
+    { detectedLanguage: 'free-text' },
+    { languageBoundaryMode: 'production-approved' }
+  ])('drops malformed provisional language attributes %#', (override) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.LANGUAGE_DECISION,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      languageBoundaryMode: 'development-provisional',
+      languageReason: 'MATCH',
+      detectedLanguage: 'es',
+      provisionalScoreBasisPoints: 8_000,
+      ...override
+    });
+    expect(harness.measurements).toHaveLength(0);
   });
 
   it('drops every non-production root key before sanitization instead of stripping it', () => {

@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTROLLED_FIXTURE_CALIBRATION_VERSION,
   CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+  DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   createLanguageRegistry,
   evaluateLanguageGate,
   getLanguageDefinition,
   listLanguageDefinitions,
+  snapshotClassifiedLanguageEvidence,
   validateClassifiedLanguageEvidence,
   validateRawLanguageDetectorOutput,
   type ClassifiedLanguageEvidence,
@@ -18,6 +21,19 @@ import {
 
 const DETECTOR_VERSION = CONTROLLED_FIXTURE_DETECTOR_VERSION;
 const CALIBRATION_VERSION = CONTROLLED_FIXTURE_CALIBRATION_VERSION;
+const DEVELOPMENT_PROFILE = {
+  approvalClass: 'development-provisional',
+  productionApproved: false,
+  detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+  profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+  provisionalScoreThreshold: 0.65,
+  provisionalMarginThreshold: 0.08,
+  minimumTextCharacters: 12,
+  minimumWindowCharacters: 1,
+  maximumInputCodePoints: 512,
+  minimumSlidingWindowWords: 1,
+  maximumSlidingWindowWords: 8
+} as const;
 
 function calibrated(
   detectedLanguage: string,
@@ -38,7 +54,7 @@ function calibrated(
 }
 
 function unavailable(
-  status: Exclude<LanguageClassificationStatus, 'calibrated'>,
+  status: Exclude<LanguageClassificationStatus, 'calibrated' | 'provisional'>,
   detectedLanguage?: string
 ): ClassifiedLanguageEvidence {
   return {
@@ -67,7 +83,8 @@ describe('language registry', () => {
           confidenceThreshold: 0.8
         },
         mixedPolicy: 'reject',
-        fixtureSuiteIds: ['language-foundation-es']
+        fixtureSuiteIds: ['language-foundation-es'],
+        developmentProvisional: DEVELOPMENT_PROFILE
       },
       {
         code: 'tr',
@@ -79,7 +96,8 @@ describe('language registry', () => {
           confidenceThreshold: 0.8
         },
         mixedPolicy: 'reject',
-        fixtureSuiteIds: ['language-foundation-tr']
+        fixtureSuiteIds: ['language-foundation-tr'],
+        developmentProvisional: DEVELOPMENT_PROFILE
       }
     ]);
   });
@@ -135,6 +153,67 @@ describe('language registry', () => {
       ])
     ).toThrow(/unsupported field/);
   });
+
+  it('rejects asymmetric or production-claiming provisional profiles', () => {
+    const definitions = TARGETS.map((code): LanguageDefinition<TargetLanguage> => ({
+      code,
+      displayName: code,
+      finalCalibration: {
+        detectorVersion: DETECTOR_VERSION,
+        calibrationVersion: CALIBRATION_VERSION,
+        confidenceThreshold: 0.8
+      },
+      mixedPolicy: 'reject',
+      fixtureSuiteIds: [`fixture-${code}`],
+      developmentProvisional: DEVELOPMENT_PROFILE
+    }));
+    expect(() => createLanguageRegistry([
+      definitions[0] as LanguageDefinition<TargetLanguage>,
+      {
+        ...definitions[1],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          provisionalScoreThreshold: 0.7
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/symmetric/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          productionApproved: true
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/never production approved/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          calibrationVersion: 'forbidden'
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/unsupported field/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          maximumInputCodePoints: 513
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/cannot exceed 512/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          minimumSlidingWindowWords: 9
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/minimum sliding window words cannot exceed maximum/);
+  });
 });
 
 describe('classifier contracts', () => {
@@ -165,7 +244,8 @@ describe('classifier contracts', () => {
       evaluateLanguageGate({
         selectedLanguage: 'es',
         evidence: raw as unknown as ClassifiedLanguageEvidence,
-        isFinal: true
+        isFinal: true,
+        boundaryMode: 'production-calibrated'
       })
     ).toThrow(/invalid status/);
 
@@ -185,7 +265,8 @@ describe('classifier contracts', () => {
         evidence: calibrated('es', 0.9, {
           detectorVersion: 'raw-detector-with-relabeled-score'
         }),
-        isFinal: true
+        isFinal: true,
+        boundaryMode: 'production-calibrated'
       })
     ).toMatchObject({
       decision: 'uncertain',
@@ -261,6 +342,74 @@ describe('classifier contracts', () => {
     ).toThrow(/finite number/);
   });
 
+  it('validates provisional evidence with exact raw-score semantics', () => {
+    const evidence = {
+      status: 'provisional',
+      detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+      profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+      detectedLanguage: 'es',
+      provisionalScore: 0.8,
+      decision: 'accept',
+      reason: 'MATCH'
+    } as const;
+    expect(() => validateClassifiedLanguageEvidence(evidence)).not.toThrow();
+    for (const forbidden of [
+      { confidence: 0.8 },
+      { calibrationVersion: 'not-calibrated' }
+    ]) {
+      expect(() => validateClassifiedLanguageEvidence({
+        ...evidence,
+        ...forbidden
+      })).toThrow(/unsupported field/);
+    }
+    expect(() => validateClassifiedLanguageEvidence({
+      ...evidence,
+      provisionalScore: Number.NaN
+    })).toThrow(/finite/);
+  });
+
+  it('snapshots only exact ordinary or frozen plain provisional evidence', () => {
+    const evidence = {
+      status: 'provisional',
+      detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+      profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+      detectedLanguage: 'es',
+      provisionalScore: 0.8,
+      decision: 'accept',
+      reason: 'MATCH'
+    } as const;
+    const ordinary = snapshotClassifiedLanguageEvidence(evidence);
+    const frozen = snapshotClassifiedLanguageEvidence(Object.freeze({ ...evidence }));
+    expect(ordinary).toEqual(evidence);
+    expect(Object.isFrozen(ordinary)).toBe(true);
+    expect(frozen).toEqual(evidence);
+
+    const nonEnumerable = { ...evidence };
+    Object.defineProperty(nonEnumerable, 'extra', { value: true });
+    const symbolExtra = { ...evidence } as Record<PropertyKey, unknown>;
+    symbolExtra[Symbol('extra')] = true;
+    let accessorCalls = 0;
+    const accessor = { ...evidence } as Record<string, unknown>;
+    Object.defineProperty(accessor, 'reason', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return 'MATCH';
+      }
+    });
+    for (const hostile of [nonEnumerable, symbolExtra, accessor]) {
+      expect(() => validateClassifiedLanguageEvidence(hostile)).toThrow();
+      expect(() => evaluateLanguageGate({
+        selectedLanguage: 'es',
+        evidence: hostile as ClassifiedLanguageEvidence,
+        isFinal: true,
+        boundaryMode: 'development-provisional'
+      })).toThrow();
+    }
+    expect(accessorCalls).toBe(0);
+  });
+
   it('rejects provider advisory metadata and logprobs as classifier evidence', () => {
     expect(() =>
       evaluateLanguageGate({
@@ -270,7 +419,8 @@ describe('classifier contracts', () => {
           source: 'transcription-metadata',
           logprobs: [{ token: 'hola', logprob: -0.1 }]
         } as unknown as ClassifiedLanguageEvidence,
-        isFinal: true
+        isFinal: true,
+        boundaryMode: 'production-calibrated'
       })
     ).toThrow(/unsupported field/);
   });
@@ -284,7 +434,8 @@ describe('classifier contracts', () => {
         evaluateLanguageGate({
           selectedLanguage: 'es',
           evidence,
-          isFinal: true
+          isFinal: true,
+          boundaryMode: 'production-calibrated'
         })
       ).toMatchObject({
         decision: 'uncertain',
@@ -296,13 +447,46 @@ describe('classifier contracts', () => {
 });
 
 describe('final language gate', () => {
+  it('authorizes exact selected-target provisional evidence only in development mode', () => {
+    for (const selectedLanguage of TARGETS) {
+      const evidence = {
+        status: 'provisional',
+        detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+        profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+        detectedLanguage: selectedLanguage,
+        provisionalScore: 0.65,
+        decision: 'accept',
+        reason: 'MATCH'
+      } as const;
+      expect(evaluateLanguageGate({
+        selectedLanguage,
+        evidence,
+        isFinal: true,
+        boundaryMode: 'development-provisional'
+      })).toMatchObject({
+        decision: 'target',
+        displayAllowed: true,
+        generationAllowed: true
+      });
+      expect(evaluateLanguageGate({
+        selectedLanguage,
+        evidence,
+        isFinal: true,
+        boundaryMode: 'production-calibrated'
+      })).toMatchObject({
+        decision: 'uncertain',
+        generationAllowed: false
+      });
+    }
+  });
   it('allows transcript display and generation only for a calibrated selected target', () => {
     for (const selectedLanguage of TARGETS) {
       expect(
         evaluateLanguageGate({
           selectedLanguage,
           evidence: calibrated(selectedLanguage, 0.8),
-          isFinal: true
+          isFinal: true,
+          boundaryMode: 'production-calibrated'
         })
       ).toMatchObject({
         decision: 'target',
@@ -329,7 +513,8 @@ describe('final language gate', () => {
           evaluateLanguageGate({
             selectedLanguage,
             evidence: calibrated(detectedLanguage, 0.99),
-            isFinal: true
+            isFinal: true,
+            boundaryMode: 'production-calibrated'
           })
         ).toMatchObject({
           decision,
@@ -346,7 +531,8 @@ describe('final language gate', () => {
         evaluateLanguageGate({
           selectedLanguage,
           evidence: calibrated(selectedLanguage, 0.79),
-          isFinal: true
+          isFinal: true,
+          boundaryMode: 'production-calibrated'
         })
       ).toMatchObject({
         decision: 'uncertain',
@@ -368,7 +554,8 @@ describe('final language gate', () => {
           evaluateLanguageGate({
             selectedLanguage,
             evidence: unavailable(status, status === 'conflicting' ? 'mixed' : selectedLanguage),
-            isFinal: true
+            isFinal: true,
+            boundaryMode: 'production-calibrated'
           })
         ).toMatchObject({
           decision: 'uncertain',
@@ -388,7 +575,8 @@ describe('partial display policy', () => {
         evaluateLanguageGate({
           selectedLanguage,
           evidence: calibrated(selectedLanguage, 1),
-          isFinal: false
+          isFinal: false,
+          boundaryMode: 'production-calibrated'
         })
       ).toMatchObject({
         decision: 'provisional',
@@ -423,7 +611,8 @@ describe('partial display policy', () => {
           {
             selectedLanguage,
             evidence: calibrated(selectedLanguage, 0.9),
-            isFinal: false
+            isFinal: false,
+            boundaryMode: 'production-calibrated'
           },
           registry
         )
@@ -445,7 +634,8 @@ describe('partial display policy', () => {
             {
               selectedLanguage,
               evidence: rejectedEvidence,
-              isFinal: false
+              isFinal: false,
+              boundaryMode: 'production-calibrated'
             },
             registry
           )
@@ -483,7 +673,8 @@ describe('partial display policy', () => {
         {
           selectedLanguage: 'fr',
           evidence: calibrated('fr', 0.9),
-          isFinal: false
+          isFinal: false,
+          boundaryMode: 'production-calibrated'
         },
         registry
       )
@@ -535,7 +726,8 @@ describe('future-language full matrix', () => {
           {
             selectedLanguage: 'fr',
             evidence: calibrated(detectedLanguage, 0.99),
-            isFinal: true
+            isFinal: true,
+            boundaryMode: 'production-calibrated'
           },
           registry
         )
@@ -553,7 +745,8 @@ describe('future-language full matrix', () => {
           {
             selectedLanguage: 'fr',
             evidence: unavailable(status, status === 'conflicting' ? 'mixed' : 'fr'),
-            isFinal: true
+            isFinal: true,
+            boundaryMode: 'production-calibrated'
           },
           registry
         )
@@ -569,7 +762,8 @@ describe('future-language full matrix', () => {
         {
           selectedLanguage: 'fr',
           evidence: calibrated('fr', 0.9),
-          isFinal: false
+          isFinal: false,
+          boundaryMode: 'production-calibrated'
         },
         registry
       )

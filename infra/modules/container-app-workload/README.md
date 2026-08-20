@@ -24,6 +24,12 @@ sensitive input. The relay receives only its canonical lower-case
 managed identities are configured with `None` and `Main` lifecycles for image
 pull and application runtime respectively.
 
+Callers must explicitly set `language_boundary_mode` to either `deny-all` or
+`development-provisional`; there is no default. The module emits it exactly
+once as the nonsecret `PALANCAR_LANGUAGE_BOUNDARY_MODE` relay environment
+value. The provisional mode is accepted only with `deployment_slot = "dev"`;
+staging and production require the explicit `deny-all` value.
+
 Ingress is external HTTP on target port 8787, disallows insecure HTTP, and
 sends 100 percent of traffic to the latest single revision. The 1 GiB LiteLLM
 proof completed real inference but peaked at 99.99% under amd64 emulation,

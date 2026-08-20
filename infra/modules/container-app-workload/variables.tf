@@ -332,6 +332,16 @@ variable "deployment_slot" {
   }
 }
 
+variable "language_boundary_mode" {
+  description = "Explicit relay language boundary mode. Development may use the provisional local detector; staging and production must remain deny-all."
+  type        = string
+
+  validation {
+    condition     = contains(["deny-all", "development-provisional"], var.language_boundary_mode)
+    error_message = "language_boundary_mode must be exactly deny-all or development-provisional."
+  }
+}
+
 variable "application_insights_connection_string" {
   description = "Required live four-field Application Insights connection string for production relay telemetry."
   type        = string

@@ -1,4 +1,8 @@
-import type { LanguageDefinition, TargetLanguage } from './types.js';
+import type {
+  DevelopmentProvisionalProfile,
+  LanguageDefinition,
+  TargetLanguage
+} from './types.js';
 
 export interface LanguageRegistry<TCode extends string> {
   readonly get: (code: string) => LanguageDefinition<TCode> | undefined;
@@ -13,6 +17,13 @@ function freezeDefinition<TCode extends string>(
     ...definition,
     fixtureSuiteIds,
     finalCalibration: Object.freeze({ ...definition.finalCalibration }),
+    ...(definition.developmentProvisional === undefined
+      ? {}
+      : {
+          developmentProvisional: Object.freeze({
+            ...definition.developmentProvisional
+          })
+        }),
     ...(definition.partialDisplayCalibration === undefined
       ? {}
       : {
@@ -74,7 +85,8 @@ function validateDefinition<TCode extends string>(
       'finalCalibration',
       'mixedPolicy',
       'fixtureSuiteIds',
-      'partialDisplayCalibration'
+      'partialDisplayCalibration',
+      'developmentProvisional'
     ],
     'Language definition'
   );
@@ -108,6 +120,108 @@ function validateDefinition<TCode extends string>(
   if (definition.partialDisplayCalibration !== undefined) {
     validateCalibrationProfile(definition.partialDisplayCalibration, 'Partial');
   }
+  if (definition.developmentProvisional !== undefined) {
+    validateDevelopmentProvisionalProfile(definition.developmentProvisional);
+  }
+}
+
+function requirePositiveInteger(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function validateDevelopmentProvisionalProfile(profile: unknown): void {
+  if (typeof profile !== 'object' || profile === null) {
+    throw new TypeError('Development provisional profile must be an object');
+  }
+  requireExactKeys(
+    profile,
+    [
+      'approvalClass',
+      'productionApproved',
+      'detectorVersion',
+      'profileVersion',
+      'provisionalScoreThreshold',
+      'provisionalMarginThreshold',
+      'minimumTextCharacters',
+      'minimumWindowCharacters',
+      'maximumInputCodePoints',
+      'minimumSlidingWindowWords',
+      'maximumSlidingWindowWords'
+    ],
+    'Development provisional profile'
+  );
+  const candidate = profile as Record<string, unknown>;
+  if (candidate.approvalClass !== 'development-provisional') {
+    throw new TypeError('Development provisional approval class is invalid');
+  }
+  if (candidate.productionApproved !== false) {
+    throw new TypeError('Development provisional profiles are never production approved');
+  }
+  requireExactNonemptyString(candidate.detectorVersion, 'Provisional detector version');
+  requireExactNonemptyString(candidate.profileVersion, 'Provisional profile version');
+  requireThreshold(candidate.provisionalScoreThreshold, 'Provisional score threshold');
+  requireThreshold(candidate.provisionalMarginThreshold, 'Provisional margin threshold');
+  const minimumTextCharacters = requirePositiveInteger(
+    candidate.minimumTextCharacters,
+    'Provisional minimum text characters'
+  );
+  const minimumWindowCharacters = requirePositiveInteger(
+    candidate.minimumWindowCharacters,
+    'Provisional minimum window characters'
+  );
+  const maximumInputCodePoints = requirePositiveInteger(
+    candidate.maximumInputCodePoints,
+    'Provisional maximum input code points'
+  );
+  const minimumSlidingWindowWords = requirePositiveInteger(
+    candidate.minimumSlidingWindowWords,
+    'Provisional minimum sliding window words'
+  );
+  const maximumSlidingWindowWords = requirePositiveInteger(
+    candidate.maximumSlidingWindowWords,
+    'Provisional maximum sliding window words'
+  );
+  if (minimumWindowCharacters > minimumTextCharacters) {
+    throw new RangeError('Provisional minimum window characters cannot exceed minimum text characters');
+  }
+  if (minimumTextCharacters > maximumInputCodePoints) {
+    throw new RangeError('Provisional minimum text characters cannot exceed maximum input code points');
+  }
+  if (maximumInputCodePoints > 512) {
+    throw new RangeError('Provisional maximum input code points cannot exceed 512');
+  }
+  if (minimumSlidingWindowWords > maximumSlidingWindowWords) {
+    throw new RangeError(
+      'Provisional minimum sliding window words cannot exceed maximum sliding window words'
+    );
+  }
+  if (maximumSlidingWindowWords > maximumInputCodePoints) {
+    throw new RangeError(
+      'Provisional maximum sliding window words cannot exceed maximum input code points'
+    );
+  }
+}
+
+function provisionalProfilesMatch(
+  left: DevelopmentProvisionalProfile,
+  right: DevelopmentProvisionalProfile
+): boolean {
+  return (
+    left.approvalClass === right.approvalClass &&
+    left.productionApproved === right.productionApproved &&
+    left.detectorVersion === right.detectorVersion &&
+    left.profileVersion === right.profileVersion &&
+    left.provisionalScoreThreshold === right.provisionalScoreThreshold &&
+    left.provisionalMarginThreshold === right.provisionalMarginThreshold &&
+    left.minimumTextCharacters === right.minimumTextCharacters &&
+    left.minimumWindowCharacters === right.minimumWindowCharacters &&
+    left.maximumInputCodePoints === right.maximumInputCodePoints &&
+    left.minimumSlidingWindowWords === right.minimumSlidingWindowWords &&
+    left.maximumSlidingWindowWords === right.maximumSlidingWindowWords
+  );
 }
 
 function validateCalibrationProfile(
@@ -144,6 +258,23 @@ export function createLanguageRegistry<TCode extends string>(
     throw new TypeError('Language definitions must be an array');
   }
   for (const definition of definitions) validateDefinition(definition);
+
+  const provisionalProfiles = definitions.map(
+    (definition) => definition.developmentProvisional
+  );
+  const firstProvisionalProfile = provisionalProfiles.find(
+    (profile): profile is DevelopmentProvisionalProfile => profile !== undefined
+  );
+  if (
+    firstProvisionalProfile !== undefined &&
+    provisionalProfiles.some(
+      (profile) =>
+        profile === undefined ||
+        !provisionalProfilesMatch(firstProvisionalProfile, profile)
+    )
+  ) {
+    throw new Error('Development provisional profiles must be symmetric');
+  }
 
   const frozenDefinitions: readonly LanguageDefinition<TCode>[] = Object.freeze(
     definitions.map((definition) => freezeDefinition<TCode>(definition))
@@ -182,6 +313,22 @@ export const CONTROLLED_FIXTURE_DETECTOR_VERSION =
   'controlled-fixture-detector-1';
 export const CONTROLLED_FIXTURE_CALIBRATION_VERSION =
   'controlled-fixture-calibration-1';
+export const DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION = 'eld-small-2.1.0';
+export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-4';
+
+const developmentProvisional = {
+  approvalClass: 'development-provisional',
+  productionApproved: false,
+  detectorVersion: DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
+  profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+  provisionalScoreThreshold: 0.65,
+  provisionalMarginThreshold: 0.08,
+  minimumTextCharacters: 12,
+  minimumWindowCharacters: 1,
+  maximumInputCodePoints: 512,
+  minimumSlidingWindowWords: 1,
+  maximumSlidingWindowWords: 8
+} as const satisfies DevelopmentProvisionalProfile;
 
 const initialDefinitions = [
   {
@@ -194,7 +341,8 @@ const initialDefinitions = [
       confidenceThreshold: 0.8
     },
     mixedPolicy: 'reject',
-    fixtureSuiteIds: ['language-foundation-es']
+    fixtureSuiteIds: ['language-foundation-es'],
+    developmentProvisional
   },
   {
     code: 'tr',
@@ -206,11 +354,12 @@ const initialDefinitions = [
       confidenceThreshold: 0.8
     },
     mixedPolicy: 'reject',
-    fixtureSuiteIds: ['language-foundation-tr']
+    fixtureSuiteIds: ['language-foundation-tr'],
+    developmentProvisional
   }
 ] as const satisfies readonly LanguageDefinition<TargetLanguage>[];
 
-export const LANGUAGE_REGISTRY_VERSION = '2.0.0';
+export const LANGUAGE_REGISTRY_VERSION = '2.3.0';
 
 export const languageRegistry = createLanguageRegistry(initialDefinitions);
 

@@ -66,6 +66,11 @@ import {
   isFailClosedDeployedTextLanguageClassifier
 } from './language-classifier.js';
 import {
+  createDevelopmentProvisionalLanguageBoundary,
+  isDevelopmentProvisionalGeneratedLanguageValidator,
+  isDevelopmentProvisionalTextLanguageClassifier
+} from './provisional-language-boundary.js';
+import {
   createAzureTableSecurityComposition,
   createConnectionAudioGrantMeter,
   createLocalMockSecurityComposition,
@@ -176,6 +181,7 @@ export interface RelayHostConfig {
   readonly bindHost?: RelayBindHost;
   readonly gatePolicyVersion: string;
   readonly securityMode?: RelaySecurityComposition['mode'];
+  readonly deploymentSlot?: 'dev' | 'staging' | 'production';
   readonly security?: RelaySecurityComposition;
   readonly securityFactory?: () => RelaySecurityComposition;
   readonly clock?: RelayClock;
@@ -185,6 +191,7 @@ export interface RelayHostConfig {
   readonly languageClassifier?: TextLanguageClassifier;
   readonly generationService?: GenerationService;
   readonly productionApprovedGenerationValidator?: GeneratedLanguageValidator;
+  readonly developmentProvisionalGenerationValidator?: GeneratedLanguageValidator;
   readonly generationReadiness?: RelayGenerationReadiness;
   readonly metricSink?: RelayMetricSink;
   readonly metricSinkFactory?: () => RelayMetricSink;
@@ -322,7 +329,8 @@ function defaultTranscriptionAdapters(): Readonly<Record<TargetLanguage, Transcr
 }
 
 function defaultGenerationService(
-  boundary: 'fixture' | 'deny-all'
+  boundary: 'fixture' | 'deny-all' | 'development-provisional',
+  provisionalValidator?: GeneratedLanguageValidator
 ): GenerationService {
   const provider = new RelayDeterministicMockProvider({
     id: 'deterministic-mock-generation',
@@ -339,9 +347,15 @@ function defaultGenerationService(
   });
   const service = new GenerationService({
     provider,
-    validator: boundary === 'fixture'
-      ? new DeterministicFixtureLanguageValidator()
-      : new FailClosedGeneratedLanguageValidator()
+    validator:
+      boundary === 'fixture'
+        ? new DeterministicFixtureLanguageValidator()
+        : boundary === 'development-provisional'
+          ? provisionalValidator ?? new FailClosedGeneratedLanguageValidator()
+          : new FailClosedGeneratedLanguageValidator(),
+    ...(boundary === 'development-provisional'
+      ? { languageValidationMode: 'development-provisional' as const }
+      : {})
   });
   if (boundary === 'fixture') {
     BUILT_IN_FIXTURE_GENERATION_SERVICES.add(service);
@@ -431,6 +445,7 @@ function rejectEnvironmentKeys(
 
 function rejectBoundarySelectionEnvironment(env: NodeJS.ProcessEnv): void {
   rejectEnvironmentKeys(env, (name) => {
+    if (name === 'PALANCAR_LANGUAGE_BOUNDARY_MODE') return false;
     const normalized = name.toUpperCase();
     return normalized.includes('LANGUAGE_BOUNDARY') ||
       normalized.includes('BOUNDARY_MODE') ||
@@ -683,6 +698,7 @@ const RELAY_HOST_CONFIG_KEYS = new Set<PropertyKey>([
   'bindHost',
   'gatePolicyVersion',
   'securityMode',
+  'deploymentSlot',
   'security',
   'securityFactory',
   'clock',
@@ -692,6 +708,7 @@ const RELAY_HOST_CONFIG_KEYS = new Set<PropertyKey>([
   'languageClassifier',
   'generationService',
   'productionApprovedGenerationValidator',
+  'developmentProvisionalGenerationValidator',
   'generationReadiness',
   'metricSink',
   'metricSinkFactory',
@@ -943,10 +960,19 @@ function snapshotRelayHostConfig(config: RelayHostConfig): RelayHostConfig {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
   if (
+    values.deploymentSlot !== undefined &&
+    values.deploymentSlot !== 'dev' &&
+    values.deploymentSlot !== 'staging' &&
+    values.deploymentSlot !== 'production'
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
     values.languageBoundaryMode !== undefined &&
     values.languageBoundaryMode !== 'fixture' &&
     values.languageBoundaryMode !== 'deny-all' &&
-    values.languageBoundaryMode !== 'production-approved'
+    values.languageBoundaryMode !== 'production-approved' &&
+    values.languageBoundaryMode !== 'development-provisional'
   ) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
@@ -982,6 +1008,9 @@ function snapshotRelayHostConfig(config: RelayHostConfig): RelayHostConfig {
   }
   if (values.productionApprovedGenerationValidator !== undefined) {
     validateGeneratedLanguageValidator(values.productionApprovedGenerationValidator);
+  }
+  if (values.developmentProvisionalGenerationValidator !== undefined) {
+    validateGeneratedLanguageValidator(values.developmentProvisionalGenerationValidator);
   }
   if (values.languageClassifier !== undefined) validateLanguageClassifier(values.languageClassifier);
   if (values.transcriptionAdapters !== undefined) {
@@ -1490,7 +1519,8 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
         transcriptionProvider !== 'mock' ||
         bindHost !== '127.0.0.1' ||
         originHost !== '127.0.0.1' ||
-        hasEnvironmentValue(env, 'PALANCAR_RELAY_ENVIRONMENT')
+        hasEnvironmentValue(env, 'PALANCAR_RELAY_ENVIRONMENT') ||
+        hasEnvironmentValue(env, 'PALANCAR_LANGUAGE_BOUNDARY_MODE')
       ) {
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
       }
@@ -1545,6 +1575,24 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
     if (deploymentSlot !== 'dev' && deploymentSlot !== 'staging' && deploymentSlot !== 'production') {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
+    const requestedLanguageBoundary = env.PALANCAR_LANGUAGE_BOUNDARY_MODE;
+    if (
+      requestedLanguageBoundary !== undefined &&
+      requestedLanguageBoundary !== 'deny-all' &&
+      requestedLanguageBoundary !== 'development-provisional'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (
+      requestedLanguageBoundary === 'development-provisional' &&
+      deploymentSlot !== 'dev'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const provisionalBoundary =
+      requestedLanguageBoundary === 'development-provisional'
+        ? createDevelopmentProvisionalLanguageBoundary()
+        : undefined;
     if (env.APPLICATIONINSIGHTS_STATSBEAT_DISABLED !== 'true' ||
       env.APPLICATION_INSIGHTS_NO_STATSBEAT !== 'true') {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
@@ -1604,13 +1652,24 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       bindHost,
       gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION,
       securityMode: 'azure-table' as const,
+      deploymentSlot,
       securityFactory: () => createAzureTableSecurityComposition({
         endpoint: tableEndpoint,
         environment,
         audience,
         managedIdentityClientId
       }),
-      languageBoundaryMode: 'deny-all' as const,
+      languageBoundaryMode:
+        provisionalBoundary === undefined
+          ? 'deny-all' as const
+          : 'development-provisional' as const,
+      ...(provisionalBoundary === undefined
+        ? {}
+        : {
+            languageClassifier: provisionalBoundary.classifier,
+            developmentProvisionalGenerationValidator:
+              provisionalBoundary.generatedLanguageValidator
+          }),
       transcriptionProvider: transcriptionProvider as 'mock' | 'azure-realtime',
       ...(azureTranscriptionEndpoint === undefined
         ? {}
@@ -1628,7 +1687,10 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       } satisfies RelayMetricSinkConfig)
     };
     if (generationProvider === 'mock') {
-      const generationService = defaultGenerationService('deny-all');
+      const generationService = defaultGenerationService(
+        provisionalBoundary === undefined ? 'deny-all' : 'development-provisional',
+        provisionalBoundary?.generatedLanguageValidator
+      );
       return Object.freeze({
         ...baseConfig,
         generationService,
@@ -1648,7 +1710,12 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
     });
     const generationService = new GenerationService({
       provider,
-      validator: new FailClosedGeneratedLanguageValidator()
+      validator:
+        provisionalBoundary?.generatedLanguageValidator ??
+        new FailClosedGeneratedLanguageValidator(),
+      ...(provisionalBoundary === undefined
+        ? {}
+        : { languageValidationMode: 'development-provisional' as const })
     });
     const generationReadiness: LiteLLMGenerationReadiness = Object.freeze({
       provider: 'litellm',
@@ -1831,6 +1898,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
     }
     const productionApprovedGenerationValidator =
       validatedConfig.productionApprovedGenerationValidator;
+    const developmentProvisionalGenerationValidator =
+      validatedConfig.developmentProvisionalGenerationValidator;
 
     if (boundary === 'fixture') {
       if (
@@ -1844,6 +1913,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         (!adaptersWillBeTargetSpecificMocks && !explicitFixtureHarness) ||
         (!isControlledFixtureTextLanguageClassifier(languageClassifier) && !explicitFixtureHarness) ||
         productionApprovedGenerationValidator !== undefined ||
+        developmentProvisionalGenerationValidator !== undefined ||
+        generationService.languageValidationMode !== 'production-calibrated' ||
         generationService.validator.id !== 'deterministic-language-fixture'
       ) {
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
@@ -1853,13 +1924,33 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         localComposition ||
         !isFailClosedDeployedTextLanguageClassifier(languageClassifier) ||
         productionApprovedGenerationValidator !== undefined ||
+        developmentProvisionalGenerationValidator !== undefined ||
+        generationService.languageValidationMode !== 'production-calibrated' ||
         generationService.validator.id !== 'fail-closed-generated-language'
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    } else if (boundary === 'development-provisional') {
+      if (
+        localComposition ||
+        validatedConfig.deploymentSlot !== 'dev' ||
+        productionApprovedGenerationValidator !== undefined ||
+        developmentProvisionalGenerationValidator === undefined ||
+        !isDevelopmentProvisionalTextLanguageClassifier(languageClassifier) ||
+        !isDevelopmentProvisionalGeneratedLanguageValidator(
+          developmentProvisionalGenerationValidator
+        ) ||
+        generationService.languageValidationMode !== 'development-provisional' ||
+        !generationService.usesValidator(
+          developmentProvisionalGenerationValidator
+        )
       ) {
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
       }
     } else if (
       localComposition ||
       productionApprovedGenerationValidator === undefined ||
+      developmentProvisionalGenerationValidator !== undefined ||
       isControlledFixtureTextLanguageClassifier(languageClassifier) ||
       isFailClosedDeployedTextLanguageClassifier(languageClassifier) ||
       (productionApprovedGenerationValidator !== undefined &&
@@ -1868,7 +1959,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
           generationService.validator.id !== productionApprovedGenerationValidator.id ||
           generationService.validator.version !== productionApprovedGenerationValidator.version)) ||
       generationService.validator.id === 'deterministic-language-fixture' ||
-      generationService.validator.id === 'fail-closed-generated-language'
+      generationService.validator.id === 'fail-closed-generated-language' ||
+      generationService.languageValidationMode !== 'production-calibrated'
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }

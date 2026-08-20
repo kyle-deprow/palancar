@@ -19,6 +19,7 @@ const FOUNDRY_COGNITIVE_ACCOUNT_ID =
 const AZURERM_PROVIDER_NAME = "registry.terraform.io/hashicorp/azurerm";
 const EXPECTED_BROWSER_ALLOWED_ORIGINS =
   "https://even-webview.synthetic.invalid";
+const EXPECTED_LANGUAGE_BOUNDARY_MODE = "development-provisional";
 const MODEL_SPIKE_DEPLOYMENT =
   `module.foundry.azurerm_cognitive_deployment.this["${PINNED_DEPLOYMENT_NAME}"]`;
 const RETIRED_DEPLOYMENT = "gpt-5-6-luna";
@@ -1038,10 +1039,22 @@ function hasExactFailClosedBrowserOriginPolicy(entries) {
   }
 }
 
+function hasExactDevelopmentLanguageBoundary(entries) {
+  return hasEnvValue(
+    entries,
+    "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+    EXPECTED_LANGUAGE_BOUNDARY_MODE,
+  );
+}
+
 function hasExactFailClosedBrowserOriginPolicyInContainerApp(after) {
   const containers = valuesByName(after?.body?.properties?.template?.containers);
   const relay = containers?.get("relay");
-  return hasExactFailClosedBrowserOriginPolicy(valuesByName(relay?.env));
+  const entries = valuesByName(relay?.env);
+  return (
+    hasExactFailClosedBrowserOriginPolicy(entries) &&
+    hasExactDevelopmentLanguageBoundary(entries)
+  );
 }
 
 function isImmutableAcrImage(value) {
@@ -1378,6 +1391,7 @@ function hasExactRuntimeContainerApp(change) {
     "PALANCAR_RELAY_ORIGIN",
     "PALANCAR_GATE_POLICY_VERSION",
     "AZURE_CLIENT_ID",
+    "PALANCAR_LANGUAGE_BOUNDARY_MODE",
     "PALANCAR_SECURITY_MODE",
     "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
     "PALANCAR_SECURITY_STATE_TABLE",
@@ -1405,6 +1419,7 @@ function hasExactRuntimeContainerApp(change) {
     !hasEnvValue(relayEnv, "PALANCAR_LITELLM_BASE_URL", "http://127.0.0.1:4000") ||
     !hasEnvValue(relayEnv, "PALANCAR_LITELLM_MODEL", "palancar-generation") ||
     !hasEnvValue(relayEnv, "PALANCAR_SECURITY_MODE", "azure-table") ||
+    !hasExactDevelopmentLanguageBoundary(relayEnv) ||
     !hasEnvValue(relayEnv, "PALANCAR_TRANSCRIPTION_PROVIDER", "mock") ||
     !hasExactFailClosedBrowserOriginPolicy(relayEnv) ||
     !hasEnvValue(relayEnv, "PALANCAR_SECURITY_STATE_TABLE", "SecurityState") ||
@@ -1805,6 +1820,7 @@ function hasExactFinalRelayEnvironment(env, runtimeClientId) {
     "PALANCAR_GATE_POLICY_VERSION",
     "AZURE_CLIENT_ID",
     "PALANCAR_DEPLOYMENT_SLOT",
+    "PALANCAR_LANGUAGE_BOUNDARY_MODE",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
     "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
     "APPLICATION_INSIGHTS_NO_STATSBEAT",
@@ -1843,6 +1859,7 @@ function hasExactFinalRelayEnvironment(env, runtimeClientId) {
     hasEnvValue(entries, "PALANCAR_GATE_POLICY_VERSION", "1.0.0") &&
     hasEnvValue(entries, "AZURE_CLIENT_ID", runtimeClientId) &&
     hasEnvValue(entries, "PALANCAR_DEPLOYMENT_SLOT", "dev") &&
+    hasExactDevelopmentLanguageBoundary(entries) &&
     hasExactFinalConnectionString(
       entries.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value,
     ) &&
@@ -2919,6 +2936,7 @@ function finalHasExactTransitionContainerAppPrior(
   const before = resourceChange.change.before;
   const after = resourceChange.change.after;
   const expectedDifferences = [
+    "body.properties.template.containers[0].env[24]",
     "body.properties.template.containers[0].image",
     "output",
   ];
@@ -4007,7 +4025,12 @@ function acceptsModelSpike(changes) {
     }
 
     if (isNoOp(actions) && change.address === CONTAINER_APP) {
-      if (!hasAllowedScale(change.change.after)) {
+      if (
+        !hasAllowedScale(change.change.after) ||
+        !hasExactFailClosedBrowserOriginPolicyInContainerApp(
+          change.change.after,
+        )
+      ) {
         return false;
       }
 

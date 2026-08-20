@@ -1,7 +1,11 @@
 import type { WEBSOCKET_SUBPROTOCOL } from '@palancar/contracts';
 import type { NegotiatedLimits, ServerControlMessage } from '@palancar/contracts';
 import type { GenerationCompletion, GenerationService } from '@palancar/generation';
-import type { TargetLanguage, TextLanguageClassifier } from '@palancar/language-registry';
+import type {
+  ProvisionalLanguageReason,
+  TargetLanguage,
+  TextLanguageClassifier
+} from '@palancar/language-registry';
 import type {
   GenerationClaim,
   SecurityRuntimeStore,
@@ -42,7 +46,18 @@ export interface RelayIdGenerator {
   errorId(): string;
 }
 
-export type RelayLanguageBoundaryMode = 'fixture' | 'deny-all' | 'production-approved';
+export type RelayLanguageBoundaryMode =
+  | 'fixture'
+  | 'deny-all'
+  | 'production-approved'
+  | 'development-provisional';
+
+export type RelayMetricDetectedLanguage =
+  | 'en'
+  | TargetLanguage
+  | 'mixed'
+  | 'other'
+  | 'unknown';
 
 export const RELAY_METRIC_NAMES = Object.freeze([
   'session.start',
@@ -113,6 +128,10 @@ export interface RelayProductionMetricInput {
   readonly count?: number;
   readonly targetLanguage?: TargetLanguage;
   readonly gateDecision?: RelayMetricGateDecision;
+  readonly languageBoundaryMode?: RelayLanguageBoundaryMode;
+  readonly languageReason?: ProvisionalLanguageReason;
+  readonly detectedLanguage?: RelayMetricDetectedLanguage;
+  readonly provisionalScoreBasisPoints?: number;
   readonly operation?: RelayMetricOperation;
   readonly outcome?: RelayMetricOutcome;
   readonly providerId?: string;

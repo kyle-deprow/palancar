@@ -375,6 +375,10 @@ function containerAppAfter(scale = { minReplicas: 0, maxReplicas: 1 }) {
               name: "relay",
               env: [
                 envValue(
+                  "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+                  "development-provisional",
+                ),
+                envValue(
                   "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
                   '["https://even-webview.synthetic.invalid"]',
                 ),
@@ -499,6 +503,10 @@ function runtimeContainerAppAfter(minReplicas = 0) {
                   "AZURE_CLIENT_ID",
                   "00000000-0000-0000-0000-000000000001",
                 ),
+                envValue(
+                  "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+                  "development-provisional",
+                ),
                 envValue("PALANCAR_SECURITY_MODE", "azure-table"),
                 envValue(
                   "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
@@ -582,6 +590,35 @@ function runtimePlan(appAfter = runtimeContainerAppAfter(), actions = ["update"]
       ...extras,
     },
   );
+}
+
+function mutateLanguageBoundary(after, mutation) {
+  const env = after.body.properties.template.containers[0].env;
+  const index = env.findIndex(
+    (entry) => entry.name === "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+  );
+  assert.notEqual(index, -1);
+  if (mutation === "missing") {
+    env.splice(index, 1);
+    return;
+  }
+  if (mutation === "deny-all") {
+    env[index].value = "deny-all";
+    return;
+  }
+  if (mutation === "duplicate") {
+    env.push(envValue(
+      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+      "development-provisional",
+    ));
+    return;
+  }
+  if (mutation === "secret") {
+    delete env[index].value;
+    env[index].secretRef = "language-boundary-mode";
+    return;
+  }
+  throw new Error("unsupported language-boundary mutation");
 }
 
 function refreshFreeZeroMapRuntimePlan() {
@@ -884,6 +921,10 @@ function finalContainerAppAfter() {
                 envValue("PALANCAR_GATE_POLICY_VERSION", "1.0.0"),
                 envValue("AZURE_CLIENT_ID", finalRuntimeClientId),
                 envValue("PALANCAR_DEPLOYMENT_SLOT", "dev"),
+                envValue(
+                  "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+                  "development-provisional",
+                ),
                 envValue(
                   "APPLICATIONINSIGHTS_CONNECTION_STRING",
                   "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com",
@@ -2211,6 +2252,47 @@ test("final-rollout requires the complete relay and LiteLLM environments", () =>
   });
 });
 
+test("final-rollout requires the exact plain development language boundary in transition and terminal plans", () => {
+  const transition = finalRolloutPlan();
+  const transitionChange = finalChange(transition, containerAppAddress).change;
+  const prior = finalValueResource(
+    transition.prior_state.values.root_module,
+    containerAppAddress,
+  );
+  const planned = finalValueResource(
+    transition.planned_values.root_module,
+    containerAppAddress,
+  );
+  for (const values of [transitionChange.before, prior.values]) {
+    assert.equal(
+      values.body.properties.template.containers[0].env.filter(
+        (entry) => entry.name === "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+      ).length,
+      0,
+    );
+  }
+  for (const values of [transitionChange.after, planned.values]) {
+    const env = values.body.properties.template.containers[0].env;
+    assert.deepEqual(env.at(-1), {
+      name: "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+      value: "development-provisional",
+    });
+    assert.equal(env.filter(
+      (entry) => entry.name === "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+    ).length, 1);
+  }
+
+  for (const idempotent of [false, true]) {
+    for (const mutation of ["missing", "deny-all", "duplicate", "secret"]) {
+      rejectsFinalMutation((candidate) => {
+        mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+          mutateLanguageBoundary(after, mutation);
+        });
+      }, idempotent);
+    }
+  }
+});
+
 test("final-rollout binds observability and Container Apps outputs exactly", () => {
   const rotatedKeyPlan = finalRolloutPlan();
   const rotatedKey = "11111111-1111-4111-8111-111111111111";
@@ -3342,6 +3424,22 @@ test("full-deploy requires the exact fail-closed browser origin policy for Conta
   }
 });
 
+test("full-deploy requires the exact plain development language boundary on app updates and no-ops", () => {
+  for (const actions of [["update"], ["no-op"]]) {
+    for (const mutation of ["missing", "deny-all", "duplicate", "secret"]) {
+      const after = containerAppAfter();
+      mutateLanguageBoundary(after, mutation);
+      assert.equal(
+        acceptsPlan(
+          fullPlan([change(containerAppAddress, actions, after)]),
+          "full-deploy",
+        ),
+        false,
+      );
+    }
+  }
+});
+
 test("full-deploy requires configured identities RBAC role assignments", () => {
   const configRoleAssignment =
     "module.identities_rbac.azurerm_role_assignment.extra";
@@ -3553,6 +3651,16 @@ test("runtime-rollout accepts only the exact OpenRouter workload at min zero or 
     imagePullIdentity,
   ];
   assert.equal(acceptsPlan(reversedIdentityOrder, "runtime-rollout"), true);
+});
+
+test("runtime-rollout requires the exact plain development language boundary for every app action", () => {
+  for (const actions of [["create"], ["update"], ["no-op"]]) {
+    for (const mutation of ["missing", "deny-all", "duplicate", "secret"]) {
+      const after = runtimeContainerAppAfter();
+      mutateLanguageBoundary(after, mutation);
+      assert.equal(acceptsPlan(runtimePlan(after, actions), "runtime-rollout"), false);
+    }
+  }
 });
 
 test("runtime-rollout accepts a realistic refresh-free zero-map plan with only the Container App update", () => {
