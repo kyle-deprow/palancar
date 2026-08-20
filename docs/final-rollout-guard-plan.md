@@ -60,11 +60,10 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   Terminal plans retain that exact entry. Missing, deny-all, duplicated, or
   secret-backed forms are rejected. The prior relay
   image is the hard-pinned reviewed digest
-  `sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
+  `sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`;
   the planned relay image equals `var.relay_image_digest`, is immutable in the
-  same ACR/repository, and is distinct from prior. The production after digest
-  is the reviewed GA item-lifecycle digest documented in `infra/README.md`;
-  it remains variable-bound and is not hard-coded in the committed guard or
+  same ACR/repository, and is distinct from prior. The reviewed after digest
+  remains variable-bound and is not hard-coded in the committed guard or
   sanitized fixture. The provider-computed
   `relay_latest_revision_name` output becomes unknown. The already deployed
   cleanup Job, action group, and six scheduled-query alerts remain no-op.

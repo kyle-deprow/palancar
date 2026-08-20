@@ -32,7 +32,7 @@ const FINAL_RESOURCE_GROUP_ID =
   `/subscriptions/${FINAL_SUBSCRIPTION_ID}/resourceGroups/${FINAL_RESOURCE_GROUP_NAME}`;
 const FINAL_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
 const FINAL_RELAY_PRIOR_IMAGE =
-  `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
+  `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`;
 const FINAL_TABLE_ACCOUNT = "palancardevstateaeeacd8c";
 const FINAL_TABLE_ENDPOINT = `https://${FINAL_TABLE_ACCOUNT}.table.core.windows.net`;
 const FINAL_TABLE_SERVICE_ID =

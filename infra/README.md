@@ -242,11 +242,10 @@ CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
 The prior state omits the new environment entry; planned state adds it exactly
 once. The prior relay image is pinned
 to the reviewed digest
-`sha256:ebd41200f7887e940273f1011458910e9e02d31fa19a931e95666e646ae1d045`;
-the reviewed planned image digest is
 `sha256:7c0a4da718d8214edcf4b0c0e8f74b2b92648cce2af1115858ff6c0f29a0dfb1`.
 The planned image must equal `var.relay_image_digest`, remain immutable in the
-same ACR/repository, and be distinct from the prior digest. The
+same ACR/repository, and be distinct from the prior digest; its reviewed digest
+is intentionally not hard-coded in the generic guard or fixture. The
 `relay_latest_revision_name` output becomes provider-unknown. There is zero
 resource drift. The action group, cleanup Job, alerts, and all other resources
 are already deployed and no-op. The action group must use the exact
