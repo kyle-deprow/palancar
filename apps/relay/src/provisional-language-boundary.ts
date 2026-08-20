@@ -477,11 +477,17 @@ function sourceConflictReason(
   detector: EldDetector,
   text: string,
   settings: DevelopmentProvisionalProfile,
-  selectedLanguage: string
+  selectedLanguage: string,
+  fullDetection: Detection
 ): 'MIXED' | 'MATCH_IGNORED_SINGLETON' | undefined {
+  const detections = new Map<string, Detection>([[text, fullDetection]]);
   const conflicts = new Map<string, StrongConflictInterval>();
   for (const interval of analysisIntervals(text, settings)) {
-    const detection = detect(detector, interval.text);
+    let detection = detections.get(interval.text);
+    if (detection === undefined) {
+      detection = detect(detector, interval.text);
+      detections.set(interval.text, detection);
+    }
     if (
       isStrongDetection(detection, settings) &&
       detection.language !== selectedLanguage
@@ -588,7 +594,8 @@ function classifySource(
       detector,
       text,
       settings,
-      expectedLanguage
+      expectedLanguage,
+      full
     );
     if (conflictReason === 'MIXED') {
       return evidence(settings, {

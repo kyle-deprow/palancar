@@ -742,6 +742,46 @@ describe('development provisional ELD-small boundary', () => {
     }
   );
 
+  it.each(['es', 'tr'] as const)(
+    'deduplicates source detector calls by exact string while preserving %s interval semantics',
+    async (target) => {
+      const singleClause = target === 'es'
+        ? 'castellano sustantivo'
+        : 'türkçe anlamlı';
+      const repeatedInterval = 'repeatedsourceword';
+      const repeatedSource = `${selectedMarker(target)}. ${repeatedInterval} ${repeatedInterval}.`;
+      const seen: string[] = [];
+      const boundary = createDevelopmentProvisionalLanguageBoundary({
+        loadDetector: () => detectorFor((text) => {
+          seen.push(text);
+          if (text === repeatedInterval) return 'fr';
+          const detected = tokenLanguage(text);
+          return detected === 'zz' ? target : detected;
+        })
+      });
+
+      await boundary.classifier.ready;
+      seen.length = 0;
+      await expect(boundary.classifier.classify(singleClause, target)).resolves.toMatchObject({
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH'
+      });
+      expect(seen[0]).toBe(singleClause);
+      expect(seen.filter((text) => text === singleClause)).toHaveLength(1);
+
+      seen.length = 0;
+      await expect(boundary.classifier.classify(repeatedSource, target)).resolves.toMatchObject({
+        detectedLanguage: 'mixed',
+        decision: 'reject',
+        reason: 'MIXED'
+      });
+      expect(seen[0]).toBe(repeatedSource);
+      expect(seen.filter((text) => text === repeatedInterval)).toHaveLength(1);
+      expect(seen).toContain(`${repeatedInterval} ${repeatedInterval}`);
+    }
+  );
+
   it.each(['tr', 'es'] as const)(
     'ignores reliable weak one-word conflicts in %s source',
     async (target) => {
