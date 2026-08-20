@@ -47,7 +47,7 @@ interface FixtureInput {
   readonly isFinal: boolean;
   readonly detectedLanguage?: string;
   readonly confidence?: number;
-  readonly status?: Exclude<LanguageClassificationStatus, 'calibrated'>;
+  readonly status?: Exclude<LanguageClassificationStatus, 'calibrated' | 'provisional'>;
   readonly text: string;
   readonly expectedDecision: GateDecision;
   readonly expectedDisplayAllowed: boolean;

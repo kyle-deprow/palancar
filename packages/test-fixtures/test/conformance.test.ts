@@ -86,7 +86,8 @@ describe('controlled language evidence matrix', () => {
       const result = evaluateLanguageGate({
         selectedLanguage: fixture.selectedLanguage,
         evidence: fixture.evidence,
-        isFinal: fixture.isFinal
+        isFinal: fixture.isFinal,
+        boundaryMode: 'production-calibrated'
       });
 
       expect(result.decision, fixture.id).toBe(fixture.expectedDecision);
@@ -164,7 +165,8 @@ describe('controlled language evidence matrix', () => {
       evaluateLanguageGate({
         selectedLanguage: 'ja',
         evidence: unreadableEvidence,
-        isFinal: true
+        isFinal: true,
+        boundaryMode: 'production-calibrated'
       });
 
     expect(evaluateUnsupportedTarget).toThrowError(RangeError);
