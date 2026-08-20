@@ -1384,6 +1384,13 @@ function mutateFinalTransitionPriorCoherently(planValue, mutate) {
   prior.values = clone(entry.change.before);
 }
 
+function mutateFinalContainerAppCoherently(planValue, mutate) {
+  mutateFinalAfterCoherently(planValue, containerAppAddress, mutate);
+  if (finalChange(planValue, containerAppAddress).change.actions[0] === "update") {
+    mutateFinalTransitionPriorCoherently(planValue, mutate);
+  }
+}
+
 function setFinalPriorRevisionCoherently(planValue, revision) {
   mutateFinalTransitionPriorCoherently(planValue, (before) => {
     before.output.properties.latestRevisionName = revision;
@@ -2269,16 +2276,14 @@ test("final-rollout requires the exact plain development language boundary in tr
     transition.planned_values.root_module,
     containerAppAddress,
   );
-  for (const values of [transitionChange.before, prior.values]) {
-    assert.equal(
-      values.body.properties.template.containers[0].env.filter(
-        (entry) => entry.name === "PALANCAR_LANGUAGE_BOUNDARY_MODE",
-      ).length,
-      0,
-    );
-  }
-  for (const values of [transitionChange.after, planned.values]) {
+  for (const values of [
+    transitionChange.before,
+    prior.values,
+    transitionChange.after,
+    planned.values,
+  ]) {
     const env = values.body.properties.template.containers[0].env;
+    assert.equal(env.length, 25);
     assert.deepEqual(env.at(-1), {
       name: "PALANCAR_LANGUAGE_BOUNDARY_MODE",
       value: "development-provisional",
@@ -2287,13 +2292,37 @@ test("final-rollout requires the exact plain development language boundary in tr
       (entry) => entry.name === "PALANCAR_LANGUAGE_BOUNDARY_MODE",
     ).length, 1);
   }
+  assert.deepEqual(
+    transitionChange.before.body.properties.template.containers[0].env,
+    transitionChange.after.body.properties.template.containers[0].env,
+  );
+  assert.deepEqual(
+    prior.values.body.properties.template.containers[0].env,
+    planned.values.body.properties.template.containers[0].env,
+  );
 
   for (const idempotent of [false, true]) {
     for (const mutation of ["missing", "deny-all", "duplicate", "secret"]) {
       rejectsFinalMutation((candidate) => {
-        mutateFinalAfterCoherently(candidate, containerAppAddress, (after) => {
+        mutateFinalContainerAppCoherently(candidate, (after) => {
           mutateLanguageBoundary(after, mutation);
         });
+      }, idempotent);
+    }
+    for (const mutate of [
+      (after) => {
+        after.body.properties.template.containers[0].env.find(
+          (entry) => entry.name === "PALANCAR_SECURITY_MODE",
+        ).value = "memory";
+      },
+      (after) => {
+        after.body.properties.template.containers[0].env.push(
+          envValue("EXTRA", "unexpected"),
+        );
+      },
+    ]) {
+      rejectsFinalMutation((candidate) => {
+        mutateFinalContainerAppCoherently(candidate, mutate);
       }, idempotent);
     }
   }

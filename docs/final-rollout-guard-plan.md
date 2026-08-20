@@ -53,12 +53,12 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   LiteLLM remains exactly 0.75 CPU/1.5Gi, relay
   remains exactly 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
   The Container App before/after recursive differences are exactly
-  `body.properties.template.containers[0].env[24]`,
-  `body.properties.template.containers[0].image`, and `output`. Prior state has
-  no `PALANCAR_LANGUAGE_BOUNDARY_MODE`; planned state appends exactly one plain,
-  nonsecret `PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry.
-  Terminal plans retain that exact entry. Missing, deny-all, duplicated, or
-  secret-backed forms are rejected. Configuration body references retain the
+  `body.properties.template.containers[0].image` and `output`. Prior, planned,
+  and terminal state each contain the same 25-entry relay environment with
+  exactly one plain, nonsecret
+  `PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry. Missing,
+  changed, duplicated, secret-backed, or otherwise drifted environments are
+  rejected. Configuration body references retain the
   exact Terraform v2 order around the boundary and sidecar expressions. The
   transition has 25 ordered empty relay `after_unknown.env` descriptors and
   exactly one passing module `language_boundary_mode` variable check. The prior relay

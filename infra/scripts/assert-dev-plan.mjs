@@ -2936,7 +2936,6 @@ function finalHasExactTransitionContainerAppPrior(
   const before = resourceChange.change.before;
   const after = resourceChange.change.after;
   const expectedDifferences = [
-    "body.properties.template.containers[0].env[24]",
     "body.properties.template.containers[0].image",
     "output",
   ];

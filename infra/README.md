@@ -234,13 +234,15 @@ It requires the complete
 39-resource transition inventory: 38 no-ops and the reviewed resource-only
 Container App update at
 `module.container_app_workload[0].azapi_resource.this`. This is the
-relay-image correction plus explicit dev language-boundary activation:
+relay-image correction with the explicit dev language boundary already active:
 LiteLLM remains at 0.75
 CPU/1.5Gi, relay remains at 0.25 CPU/0.5Gi, and the aggregate remains exactly
-1 CPU/2Gi. The only recursive Container App differences are the appended relay
-`containers[0].env[24]` entry, `containers[0].image`, and the provider output.
-The prior state omits the new environment entry; planned state adds it exactly
-once. The configuration body references preserve Terraform v2's exact order,
+1 CPU/2Gi. The only recursive Container App differences are
+`containers[0].image` and the provider output. Prior and planned state contain
+the same 25-entry relay environment, including exactly one plain, nonsecret
+`PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry. Missing,
+changed, duplicated, secret-backed, or otherwise drifted environments are
+rejected. The configuration body references preserve Terraform v2's exact order,
 with `var.language_boundary_mode` between the two sidecar-dependent reference
 groups. The update's relay `after_unknown.env` has 25 ordered empty descriptors,
 one for every planned relay environment entry. The check envelope contains
