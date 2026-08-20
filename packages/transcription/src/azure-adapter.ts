@@ -156,6 +156,8 @@ const AZURE_SERVER_EVENT_ALLOWED_STATES = Object.freeze({
   'input_audio_buffer.speech_stopped': Object.freeze([] as const),
   'input_audio_buffer.timeout_triggered': Object.freeze([] as const),
   'conversation.item.created': ACTIVE_CONFIGURED_STATES,
+  'conversation.item.added': ACTIVE_CONFIGURED_STATES,
+  'conversation.item.done': ACTIVE_CONFIGURED_STATES,
   'conversation.item.input_audio_transcription.delta': ACTIVE_CONFIGURED_STATES,
   'conversation.item.input_audio_transcription.completed': ACTIVE_CONFIGURED_STATES,
   'conversation.item.input_audio_transcription.segment': ACTIVE_CONFIGURED_STATES,
@@ -178,6 +180,7 @@ interface CommittedItem {
   readonly originalOffset: number;
   readonly order: number;
   created: boolean;
+  done: boolean;
   text: string;
   completed: boolean;
 }
@@ -1223,7 +1226,11 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         this.#fail('protocol');
         return;
       case 'conversation.item.created':
+      case 'conversation.item.added':
         this.#handleItemCreated(event.item_id, event.previous_item_id);
+        return;
+      case 'conversation.item.done':
+        this.#handleItemDone(event.item_id, event.previous_item_id);
         return;
       case 'conversation.item.input_audio_transcription.delta':
         this.#handleDelta(event.item_id, event.delta);
@@ -1269,6 +1276,7 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       originalOffset,
       order: this.#items.length,
       created: false,
+      done: false,
       text: '',
       completed: false
     };
@@ -1288,6 +1296,19 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       return;
     }
     item.created = true;
+  }
+
+  #handleItemDone(itemId: string, previousItemId: string | null): void {
+    const item = this.#itemsById.get(itemId);
+    const expectedPreviousItemId = item === undefined || item.order === 0
+      ? null
+      : this.#items[item.order - 1]?.itemId ?? null;
+    if (item === undefined || !item.created || item.done ||
+        previousItemId !== expectedPreviousItemId) {
+      this.#fail('protocol');
+      return;
+    }
+    item.done = true;
   }
 
   #hasIncompleteItem(itemId: string): boolean {

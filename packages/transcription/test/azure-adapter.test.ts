@@ -231,8 +231,12 @@ function timeoutTriggered(): string {
   });
 }
 
-function itemCreated(itemId: string, previousItemId: string | null): string {
-  return serverEvent('conversation.item.created', {
+function itemLifecycle(
+  type: 'conversation.item.created' | 'conversation.item.added' | 'conversation.item.done',
+  itemId: string,
+  previousItemId: string | null
+): string {
+  return serverEvent(type, {
     previous_item_id: previousItemId,
     item: {
       id: itemId,
@@ -243,6 +247,18 @@ function itemCreated(itemId: string, previousItemId: string | null): string {
       content: [{ type: 'input_audio', transcript: null }]
     }
   });
+}
+
+function itemCreated(itemId: string, previousItemId: string | null): string {
+  return itemLifecycle('conversation.item.created', itemId, previousItemId);
+}
+
+function itemAdded(itemId: string, previousItemId: string | null): string {
+  return itemLifecycle('conversation.item.added', itemId, previousItemId);
+}
+
+function itemDone(itemId: string, previousItemId: string | null): string {
+  return itemLifecycle('conversation.item.done', itemId, previousItemId);
 }
 
 function segment(itemId: string, segmentId = 'segment-1'): string {
@@ -761,6 +777,8 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     ['speech stopped', speechStopped],
     ['timeout', timeoutTriggered],
     ['conversation item', () => itemCreated('item-before-config', null)],
+    ['conversation item added', () => itemAdded('item-before-config', null)],
+    ['conversation item done', () => itemDone('item-before-config', null)],
     ['transcription delta', () => delta('item-before-config', 'premature')],
     ['transcription completion', () => completed('item-before-config', 'premature')],
     ['transcription segment', () => segment('item-before-config')],
@@ -811,6 +829,8 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     ['input_audio_buffer.speech_stopped', speechStopped, 'protocol'],
     ['input_audio_buffer.timeout_triggered', timeoutTriggered, 'protocol'],
     ['conversation.item.created', () => itemCreated('missing-item', null), 'protocol'],
+    ['conversation.item.added', () => itemAdded('missing-item', null), 'protocol'],
+    ['conversation.item.done', () => itemDone('missing-item', null), 'protocol'],
     ['transcription.delta', () => delta('missing-item', 'missing'), 'protocol'],
     ['transcription.completed', () => completed('missing-item', 'missing'), 'protocol'],
     ['transcription.segment', () => segment('missing-item'), 'protocol'],
@@ -850,6 +870,7 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     companionSession.finalize(UTTERANCE_ID);
     companionSocket.message(committed('item-1', null));
     companionSocket.message(itemCreated('item-1', null));
+    companionSocket.message(itemDone('item-1', null));
     companionSocket.message(segment('item-1'));
     expect(companionFailures).toEqual([]);
     companionSocket.message(segment('item-1'));
@@ -883,6 +904,156 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     failureSocket.message(committed('item-1', null));
     failureSocket.message(transcriptionFailed('item-1'));
     expect(providerFailures).toMatchObject([{ reason: 'provider' }]);
+  });
+
+  it('accepts the observed GA added/done sequence without emitting lifecycle output', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(socket, events, failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+
+    socket.message(committed('item-1', null));
+    socket.message(itemAdded('item-1', null));
+    socket.message(itemDone('item-1', null));
+    expect(events).toEqual([]);
+    expect(failures).toEqual([]);
+
+    socket.message(delta('item-1', 'hola mundo'));
+    socket.message(completed('item-1', 'hola mundo'));
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'hola mundo'
+    });
+  });
+
+  it('allows transcription deltas before an optional item done acknowledgement', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(socket, events, failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    socket.message(committed('item-1', null));
+    socket.message(itemAdded('item-1', null));
+    socket.message(delta('item-1', 'hola'));
+    socket.message(itemDone('item-1', null));
+    socket.message(completed('item-1', 'hola mundo'));
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'hola mundo'
+    });
+  });
+
+  it('accepts item done after transcription completion while later items remain active', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(socket, events, failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_601 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    socket.message(committed('item-1', null));
+    socket.message(committed('item-2', 'item-1'));
+    socket.message(itemAdded('item-1', null));
+    socket.message(itemAdded('item-2', 'item-1'));
+    socket.message(completed('item-1', 'hola'));
+    socket.message(itemDone('item-1', null));
+    socket.message(itemDone('item-2', 'item-1'));
+    socket.message(completed('item-2', 'mundo'));
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'hola mundo'
+    });
+  });
+
+  it.each([
+    ['done before creation', (socket: FakeSocket) => {
+      socket.message(itemDone('item-1', null));
+    }],
+    ['duplicate added', (socket: FakeSocket) => {
+      socket.message(itemAdded('item-1', null));
+      socket.message(itemAdded('item-1', null));
+    }],
+    ['created after added', (socket: FakeSocket) => {
+      socket.message(itemAdded('item-1', null));
+      socket.message(itemCreated('item-1', null));
+    }],
+    ['duplicate done', (socket: FakeSocket) => {
+      socket.message(itemAdded('item-1', null));
+      socket.message(itemDone('item-1', null));
+      socket.message(itemDone('item-1', null));
+    }],
+    ['unknown done item', (socket: FakeSocket) => {
+      socket.message(itemDone('unknown-item', null));
+    }],
+    ['wrong added predecessor', (socket: FakeSocket) => {
+      socket.message(itemAdded('item-1', 'wrong-item'));
+    }],
+    ['wrong done predecessor', (socket: FakeSocket) => {
+      socket.message(itemAdded('item-1', null));
+      socket.message(itemDone('item-1', 'wrong-item'));
+    }]
+  ] as const)('rejects %s lifecycle events', async (_label, sendLifecycle) => {
+    const socket = new FakeSocket();
+    const failures: unknown[] = [];
+    const session = makeSession(socket, [], failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    socket.message(committed('item-1', null));
+
+    sendLifecycle(socket);
+
+    expect(failures).toMatchObject([{ reason: 'protocol' }]);
+    expect(session.state.connectionState).toBe('failed');
+  });
+
+  it('accepts correlated cross-item lifecycle interleavings', async () => {
+    const socket = new FakeSocket();
+    const failures: unknown[] = [];
+    const session = makeSession(socket, [], failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_601 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    socket.message(committed('item-1', null));
+    socket.message(committed('item-2', 'item-1'));
+    socket.message(itemAdded('item-2', 'item-1'));
+    socket.message(itemAdded('item-1', null));
+    socket.message(itemDone('item-2', 'item-1'));
+    socket.message(itemDone('item-1', null));
+
+    expect(failures).toEqual([]);
+    expect(session.state.connectionState).toBe('finalizing');
+    session.close();
   });
 
   it('rejects configuration and lifecycle events in invalid protocol states', async () => {

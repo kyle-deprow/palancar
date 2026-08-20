@@ -130,6 +130,26 @@ function segmentEvent(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
+function itemLifecycleEvent(
+  type: 'conversation.item.created' | 'conversation.item.added' | 'conversation.item.done',
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    type,
+    event_id: `event_${type.slice('conversation.item.'.length)}`,
+    previous_item_id: null,
+    item: {
+      id: 'item_lifecycle',
+      object: 'realtime.item',
+      status: 'completed',
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_audio', transcript: 'sensitive provider content' }]
+    },
+    ...overrides
+  };
+}
+
 describe('Azure Realtime GA server event parser', () => {
   it('requires and validates the expected deployment', () => {
     const event = providerEvent({
@@ -360,6 +380,22 @@ describe('Azure Realtime GA server event parser', () => {
       },
       {
         type: 'conversation.item.created',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_audio' }]
+        }
+      },
+      {
+        type: 'conversation.item.added',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_audio' }]
+        }
+      },
+      {
+        type: 'conversation.item.done',
         item: {
           type: 'message',
           role: 'user',
@@ -1046,19 +1082,38 @@ describe('Azure Realtime GA server event parser', () => {
           role: 'user',
           content: [{ type: 'input_audio', transcript: null }]
         }
+      },
+      {
+        ...itemLifecycleEvent('conversation.item.added'),
+        event_id: 'event_item_added'
+      },
+      {
+        ...itemLifecycleEvent('conversation.item.done'),
+        event_id: 'event_item_done'
       }
     ];
     for (const event of events) {
       const result = parseServerEvent(providerEvent(event));
-      expect(result).toEqual(event.type === 'conversation.item.created'
+      expect(result).toEqual(String(event.type).startsWith('conversation.item.')
         ? {
             type: event.type,
             category: 'ignored',
-            item_id: 'item_created',
+            item_id: event.type === 'conversation.item.created'
+              ? 'item_created'
+              : 'item_lifecycle',
             previous_item_id: null
           }
         : { type: event.type, category: 'ignored' });
       expect(Object.isFrozen(result)).toBe(true);
+      if (String(event.type).startsWith('conversation.item.')) {
+        expect(Object.keys(result)).toEqual([
+          'type',
+          'category',
+          'item_id',
+          'previous_item_id'
+        ]);
+        expect(JSON.stringify(result)).not.toContain('sensitive provider content');
+      }
     }
 
     const malformedEvents = [
@@ -1082,6 +1137,17 @@ describe('Azure Realtime GA server event parser', () => {
           ...(events[3]!.item as Record<string, unknown>),
           role: 'assistant'
         }
+      },
+      {
+        ...events[4],
+        previous_item_id: 'bad previous item'
+      },
+      {
+        ...events[5],
+        item: {
+          ...(events[5]!.item as Record<string, unknown>),
+          status: 'malformed'
+        }
       }
     ];
     for (const event of malformedEvents) {
@@ -1091,6 +1157,15 @@ describe('Azure Realtime GA server event parser', () => {
       () => parseServerEvent(providerEvent({ ...events[2], extra: true })),
       'invalid-event'
     );
+    for (const type of [
+      'conversation.item.added',
+      'conversation.item.done'
+    ] as const) {
+      expectReason(() => parseServerEvent(providerEvent({
+        ...itemLifecycleEvent(type),
+        extra: true
+      })), 'invalid-event');
+    }
 
     expect(parseServerEvent(providerEvent({
       type: 'input_audio_buffer.committed',

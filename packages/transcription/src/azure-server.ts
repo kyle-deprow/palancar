@@ -30,7 +30,7 @@ export const MAX_AZURE_REALTIME_SERVER_SEGMENT_SECONDS = 86_400 as const;
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-// Dedicated transcription streams plus the VAD lifecycle and item-created event
+// Dedicated transcription streams plus the VAD and item lifecycle events
 // documented as companions to automatic/manual input-audio commits.
 const EVENT_TYPES = new Set([
   'session.created',
@@ -42,6 +42,8 @@ const EVENT_TYPES = new Set([
   'input_audio_buffer.speech_stopped',
   'input_audio_buffer.timeout_triggered',
   'conversation.item.created',
+  'conversation.item.added',
+  'conversation.item.done',
   'conversation.item.input_audio_transcription.delta',
   'conversation.item.input_audio_transcription.completed',
   'conversation.item.input_audio_transcription.segment',
@@ -112,6 +114,8 @@ export type AzureRealtimeServerEventType =
   | 'input_audio_buffer.speech_stopped'
   | 'input_audio_buffer.timeout_triggered'
   | 'conversation.item.created'
+  | 'conversation.item.added'
+  | 'conversation.item.done'
   | 'conversation.item.input_audio_transcription.delta'
   | 'conversation.item.input_audio_transcription.completed'
   | 'conversation.item.input_audio_transcription.segment'
@@ -168,6 +172,25 @@ export interface AzureRealtimeConversationItemCreatedEvent {
   readonly item_id: string;
   readonly previous_item_id: string | null;
 }
+
+export interface AzureRealtimeConversationItemAddedEvent {
+  readonly type: 'conversation.item.added';
+  readonly category: 'ignored';
+  readonly item_id: string;
+  readonly previous_item_id: string | null;
+}
+
+export interface AzureRealtimeConversationItemDoneEvent {
+  readonly type: 'conversation.item.done';
+  readonly category: 'ignored';
+  readonly item_id: string;
+  readonly previous_item_id: string | null;
+}
+
+export type AzureRealtimeConversationItemLifecycleEvent =
+  | AzureRealtimeConversationItemCreatedEvent
+  | AzureRealtimeConversationItemAddedEvent
+  | AzureRealtimeConversationItemDoneEvent;
 
 export interface AzureRealtimeInputAudioTranscriptionDeltaEvent {
   readonly type: 'conversation.item.input_audio_transcription.delta';
@@ -242,7 +265,7 @@ export type AzureRealtimeServerEvent =
   | AzureRealtimeInputAudioCommittedEvent
   | AzureRealtimeInputAudioClearedEvent
   | AzureRealtimeIgnoredTranscriptionStreamEvent
-  | AzureRealtimeConversationItemCreatedEvent
+  | AzureRealtimeConversationItemLifecycleEvent
   | AzureRealtimeInputAudioTranscriptionDeltaEvent
   | AzureRealtimeInputAudioTranscriptionCompletedEvent
   | AzureRealtimeInputAudioTranscriptionSegmentEvent
@@ -1060,7 +1083,7 @@ function parseUsage(value: unknown): AzureRealtimeTranscriptionUsage {
   fail('invalid-field');
 }
 
-function validateCreatedAudioItem(value: unknown): string {
+function validateInputAudioUserMessageItem(value: unknown): string {
   if (!isPlainObject(value) || !hasExactKeys(
     value,
     ['type', 'role', 'content'],
@@ -1118,9 +1141,12 @@ function validateCreatedAudioItem(value: unknown): string {
 
 function parseIgnoredTranscriptionStreamEvent(
   value: Record<string, unknown>,
-  type: AzureRealtimeIgnoredTranscriptionStreamEvent['type'] | 'conversation.item.created'
-): AzureRealtimeIgnoredTranscriptionStreamEvent | AzureRealtimeConversationItemCreatedEvent {
-  if (type === 'conversation.item.created') {
+  type: AzureRealtimeIgnoredTranscriptionStreamEvent['type'] |
+    AzureRealtimeConversationItemLifecycleEvent['type']
+): AzureRealtimeIgnoredTranscriptionStreamEvent | AzureRealtimeConversationItemLifecycleEvent {
+  if (type === 'conversation.item.created' ||
+      type === 'conversation.item.added' ||
+      type === 'conversation.item.done') {
     if (!hasExactKeys(
       value,
       ['type', 'event_id', 'item'],
@@ -1133,7 +1159,7 @@ function parseIgnoredTranscriptionStreamEvent(
       !isIdentifier(previousItemId)) {
       fail('invalid-field');
     }
-    const itemId = validateCreatedAudioItem(valueOf(value, 'item'));
+    const itemId = validateInputAudioUserMessageItem(valueOf(value, 'item'));
     return Object.freeze({
       type,
       category: 'ignored',
@@ -1268,6 +1294,8 @@ function parseObjectEvent(
     case 'input_audio_buffer.speech_stopped':
     case 'input_audio_buffer.timeout_triggered':
     case 'conversation.item.created':
+    case 'conversation.item.added':
+    case 'conversation.item.done':
       return parseIgnoredTranscriptionStreamEvent(value, type);
     case 'conversation.item.input_audio_transcription.delta': {
       if (!hasExactKeys(
