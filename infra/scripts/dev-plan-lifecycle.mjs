@@ -24,7 +24,7 @@ import {
   writeSync,
   statSync,
 } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,6 +36,8 @@ export const EVIDENCE_ROOT =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover";
 export const CLOSURE_PATH =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-closure";
+const LIFECYCLE_CACHE_ROOT =
+  "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache";
 export const TERRAFORM_PATH = "/home/dev/.local/bin/terraform-1.15.8";
 export const TERRAFORM_SHA256 =
   "00f55981f5215594c418cd6b20f44fa4c99f9126650602e65d533d131005ea81";
@@ -219,6 +221,7 @@ const ALLOWED_CHILD_ENV_KEYS = Object.freeze([
   "LANG",
   "LC_ALL",
   "AZURE_CONFIG_DIR",
+  "XDG_CACHE_HOME",
   "CHECKPOINT_DISABLE",
   "TF_IN_AUTOMATION",
   "TF_CLI_CONFIG_FILE",
@@ -1527,6 +1530,49 @@ function checkInheritedEnvironment(environment) {
   }
 }
 
+function assertOnlyEntry(directory, expected, code) {
+  const entries = readdirSync(directory, { withFileTypes: true });
+  failIf(
+    entries.length > 1 ||
+      (entries.length === 1 && entries[0].name !== expected) ||
+      entries.some((entry) => entry.isSymbolicLink()),
+    code,
+  );
+}
+
+function ensureLifecycleCache() {
+  const parent = path.dirname(LIFECYCLE_CACHE_ROOT);
+  assertDirectory(parent, "lifecycle-cache-parent");
+  ensureDirectory(LIFECYCLE_CACHE_ROOT, "lifecycle-cache");
+  assertOnlyEntry(LIFECYCLE_CACHE_ROOT, "Microsoft", "lifecycle-cache-entries");
+
+  const microsoft = path.join(LIFECYCLE_CACHE_ROOT, "Microsoft");
+  ensureDirectory(microsoft, "lifecycle-cache-microsoft");
+  assertOnlyEntry(microsoft, "DeveloperTools", "lifecycle-cache-entries");
+
+  const developerTools = path.join(microsoft, "DeveloperTools");
+  ensureDirectory(developerTools, "lifecycle-cache-developer-tools");
+  assertOnlyEntry(developerTools, "deviceid", "lifecycle-cache-entries");
+
+  const deviceIdPath = path.join(developerTools, "deviceid");
+  if (existsSync(deviceIdPath)) {
+    const deviceIdStat = assertRegular(
+      deviceIdPath,
+      ARTIFACT_MODE,
+      "lifecycle-cache-device-id",
+    );
+    failIf(deviceIdStat.size !== 36, "lifecycle-cache-device-id");
+    failIf(!UUID_RE.test(readFileSync(deviceIdPath, "utf8")), "lifecycle-cache-device-id");
+  } else {
+    exclusiveText(deviceIdPath, randomUUID(), "lifecycle-cache-device-id");
+  }
+  assertOnlyEntry(developerTools, "deviceid", "lifecycle-cache-entries");
+  fsyncDirectory(developerTools);
+  fsyncDirectory(microsoft);
+  fsyncDirectory(LIFECYCLE_CACHE_ROOT);
+  return LIFECYCLE_CACHE_ROOT;
+}
+
 export function buildChildEnvironment(runDirectory, inherited = process.env) {
   checkInheritedEnvironment(inherited);
   const configPath = path.join(runDirectory, "tf-cli.tfrc");
@@ -1537,11 +1583,13 @@ export function buildChildEnvironment(runDirectory, inherited = process.env) {
   } else {
     exclusiveText(configPath, "", "terraform-cli-config");
   }
+  const cacheRoot = ensureLifecycleCache();
   const environment = {
     PATH: "/usr/bin:/bin",
     LANG: "C",
     LC_ALL: "C",
     AZURE_CONFIG_DIR: "/home/dev/.azure",
+    XDG_CACHE_HOME: cacheRoot,
     CHECKPOINT_DISABLE: "1",
     TF_IN_AUTOMATION: "1",
     TF_CLI_CONFIG_FILE: configPath,
@@ -2962,13 +3010,8 @@ function assertRequiredKeys(value, keys, code) {
 }
 
 function pagedAzureList(value, code) {
-  assertKnownKeys(value, ["nextLink", "value"], code);
-  assertRequiredKeys(value, ["value"], code);
-  failIf(!Array.isArray(value.value), code);
-  if (Object.hasOwn(value, "nextLink")) {
-    failIf(typeof value.nextLink !== "string" || value.nextLink.length !== 0, `${code}-pagination`);
-  }
-  return value.value;
+  failIf(!Array.isArray(value), code);
+  return value;
 }
 
 function deploymentIdParts(resourceId, code) {

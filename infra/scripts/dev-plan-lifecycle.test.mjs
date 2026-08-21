@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { pathToFileURL } from "node:url";
 
 const PRODUCTION_MODULE_PATH = path.join(
@@ -28,13 +28,21 @@ const instrumentedDirectory = mkdtempSync(
   path.join(tmpdir(), "palancar-lifecycle-test-module-"),
 );
 const instrumentedPath = path.join(instrumentedDirectory, "dev-plan-lifecycle.testable.mjs");
+const instrumentedCacheRoot = path.join(instrumentedDirectory, "cache");
 const scriptPathDeclaration = "const SCRIPT_PATH = fileURLToPath(import.meta.url);";
+const cachePathDeclaration = "const LIFECYCLE_CACHE_ROOT =\n  \"/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache\";";
 const productionSource = readFileSync(PRODUCTION_MODULE_PATH, "utf8");
 assert.equal(productionSource.includes(scriptPathDeclaration), true);
-const instrumentedSource = `${productionSource.replace(
-  scriptPathDeclaration,
-  `const SCRIPT_PATH = ${JSON.stringify(PRODUCTION_MODULE_PATH)};`,
-)}\nexport { createLifecycle, runCli, createLifecycleForTests, runCliForTests };\n`;
+assert.equal(productionSource.includes(cachePathDeclaration), true);
+const instrumentedSource = `${productionSource
+  .replace(
+    scriptPathDeclaration,
+    `const SCRIPT_PATH = ${JSON.stringify(PRODUCTION_MODULE_PATH)};`,
+  )
+  .replace(
+    cachePathDeclaration,
+    `const LIFECYCLE_CACHE_ROOT = ${JSON.stringify(instrumentedCacheRoot)};`,
+  )}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests };\n`;
 const instrumentedFd = openSync(instrumentedPath, "wx", 0o600);
 try {
   writeSync(instrumentedFd, instrumentedSource, 0, "utf8");
@@ -45,8 +53,9 @@ let lifecycleModule;
 try {
   lifecycleModule = await import(pathToFileURL(instrumentedPath).href);
 } finally {
-  rmSync(instrumentedDirectory, { recursive: true, force: true });
+  rmSync(instrumentedPath, { force: true });
 }
+after(() => rmSync(instrumentedDirectory, { recursive: true, force: true }));
 const {
   BACKEND_SHA256,
   canonicalBackendIdentityJson,
@@ -57,6 +66,7 @@ const {
   canonicalJson,
   createLifecycle,
   createLifecycleForTests,
+  LIFECYCLE_CACHE_ROOT,
   parseCanonicalBackendConfig,
   parseTerraformStateCache,
   parseCli,
@@ -415,7 +425,7 @@ function makeHarness(overrides = {}) {
         };
       }
       if (request.argv[0] === "cognitiveservices" && request.argv[1] === "account" && request.argv[2] === "deployment" && request.argv[3] === "list") {
-        if (modelCase === "deployment-malformed") return { status: 0, stdout: JSON.stringify([]) };
+        if (modelCase === "deployment-malformed") return { status: 0, stdout: JSON.stringify({ value: [] }) };
         if (modelCase === "deployment-unknown-shape") return { status: 0, stdout: JSON.stringify({ deployments: [] }) };
         const transcription = {
           id: TRANSCRIPTION_ID,
@@ -455,10 +465,10 @@ function makeHarness(overrides = {}) {
             sku: { name: lunaSku, capacity: lunaCapacity },
           });
         }
-        return { status: 0, stdout: JSON.stringify({ value: deployments }) };
+        return { status: 0, stdout: JSON.stringify(deployments) };
       }
       if (request.argv[1] === "model") {
-        if (modelCase === "catalog-malformed") return { status: 0, stdout: JSON.stringify([]) };
+        if (modelCase === "catalog-malformed") return { status: 0, stdout: JSON.stringify({ value: [] }) };
         if (modelCase === "catalog-unknown-shape") return { status: 0, stdout: JSON.stringify({ models: [] }) };
         const modelEntry = (kind) => ({
           description: "Synthetic model catalog entry",
@@ -478,17 +488,15 @@ function makeHarness(overrides = {}) {
         });
         return {
           status: 0,
-          stdout: JSON.stringify({
-            value: [
-              modelEntry(modelCase === "catalog-wrong-kind" ? "AIServices" : "OpenAI"),
-              modelEntry("AIServices"),
-              ...(modelCase === "catalog-duplicate" ? [modelEntry("OpenAI")] : []),
-            ],
-          }),
+          stdout: JSON.stringify([
+            modelEntry(modelCase === "catalog-wrong-kind" ? "AIServices" : "OpenAI"),
+            modelEntry("AIServices"),
+            ...(modelCase === "catalog-duplicate" ? [modelEntry("OpenAI")] : []),
+          ]),
         };
       }
       if (request.argv[1] === "usage") {
-        if (modelCase === "quota-malformed") return { status: 0, stdout: JSON.stringify([]) };
+        if (modelCase === "quota-malformed") return { status: 0, stdout: JSON.stringify({ value: [] }) };
         if (modelCase === "quota-unknown-shape") return { status: 0, stdout: JSON.stringify({ usages: [] }) };
         const quotaModel = modelCase === "quota-wrong-model" ? "gpt-4o" : "gpt-5.6-luna";
         const quota = {
@@ -511,7 +519,7 @@ function makeHarness(overrides = {}) {
             }]
           : [quota];
         if (modelCase === "quota-duplicate") values.push(structuredClone(values[0]));
-        return { status: 0, stdout: JSON.stringify({ value: values }) };
+        return { status: 0, stdout: JSON.stringify(values) };
       }
       if (request.argv[0] === "containerapp") {
         const app = liveAppMutator(liveContainerApp(topology, revision));
@@ -1620,12 +1628,56 @@ test("CLI and exact child environment remain closed", () => {
       LANG: "C",
       LC_ALL: "C",
       AZURE_CONFIG_DIR: "/home/dev/.azure",
+      XDG_CACHE_HOME: LIFECYCLE_CACHE_ROOT,
       CHECKPOINT_DISABLE: "1",
       TF_IN_AUTOMATION: "1",
       TF_CLI_CONFIG_FILE: path.join(harness.root, "run/tf-cli.tfrc"),
     });
     expectCode(() => buildChildEnvironment(path.join(harness.root, "run2"), { TF_UNKNOWN: "1" }), "contaminated-environment");
   } finally {
+    harness.cleanup();
+  }
+});
+
+test("lifecycle cache is dedicated, owner-only, canonical, and replacement-safe", () => {
+  const harness = makeHarness();
+  const target = mkdtempSync(path.join(tmpdir(), "palancar-lifecycle-cache-target-"));
+  try {
+    mkdirSync(path.join(harness.root, "cache-run"), { mode: 0o700 });
+    buildChildEnvironment(path.join(harness.root, "cache-run"), {});
+    assert.equal(statSync(LIFECYCLE_CACHE_ROOT).mode & 0o777, 0o700);
+    const deviceId = path.join(LIFECYCLE_CACHE_ROOT, "Microsoft/DeveloperTools/deviceid");
+    assert.equal(statSync(deviceId).mode & 0o777, 0o600);
+
+    chmodSync(LIFECYCLE_CACHE_ROOT, 0o755);
+    expectCode(
+      () => buildChildEnvironment(path.join(harness.root, "cache-run"), {}),
+      "lifecycle-cache-mode",
+    );
+    chmodSync(LIFECYCLE_CACHE_ROOT, 0o700);
+
+    replaceExisting(deviceId, "not-a-device-id");
+    expectCode(
+      () => buildChildEnvironment(path.join(harness.root, "cache-run"), {}),
+      "lifecycle-cache-device-id",
+    );
+
+    replaceExisting(deviceId, "x".repeat(1024 * 1024));
+    expectCode(
+      () => buildChildEnvironment(path.join(harness.root, "cache-run"), {}),
+      "lifecycle-cache-device-id",
+    );
+
+    rmSync(LIFECYCLE_CACHE_ROOT, { recursive: true, force: true });
+    symlinkSync(target, LIFECYCLE_CACHE_ROOT);
+    expectCode(
+      () => buildChildEnvironment(path.join(harness.root, "cache-run"), {}),
+      "lifecycle-cache-symlink",
+    );
+  } finally {
+    rmSync(LIFECYCLE_CACHE_ROOT, { recursive: true, force: true });
+    buildChildEnvironment(path.join(harness.root, "cache-run"), {});
+    rmSync(target, { recursive: true, force: true });
     harness.cleanup();
   }
 });
