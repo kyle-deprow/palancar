@@ -116,16 +116,6 @@ variable "runtime_identity_client_id" {
   }
 }
 
-variable "runtime_secrets_user_role_assignment_id" {
-  description = "Key Vault Secrets User role assignment ID used as a Terraform dependency token."
-  type        = string
-
-  validation {
-    condition     = trimspace(var.runtime_secrets_user_role_assignment_id) != ""
-    error_message = "runtime_secrets_user_role_assignment_id must be nonempty."
-  }
-}
-
 variable "runtime_openai_user_role_assignment_id" {
   description = "Cognitive Services OpenAI User role assignment ID used as a Terraform dependency token."
   type        = string
@@ -395,104 +385,30 @@ variable "application_insights_connection_string" {
   }
 }
 
-variable "enable_litellm_sidecar" {
-  description = "Whether to add the optional LiteLLM generation sidecar."
-  type        = bool
-  default     = false
-}
-
-variable "litellm_image_digest" {
-  description = "Immutable palancar-litellm-proxy sidecar image digest in acr_login_server."
+variable "azure_generation_endpoint" {
+  description = "Canonical Azure OpenAI origin used for relay generation."
   type        = string
-  default     = ""
 
   validation {
-    condition = var.litellm_image_digest == "" || can(regex(
-      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
-      var.litellm_image_digest
-    ))
-    error_message = "litellm_image_digest must be empty or use a 5-50 character lower-case ACR name, the exact palancar-litellm-proxy repository, and an exact lower-case sha256 digest."
-  }
-}
-
-variable "litellm_backend" {
-  description = "LiteLLM upstream backend; only OpenRouter is production-qualified."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = contains(["", "openrouter"], var.litellm_backend)
-    error_message = "litellm_backend must be empty or openrouter; Azure is not qualified."
-  }
-}
-
-variable "litellm_upstream_model" {
-  description = "Provider-prefixed upstream model routed by LiteLLM."
-  type        = string
-  default     = ""
-
-  validation {
-    condition = var.litellm_upstream_model == "" || (
-      length(var.litellm_upstream_model) <= 194 &&
+    condition = (
+      length(var.azure_generation_endpoint) <= 261 &&
+      length(trimprefix(var.azure_generation_endpoint, "https://")) <= 253 &&
       can(regex(
-        "^openrouter/[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?/[a-z0-9](?:[a-z0-9._:-]{0,126}[a-z0-9])?$",
-        var.litellm_upstream_model
+        "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.openai\\.azure\\.com$",
+        var.azure_generation_endpoint
       ))
     )
-    error_message = "litellm_upstream_model must be empty or an exact bounded lower-case openrouter/owner/model identifier."
+    error_message = "azure_generation_endpoint must be a canonical lower-case HTTPS Azure OpenAI origin with an exact .openai.azure.com suffix and no port, path, query, fragment, whitespace, or trailing slash."
   }
 }
 
-variable "openrouter_api_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the OpenRouter API key."
+variable "azure_generation_deployment" {
+  description = "Fixed Azure OpenAI generation deployment."
   type        = string
-  default     = ""
+  default     = "gpt-5.6-luna"
 
   validation {
-    condition     = var.openrouter_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.openrouter_api_key_secret_url))
-    error_message = "openrouter_api_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "litellm_master_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the LiteLLM master key."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.litellm_master_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.litellm_master_key_secret_url))
-    error_message = "litellm_master_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "key_vault_uri" {
-  description = "Same-vault URI used to validate versionless sidecar secret references."
-  type        = string
-
-  validation {
-    condition     = can(regex("^https://[a-z0-9-]+\\.vault\\.azure\\.net/$", var.key_vault_uri))
-    error_message = "key_vault_uri must be an Azure Key Vault URI ending in a slash."
-  }
-}
-
-variable "azure_api_base" {
-  description = "Qualification-blocked LiteLLM Azure API base; must remain empty."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.azure_api_base == ""
-    error_message = "azure_api_base must be exactly empty because Azure generation is not qualified."
-  }
-}
-
-variable "azure_api_version" {
-  description = "Qualification-blocked LiteLLM Azure API version; must remain empty."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.azure_api_version == ""
-    error_message = "azure_api_version must be exactly empty because Azure generation is not qualified."
+    condition     = var.azure_generation_deployment == "gpt-5.6-luna"
+    error_message = "azure_generation_deployment must be exactly gpt-5.6-luna."
   }
 }

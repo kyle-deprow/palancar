@@ -33,6 +33,12 @@ variable "runtime_principal_id" {
   }
 }
 
+variable "enable_runtime_secrets_user_assignment" {
+  description = "Whether to grant the runtime identity Key Vault Secrets User access."
+  type        = bool
+  default     = true
+}
+
 variable "key_vault_secrets_user_role_definition_id" {
   description = "Stable built-in Key Vault Secrets User role definition ID."
   type        = string

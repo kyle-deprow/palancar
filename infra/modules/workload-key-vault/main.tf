@@ -30,6 +30,7 @@ resource "azurerm_key_vault" "this" {
 }
 
 resource "azurerm_role_assignment" "runtime_secrets_user" {
+  count              = var.enable_runtime_secrets_user_assignment ? 1 : 0
   name               = local.runtime_role_assignment_name
   scope              = azurerm_key_vault.this.id
   role_definition_id = local.role_definition_ids.secrets_user

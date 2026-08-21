@@ -11,7 +11,6 @@ variables {
   image_pull_identity_id                                  = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull"
   runtime_identity_id                                     = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-runtime"
   runtime_identity_client_id                              = "00000000-0000-0000-0000-000000000001"
-  runtime_secrets_user_role_assignment_id                 = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000002"
   runtime_openai_user_role_assignment_id                  = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000003"
   runtime_monitoring_metrics_publisher_role_assignment_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000004"
   workload_table_endpoint                                 = "https://palancardev.table.core.windows.net/"
@@ -22,37 +21,134 @@ variables {
   language_boundary_mode                                  = "development-provisional"
   application_insights_connection_string                  = "LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com/;InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
   relay_origin                                            = "wss://ca-palancar-dev-relay-test.example.azurecontainerapps.io"
-  key_vault_uri                                           = "https://palancar-vault.vault.azure.net/"
+  azure_generation_endpoint                               = "https://palancardev.openai.azure.com"
+  azure_generation_deployment                             = "gpt-5.6-luna"
 }
 
-run "mock_runtime_contract" {
+run "azure_generation_runtime_contract" {
   command = plan
 
   assert {
-    condition     = azapi_resource.this.body.properties.template.scale.minReplicas == 1
-    error_message = "the deployed relay must keep exactly one warm replica"
+    condition = (
+      azapi_resource.this.body.properties.configuration.activeRevisionsMode == "Single" &&
+      azapi_resource.this.body.properties.configuration.maxInactiveRevisions == 1
+    )
+    error_message = "the workload must use single revisions and retain exactly one inactive predecessor"
   }
 
   assert {
-    condition     = azapi_resource.this.body.properties.template.scale.maxReplicas == 1
-    error_message = "the module must hardcode maxReplicas to one"
+    condition = (
+      azapi_resource.this.body.properties.template.scale.minReplicas == 1 &&
+      azapi_resource.this.body.properties.template.scale.maxReplicas == 1
+    )
+    error_message = "the deployed relay must keep exactly one warm replica with a hard maximum of one"
   }
 
   assert {
-    condition     = length(azapi_resource.this.body.properties.template.containers) == 1
-    error_message = "a disabled sidecar must emit only the relay container"
+    condition = (
+      length(azapi_resource.this.body.properties.template.containers) == 1 &&
+      azapi_resource.this.body.properties.template.containers[0].name == "relay" &&
+      azapi_resource.this.body.properties.template.containers[0].image == var.image_digest &&
+      azapi_resource.this.body.properties.template.containers[0].resources == {
+        cpu    = 0.25
+        memory = "0.5Gi"
+      }
+    )
+    error_message = "the workload must contain only the immutable 0.25 CPU/0.5 GiB relay container"
   }
 
   assert {
-    condition     = length(azapi_resource.this.body.properties.configuration.secrets) == 0
-    error_message = "a disabled sidecar must emit no generation secrets"
+    condition     = azapi_resource.this.body.properties.configuration.secrets == []
+    error_message = "the Entra-only workload must emit an empty secrets collection"
   }
 
   assert {
-    condition = length(azapi_resource.this.body.properties.template.containers[0].env) == length(toset([
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
-    ]))
-    error_message = "mock relay environment names must be unique"
+    condition = (
+      length(azapi_resource.this.body.properties.template.containers[0].env) == length(toset([
+        for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
+      ])) &&
+      alltrue([
+        for item in azapi_resource.this.body.properties.template.containers[0].env :
+        toset(keys(item)) == toset(["name", "value"]) &&
+        contains(keys(item), "value") &&
+        !contains(keys(item), "secretRef")
+      ])
+    )
+    error_message = "relay environment names must be unique and every entry must be nonsecret"
+  }
+
+  assert {
+    condition = (
+      toset(keys(azapi_resource.this.body)) == toset(["properties"]) &&
+      toset(keys(azapi_resource.this.body.properties)) == toset([
+        "managedEnvironmentId",
+        "configuration",
+        "template",
+      ]) &&
+      toset(keys(azapi_resource.this.body.properties.configuration)) == toset([
+        "activeRevisionsMode",
+        "maxInactiveRevisions",
+        "ingress",
+        "registries",
+        "identitySettings",
+        "secrets",
+      ]) &&
+      toset(keys(azapi_resource.this.body.properties.configuration.ingress)) == toset([
+        "external",
+        "targetPort",
+        "transport",
+        "allowInsecure",
+        "traffic",
+      ]) &&
+      alltrue([
+        for item in azapi_resource.this.body.properties.configuration.ingress.traffic :
+        toset(keys(item)) == toset(["latestRevision", "weight"])
+      ]) &&
+      alltrue([
+        for item in azapi_resource.this.body.properties.configuration.registries :
+        toset(keys(item)) == toset(["server", "identity"]) &&
+        !contains(keys(item), "passwordSecretRef") &&
+        !contains(keys(item), "secretRef")
+      ]) &&
+      length(azapi_resource.this.body.properties.configuration.registries) == 1 &&
+      alltrue([
+        for item in azapi_resource.this.body.properties.configuration.identitySettings :
+        toset(keys(item)) == toset(["identity", "lifecycle"])
+      ]) &&
+      azapi_resource.this.body.properties.configuration.secrets == [] &&
+      toset(keys(azapi_resource.this.body.properties.template)) == toset(["containers", "scale"]) &&
+      toset(keys(azapi_resource.this.body.properties.template.scale)) == toset(["minReplicas", "maxReplicas"]) &&
+      length(azapi_resource.this.body.properties.template.containers) == 1 &&
+      toset(keys(azapi_resource.this.body.properties.template.containers[0])) == toset([
+        "name",
+        "image",
+        "resources",
+        "env",
+      ]) &&
+      !contains(keys(azapi_resource.this.body.properties.template.containers[0]), "probes") &&
+      toset(keys(azapi_resource.this.body.properties.template.containers[0].resources)) == toset(["cpu", "memory"])
+    )
+    error_message = "the Azure generation workload body must use the exact probe-free, secret-free body, container, registry, and resource key sets"
+  }
+
+  assert {
+    condition = (
+      azapi_resource.this.body.properties.managedEnvironmentId == var.container_app_environment_id &&
+      jsonencode(azapi_resource.this.body.properties.configuration.ingress) == jsonencode({
+        external      = true
+        targetPort    = 8787
+        transport     = "Http"
+        allowInsecure = false
+        traffic       = [{ latestRevision = true, weight = 100 }]
+      }) &&
+      jsonencode(azapi_resource.this.body.properties.configuration.registries) == jsonencode([
+        {
+          server   = var.acr_login_server
+          identity = var.image_pull_identity_id
+        },
+      ])
+    )
+    error_message = "the workload must use the canonical environment, ingress, and passwordless ACR registry contract"
   }
 
   assert {
@@ -62,13 +158,14 @@ run "mock_runtime_contract" {
       "NODE_ENV",
       "PORT",
       "PALANCAR_GENERATION_PROVIDER",
+      "PALANCAR_AZURE_GENERATION_ENDPOINT",
+      "PALANCAR_AZURE_GENERATION_DEPLOYMENT",
       "PALANCAR_RELAY_BIND_HOST",
       "PALANCAR_RELAY_ENVIRONMENT",
       "PALANCAR_RELAY_ORIGIN",
       "PALANCAR_GATE_POLICY_VERSION",
       "AZURE_CLIENT_ID",
       "PALANCAR_DEPLOYMENT_SLOT",
-      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
       "APPLICATIONINSIGHTS_CONNECTION_STRING",
       "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
       "APPLICATION_INSIGHTS_NO_STATSBEAT",
@@ -79,8 +176,9 @@ run "mock_runtime_contract" {
       "PALANCAR_TRANSCRIPTION_PROVIDER",
       "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
       "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
     ])
-    error_message = "mock mode must emit the exact relay environment key set"
+    error_message = "the relay must emit exactly the Azure generation and retained runtime environment key set"
   }
 
   assert {
@@ -89,14 +187,15 @@ run "mock_runtime_contract" {
       }) == {
       NODE_ENV                               = "production"
       PORT                                   = "8787"
-      PALANCAR_GENERATION_PROVIDER           = "mock"
+      PALANCAR_GENERATION_PROVIDER           = "azure-openai"
+      PALANCAR_AZURE_GENERATION_ENDPOINT     = "https://palancardev.openai.azure.com"
+      PALANCAR_AZURE_GENERATION_DEPLOYMENT   = "gpt-5.6-luna"
       PALANCAR_RELAY_BIND_HOST               = "0.0.0.0"
       PALANCAR_RELAY_ENVIRONMENT             = "dev"
       PALANCAR_RELAY_ORIGIN                  = "wss://ca-palancar-dev-relay-test.example.azurecontainerapps.io"
       PALANCAR_GATE_POLICY_VERSION           = "1.0.0"
       AZURE_CLIENT_ID                        = "00000000-0000-0000-0000-000000000001"
       PALANCAR_DEPLOYMENT_SLOT               = "dev"
-      PALANCAR_LANGUAGE_BOUNDARY_MODE        = "development-provisional"
       APPLICATIONINSIGHTS_CONNECTION_STRING  = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com"
       APPLICATIONINSIGHTS_STATSBEAT_DISABLED = "true"
       APPLICATION_INSIGHTS_NO_STATSBEAT      = "true"
@@ -107,190 +206,9 @@ run "mock_runtime_contract" {
       PALANCAR_TRANSCRIPTION_PROVIDER        = "mock"
       PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON  = "[\"https://even-webview.synthetic.invalid\"]"
       PALANCAR_ALLOW_NULL_BROWSER_ORIGIN     = "false"
+      PALANCAR_LANGUAGE_BOUNDARY_MODE        = "development-provisional"
     }
-    error_message = "mock mode must emit the exact canonical relay environment values"
-  }
-}
-
-run "accept_minimum_container_app_name" {
-  command = plan
-
-  variables {
-    name = "aa"
-  }
-
-  assert {
-    condition     = azapi_resource.this.name == "aa"
-    error_message = "a two-character lower-case Container App name must be accepted"
-  }
-}
-
-run "accept_maximum_container_app_name" {
-  command = plan
-
-  variables {
-    name = join("", [for index in range(32) : "a"])
-  }
-
-  assert {
-    condition     = length(azapi_resource.this.name) == 32
-    error_message = "a thirty-two-character lower-case Container App name must be accepted"
-  }
-}
-
-run "reject_one_character_container_app_name" {
-  command = plan
-
-  variables {
-    name = "a"
-  }
-
-  expect_failures = [var.name]
-}
-
-run "reject_overlong_container_app_name" {
-  command = plan
-
-  variables {
-    name = join("", [for index in range(33) : "a"])
-  }
-
-  expect_failures = [var.name]
-}
-
-run "reject_uppercase_container_app_name" {
-  command = plan
-
-  variables {
-    name = "ca-Palancar-relay"
-  }
-
-  expect_failures = [var.name]
-}
-
-run "reject_leading_hyphen_container_app_name" {
-  command = plan
-
-  variables {
-    name = "-ca-relay"
-  }
-
-  expect_failures = [var.name]
-}
-
-run "reject_trailing_hyphen_container_app_name" {
-  command = plan
-
-  variables {
-    name = "ca-relay-"
-  }
-
-  expect_failures = [var.name]
-}
-
-run "reject_double_hyphen_container_app_name" {
-  command = plan
-
-  variables {
-    name = "ca--relay"
-  }
-
-  expect_failures = [var.name]
-}
-
-run "live_four_field_connection_is_canonicalized" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB;IngestionEndpoint=https://dc.services.visualstudio.com/;LiveEndpoint=https://live.applicationinsights.azure.com/;ApplicationId=33333333-3333-4333-8333-333333333333"
-  }
-
-  assert {
-    condition = nonsensitive({
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
-    })["APPLICATIONINSIGHTS_CONNECTION_STRING"] == "InstrumentationKey=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb;IngestionEndpoint=https://dc.services.visualstudio.com"
-    error_message = "the live four-field input must emit only the canonical lower-case instrumentation key and slash-free approved ingestion endpoint"
-  }
-
-  assert {
-    condition = alltrue([
-      for item in azapi_resource.this.body.properties.template.containers[0].env :
-      !strcontains(try(item.value, ""), "LiveEndpoint=") &&
-      !strcontains(try(item.value, ""), "ApplicationId=")
-    ])
-    error_message = "LiveEndpoint and ApplicationId must never be passed to the relay"
-  }
-}
-
-run "enabled_openrouter_contract" {
-  command = plan
-
-  variables {
-    enable_litellm_sidecar        = true
-    litellm_image_digest          = "palancardev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    litellm_backend               = "openrouter"
-    litellm_upstream_model        = "openrouter/openai/gpt-4o-mini"
-    openrouter_api_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/openrouter-api-key"
-    litellm_master_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/litellm-master-key"
-    min_replicas                  = 1
-  }
-
-  assert {
-    condition     = length(azapi_resource.this.body.properties.template.containers) == 2
-    error_message = "OpenRouter mode must emit exactly relay and LiteLLM containers"
-  }
-
-  assert {
-    condition = jsonencode([
-      for item in azapi_resource.this.body.properties.template.containers : {
-        name      = item.name
-        resources = item.resources
-      }
-      ]) == jsonencode([
-      {
-        name = "relay"
-        resources = {
-          cpu    = 0.25
-          memory = "0.5Gi"
-        }
-      },
-      {
-        name = "litellm"
-        resources = {
-          cpu    = 0.75
-          memory = "1.5Gi"
-        }
-      },
-    ])
-    error_message = "OpenRouter mode must emit relay at 0.25 CPU/0.5 GiB followed by LiteLLM at 0.75 CPU/1.5 GiB"
-  }
-
-  assert {
-    condition = (
-      sum([
-        for item in azapi_resource.this.body.properties.template.containers : item.resources.cpu
-      ]) == 1 &&
-      sum([
-        for item in azapi_resource.this.body.properties.template.containers : tonumber(trimsuffix(item.resources.memory, "Gi"))
-      ]) == 2
-    )
-    error_message = "OpenRouter mode must allocate exactly 1 CPU/2 GiB across relay and LiteLLM"
-  }
-
-  assert {
-    condition = jsonencode(azapi_resource.this.body.properties.configuration.secrets) == jsonencode([
-      {
-        name        = "litellm-master-key"
-        keyVaultUrl = "https://palancar-vault.vault.azure.net/secrets/litellm-master-key"
-        identity    = var.runtime_identity_id
-      },
-      {
-        name        = "openrouter-api-key"
-        keyVaultUrl = "https://palancar-vault.vault.azure.net/secrets/openrouter-api-key"
-        identity    = var.runtime_identity_id
-      },
-    ])
-    error_message = "OpenRouter mode must emit exactly two versionless same-vault secret references using the runtime identity"
+    error_message = "the relay must emit the exact canonical Azure generation and retained runtime values"
   }
 
   assert {
@@ -301,128 +219,7 @@ run "enabled_openrouter_contract" {
         var.runtime_identity_id,
       ])
     )
-    error_message = "the workload must use exactly the image-pull and runtime user-assigned identities"
-  }
-
-  assert {
-    condition     = azapi_resource.this.body.properties.template.containers[1].image == "palancardev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    error_message = "the LiteLLM image must be an immutable digest in the relay ACR"
-  }
-
-  assert {
-    condition = length(azapi_resource.this.body.properties.template.containers[1].env) == length(toset([
-      for item in azapi_resource.this.body.properties.template.containers[1].env : item.name
-    ]))
-    error_message = "the LiteLLM sidecar environment names must be unique"
-  }
-
-  assert {
-    condition = toset([
-      for item in azapi_resource.this.body.properties.template.containers[1].env : item.name
-      ]) == toset([
-      "PALANCAR_LITELLM_BACKEND",
-      "PALANCAR_LITELLM_UPSTREAM_MODEL",
-      "LITELLM_MASTER_KEY",
-      "OPENROUTER_API_KEY",
-    ])
-    error_message = "the LiteLLM sidecar must emit the exact qualified OpenRouter key set"
-  }
-
-  assert {
-    condition = {
-      for item in azapi_resource.this.body.properties.template.containers[1].env : item.name => {
-        value      = try(item.value, null)
-        secret_ref = try(item.secretRef, null)
-      }
-      } == {
-      PALANCAR_LITELLM_BACKEND        = { value = "openrouter", secret_ref = null }
-      PALANCAR_LITELLM_UPSTREAM_MODEL = { value = "openrouter/openai/gpt-4o-mini", secret_ref = null }
-      LITELLM_MASTER_KEY              = { value = null, secret_ref = "litellm-master-key" }
-      OPENROUTER_API_KEY              = { value = null, secret_ref = "openrouter-api-key" }
-    }
-    error_message = "the LiteLLM sidecar must emit the exact qualified OpenRouter values and secret references"
-  }
-
-  assert {
-    condition = length(azapi_resource.this.body.properties.template.containers[0].env) == length(toset([
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
-    ]))
-    error_message = "OpenRouter relay environment names must be unique"
-  }
-
-  assert {
-    condition = toset([
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
-      ]) == toset([
-      "NODE_ENV",
-      "PORT",
-      "PALANCAR_GENERATION_PROVIDER",
-      "PALANCAR_RELAY_BIND_HOST",
-      "PALANCAR_RELAY_ENVIRONMENT",
-      "PALANCAR_RELAY_ORIGIN",
-      "PALANCAR_GATE_POLICY_VERSION",
-      "AZURE_CLIENT_ID",
-      "PALANCAR_DEPLOYMENT_SLOT",
-      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
-      "APPLICATIONINSIGHTS_CONNECTION_STRING",
-      "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
-      "APPLICATION_INSIGHTS_NO_STATSBEAT",
-      "PALANCAR_SECURITY_MODE",
-      "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
-      "PALANCAR_SECURITY_STATE_TABLE",
-      "PALANCAR_RATE_STATE_TABLE",
-      "PALANCAR_TRANSCRIPTION_PROVIDER",
-      "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
-      "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
-      "PALANCAR_LITELLM_BASE_URL",
-      "PALANCAR_LITELLM_MODEL",
-      "PALANCAR_LITELLM_API_KEY",
-    ])
-    error_message = "OpenRouter mode must emit the exact relay environment key set"
-  }
-
-  assert {
-    condition = nonsensitive({
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => {
-        value      = try(item.value, null)
-        secret_ref = try(item.secretRef, null)
-      }
-      }) == {
-      NODE_ENV                               = { value = "production", secret_ref = null }
-      PORT                                   = { value = "8787", secret_ref = null }
-      PALANCAR_GENERATION_PROVIDER           = { value = "litellm", secret_ref = null }
-      PALANCAR_RELAY_BIND_HOST               = { value = "0.0.0.0", secret_ref = null }
-      PALANCAR_RELAY_ENVIRONMENT             = { value = "dev", secret_ref = null }
-      PALANCAR_RELAY_ORIGIN                  = { value = "wss://ca-palancar-dev-relay-test.example.azurecontainerapps.io", secret_ref = null }
-      PALANCAR_GATE_POLICY_VERSION           = { value = "1.0.0", secret_ref = null }
-      AZURE_CLIENT_ID                        = { value = "00000000-0000-0000-0000-000000000001", secret_ref = null }
-      PALANCAR_DEPLOYMENT_SLOT               = { value = "dev", secret_ref = null }
-      PALANCAR_LANGUAGE_BOUNDARY_MODE        = { value = "development-provisional", secret_ref = null }
-      APPLICATIONINSIGHTS_CONNECTION_STRING  = { value = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com", secret_ref = null }
-      APPLICATIONINSIGHTS_STATSBEAT_DISABLED = { value = "true", secret_ref = null }
-      APPLICATION_INSIGHTS_NO_STATSBEAT      = { value = "true", secret_ref = null }
-      PALANCAR_SECURITY_MODE                 = { value = "azure-table", secret_ref = null }
-      PALANCAR_WORKLOAD_TABLE_ENDPOINT       = { value = "https://palancardev.table.core.windows.net", secret_ref = null }
-      PALANCAR_SECURITY_STATE_TABLE          = { value = "SecurityState", secret_ref = null }
-      PALANCAR_RATE_STATE_TABLE              = { value = "RateState", secret_ref = null }
-      PALANCAR_TRANSCRIPTION_PROVIDER        = { value = "mock", secret_ref = null }
-      PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON  = { value = "[\"https://even-webview.synthetic.invalid\"]", secret_ref = null }
-      PALANCAR_ALLOW_NULL_BROWSER_ORIGIN     = { value = "false", secret_ref = null }
-      PALANCAR_LITELLM_BASE_URL              = { value = "http://127.0.0.1:4000", secret_ref = null }
-      PALANCAR_LITELLM_MODEL                 = { value = "palancar-generation", secret_ref = null }
-      PALANCAR_LITELLM_API_KEY               = { value = null, secret_ref = "litellm-master-key" }
-    }
-    error_message = "OpenRouter mode must emit the exact relay values, fixed localhost endpoint, alias, and secret reference"
-  }
-
-  assert {
-    condition     = azapi_resource.this.body.properties.template.scale.minReplicas == 1
-    error_message = "one warm replica must remain an exact supported option"
-  }
-
-  assert {
-    condition     = azapi_resource.this.body.properties.managedEnvironmentId == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.App/managedEnvironments/cae-palancar-dev"
-    error_message = "managedEnvironmentId must be the canonical Container Apps environment in the fixture boundary"
+    error_message = "the workload must retain exactly the image-pull and runtime user-assigned identities"
   }
 
   assert {
@@ -436,75 +233,7 @@ run "enabled_openrouter_contract" {
         lifecycle = "Main"
       },
     ])
-    error_message = "identitySettings must only lowercase the resourceGroups path segment"
-  }
-
-  assert {
-    condition = nonsensitive({
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => try(item.value, null)
-    })["PALANCAR_WORKLOAD_TABLE_ENDPOINT"] == "https://palancardev.table.core.windows.net"
-    error_message = "the relay workload table endpoint must be slash-free"
-  }
-
-  assert {
-    condition = jsonencode(azapi_resource.this.body.properties.configuration.ingress) == jsonencode({
-      external      = true
-      targetPort    = 8787
-      transport     = "Http"
-      allowInsecure = false
-      traffic       = [{ latestRevision = true, weight = 100 }]
-    })
-    error_message = "ingress must be exact external HTTP on 8787 with only latest-revision traffic"
-  }
-
-  assert {
-    condition = jsonencode(azapi_resource.this.body.properties.template.containers[0].probes) == jsonencode([
-      {
-        type                = "Liveness"
-        tcpSocket           = { port = 8787 }
-        initialDelaySeconds = 10
-        periodSeconds       = 10
-        timeoutSeconds      = 3
-        failureThreshold    = 3
-      },
-      {
-        type                = "Readiness"
-        httpGet             = { path = "/readyz", port = 8787 }
-        initialDelaySeconds = 5
-        periodSeconds       = 10
-        timeoutSeconds      = 7
-        failureThreshold    = 3
-      },
-    ])
-    error_message = "relay probes must match the exact HTTP contract"
-  }
-
-  assert {
-    condition = jsonencode(azapi_resource.this.body.properties.template.containers[1].probes) == jsonencode([
-      {
-        type                = "Liveness"
-        tcpSocket           = { port = 4000 }
-        initialDelaySeconds = 10
-        periodSeconds       = 30
-        timeoutSeconds      = 3
-        failureThreshold    = 3
-      },
-      {
-        type             = "Readiness"
-        httpGet          = { path = "/health/readiness", port = 4000 }
-        periodSeconds    = 10
-        timeoutSeconds   = 7
-        failureThreshold = 3
-      },
-      {
-        type             = "Startup"
-        httpGet          = { path = "/health/liveliness", port = 4000 }
-        periodSeconds    = 10
-        timeoutSeconds   = 3
-        failureThreshold = 10
-      },
-    ])
-    error_message = "LiteLLM probes must match the exact HTTP contract"
+    error_message = "identitySettings must retain the image-pull None and runtime Main lifecycles"
   }
 }
 
@@ -520,163 +249,257 @@ run "azure_realtime_runtime_contract" {
   }
 
   assert {
-    condition     = length(azapi_resource.this.body.properties.template.containers) == 1
-    error_message = "Azure realtime mode without generation sidecar must emit only the relay container"
-  }
-
-  assert {
-    condition = length(azapi_resource.this.body.properties.template.containers[0].env) == length(toset([
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
-    ]))
-    error_message = "Azure realtime relay environment names must be unique"
-  }
-
-  assert {
-    condition = toset([
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
-      ]) == toset([
-      "NODE_ENV",
-      "PORT",
-      "PALANCAR_GENERATION_PROVIDER",
-      "PALANCAR_RELAY_BIND_HOST",
-      "PALANCAR_RELAY_ENVIRONMENT",
-      "PALANCAR_RELAY_ORIGIN",
-      "PALANCAR_GATE_POLICY_VERSION",
-      "AZURE_CLIENT_ID",
-      "PALANCAR_DEPLOYMENT_SLOT",
-      "PALANCAR_LANGUAGE_BOUNDARY_MODE",
-      "APPLICATIONINSIGHTS_CONNECTION_STRING",
-      "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
-      "APPLICATION_INSIGHTS_NO_STATSBEAT",
-      "PALANCAR_SECURITY_MODE",
-      "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
-      "PALANCAR_SECURITY_STATE_TABLE",
-      "PALANCAR_RATE_STATE_TABLE",
-      "PALANCAR_TRANSCRIPTION_PROVIDER",
-      "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
-      "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
-      "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
-      "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
-    ])
-    error_message = "Azure realtime mode must emit the exact relay environment key set"
-  }
-
-  assert {
-    condition = nonsensitive({
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
-      }) == {
-      NODE_ENV                                = "production"
-      PORT                                    = "8787"
-      PALANCAR_GENERATION_PROVIDER            = "mock"
-      PALANCAR_RELAY_BIND_HOST                = "0.0.0.0"
-      PALANCAR_RELAY_ENVIRONMENT              = "dev"
-      PALANCAR_RELAY_ORIGIN                   = "wss://ca-palancar-dev-relay-test.example.azurecontainerapps.io"
-      PALANCAR_GATE_POLICY_VERSION            = "1.0.0"
-      AZURE_CLIENT_ID                         = "00000000-0000-0000-0000-000000000001"
-      PALANCAR_DEPLOYMENT_SLOT                = "staging"
-      PALANCAR_LANGUAGE_BOUNDARY_MODE         = "deny-all"
-      APPLICATIONINSIGHTS_CONNECTION_STRING   = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com"
-      APPLICATIONINSIGHTS_STATSBEAT_DISABLED  = "true"
-      APPLICATION_INSIGHTS_NO_STATSBEAT       = "true"
-      PALANCAR_SECURITY_MODE                  = "azure-table"
-      PALANCAR_WORKLOAD_TABLE_ENDPOINT        = "https://palancardev.table.core.windows.net"
-      PALANCAR_SECURITY_STATE_TABLE           = "SecurityState"
-      PALANCAR_RATE_STATE_TABLE               = "RateState"
-      PALANCAR_TRANSCRIPTION_PROVIDER         = "azure-realtime"
-      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT   = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
-      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT = "gpt-4o-mini-transcribe"
-      PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON   = "[\"https://even-webview.synthetic.invalid\"]"
-      PALANCAR_ALLOW_NULL_BROWSER_ORIGIN      = "false"
-    }
-    error_message = "Azure realtime mode must emit the exact canonical relay environment values"
+    condition = (
+      length(azapi_resource.this.body.properties.template.containers) == 1 &&
+      toset([
+        for item in azapi_resource.this.body.properties.template.containers[0].env : item.name
+        ]) == toset([
+        "NODE_ENV",
+        "PORT",
+        "PALANCAR_GENERATION_PROVIDER",
+        "PALANCAR_AZURE_GENERATION_ENDPOINT",
+        "PALANCAR_AZURE_GENERATION_DEPLOYMENT",
+        "PALANCAR_RELAY_BIND_HOST",
+        "PALANCAR_RELAY_ENVIRONMENT",
+        "PALANCAR_RELAY_ORIGIN",
+        "PALANCAR_GATE_POLICY_VERSION",
+        "AZURE_CLIENT_ID",
+        "PALANCAR_DEPLOYMENT_SLOT",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING",
+        "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
+        "APPLICATION_INSIGHTS_NO_STATSBEAT",
+        "PALANCAR_SECURITY_MODE",
+        "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+        "PALANCAR_SECURITY_STATE_TABLE",
+        "PALANCAR_RATE_STATE_TABLE",
+        "PALANCAR_TRANSCRIPTION_PROVIDER",
+        "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+        "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+        "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+        "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+        "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+      ])
+    )
+    error_message = "Azure realtime mode must preserve transcription fields alongside the fixed generation fields"
   }
 
   assert {
     condition = alltrue([
       for item in azapi_resource.this.body.properties.template.containers[0].env :
-      !startswith(item.name, "OTEL_") &&
-      !startswith(item.name, "OTLP_") &&
-      item.name != "AZURE_LOG_LEVEL" &&
-      !contains(["AZURE_OPENAI_API_KEY", "AZURE_API_KEY", "OPENAI_API_KEY", "PALANCAR_AZURE_TRANSCRIPTION_API_KEY"], item.name)
+      toset(keys(item)) == toset(["name", "value"]) && !contains(keys(item), "secretRef")
     ])
-    error_message = "Azure transcription and telemetry must use managed identity and must not emit API keys or forbidden telemetry variables"
+    error_message = "Azure realtime mode must keep the one relay container secret-free"
+  }
+
+  assert {
+    condition = alltrue([
+      nonsensitive({
+        for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
+      })["PALANCAR_AZURE_GENERATION_DEPLOYMENT"] == "gpt-5.6-luna",
+      nonsensitive({
+        for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
+      })["PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT"] == "gpt-4o-mini-transcribe",
+    ])
+    error_message = "generation and transcription deployments must remain independently fixed"
   }
 }
 
-run "reject_azure_backend" {
+run "canonicalizes_live_telemetry_fields" {
   command = plan
 
   variables {
-    litellm_backend = "azure"
+    application_insights_connection_string = "InstrumentationKey=BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB;IngestionEndpoint=https://dc.services.visualstudio.com/;LiveEndpoint=https://live.applicationinsights.azure.com/;ApplicationId=33333333-3333-4333-8333-333333333333"
   }
 
-  expect_failures = [var.litellm_backend]
+  assert {
+    condition = nonsensitive({
+      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
+    })["APPLICATIONINSIGHTS_CONNECTION_STRING"] == "InstrumentationKey=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb;IngestionEndpoint=https://dc.services.visualstudio.com"
+    error_message = "telemetry must emit only the canonical lower-case instrumentation key and slash-free ingestion endpoint"
+  }
 }
 
-run "reject_disabled_sidecar_values" {
+run "accepts_boundary_container_app_names" {
   command = plan
 
   variables {
-    litellm_backend = "openrouter"
+    name = "aa"
   }
 
-  expect_failures = [azapi_resource.this]
+  assert {
+    condition     = azapi_resource.this.name == "aa"
+    error_message = "a two-character lower-case Container App name must be accepted"
+  }
 }
 
-run "reject_incomplete_openrouter" {
+run "accepts_maximum_container_app_name" {
   command = plan
 
   variables {
-    enable_litellm_sidecar = true
-    litellm_backend        = "openrouter"
-    litellm_image_digest   = "palancardev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    litellm_upstream_model = "openrouter/openai/gpt-4o-mini"
+    name = join("", [for index in range(32) : "a"])
   }
 
-  expect_failures = [azapi_resource.this]
+  assert {
+    condition     = length(azapi_resource.this.name) == 32
+    error_message = "a thirty-two-character lower-case Container App name must be accepted"
+  }
 }
 
-run "reject_azure_fields" {
+run "rejects_invalid_container_app_names" {
   command = plan
 
   variables {
-    azure_api_base = "https://fixture.invalid"
+    name = "ca--relay"
   }
 
-  expect_failures = [var.azure_api_base]
+  expect_failures = [var.name]
 }
 
-run "reject_versioned_secret_url" {
+run "rejects_generation_endpoint_uppercase" {
   command = plan
 
   variables {
-    enable_litellm_sidecar        = true
-    litellm_backend               = "openrouter"
-    litellm_image_digest          = "palancardev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    litellm_upstream_model        = "openrouter/openai/gpt-4o-mini"
-    openrouter_api_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/openrouter-api-key/version"
-    litellm_master_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/litellm-master-key"
+    azure_generation_endpoint = "https://Palancardev.openai.azure.com"
   }
 
-  expect_failures = [azapi_resource.this]
+  expect_failures = [var.azure_generation_endpoint]
 }
 
-run "reject_cross_vault_secret_url" {
+run "rejects_generation_endpoint_trailing_slash" {
   command = plan
 
   variables {
-    enable_litellm_sidecar        = true
-    litellm_backend               = "openrouter"
-    litellm_image_digest          = "palancardev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    litellm_upstream_model        = "openrouter/openai/gpt-4o-mini"
-    openrouter_api_key_secret_url = "https://other-vault.vault.azure.net/secrets/openrouter-api-key"
-    litellm_master_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/litellm-master-key"
+    azure_generation_endpoint = "https://palancardev.openai.azure.com/"
   }
 
-  expect_failures = [azapi_resource.this]
+  expect_failures = [var.azure_generation_endpoint]
 }
 
-run "reject_security_mode" {
+run "rejects_generation_endpoint_leading_whitespace" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = " https://palancardev.openai.azure.com"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_trailing_whitespace" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.com "
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_userinfo" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://user@palancardev.openai.azure.com"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_explicit_port" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.com:443"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_path" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.com/openai"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_query" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.com?api-version=2026-01-01"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_fragment" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.com#fragment"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_wrong_scheme" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "http://palancardev.openai.azure.com"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_endpoint_wrong_suffix" {
+  command = plan
+
+  variables {
+    azure_generation_endpoint = "https://palancardev.openai.azure.net"
+  }
+
+  expect_failures = [var.azure_generation_endpoint]
+}
+
+run "rejects_generation_deployment_alias" {
+  command = plan
+
+  variables {
+    azure_generation_deployment = "gpt-5.6-luna-2026-07-09"
+  }
+
+  expect_failures = [var.azure_generation_deployment]
+}
+
+run "rejects_generation_deployment_case_and_whitespace" {
+  command = plan
+
+  variables {
+    azure_generation_deployment = " GPT-5.6-LUNA "
+  }
+
+  expect_failures = [var.azure_generation_deployment]
+}
+
+run "rejects_missing_runtime_role_dependencies" {
+  command = plan
+
+  variables {
+    runtime_openai_user_role_assignment_id                  = ""
+    runtime_monitoring_metrics_publisher_role_assignment_id = ""
+  }
+
+  expect_failures = [
+    var.runtime_openai_user_role_assignment_id,
+    var.runtime_monitoring_metrics_publisher_role_assignment_id,
+  ]
+}
+
+run "rejects_wrong_security_mode" {
   command = plan
 
   variables {
@@ -686,7 +509,17 @@ run "reject_security_mode" {
   expect_failures = [azapi_resource.this]
 }
 
-run "reject_unknown_transcription_provider" {
+run "rejects_wrong_table_contract" {
+  command = plan
+
+  variables {
+    security_state_table_name = "OtherSecurityState"
+  }
+
+  expect_failures = [var.security_state_table_name]
+}
+
+run "rejects_unknown_transcription_provider" {
   command = plan
 
   variables {
@@ -696,17 +529,18 @@ run "reject_unknown_transcription_provider" {
   expect_failures = [var.transcription_provider]
 }
 
-run "reject_mock_with_azure_fields" {
+run "rejects_mock_with_transcription_fields" {
   command = plan
 
   variables {
-    azure_transcription_endpoint = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
+    azure_transcription_endpoint   = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
+    azure_transcription_deployment = "gpt-4o-mini-transcribe"
   }
 
   expect_failures = [azapi_resource.this]
 }
 
-run "reject_azure_realtime_without_fields" {
+run "rejects_azure_realtime_without_transcription_fields" {
   command = plan
 
   variables {
@@ -716,7 +550,19 @@ run "reject_azure_realtime_without_fields" {
   expect_failures = [azapi_resource.this]
 }
 
-run "reject_hostile_azure_transcription_endpoint" {
+run "rejects_wrong_transcription_deployment" {
+  command = plan
+
+  variables {
+    transcription_provider         = "azure-realtime"
+    azure_transcription_endpoint   = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
+    azure_transcription_deployment = "gpt-4o"
+  }
+
+  expect_failures = [var.azure_transcription_deployment]
+}
+
+run "rejects_hostile_azure_transcription_endpoint" {
   command = plan
 
   variables {
@@ -727,39 +573,42 @@ run "reject_hostile_azure_transcription_endpoint" {
   expect_failures = [var.azure_transcription_endpoint]
 }
 
-run "reject_wrong_azure_transcription_deployment" {
+run "rejects_disabled_transcription_field_whitespace" {
   command = plan
 
   variables {
-    transcription_provider         = "azure-realtime"
-    azure_transcription_endpoint   = "wss://palancardev.openai.azure.com/openai/v1/realtime?intent=transcription"
-    azure_transcription_deployment = "gpt-4o-transcribe"
+    azure_transcription_endpoint   = " "
+    azure_transcription_deployment = "\n"
   }
 
-  expect_failures = [var.azure_transcription_deployment]
+  expect_failures = [
+    var.azure_transcription_endpoint,
+    var.azure_transcription_deployment,
+  ]
 }
 
-run "reject_invalid_minimum" {
+run "rejects_overlong_azure_transcription_dns_label" {
   command = plan
 
   variables {
-    min_replicas = 2
+    azure_transcription_endpoint = "wss://${join("", [for index in range(64) : "a"])}.openai.azure.com/openai/v1/realtime?intent=transcription"
   }
 
-  expect_failures = [var.min_replicas]
+  expect_failures = [var.azure_transcription_endpoint]
 }
 
-run "reject_scale_to_zero" {
+run "rejects_provisional_boundary_outside_dev" {
   command = plan
 
   variables {
-    min_replicas = 0
+    deployment_slot        = "production"
+    language_boundary_mode = "development-provisional"
   }
 
-  expect_failures = [var.min_replicas]
+  expect_failures = [azapi_resource.this]
 }
 
-run "reject_hostile_deployment_slot" {
+run "rejects_hostile_deployment_slot" {
   command = plan
 
   variables {
@@ -769,7 +618,7 @@ run "reject_hostile_deployment_slot" {
   expect_failures = [var.deployment_slot]
 }
 
-run "reject_unknown_language_boundary_mode" {
+run "rejects_unknown_language_boundary_mode" {
   command = plan
 
   variables {
@@ -779,7 +628,7 @@ run "reject_unknown_language_boundary_mode" {
   expect_failures = [var.language_boundary_mode]
 }
 
-run "reject_uppercase_language_boundary_mode" {
+run "rejects_uppercase_language_boundary_mode" {
   command = plan
 
   variables {
@@ -789,7 +638,7 @@ run "reject_uppercase_language_boundary_mode" {
   expect_failures = [var.language_boundary_mode]
 }
 
-run "reject_language_boundary_mode_whitespace" {
+run "rejects_language_boundary_mode_whitespace" {
   command = plan
 
   variables {
@@ -799,22 +648,11 @@ run "reject_language_boundary_mode_whitespace" {
   expect_failures = [var.language_boundary_mode]
 }
 
-run "reject_provisional_language_boundary_in_staging" {
+run "rejects_provisional_language_boundary_in_staging" {
   command = plan
 
   variables {
     deployment_slot        = "staging"
-    language_boundary_mode = "development-provisional"
-  }
-
-  expect_failures = [azapi_resource.this]
-}
-
-run "reject_provisional_language_boundary_in_production" {
-  command = plan
-
-  variables {
-    deployment_slot        = "production"
     language_boundary_mode = "development-provisional"
   }
 
@@ -831,175 +669,47 @@ run "production_deny_all_language_boundary_is_explicit" {
 
   assert {
     condition = nonsensitive({
-      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => {
-        value      = try(item.value, null)
-        secret_ref = try(item.secretRef, null)
-      }
-      })["PALANCAR_LANGUAGE_BOUNDARY_MODE"] == {
-      value      = "deny-all"
-      secret_ref = null
-    }
+      for item in azapi_resource.this.body.properties.template.containers[0].env : item.name => item.value
+    })["PALANCAR_LANGUAGE_BOUNDARY_MODE"] == "deny-all"
     error_message = "production must emit exactly one plain deny-all language boundary value"
   }
 }
 
-run "reject_hostile_telemetry_connection_string" {
+run "rejects_invalid_replica_controls" {
   command = plan
 
   variables {
-    application_insights_connection_string = "OTLP=https://127.0.0.1:4317"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_duplicate_telemetry_key" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;InstrumentationKey=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_authorization_telemetry_field" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;Authorization=ikey"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_aad_audience_telemetry_field" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;AADAudience=https://monitor.azure.com"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_telemetry_whitespace" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa; IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_telemetry_control_character" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222\n"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_unapproved_ingestion_host" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com.evil.invalid/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_unapproved_live_host" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com.evil.invalid/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_noncanonical_multilabel_telemetry_hosts" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://east.us.in.applicationinsights.azure.com/;LiveEndpoint=https://east.us.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_noncanonical_application_id" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_telemetry_extra_equals" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/?x=y;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_overlong_ingestion_label" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://${join("", [for index in range(64) : "a"])}.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_overlong_live_hostname" {
-  command = plan
-
-  variables {
-    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://${join(".", [for index in range(4) : join("", [for character in range(63) : "a"])])}.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
-  }
-
-  expect_failures = [var.application_insights_connection_string]
-}
-
-run "reject_missing_rbac_dependency_tokens" {
-  command = plan
-
-  variables {
-    runtime_secrets_user_role_assignment_id                 = ""
-    runtime_openai_user_role_assignment_id                  = ""
-    runtime_monitoring_metrics_publisher_role_assignment_id = ""
+    min_replicas = 2
+    target_port  = 8080
   }
 
   expect_failures = [
-    var.runtime_secrets_user_role_assignment_id,
-    var.runtime_openai_user_role_assignment_id,
-    var.runtime_monitoring_metrics_publisher_role_assignment_id,
+    var.min_replicas,
+    var.target_port,
   ]
 }
 
-run "reject_wrong_table_contract" {
+run "rejects_invalid_minimum_replica_count" {
   command = plan
 
   variables {
-    security_state_table_name = "OtherSecurityState"
+    min_replicas = 2
   }
 
-  expect_failures = [var.security_state_table_name]
+  expect_failures = [var.min_replicas]
 }
 
-run "reject_relay_image_from_other_registry" {
+run "rejects_scale_to_zero" {
+  command = plan
+
+  variables {
+    min_replicas = 0
+  }
+
+  expect_failures = [var.min_replicas]
+}
+
+run "rejects_image_from_another_registry" {
   command = plan
 
   variables {
@@ -1009,42 +719,87 @@ run "reject_relay_image_from_other_registry" {
   expect_failures = [azapi_resource.this]
 }
 
-run "reject_litellm_image_outside_acr" {
+run "rejects_mutable_image" {
   command = plan
 
   variables {
-    enable_litellm_sidecar        = true
-    litellm_backend               = "openrouter"
-    litellm_image_digest          = "otherdev.azurecr.io/palancar-litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    litellm_upstream_model        = "openrouter/openai/gpt-4o-mini"
-    openrouter_api_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/openrouter-api-key"
-    litellm_master_key_secret_url = "https://palancar-vault.vault.azure.net/secrets/litellm-master-key"
+    image_digest = "palancardev.azurecr.io/palancar-relay:latest"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_wrong_image_repository" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar-worker@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_uppercase_image_repository" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/Palancar-relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_empty_image_repository_component" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar//relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_dot_image_repository_component" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar/./relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_dot_dot_image_repository_component" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar/../relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_uri_character_in_image" {
+  command = plan
+
+  variables {
+    image_digest = "palancardev.azurecr.io/palancar-relay?tag=bad@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  expect_failures = [var.image_digest]
+}
+
+run "rejects_case_only_duplicate_identities" {
+  command = plan
+
+  variables {
+    runtime_identity_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull"
   }
 
   expect_failures = [azapi_resource.this]
 }
 
-run "reject_non_acr_litellm_image" {
-  command = plan
-
-  variables {
-    litellm_image_digest = "ghcr.io/palancar/litellm-proxy@sha256:2222222222222222222222222222222222222222222222222222222222222222"
-  }
-
-  expect_failures = [var.litellm_image_digest]
-}
-
-run "reject_case_only_duplicate_identities" {
-  command = plan
-
-  variables {
-    runtime_identity_id = "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG-PALANCAR-DEV/PROVIDERS/MICROSOFT.MANAGEDIDENTITY/USERASSIGNEDIDENTITIES/ID-PALANCAR-DEV-IMAGE-PULL"
-  }
-
-  expect_failures = [var.runtime_identity_id]
-}
-
-run "reject_hostile_arm_resource_ids" {
+run "rejects_hostile_arm_resource_ids" {
   command = plan
 
   variables {
@@ -1062,7 +817,190 @@ run "reject_hostile_arm_resource_ids" {
   ]
 }
 
-run "reject_arm_id_whitespace_query_fragment_and_missing_segment" {
+run "rejects_invalid_acr_login_server" {
+  command = plan
+
+  variables {
+    acr_login_server = "PALANCAR.azurecr.io"
+  }
+
+  expect_failures = [var.acr_login_server]
+}
+
+run "rejects_short_acr_registry_name" {
+  command = plan
+
+  variables {
+    acr_login_server = "four.azurecr.io"
+  }
+
+  expect_failures = [var.acr_login_server]
+}
+
+run "rejects_invalid_environment" {
+  command = plan
+
+  variables {
+    environment = " dev "
+  }
+
+  expect_failures = [var.environment]
+}
+
+run "rejects_noncanonical_environment" {
+  command = plan
+
+  variables {
+    environment = "qa"
+  }
+
+  expect_failures = [var.environment]
+}
+
+run "rejects_invalid_relay_origin" {
+  command = plan
+
+  variables {
+    relay_origin = "https://ca-palancar-dev-relay-test.example.azurecontainerapps.io"
+  }
+
+  expect_failures = [var.relay_origin]
+}
+
+run "rejects_overlong_relay_dns_label" {
+  command = plan
+
+  variables {
+    relay_origin = "wss://${join("", [for index in range(64) : "a"])}.azurecontainerapps.io"
+  }
+
+  expect_failures = [var.relay_origin]
+}
+
+run "rejects_overlong_relay_hostname" {
+  command = plan
+
+  variables {
+    relay_origin = "wss://${join(".", [for index in range(4) : join("", [for character in range(63) : "a"])])}.azurecontainerapps.io"
+  }
+
+  expect_failures = [var.relay_origin]
+}
+
+run "rejects_invalid_browser_origin" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = ["*"]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "rejects_duplicate_browser_origins" {
+  command = plan
+
+  variables {
+    browser_allowed_origins = [
+      "https://even-webview.synthetic.invalid",
+      "https://even-webview.synthetic.invalid",
+    ]
+  }
+
+  expect_failures = [var.browser_allowed_origins]
+}
+
+run "rejects_hostile_telemetry_connection_string" {
+  command = plan
+
+  variables {
+    application_insights_connection_string = "InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA;IngestionEndpoint=https://evil.example.com/;LiveEndpoint=https://live.applicationinsights.azure.com/;ApplicationId=33333333-3333-4333-8333-333333333333"
+  }
+
+  expect_failures = [var.application_insights_connection_string]
+}
+
+run "rejects_telemetry_extra_fields" {
+  command = plan
+
+  variables {
+    application_insights_connection_string = "InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA;IngestionEndpoint=https://dc.services.visualstudio.com/;LiveEndpoint=https://live.applicationinsights.azure.com/;ApplicationId=33333333-3333-4333-8333-333333333333;Extra=value"
+  }
+
+  expect_failures = [var.application_insights_connection_string]
+}
+
+run "rejects_noncanonical_telemetry_host_labels" {
+  command = plan
+
+  variables {
+    application_insights_connection_string = "InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA;IngestionEndpoint=https://west.eastus2-1.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.foo.livediagnostics.monitor.azure.com/;ApplicationId=33333333-3333-4333-8333-333333333333"
+  }
+
+  expect_failures = [var.application_insights_connection_string]
+}
+
+run "rejects_noncanonical_application_id" {
+  command = plan
+
+  variables {
+    application_insights_connection_string = "InstrumentationKey=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA;IngestionEndpoint=https://dc.services.visualstudio.com/;LiveEndpoint=https://live.applicationinsights.azure.com/;ApplicationId=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+  }
+
+  expect_failures = [var.application_insights_connection_string]
+}
+
+run "rejects_one_character_container_app_name" {
+  command = plan
+
+  variables {
+    name = "a"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_overlong_container_app_name" {
+  command = plan
+
+  variables {
+    name = join("", [for index in range(33) : "a"])
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_uppercase_container_app_name" {
+  command = plan
+
+  variables {
+    name = "ca-Palancar-relay"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_leading_hyphen_container_app_name" {
+  command = plan
+
+  variables {
+    name = "-ca-relay"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_trailing_hyphen_container_app_name" {
+  command = plan
+
+  variables {
+    name = "ca-relay-"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_arm_id_whitespace_query_fragment_and_missing_segment" {
   command = plan
 
   variables {
@@ -1080,7 +1018,7 @@ run "reject_arm_id_whitespace_query_fragment_and_missing_segment" {
   ]
 }
 
-run "reject_overlong_arm_id_segment" {
+run "rejects_overlong_arm_id_segment" {
   command = plan
 
   variables {
@@ -1090,225 +1028,127 @@ run "reject_overlong_arm_id_segment" {
   expect_failures = [var.resource_group_id]
 }
 
-run "reject_invalid_acr_login_server" {
+run "rejects_telemetry_control_protocol" {
   command = plan
 
   variables {
-    acr_login_server = "bad-name.azurecr.io"
+    application_insights_connection_string = "OTLP=https://127.0.0.1:4317"
   }
 
-  expect_failures = [var.acr_login_server]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_short_acr_registry_name" {
+run "rejects_duplicate_telemetry_key" {
   command = plan
 
   variables {
-    acr_login_server = "four.azurecr.io"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;InstrumentationKey=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
   }
 
-  expect_failures = [var.acr_login_server]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_mutable_relay_image" {
+run "rejects_authorization_telemetry_field" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar-relay:latest"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;Authorization=ikey"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_wrong_relay_image_repository" {
+run "rejects_aad_audience_telemetry_field" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar-relay-alt@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222;AADAudience=https://monitor.azure.com"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_uppercase_relay_image_repository" {
+run "rejects_telemetry_whitespace" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/Palancar-relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa; IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_empty_relay_image_repository_component" {
+run "rejects_telemetry_control_character" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar//relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222\n"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_dot_relay_image_repository_component" {
+run "rejects_unapproved_ingestion_host" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar/./relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com.evil.invalid/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_dot_dot_relay_image_repository_component" {
+run "rejects_unapproved_live_host" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar/../relay@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com.evil.invalid/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_uri_character_in_relay_image" {
+run "rejects_noncanonical_multilabel_telemetry_hosts" {
   command = plan
 
   variables {
-    image_digest = "palancardev.azurecr.io/palancar-relay?tag=bad@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://east.us.in.applicationinsights.azure.com/;LiveEndpoint=https://east.us.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_mutable_litellm_image" {
+run "rejects_telemetry_extra_equals" {
   command = plan
 
   variables {
-    litellm_image_digest = "palancardev.azurecr.io/palancar-litellm-proxy:latest"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/?x=y;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.litellm_image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_wrong_litellm_image_repository" {
+run "rejects_overlong_ingestion_label" {
   command = plan
 
   variables {
-    litellm_image_digest = "palancardev.azurecr.io/palancar-litellm@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://${join("", [for index in range(64) : "a"])}.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.litellm_image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_dot_litellm_image_repository_component" {
+run "rejects_overlong_live_hostname" {
   command = plan
 
   variables {
-    litellm_image_digest = "palancardev.azurecr.io/palancar/../litellm@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    application_insights_connection_string = "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2.in.applicationinsights.azure.com/;LiveEndpoint=https://${join(".", [for index in range(4) : join("", [for character in range(63) : "a"])])}.livediagnostics.monitor.azure.com/;ApplicationId=22222222-2222-4222-8222-222222222222"
   }
 
-  expect_failures = [var.litellm_image_digest]
+  expect_failures = [var.application_insights_connection_string]
 }
 
-run "reject_noncanonical_environment" {
-  command = plan
-
-  variables {
-    environment = "qa"
-  }
-
-  expect_failures = [var.environment]
-}
-
-run "reject_environment_whitespace" {
-  command = plan
-
-  variables {
-    environment = "dev\n"
-  }
-
-  expect_failures = [var.environment]
-}
-
-run "reject_wrong_litellm_model_provider" {
-  command = plan
-
-  variables {
-    litellm_upstream_model = "azure/openai/gpt-4o-mini"
-  }
-
-  expect_failures = [var.litellm_upstream_model]
-}
-
-run "reject_malformed_litellm_model" {
-  command = plan
-
-  variables {
-    litellm_upstream_model = "openrouter/openai//gpt-4o-mini"
-  }
-
-  expect_failures = [var.litellm_upstream_model]
-}
-
-run "reject_litellm_model_whitespace" {
-  command = plan
-
-  variables {
-    litellm_upstream_model = " openrouter/openai/gpt-4o-mini"
-  }
-
-  expect_failures = [var.litellm_upstream_model]
-}
-
-run "reject_disabled_provider_whitespace" {
-  command = plan
-
-  variables {
-    azure_api_base    = " "
-    azure_api_version = "\n"
-  }
-
-  expect_failures = [
-    var.azure_api_base,
-    var.azure_api_version,
-  ]
-}
-
-run "reject_disabled_transcription_field_whitespace" {
-  command = plan
-
-  variables {
-    azure_transcription_endpoint   = " "
-    azure_transcription_deployment = "\n"
-  }
-
-  expect_failures = [
-    var.azure_transcription_endpoint,
-    var.azure_transcription_deployment,
-  ]
-}
-
-run "reject_overlong_relay_dns_label" {
-  command = plan
-
-  variables {
-    relay_origin = "wss://${join("", [for index in range(64) : "a"])}.azurecontainerapps.io"
-  }
-
-  expect_failures = [var.relay_origin]
-}
-
-run "reject_overlong_relay_hostname" {
-  command = plan
-
-  variables {
-    relay_origin = "wss://${join(".", [for index in range(4) : join("", [for character in range(63) : "a"])])}.azurecontainerapps.io"
-  }
-
-  expect_failures = [var.relay_origin]
-}
-
-run "reject_overlong_browser_dns_label" {
+run "rejects_overlong_browser_dns_label" {
   command = plan
 
   variables {
@@ -1318,7 +1158,7 @@ run "reject_overlong_browser_dns_label" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_overlong_browser_hostname" {
+run "rejects_overlong_browser_hostname" {
   command = plan
 
   variables {
@@ -1328,17 +1168,7 @@ run "reject_overlong_browser_hostname" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_overlong_azure_transcription_dns_label" {
-  command = plan
-
-  variables {
-    azure_transcription_endpoint = "wss://${join("", [for index in range(64) : "a"])}.openai.azure.com/openai/v1/realtime?intent=transcription"
-  }
-
-  expect_failures = [var.azure_transcription_endpoint]
-}
-
-run "reject_malformed_browser_origin" {
+run "rejects_malformed_browser_origin" {
   command = plan
 
   variables {
@@ -1348,7 +1178,7 @@ run "reject_malformed_browser_origin" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_duplicate_browser_origins" {
+run "rejects_duplicate_canonical_browser_origins" {
   command = plan
 
   variables {
@@ -1361,7 +1191,7 @@ run "reject_duplicate_browser_origins" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_too_many_browser_origins" {
+run "rejects_too_many_browser_origins" {
   command = plan
 
   variables {
@@ -1371,7 +1201,7 @@ run "reject_too_many_browser_origins" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_wildcard_browser_origin" {
+run "rejects_wildcard_browser_origin" {
   command = plan
 
   variables {
@@ -1381,7 +1211,7 @@ run "reject_wildcard_browser_origin" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_trailing_slash_browser_origin" {
+run "rejects_trailing_slash_browser_origin" {
   command = plan
 
   variables {
@@ -1391,7 +1221,7 @@ run "reject_trailing_slash_browser_origin" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_explicit_default_browser_origin_port" {
+run "rejects_explicit_default_browser_origin_port" {
   command = plan
 
   variables {
@@ -1401,7 +1231,7 @@ run "reject_explicit_default_browser_origin_port" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_uppercase_browser_origin_host" {
+run "rejects_uppercase_browser_origin_host" {
   command = plan
 
   variables {
@@ -1411,7 +1241,7 @@ run "reject_uppercase_browser_origin_host" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_numeric_browser_origin_host" {
+run "rejects_numeric_browser_origin_host" {
   command = plan
 
   variables {
@@ -1421,7 +1251,7 @@ run "reject_numeric_browser_origin_host" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_hex_numeric_browser_origin_host" {
+run "rejects_hex_numeric_browser_origin_host" {
   command = plan
 
   variables {
@@ -1431,7 +1261,7 @@ run "reject_hex_numeric_browser_origin_host" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_decimal_numeric_browser_origin_final_label" {
+run "rejects_decimal_numeric_browser_origin_final_label" {
   command = plan
 
   variables {
@@ -1441,7 +1271,7 @@ run "reject_decimal_numeric_browser_origin_final_label" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_hex_numeric_browser_origin_final_label" {
+run "rejects_hex_numeric_browser_origin_final_label" {
   command = plan
 
   variables {
@@ -1451,7 +1281,7 @@ run "reject_hex_numeric_browser_origin_final_label" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_bare_hex_browser_origin_host" {
+run "rejects_bare_hex_browser_origin_host" {
   command = plan
 
   variables {
@@ -1461,7 +1291,7 @@ run "reject_bare_hex_browser_origin_host" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_bare_hex_browser_origin_final_label" {
+run "rejects_bare_hex_browser_origin_final_label" {
   command = plan
 
   variables {
@@ -1471,7 +1301,7 @@ run "reject_bare_hex_browser_origin_final_label" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_too_many_ipv4_browser_origin_components" {
+run "rejects_too_many_ipv4_browser_origin_components" {
   command = plan
 
   variables {
@@ -1481,7 +1311,7 @@ run "reject_too_many_ipv4_browser_origin_components" {
   expect_failures = [var.browser_allowed_origins]
 }
 
-run "reject_browser_origin_path" {
+run "rejects_browser_origin_path" {
   command = plan
 
   variables {
@@ -1521,7 +1351,7 @@ run "explicit_null_allow_null_browser_origin_uses_default" {
   }
 }
 
-run "accept_empty_browser_origins" {
+run "accepts_empty_browser_origins" {
   command = plan
 
   variables {
@@ -1536,7 +1366,7 @@ run "accept_empty_browser_origins" {
   }
 }
 
-run "accept_exactly_32_unique_browser_origins" {
+run "accepts_exactly_32_unique_browser_origins" {
   command = plan
 
   variables {
@@ -1553,7 +1383,7 @@ run "accept_exactly_32_unique_browser_origins" {
   }
 }
 
-run "accept_canonical_non_default_browser_origin_port" {
+run "accepts_canonical_non_default_browser_origin_port" {
   command = plan
 
   variables {
@@ -1568,7 +1398,7 @@ run "accept_canonical_non_default_browser_origin_port" {
   }
 }
 
-run "accept_numeric_non_final_browser_origin_label" {
+run "accepts_numeric_non_final_browser_origin_label" {
   command = plan
 
   variables {
@@ -1583,7 +1413,7 @@ run "accept_numeric_non_final_browser_origin_label" {
   }
 }
 
-run "accept_true_allow_null_browser_origin" {
+run "accepts_true_allow_null_browser_origin" {
   command = plan
 
   variables {

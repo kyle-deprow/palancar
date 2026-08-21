@@ -15,5 +15,5 @@ output "uri" {
 
 output "runtime_secrets_user_role_assignment_id" {
   description = "Runtime identity Key Vault Secrets User role assignment ID."
-  value       = azurerm_role_assignment.runtime_secrets_user.id
+  value       = one(azurerm_role_assignment.runtime_secrets_user[*].id)
 }

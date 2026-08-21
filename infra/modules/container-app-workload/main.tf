@@ -21,7 +21,8 @@ resource "azapi_resource" "this" {
       managedEnvironmentId = var.container_app_environment_id
 
       configuration = {
-        activeRevisionsMode = "Single"
+        activeRevisionsMode  = "Single"
+        maxInactiveRevisions = 1
 
         # exposedPort is TCP-only in this API schema; HTTP ingress exposes only
         # the relay target and has no additional port mappings.
@@ -56,234 +57,126 @@ resource "azapi_resource" "this" {
           }
         ]
 
-        secrets = var.enable_litellm_sidecar ? [
-          {
-            name        = "litellm-master-key"
-            keyVaultUrl = var.litellm_master_key_secret_url
-            identity    = var.runtime_identity_id
-          },
-          {
-            name        = "openrouter-api-key"
-            keyVaultUrl = var.openrouter_api_key_secret_url
-            identity    = var.runtime_identity_id
-          }
-        ] : []
+        secrets = []
       }
 
       template = {
-        containers = concat(
-          [
-            {
-              name  = "relay"
-              image = var.image_digest
+        containers = [
+          {
+            name  = "relay"
+            image = var.image_digest
 
-              resources = {
-                cpu    = 0.25
-                memory = "0.5Gi"
-              }
-
-              env = concat(
-                [
-                  {
-                    name  = "NODE_ENV"
-                    value = "production"
-                  },
-                  {
-                    name  = "PORT"
-                    value = tostring(var.target_port)
-                  },
-                  {
-                    name  = "PALANCAR_GENERATION_PROVIDER"
-                    value = var.enable_litellm_sidecar ? "litellm" : "mock"
-                  },
-                  {
-                    name  = "PALANCAR_RELAY_BIND_HOST"
-                    value = "0.0.0.0"
-                  },
-                  {
-                    name  = "PALANCAR_RELAY_ENVIRONMENT"
-                    value = var.environment
-                  },
-                  {
-                    name  = "PALANCAR_RELAY_ORIGIN"
-                    value = var.relay_origin
-                  },
-                  {
-                    name  = "PALANCAR_GATE_POLICY_VERSION"
-                    value = var.gate_policy_version
-                  },
-                  {
-                    name  = "AZURE_CLIENT_ID"
-                    value = var.runtime_identity_client_id
-                  },
-                  {
-                    name  = "PALANCAR_DEPLOYMENT_SLOT"
-                    value = var.deployment_slot
-                  },
-                  {
-                    name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
-                    value = local.relay_application_insights_connection_string
-                  },
-                  {
-                    name  = "APPLICATIONINSIGHTS_STATSBEAT_DISABLED"
-                    value = "true"
-                  },
-                  {
-                    name  = "APPLICATION_INSIGHTS_NO_STATSBEAT"
-                    value = "true"
-                  },
-                  {
-                    name  = "PALANCAR_SECURITY_MODE"
-                    value = var.security_mode
-                  },
-                  {
-                    name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
-                    value = trimsuffix(var.workload_table_endpoint, "/")
-                  },
-                  {
-                    name  = "PALANCAR_SECURITY_STATE_TABLE"
-                    value = var.security_state_table_name
-                  },
-                  {
-                    name  = "PALANCAR_RATE_STATE_TABLE"
-                    value = var.rate_state_table_name
-                  },
-                  {
-                    name  = "PALANCAR_TRANSCRIPTION_PROVIDER"
-                    value = var.transcription_provider
-                  },
-                ],
-                var.transcription_provider == "azure-realtime" ? [
-                  {
-                    name  = "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT"
-                    value = var.azure_transcription_endpoint
-                  },
-                  {
-                    name  = "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT"
-                    value = var.azure_transcription_deployment
-                  }
-                ] : [],
-                [
-                  {
-                    name  = "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON"
-                    value = jsonencode(var.browser_allowed_origins)
-                  },
-                  {
-                    name  = "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN"
-                    value = tostring(var.allow_null_browser_origin)
-                  }
-                ],
-                var.enable_litellm_sidecar ? [
-                  {
-                    name  = "PALANCAR_LITELLM_BASE_URL"
-                    value = "http://127.0.0.1:4000"
-                  },
-                  {
-                    name  = "PALANCAR_LITELLM_MODEL"
-                    value = "palancar-generation"
-                  },
-                  {
-                    name      = "PALANCAR_LITELLM_API_KEY"
-                    secretRef = "litellm-master-key"
-                  }
-                ] : [],
-                [
-                  {
-                    name  = "PALANCAR_LANGUAGE_BOUNDARY_MODE"
-                    value = var.language_boundary_mode
-                  }
-                ]
-              )
-
-              probes = [
-                {
-                  type = "Liveness"
-                  tcpSocket = {
-                    port = 8787
-                  }
-                  initialDelaySeconds = 10
-                  periodSeconds       = 10
-                  timeoutSeconds      = 3
-                  failureThreshold    = 3
-                },
-                {
-                  type = "Readiness"
-                  httpGet = {
-                    path = "/readyz"
-                    port = 8787
-                  }
-                  initialDelaySeconds = 5
-                  periodSeconds       = 10
-                  timeoutSeconds      = 7
-                  failureThreshold    = 3
-                }
-              ]
+            resources = {
+              cpu    = 0.25
+              memory = "0.5Gi"
             }
-          ],
-          var.enable_litellm_sidecar ? [
-            {
-              name  = "litellm"
-              image = var.litellm_image_digest
 
-              resources = {
-                cpu    = 0.75
-                memory = "1.5Gi"
-              }
-
-              env = [
+            env = concat(
+              [
                 {
-                  name  = "PALANCAR_LITELLM_BACKEND"
-                  value = "openrouter"
+                  name  = "NODE_ENV"
+                  value = "production"
                 },
                 {
-                  name  = "PALANCAR_LITELLM_UPSTREAM_MODEL"
-                  value = var.litellm_upstream_model
+                  name  = "PORT"
+                  value = tostring(var.target_port)
                 },
                 {
-                  name      = "LITELLM_MASTER_KEY"
-                  secretRef = "litellm-master-key"
+                  name  = "PALANCAR_GENERATION_PROVIDER"
+                  value = "azure-openai"
                 },
                 {
-                  name      = "OPENROUTER_API_KEY"
-                  secretRef = "openrouter-api-key"
+                  name  = "PALANCAR_AZURE_GENERATION_ENDPOINT"
+                  value = var.azure_generation_endpoint
+                },
+                {
+                  name  = "PALANCAR_AZURE_GENERATION_DEPLOYMENT"
+                  value = var.azure_generation_deployment
+                },
+                {
+                  name  = "PALANCAR_RELAY_BIND_HOST"
+                  value = "0.0.0.0"
+                },
+                {
+                  name  = "PALANCAR_RELAY_ENVIRONMENT"
+                  value = var.environment
+                },
+                {
+                  name  = "PALANCAR_RELAY_ORIGIN"
+                  value = var.relay_origin
+                },
+                {
+                  name  = "PALANCAR_GATE_POLICY_VERSION"
+                  value = var.gate_policy_version
+                },
+                {
+                  name  = "AZURE_CLIENT_ID"
+                  value = var.runtime_identity_client_id
+                },
+                {
+                  name  = "PALANCAR_DEPLOYMENT_SLOT"
+                  value = var.deployment_slot
+                },
+                {
+                  name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+                  value = local.relay_application_insights_connection_string
+                },
+                {
+                  name  = "APPLICATIONINSIGHTS_STATSBEAT_DISABLED"
+                  value = "true"
+                },
+                {
+                  name  = "APPLICATION_INSIGHTS_NO_STATSBEAT"
+                  value = "true"
+                },
+                {
+                  name  = "PALANCAR_SECURITY_MODE"
+                  value = var.security_mode
+                },
+                {
+                  name  = "PALANCAR_WORKLOAD_TABLE_ENDPOINT"
+                  value = trimsuffix(var.workload_table_endpoint, "/")
+                },
+                {
+                  name  = "PALANCAR_SECURITY_STATE_TABLE"
+                  value = var.security_state_table_name
+                },
+                {
+                  name  = "PALANCAR_RATE_STATE_TABLE"
+                  value = var.rate_state_table_name
+                },
+                {
+                  name  = "PALANCAR_TRANSCRIPTION_PROVIDER"
+                  value = var.transcription_provider
+                },
+              ],
+              var.transcription_provider == "azure-realtime" ? [
+                {
+                  name  = "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT"
+                  value = var.azure_transcription_endpoint
+                },
+                {
+                  name  = "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT"
+                  value = var.azure_transcription_deployment
+                }
+              ] : [],
+              [
+                {
+                  name  = "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON"
+                  value = jsonencode(var.browser_allowed_origins)
+                },
+                {
+                  name  = "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN"
+                  value = tostring(var.allow_null_browser_origin)
+                },
+                {
+                  name  = "PALANCAR_LANGUAGE_BOUNDARY_MODE"
+                  value = var.language_boundary_mode
                 }
               ]
-
-              probes = [
-                {
-                  type = "Liveness"
-                  tcpSocket = {
-                    port = 4000
-                  }
-                  initialDelaySeconds = 10
-                  periodSeconds       = 30
-                  timeoutSeconds      = 3
-                  failureThreshold    = 3
-                },
-                {
-                  type = "Readiness"
-                  httpGet = {
-                    path = "/health/readiness"
-                    port = 4000
-                  }
-                  periodSeconds    = 10
-                  timeoutSeconds   = 7
-                  failureThreshold = 3
-                },
-                {
-                  type = "Startup"
-                  httpGet = {
-                    path = "/health/liveliness"
-                    port = 4000
-                  }
-                  periodSeconds    = 10
-                  timeoutSeconds   = 3
-                  failureThreshold = 10
-                }
-              ]
-            }
-          ] : []
-        )
+            )
+          }
+        ]
 
         scale = {
           minReplicas = var.min_replicas
@@ -300,11 +193,6 @@ resource "azapi_resource" "this" {
   ]
 
   lifecycle {
-    precondition {
-      condition     = trimspace(var.runtime_secrets_user_role_assignment_id) != ""
-      error_message = "runtime_secrets_user_role_assignment_id must be nonempty."
-    }
-
     precondition {
       condition     = trimspace(var.runtime_openai_user_role_assignment_id) != ""
       error_message = "runtime_openai_user_role_assignment_id must be nonempty."
@@ -351,38 +239,8 @@ resource "azapi_resource" "this" {
     }
 
     precondition {
-      condition = !var.enable_litellm_sidecar || (
-        var.litellm_backend == "openrouter" &&
-        var.litellm_image_digest != "" &&
-        startswith(var.litellm_image_digest, "${var.acr_login_server}/") &&
-        startswith(var.litellm_upstream_model, "openrouter/") &&
-        var.litellm_master_key_secret_url != "" &&
-        var.openrouter_api_key_secret_url != "" &&
-        var.azure_api_base == "" &&
-        var.azure_api_version == ""
-      )
-      error_message = "enabled LiteLLM requires the complete OpenRouter configuration, an immutable image in acr_login_server, and empty Azure fields."
-    }
-
-    precondition {
-      condition = var.enable_litellm_sidecar || (
-        var.litellm_backend == "" &&
-        var.litellm_image_digest == "" &&
-        var.litellm_upstream_model == "" &&
-        var.litellm_master_key_secret_url == "" &&
-        var.openrouter_api_key_secret_url == "" &&
-        var.azure_api_base == "" &&
-        var.azure_api_version == ""
-      )
-      error_message = "all LiteLLM and provider values must be empty when the sidecar is disabled."
-    }
-
-    precondition {
-      condition = !var.enable_litellm_sidecar || (
-        var.openrouter_api_key_secret_url == "${trimsuffix(var.key_vault_uri, "/")}/secrets/openrouter-api-key" &&
-        var.litellm_master_key_secret_url == "${trimsuffix(var.key_vault_uri, "/")}/secrets/litellm-master-key"
-      )
-      error_message = "sidecar secret URLs must be versionless exact-name references in key_vault_uri."
+      condition     = var.azure_generation_deployment == "gpt-5.6-luna"
+      error_message = "azure_generation_deployment must be exactly gpt-5.6-luna."
     }
   }
 }
