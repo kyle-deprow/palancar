@@ -3221,10 +3221,12 @@ function validateCatalogItem(item, outputs, config) {
     "model-catalog",
   );
   const id = catalogIdParts(item.id, "model-catalog");
+  const expectedLocation = outputs.region.toLowerCase();
   failIf(
     id.subscription !== config.account.subscription ||
-      id.location !== outputs.region ||
-      item.location !== outputs.region ||
+      id.location.toLowerCase() !== expectedLocation ||
+      item.location.toLowerCase() !== expectedLocation ||
+      id.location.toLowerCase() !== item.location.toLowerCase() ||
       item.type !== "Microsoft.CognitiveServices/locations/models" ||
       item.name !== id.model,
     "catalog-context",
