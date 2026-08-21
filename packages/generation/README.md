@@ -1,3 +1,16 @@
+# Direct Azure OpenAI generation
+
+Generation uses the direct Azure OpenAI v1 chat-completions endpoint through
+`AzureOpenAIChatGenerationProvider`. It sends one bounded, non-streaming
+request to the configured deployment and validates the returned English and
+selected-target-language text before returning it.
+
+Authentication is Entra-only. The provider accepts an injected
+`AzureTokenProvider`; it has no API-key configuration or authentication
+fallback. Endpoints must be canonical HTTPS Azure OpenAI origins, and the
+provider uses the fixed `/openai/v1/chat/completions` path with a fixed
+15-second deadline and 8,192-byte response bound.
+
 # Generated-language validation
 
 Generation validates every English and selected-target output before returning
