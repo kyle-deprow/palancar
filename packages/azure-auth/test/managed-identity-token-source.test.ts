@@ -1,12 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  AZURE_FOUNDRY_TOKEN_SCOPE,
-  AzureManagedIdentityTokenSource as AzureAuthManagedIdentityTokenSource,
-  AzureManagedIdentityTokenSourceError as AzureAuthManagedIdentityTokenSourceError,
-  createAzureManagedIdentityTokenSource as createAzureAuthManagedIdentityTokenSource
-} from '@palancar/azure-auth';
-
 const identityMock = vi.hoisted(() => ({
   constructor: vi.fn(),
   getToken: vi.fn()
@@ -25,8 +18,7 @@ vi.mock('@azure/identity', () => ({
 }));
 
 import {
-  AZURE_REALTIME_TOKEN_SCOPE,
-  AzureManagedIdentityTokenSource,
+  AZURE_FOUNDRY_TOKEN_SCOPE,
   AzureManagedIdentityTokenSourceError,
   createAzureManagedIdentityTokenSource
 } from '../src/index.js';
@@ -65,21 +57,16 @@ describe('AzureManagedIdentityTokenSource', () => {
     identityMock.getToken.mockReset();
   });
 
-  it('preserves the Azure Auth exports and scope alias', async () => {
+  it('constructs exactly one managed identity credential and requests the AI scope', async () => {
     identityMock.getToken.mockResolvedValue(validToken());
     const source = createAzureManagedIdentityTokenSource({ clientId: CLIENT_ID, now: () => NOW });
 
-    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe(AZURE_FOUNDRY_TOKEN_SCOPE);
-    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe('https://ai.azure.com/.default');
-    expect(AzureManagedIdentityTokenSource).toBe(AzureAuthManagedIdentityTokenSource);
-    expect(AzureManagedIdentityTokenSourceError).toBe(AzureAuthManagedIdentityTokenSourceError);
-    expect(createAzureManagedIdentityTokenSource).toBe(createAzureAuthManagedIdentityTokenSource);
-    expect(source).toBeInstanceOf(AzureAuthManagedIdentityTokenSource);
+    expect(AZURE_FOUNDRY_TOKEN_SCOPE).toBe('https://ai.azure.com/.default');
     expect(identityMock.constructor).toHaveBeenCalledOnce();
     expect(identityMock.constructor).toHaveBeenCalledWith({ clientId: CLIENT_ID });
     await expect(source.checkReadiness()).resolves.toBe(true);
     expect(identityMock.getToken).toHaveBeenCalledOnce();
-    expect(identityMock.getToken.mock.calls[0]?.[0]).toBe(AZURE_REALTIME_TOKEN_SCOPE);
+    expect(identityMock.getToken.mock.calls[0]?.[0]).toBe(AZURE_FOUNDRY_TOKEN_SCOPE);
     expect(identityMock.getToken.mock.calls[0]?.[1]).toMatchObject({
       abortSignal: expect.any(AbortSignal)
     });
