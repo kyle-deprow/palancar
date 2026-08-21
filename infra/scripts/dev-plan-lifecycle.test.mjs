@@ -480,7 +480,7 @@ function makeHarness(overrides = {}) {
             : "2026-07-09";
           const catalogName = `${format}.gpt-5.6-luna.${version}`;
           return {
-            description: "Synthetic model catalog entry",
+            description: null,
             id: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.CognitiveServices/locations/eastus2/models/${catalogName}`,
             kind,
             location: modelCase === "catalog-wrong-region" ? "westus" : "eastus2",

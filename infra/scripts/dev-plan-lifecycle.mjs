@@ -3212,7 +3212,7 @@ function validateCatalogItem(item, outputs, config) {
   assertKnownKeys(item, ["description", "id", "kind", "location", "model", "name", "skuName", "type"], "model-catalog");
   assertRequiredKeys(item, ["description", "id", "kind", "location", "model", "name", "skuName", "type"], "model-catalog");
   failIf(
-    typeof item.description !== "string" ||
+    item.description !== null ||
       typeof item.kind !== "string" ||
       typeof item.location !== "string" ||
       typeof item.name !== "string" ||
