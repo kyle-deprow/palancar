@@ -512,7 +512,9 @@ function makeHarness(overrides = {}) {
         const quota = {
           name: {
             value: `OpenAI.GlobalStandard.${quotaModel}`,
-            localizedValue: `One Thousand Tokens Per Minute - ${quotaModel} - GlobalStandard`,
+            localizedValue: modelCase === "quota-localized-bad"
+              ? `Tokens Per Minute (thousands) - ${quotaModel}`
+              : `One Thousand Tokens Per Minute - ${quotaModel} - GlobalStandard`,
           },
           currentValue: modelCase === "quota-total-only" ? undefined : (modelCase === "quota-bad" ? 1013 : 0),
           limit: modelCase === "quota-current-only" ? undefined : 1013,
@@ -1825,6 +1827,7 @@ test("A2 exact deployment, catalog, quota, context, and error-shape checks fail 
     ["quota-bad", "quota-unreleased"],
     ["quota-duplicate", "quota-duplicate"],
     ["quota-unknown-unit", "model-quota"],
+    ["quota-localized-bad", "model-quota"],
     ["quota-status-blocked", "model-quota"],
     ["quota-status-overage", "model-quota"],
     ["quota-status-unknown", "model-quota"],

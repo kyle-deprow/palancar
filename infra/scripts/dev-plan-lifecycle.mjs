@@ -3339,17 +3339,9 @@ function validateQuotaItem(item) {
       item.status !== null,
     "model-quota",
   );
-  const match = /^([^\.]+)\.([^\.]+)\.(.+)$/.exec(item.name.value);
-  failIf(!match, "model-quota");
-  failIf(
-    item.name.localizedValue !==
-      `${MODEL_BOOTSTRAP_CONTRACT.quotaLocalizedPrefix}${match[3]} - ${match[2]}`,
-    "model-quota",
-  );
   return {
-    provider: match[1],
-    sku: match[2],
-    modelName: match[3],
+    nameValue: item.name.value,
+    localizedValue: item.name.localizedValue,
     unit: item.unit,
     currentValue: item.currentValue,
     limit: item.limit,
@@ -3371,19 +3363,20 @@ function verifyQuota(config, outputs, catalogReceipt) {
   ], "model-quota");
   const entries = pagedAzureList(quota, "model-quota");
   const descriptors = entries.map(validateQuotaItem);
-  const exact = descriptors.filter(
-    (descriptor) =>
-      descriptor.provider === "OpenAI" &&
-      descriptor.sku === MODEL_BOOTSTRAP_CONTRACT.sku &&
-      descriptor.modelName === MODEL_BOOTSTRAP_CONTRACT.lunaDeployment,
-  );
+  const expectedName = `OpenAI.${MODEL_BOOTSTRAP_CONTRACT.sku}.${MODEL_BOOTSTRAP_CONTRACT.lunaDeployment}`;
+  const exact = descriptors.filter((descriptor) => descriptor.nameValue === expectedName);
   failIf(exact.length > 1, "quota-duplicate");
   failIf(exact.length !== 1, "quota-unreleased");
   const selected = exact[0];
+  failIf(
+    selected.localizedValue !==
+      `${MODEL_BOOTSTRAP_CONTRACT.quotaLocalizedPrefix}${MODEL_BOOTSTRAP_CONTRACT.lunaDeployment} - ${MODEL_BOOTSTRAP_CONTRACT.sku}`,
+    "model-quota",
+  );
   failIf(selected.available < MODEL_BOOTSTRAP_CONTRACT.lunaCapacity, "quota-unreleased");
   failIf(
-    catalogReceipt.modelName !== selected.modelName ||
-      catalogReceipt.sku !== selected.sku,
+    catalogReceipt.modelName !== MODEL_BOOTSTRAP_CONTRACT.lunaDeployment ||
+      catalogReceipt.sku !== MODEL_BOOTSTRAP_CONTRACT.sku,
     "quota-context",
   );
   return selected;
@@ -3415,9 +3408,9 @@ function verifyModelMetadata(config, outputs) {
   };
   const quotaReceipt = {
     region: accountContext.location,
-    provider: quota.provider,
-    sku: quota.sku,
-    modelName: quota.modelName,
+    provider: "OpenAI",
+    sku: MODEL_BOOTSTRAP_CONTRACT.sku,
+    modelName: MODEL_BOOTSTRAP_CONTRACT.lunaDeployment,
     unit: quota.unit,
     currentValue: quota.currentValue,
     limit: quota.limit,
