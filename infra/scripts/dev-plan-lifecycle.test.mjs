@@ -4,6 +4,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -81,6 +82,11 @@ const SHA = "a".repeat(64);
 const BLOB = "e".repeat(40);
 const COMMIT = "f".repeat(40);
 const REPO_ROOT = process.cwd();
+const REAL_GUARD_PATH = path.join(REPO_ROOT, "infra/scripts/assert-dev-plan.mjs");
+const REVIEWED_LUNA_FIXTURE_TEXT = readFileSync(
+  path.join(REPO_ROOT, "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json"),
+  "utf8",
+);
 const REAL_BACKEND_PATH = path.join(REPO_ROOT, "infra/environments/dev/backend.hcl");
 const REAL_BACKEND = parseCanonicalBackendConfig(readFileSync(REAL_BACKEND_PATH, "utf8"));
 const SUBSCRIPTION = REAL_BACKEND.identity.subscription_id;
@@ -1656,6 +1662,30 @@ test("CLI and exact child environment remain closed", () => {
     expectCode(() => buildChildEnvironment(path.join(harness.root, "run2"), { TF_UNKNOWN: "1" }), "contaminated-environment");
   } finally {
     harness.cleanup();
+  }
+});
+
+test("real Luna guard entrypoint is executable under the closed child environment", () => {
+  const guardStat = lstatSync(REAL_GUARD_PATH);
+  assert.equal(guardStat.isFile(), true);
+  assert.equal(guardStat.isSymbolicLink(), false);
+  assert.notEqual(guardStat.mode & 0o111, 0);
+
+  const runDirectory = mkdtempSync(path.join(tmpdir(), "palancar-lifecycle-guard-run-"));
+  chmodSync(runDirectory, 0o700);
+  try {
+    const child = spawnSync(REAL_GUARD_PATH, ["--mode=luna-model-bootstrap"], {
+      cwd: REPO_ROOT,
+      env: buildChildEnvironment(runDirectory, {}),
+      encoding: "utf8",
+      input: REVIEWED_LUNA_FIXTURE_TEXT,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    assert.equal(child.status, 0);
+    assert.equal(child.stdout, "");
+    assert.equal(child.stderr, "");
+  } finally {
+    rmSync(runDirectory, { recursive: true, force: true });
   }
 });
 
