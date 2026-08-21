@@ -84,7 +84,7 @@ output "foundry_account_id" {
 }
 
 output "foundry_deployment_names" {
-  description = "Reviewed Foundry deployment names; empty during the runtime rollout."
+  description = "Reviewed Foundry deployment names."
   value       = module.foundry.deployment_names
 }
 
@@ -129,7 +129,7 @@ output "key_vault_id" {
 }
 
 output "key_vault_uri" {
-  description = "Workload Key Vault URI for secret references."
+  description = "Workload Key Vault URI."
   value       = module.workload_key_vault.uri
 }
 

@@ -31,8 +31,11 @@ locals {
 
   relay_origin = "wss://${local.names.relay_container_app}.${module.container_app_environment.default_domain}"
 
-  foundry_realtime_endpoint = "wss://${trimprefix(trimsuffix(module.foundry.endpoint, "/"), "https://")}/openai/v1/realtime?intent=transcription"
+  foundry_generation_endpoint = trimsuffix(module.foundry.endpoint, "/")
+  foundry_realtime_endpoint   = "wss://${trimprefix(trimsuffix(module.foundry.endpoint, "/"), "https://")}/openai/v1/realtime?intent=transcription"
 
+  relay_generation_endpoint      = var.deploy_relay_workload ? local.foundry_generation_endpoint : ""
+  relay_generation_deployment    = var.deploy_relay_workload ? "gpt-5.6-luna" : ""
   relay_transcription_provider   = var.deploy_relay_workload ? "azure-realtime" : ""
   relay_transcription_endpoint   = var.deploy_relay_workload ? local.foundry_realtime_endpoint : ""
   relay_transcription_deployment = var.deploy_relay_workload ? "gpt-4o-mini-transcribe" : ""

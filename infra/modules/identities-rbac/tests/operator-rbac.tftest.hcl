@@ -63,6 +63,16 @@ run "exact_operator_table_assignments" {
   }
 
   assert {
+    condition = (
+      azurerm_role_assignment.runtime_openai.scope == var.cognitive_account_id &&
+      azurerm_role_assignment.runtime_openai.role_definition_id == "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/5e0bd9bd-7b93-4f28-af87-19fc36ad61bd" &&
+      azurerm_role_assignment.runtime_openai.principal_id == "11111111-1111-1111-1111-111111111111" &&
+      azurerm_role_assignment.runtime_openai.principal_type == "ServicePrincipal"
+    )
+    error_message = "runtime inference access must retain the account-scoped Cognitive Services OpenAI User role for the runtime service principal"
+  }
+
+  assert {
     condition     = azurerm_role_assignment.operator_security_table.scope == var.security_state_table_id
     error_message = "operator SecurityState access must use the exact table scope"
   }

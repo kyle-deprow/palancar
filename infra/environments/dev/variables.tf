@@ -293,84 +293,8 @@ variable "allow_null_browser_origin" {
   default     = false
 }
 
-variable "enable_litellm_sidecar" {
-  description = "Whether to add the optional LiteLLM generation sidecar to the relay workload."
+variable "enable_runtime_secrets_user_assignment" {
+  description = "Whether to retain the runtime identity's Key Vault Secrets User role assignment during the runtime-secrets cutover; set false only after the workload no longer uses runtime Key Vault secrets and the assignment is ready for cleanup."
   type        = bool
-  default     = false
-}
-
-variable "litellm_image_digest" {
-  description = "Immutable LiteLLM sidecar image digest in the development ACR."
-  type        = string
-  default     = ""
-
-  validation {
-    condition = var.litellm_image_digest == "" || can(regex(
-      "^[a-z0-9]{5,50}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
-      var.litellm_image_digest
-    ))
-    error_message = "litellm_image_digest must be empty or the exact immutable <acr>.azurecr.io/palancar-litellm-proxy@sha256 digest."
-  }
-}
-
-variable "litellm_backend" {
-  description = "LiteLLM upstream backend; only OpenRouter is production-qualified."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = contains(["", "openrouter"], var.litellm_backend)
-    error_message = "litellm_backend must be empty or openrouter; Azure is not qualified."
-  }
-}
-
-variable "litellm_upstream_model" {
-  description = "Provider-prefixed upstream model routed by LiteLLM."
-  type        = string
-  default     = ""
-
-  validation {
-    condition = var.litellm_upstream_model == "" || (
-      length(var.litellm_upstream_model) <= 194 &&
-      can(regex(
-        "^openrouter/[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?/[a-z0-9](?:[a-z0-9._:-]{0,126}[a-z0-9])?$",
-        var.litellm_upstream_model
-      ))
-    )
-    error_message = "litellm_upstream_model must be empty or an exact bounded lower-case openrouter/owner/model identifier."
-  }
-}
-
-variable "openrouter_api_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the OpenRouter API key."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.openrouter_api_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.openrouter_api_key_secret_url))
-    error_message = "openrouter_api_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "litellm_master_key_secret_url" {
-  description = "HTTPS Key Vault secret URL for the LiteLLM master key."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.litellm_master_key_secret_url == "" || can(regex("^https://[^[:space:]]+$", var.litellm_master_key_secret_url))
-    error_message = "litellm_master_key_secret_url must be empty or an HTTPS URL."
-  }
-}
-
-variable "azure_api_base" {
-  description = "Qualification-blocked LiteLLM Azure API base; must remain empty."
-  type        = string
-  default     = ""
-}
-
-variable "azure_api_version" {
-  description = "Qualification-blocked LiteLLM Azure API version; must remain empty."
-  type        = string
-  default     = ""
+  default     = true
 }

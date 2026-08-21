@@ -5,29 +5,6 @@ resource "azurerm_resource_group" "foundation" {
 
   lifecycle {
     precondition {
-      condition = var.enable_litellm_sidecar ? (
-        var.deploy_relay_workload &&
-        var.litellm_backend == "openrouter" &&
-        trimspace(var.litellm_image_digest) != "" &&
-        startswith(var.litellm_image_digest, "${local.names.acr}.azurecr.io/") &&
-        startswith(var.litellm_upstream_model, "openrouter/") &&
-        trimspace(var.openrouter_api_key_secret_url) != "" &&
-        trimspace(var.litellm_master_key_secret_url) != "" &&
-        trimspace(var.azure_api_base) == "" &&
-        trimspace(var.azure_api_version) == ""
-        ) : (
-        trimspace(var.litellm_backend) == "" &&
-        trimspace(var.litellm_image_digest) == "" &&
-        trimspace(var.litellm_upstream_model) == "" &&
-        trimspace(var.openrouter_api_key_secret_url) == "" &&
-        trimspace(var.litellm_master_key_secret_url) == "" &&
-        trimspace(var.azure_api_base) == "" &&
-        trimspace(var.azure_api_version) == ""
-      )
-      error_message = "LiteLLM must be a complete OpenRouter-only sidecar configuration when enabled and entirely empty when disabled."
-    }
-
-    precondition {
       condition = var.deploy_relay_workload ? (
         trimspace(var.relay_image_digest) != "" &&
         can(regex(
@@ -39,31 +16,12 @@ resource "azurerm_resource_group" "foundation" {
           "^${local.names.acr}\\.azurecr\\.io/palancar-expiry-cleanup@sha256:[0-9a-f]{64}$",
           var.expiry_cleanup_image_digest
         )) &&
-        var.enable_litellm_sidecar &&
-        var.litellm_backend == "openrouter" &&
-        trimspace(var.litellm_image_digest) != "" &&
-        can(regex(
-          "^${local.names.acr}\\.azurecr\\.io/palancar-litellm-proxy@sha256:[0-9a-f]{64}$",
-          var.litellm_image_digest
-        )) &&
-        startswith(var.litellm_upstream_model, "openrouter/") &&
-        trimspace(var.openrouter_api_key_secret_url) != "" &&
-        trimspace(var.litellm_master_key_secret_url) != "" &&
-        var.azure_api_base == "" &&
-        var.azure_api_version == ""
+        var.foundry_deployments == local.required_foundry_deployments
         ) : (
         var.relay_image_digest == "" &&
-        var.expiry_cleanup_image_digest == "" &&
-        !var.enable_litellm_sidecar &&
-        var.litellm_image_digest == "" &&
-        var.litellm_backend == "" &&
-        var.litellm_upstream_model == "" &&
-        var.openrouter_api_key_secret_url == "" &&
-        var.litellm_master_key_secret_url == "" &&
-        var.azure_api_base == "" &&
-        var.azure_api_version == ""
+        var.expiry_cleanup_image_digest == ""
       )
-      error_message = "A deployed relay requires same-ACR relay and cleanup digests plus the complete OpenRouter LiteLLM sidecar; disabled workloads require exact empty image/provider values."
+      error_message = "A deployed relay requires same-ACR relay and cleanup digests plus the exact two-entry Foundry deployment contract; disabled workloads require empty image values."
     }
 
     precondition {
@@ -196,11 +154,12 @@ module "identities_rbac" {
 module "workload_key_vault" {
   source = "../../modules/workload-key-vault"
 
-  name                 = substr("kv${local.name_seed}${local.suffix}", 0, 24)
-  resource_group_name  = azurerm_resource_group.foundation.name
-  location             = var.location
-  tags                 = local.tags
-  runtime_principal_id = module.identities_rbac.runtime_principal_id
+  name                                   = substr("kv${local.name_seed}${local.suffix}", 0, 24)
+  resource_group_name                    = azurerm_resource_group.foundation.name
+  location                               = var.location
+  tags                                   = local.tags
+  runtime_principal_id                   = module.identities_rbac.runtime_principal_id
+  enable_runtime_secrets_user_assignment = var.enable_runtime_secrets_user_assignment
 }
 
 module "container_app_workload" {
@@ -232,20 +191,12 @@ module "container_app_workload" {
   deployment_slot                                         = local.relay_deployment_slot
   language_boundary_mode                                  = "development-provisional"
   application_insights_connection_string                  = module.observability.application_insights_connection_string
-  enable_litellm_sidecar                                  = var.enable_litellm_sidecar
-  litellm_image_digest                                    = var.litellm_image_digest
-  litellm_backend                                         = var.litellm_backend
-  litellm_upstream_model                                  = var.litellm_upstream_model
-  openrouter_api_key_secret_url                           = var.openrouter_api_key_secret_url
-  litellm_master_key_secret_url                           = var.litellm_master_key_secret_url
-  key_vault_uri                                           = module.workload_key_vault.uri
-  azure_api_base                                          = var.azure_api_base
-  azure_api_version                                       = var.azure_api_version
-  runtime_secrets_user_role_assignment_id                 = module.workload_key_vault.runtime_secrets_user_role_assignment_id
+  azure_generation_endpoint                               = local.relay_generation_endpoint
+  azure_generation_deployment                             = local.relay_generation_deployment
   runtime_openai_user_role_assignment_id                  = module.identities_rbac.runtime_openai_user_role_assignment_id
   runtime_monitoring_metrics_publisher_role_assignment_id = module.identities_rbac.runtime_application_insights_role_assignment_id
 
-  depends_on = [module.identities_rbac, module.foundry, module.workload_key_vault]
+  depends_on = [module.identities_rbac, module.foundry]
 }
 
 module "expiry_cleanup_job" {
