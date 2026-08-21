@@ -3234,15 +3234,18 @@ function validateCatalogItem(item, outputs, config) {
     "callRateLimit",
     "capabilities",
     "deprecation",
+    "description",
     "finetuneCapabilities",
     "format",
     "isDefaultVersion",
     "lifecycleStatus",
     "maxCapacity",
     "modelCatalogAssetId",
+    "models",
     "name",
     "publisher",
     "replacementConfig",
+    "routingModes",
     "skus",
     "source",
     "sourceAccount",
@@ -3261,7 +3264,7 @@ function validateCatalogItem(item, outputs, config) {
     "model-catalog",
   );
   const skus = item.model.skus.map((sku) => {
-    assertKnownKeys(sku, ["capacity", "cost", "deprecationDate", "name", "rateLimits", "usageName"], "model-catalog");
+    assertKnownKeys(sku, ["capacity", "cost", "costs", "deprecationDate", "name", "rateLimits", "usageName"], "model-catalog");
     assertRequiredKeys(sku, ["name"], "model-catalog");
     failIf(typeof sku.name !== "string" || sku.name.length === 0, "model-catalog");
     return sku.name;
