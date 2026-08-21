@@ -18,6 +18,7 @@ import type {
   SessionLease
 } from '@palancar/security-state';
 import type { NormalizedTranscriptionEvent, TranscriptionAdapter } from '@palancar/transcription';
+import type { TelemetryProviderFailureStage } from '@palancar/telemetry';
 
 export interface RelayUpgradeAudience {
   readonly origin: string;
@@ -129,8 +130,7 @@ export type RelayMetricGateDecision =
  * user/provider content, and audio are structurally excluded at the core
  * boundary; a host adapter may add deployment metadata after this boundary.
  */
-export interface RelayProductionMetricInput {
-  readonly name: RelayMetricName;
+interface RelayProductionMetricFields {
   readonly timestamp: string;
   readonly protocolVersion?: 1;
   readonly durationMs?: number;
@@ -183,6 +183,22 @@ export interface RelayProductionMetricInput {
   readonly providerBody?: never;
   readonly message?: never;
 }
+
+export type RelayProductionMetricInputForName<Name extends RelayMetricName> =
+  RelayProductionMetricFields &
+  (Name extends 'generation.failure.provider_response'
+    ? {
+        readonly name: Name;
+        readonly providerFailureStage: TelemetryProviderFailureStage;
+      }
+    : {
+        readonly name: Name;
+        readonly providerFailureStage?: never;
+      });
+
+export type RelayProductionMetricInput = {
+  [Name in RelayMetricName]: RelayProductionMetricInputForName<Name>;
+}[RelayMetricName];
 
 export type RelayMetricInput = RelayProductionMetricInput;
 

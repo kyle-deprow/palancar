@@ -112,10 +112,13 @@ export class GenerationProviderError extends Error {
 export function trustedGenerationProviderFailureStage(
   value: unknown
 ): GenerationProviderFailureStage | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (typeof value !== 'object' || value === null) {
     return undefined;
   }
   try {
+    if (Array.isArray(value)) {
+      return undefined;
+    }
     if (TRUSTED_GENERATION_ERRORS.has(value)) {
       return Object.getPrototypeOf(value) === GenerationError.prototype
         ? TRUSTED_GENERATION_ERROR_STAGES.get(value)

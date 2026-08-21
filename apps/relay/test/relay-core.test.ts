@@ -1097,13 +1097,43 @@ describe('relay session core', () => {
         name: 'generation.failure.provider_response',
         error: new GenerationError('provider-failure'),
         synchronous: false,
-        providerFailure: true
+        providerFailure: true,
+        providerFailureStage: 'unknown'
       },
       {
         name: 'generation.failure.provider_response',
         error: new GenerationError('invalid-provider-result'),
         synchronous: true,
-        providerFailure: true
+        providerFailure: true,
+        providerFailureStage: 'unknown'
+      },
+      ...([
+        'identity',
+        'timeout',
+        'transport',
+        'auth',
+        'rate_limit',
+        'http',
+        'response_size',
+        'response_envelope',
+        'finish_length',
+        'finish_other',
+        'completion_json',
+        'completion_schema',
+        'unknown'
+      ] as const).map((providerFailureStage) => ({
+        name: 'generation.failure.provider_response' as const,
+        error: new GenerationError('provider-failure', providerFailureStage),
+        synchronous: false as const,
+        providerFailure: true as const,
+        providerFailureStage
+      })),
+      {
+        name: 'generation.failure.provider_response',
+        error: new GenerationError('provider-failure', 'forged-stage'),
+        synchronous: false,
+        providerFailure: true,
+        providerFailureStage: 'unknown'
       },
       {
         name: 'generation.failure.invalid_generated_language',
@@ -1170,6 +1200,9 @@ describe('relay session core', () => {
           targetLanguage: 'es',
           operation: 'generation',
           outcome: 'failure',
+          ...(testCase.name === 'generation.failure.provider_response'
+            ? { providerFailureStage: testCase.providerFailureStage }
+            : {}),
           providerId: 'deterministic-mock-generation',
           providerVersion: '1.0.0'
         })
@@ -1574,7 +1607,7 @@ describe('relay session core', () => {
   it('treats GenerationError subclasses and category accessors as internal without observing them', async () => {
     class DerivedGenerationError extends GenerationError {}
     let accessorCalls = 0;
-    const accessorError = new GenerationError('provider-failure');
+    const accessorError = Object.create(GenerationError.prototype) as GenerationError;
     Object.defineProperty(accessorError, 'category', {
       configurable: true,
       get: () => {

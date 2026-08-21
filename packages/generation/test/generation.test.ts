@@ -10,7 +10,8 @@ import {
   createGenerationEvidenceRecord,
   createAcceptedTargetTurn,
   isDeterministicFixtureLanguageValidator,
-  isAcceptedTargetTurn
+  isAcceptedTargetTurn,
+  trustedGenerationProviderFailureStage
 } from '../src/index.js';
 import type {
   AcceptedTargetTurn,
@@ -433,6 +434,48 @@ describe('provider failures, validation, retry, and deduplication', () => {
       { failureCategory: 'provider-failure', providerFailureStage: 'unknown' },
       { failureCategory: 'provider-failure', providerFailureStage: 'unknown' }
     ]);
+  });
+
+  it('returns undefined for revoked object and array proxies', () => {
+    const revokedObject = Proxy.revocable({ secret: 'revoked object secret' }, {});
+    const revokedArray = Proxy.revocable(['revoked array secret'], {});
+    revokedObject.revoke();
+    revokedArray.revoke();
+
+    expect(() => trustedGenerationProviderFailureStage(revokedObject.proxy)).not.toThrow();
+    expect(() => trustedGenerationProviderFailureStage(revokedArray.proxy)).not.toThrow();
+    expect(trustedGenerationProviderFailureStage(revokedObject.proxy)).toBeUndefined();
+    expect(trustedGenerationProviderFailureStage(revokedArray.proxy)).toBeUndefined();
+  });
+
+  it('normalizes revoked object and array proxies to unknown without leaking content', async () => {
+    const revokedObject = Proxy.revocable({ secret: 'revoked object secret' }, {});
+    const revokedArray = Proxy.revocable(['revoked array secret'], {});
+    revokedObject.revoke();
+    revokedArray.revoke();
+    const hostileErrors: unknown[] = [revokedObject.proxy, revokedArray.proxy];
+    const provider: GenerationProvider = {
+      id: 'revoked-proxy-provider',
+      version: '1.0.0',
+      complete: async () => {
+        throw hostileErrors.shift();
+      }
+    };
+    const service = serviceWithValidator(provider);
+
+    for (let index = 0; index < 2; index += 1) {
+      await expect(service.complete(turn())).rejects.toMatchObject({
+        category: 'provider-failure',
+        providerFailureStage: 'unknown',
+        message: 'Generation provider failed.'
+      });
+    }
+
+    const serializedEvidence = JSON.stringify(service.evidence);
+    expect(service.evidence).toHaveLength(2);
+    expect(service.evidence.every((record) => record.providerFailureStage === 'unknown')).toBe(true);
+    expect(serializedEvidence).not.toContain('revoked object secret');
+    expect(serializedEvidence).not.toContain('revoked array secret');
   });
 
   it('redacts provider failures without retaining a cause and permits retry', async () => {

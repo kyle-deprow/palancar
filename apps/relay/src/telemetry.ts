@@ -13,10 +13,12 @@ import {
 } from '@opentelemetry/sdk-metrics';
 import {
   TELEMETRY_METRIC_NAMES,
+  isTelemetryProviderFailureStage,
   sanitizeTelemetryForExport,
   type DeploymentSlot,
   type SanitizedTelemetryRecord,
-  type TelemetryMetricName
+  type TelemetryMetricName,
+  type TelemetryProviderFailureStage
 } from '@palancar/telemetry';
 import { types as utilTypes } from 'node:util';
 
@@ -56,6 +58,7 @@ const EXPORT_RECORD_KEYS = new Set([
   'outcome',
   'providerId',
   'providerVersion',
+  'providerFailureStage',
   'deploymentSlot',
   'reconnectReason'
 ]);
@@ -501,6 +504,19 @@ function recordWithDeploymentSlot(
       return descriptor.value;
     };
     const name = valueFor('name');
+    const providerFailureStage = valueFor('providerFailureStage') as
+      | TelemetryProviderFailureStage
+      | undefined;
+    if (name === TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE) {
+      if (
+        !Object.hasOwn(descriptors, 'providerFailureStage') ||
+        !isTelemetryProviderFailureStage(providerFailureStage)
+      ) {
+        return undefined;
+      }
+    } else if (Object.hasOwn(descriptors, 'providerFailureStage')) {
+      return undefined;
+    }
     const boundaryMode = valueFor('languageBoundaryMode');
     const reason = valueFor('languageReason');
     const targetLanguage = valueFor('targetLanguage');
@@ -766,6 +782,12 @@ function pointAttributes(
   }
   if (record.providerVersion !== undefined) {
     attributes['palancar.provider.version'] = record.providerVersion;
+  }
+  if (
+    record.name === TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE &&
+    record.providerFailureStage !== undefined
+  ) {
+    attributes['palancar.provider.failure_stage'] = record.providerFailureStage;
   }
   if (record.reconnectReason !== undefined) {
     attributes['palancar.reconnect.reason'] = record.reconnectReason;

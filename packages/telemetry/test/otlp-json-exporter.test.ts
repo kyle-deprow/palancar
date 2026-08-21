@@ -13,6 +13,7 @@ import {
   TelemetryValidationError,
   type OtlpJsonExporterOptions,
   type TelemetryMetricName,
+  type TelemetryProviderFailureStage,
   type TelemetryRecordInput
 } from '../src/index.js';
 
@@ -128,21 +129,44 @@ function exporter(options: OtlpJsonExporterOptions = OPTIONS): OtlpJsonExporter 
   return new OtlpJsonExporter(options);
 }
 
+type InputAdditions = Partial<Omit<TelemetryRecordInput, 'name' | 'providerFailureStage'>>;
+type ProviderResponseInput = Extract<
+  TelemetryRecordInput,
+  { readonly name: typeof TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE }
+>;
+type NonProviderResponseInput = Exclude<TelemetryRecordInput, ProviderResponseInput>;
+
+function input(
+  name: typeof TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE,
+  additions?: InputAdditions & { readonly providerFailureStage?: TelemetryProviderFailureStage }
+): ProviderResponseInput;
+function input(
+  name?: Exclude<
+    TelemetryMetricName,
+    typeof TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE
+  >,
+  additions?: InputAdditions
+): NonProviderResponseInput;
+function input(name: TelemetryMetricName, additions?: InputAdditions): TelemetryRecordInput;
 function input(
   name: TelemetryMetricName = TELEMETRY_METRIC_NAMES.SESSION_START,
-  additions: Partial<TelemetryRecordInput> = {}
+  additions: InputAdditions & { readonly providerFailureStage?: TelemetryProviderFailureStage } = {}
 ): TelemetryRecordInput {
   const mapping = EXACT_METRIC_MAPPING.find((candidate) => candidate.name === name);
   const measurement = mapping?.kind === 'histogram'
     ? { durationMs: 12 }
     : mapping?.unit === '{sample}' ? { sampleCount: 160 } : {};
+  const { providerFailureStage, ...safeAdditions } = additions;
   return {
     name,
     timestamp: EPOCH,
     deploymentSlot: SLOT,
     ...measurement,
-    ...additions
-  };
+    ...safeAdditions,
+    ...(name === TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE
+      ? { providerFailureStage: providerFailureStage ?? 'unknown' }
+      : {})
+  } as TelemetryRecordInput;
 }
 
 function requiredRequest(instance: OtlpJsonExporter, nowMs = 0) {
@@ -331,6 +355,35 @@ describe('OTLP JSON construction', () => {
     expect(body).not.toMatch(/correlation|sessionId|requestId/);
   });
 
+  it('emits the provider response failure stage with the exact sorted attributes', () => {
+    const instance = exporter();
+    instance.enqueue(input(TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE, {
+      operation: 'generation',
+      outcome: 'failure',
+      providerId: 'azure-openai-chat',
+      providerVersion: '1.0.0',
+      providerFailureStage: 'auth'
+    }));
+
+    const request = requiredRequest(instance);
+    const point = ((firstMetric(request).sum as {
+      dataPoints: Array<{
+        attributes: Array<{ key: string; value: unknown }>;
+      }>;
+    }).dataPoints[0]);
+    expect(point?.attributes).toEqual([
+      { key: 'palancar.operation', value: { stringValue: 'generation' } },
+      { key: 'palancar.outcome', value: { stringValue: 'failure' } },
+      {
+        key: 'palancar.provider.failure_stage',
+        value: { stringValue: 'auth' }
+      },
+      { key: 'palancar.provider.id', value: { stringValue: 'azure-openai-chat' } },
+      { key: 'palancar.provider.version', value: { stringValue: '1.0.0' } }
+    ]);
+    expect(request.body).not.toContain('content');
+  });
+
   it('converts both supported UTC boundaries to exact nanosecond decimal strings', () => {
     const instance = exporter();
     instance.enqueue(input(TELEMETRY_METRIC_NAMES.SESSION_START, {
@@ -422,6 +475,15 @@ describe('strict enqueue boundary', () => {
     for (const candidate of invalid) {
       expect(() => exporter().enqueue(candidate)).toThrowError(TelemetryValidationError);
     }
+  });
+
+  it('rejects a provider failure stage forged onto the wrong metric through enqueue', () => {
+    const instance = exporter();
+    expect(() => instance.enqueue({
+      ...input(TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE),
+      providerFailureStage: 'auth'
+    })).toThrowError(TelemetryValidationError);
+    expect(instance.counter('telemetry.export.rejected')).toBe(1);
   });
 
   it('accepts only the closed provider and error pairs', () => {

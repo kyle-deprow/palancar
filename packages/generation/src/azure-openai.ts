@@ -24,7 +24,7 @@ const MAX_TRANSLATION_LENGTH = 256;
 const MAX_SUGGESTION_LENGTH = 160;
 const PROVIDER_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const AZURE_ENDPOINT =
-  /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.openai\.azure\.com$/;
+  /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.openai\.azure\.com$/;
 const DEPLOYMENT_PATTERN =
   /^(?=.{1,128}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/;
 const TOKEN_ENCODER = new TextEncoder();

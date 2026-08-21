@@ -17,10 +17,13 @@ import {
   TELEMETRY_METRIC_NAMES,
   TELEMETRY_OPERATIONS,
   TELEMETRY_OUTCOMES,
+  TELEMETRY_PROVIDER_FAILURE_STAGES,
   TELEMETRY_PROTOCOL_VERSION,
   TelemetryValidationError,
   createTelemetryRecord,
+  isTelemetryProviderFailureStage,
   sanitizeTelemetry,
+  sanitizeTelemetryForExport,
   summarizeError,
   type SanitizedTelemetryRecord,
   type TelemetryRecordInput,
@@ -33,6 +36,21 @@ const RAW_UUID = '11111111-1111-4111-8111-111111111111';
 const SPANISH_CONVERSATION = '¿Puedes traducir esta conversación, por favor?';
 const TURKISH_CONVERSATION = 'Bu konuşmayı Türkçeye çevirebilir misin?';
 const ENGLISH_CONVERSATION = 'Please translate this private conversation.';
+const PROVIDER_FAILURE_STAGES = [
+  'identity',
+  'timeout',
+  'transport',
+  'auth',
+  'rate_limit',
+  'http',
+  'response_size',
+  'response_envelope',
+  'finish_length',
+  'finish_other',
+  'completion_json',
+  'completion_schema',
+  'unknown'
+] as const;
 
 const CORRELATION_FIELDS = [
   'correlationId',
@@ -141,11 +159,41 @@ function expectValidation(input: unknown, reason?: TelemetryValidationReason): v
   expect(String(caught)).not.toMatch(/traducir|konuşmayı|private conversation|secret/i);
 }
 
+function expectExportValidation(input: unknown, reason?: TelemetryValidationReason): void {
+  let caught: unknown;
+  try {
+    sanitizeTelemetryForExport(input, DEPLOYMENT_SLOTS.DEV);
+  } catch (error: unknown) {
+    caught = error;
+  }
+
+  expect(caught).toBeInstanceOf(TelemetryValidationError);
+  if (reason !== undefined) {
+    expect((caught as TelemetryValidationError).reason).toBe(reason);
+  }
+}
+
 function withField(field: string, value: unknown): Record<string, unknown> {
   return { ...MINIMAL_RECORD, [field]: value };
 }
 
 describe('telemetry vocabulary and record sanitization', () => {
+  it('owns the exact frozen provider failure vocabulary and predicate', () => {
+    expect(TELEMETRY_PROVIDER_FAILURE_STAGES).toEqual(PROVIDER_FAILURE_STAGES);
+    expect(new Set(TELEMETRY_PROVIDER_FAILURE_STAGES)).toEqual(
+      new Set(PROVIDER_FAILURE_STAGES)
+    );
+    expect(TELEMETRY_PROVIDER_FAILURE_STAGES).toHaveLength(13);
+    expect(new Set(TELEMETRY_PROVIDER_FAILURE_STAGES).size).toBe(13);
+    expect(Object.isFrozen(TELEMETRY_PROVIDER_FAILURE_STAGES)).toBe(true);
+    for (const stage of PROVIDER_FAILURE_STAGES) {
+      expect(isTelemetryProviderFailureStage(stage)).toBe(true);
+    }
+    for (const value of ['HTTP', 'provider_stage_canary', undefined, null, {}, []]) {
+      expect(isTelemetryProviderFailureStage(value)).toBe(false);
+    }
+  });
+
   it('does not expose or accept the removed non-resumable vocabulary', () => {
     expect(Object.values(TELEMETRY_METRIC_NAMES)).not.toContain('transport.non_resumable');
     expect(Object.values(TELEMETRY_OUTCOMES)).not.toContain('non_resumable');
@@ -158,7 +206,13 @@ describe('telemetry vocabulary and record sanitization', () => {
     expect(new Set(names).size).toBe(names.length);
 
     for (const name of names) {
-      const record = sanitizeTelemetry({ ...MINIMAL_RECORD, name });
+      const record = sanitizeTelemetry({
+        ...MINIMAL_RECORD,
+        name,
+        ...(name === GENERATION_FAILURE_PROVIDER_RESPONSE
+          ? { providerFailureStage: 'unknown' }
+          : {})
+      });
       expect(record.name).toBe(name);
       expect(record.timestamp).toBe(TIMESTAMP);
     }
@@ -188,6 +242,9 @@ describe('telemetry vocabulary and record sanitization', () => {
       const record = sanitizeTelemetry({
         ...MINIMAL_RECORD,
         name,
+        ...(name === GENERATION_FAILURE_PROVIDER_RESPONSE
+          ? { providerFailureStage: 'unknown' }
+          : {}),
         count: 1,
         targetLanguage: TARGET_LANGUAGES.ES,
         operation: TELEMETRY_OPERATIONS.GENERATION,
@@ -209,6 +266,193 @@ describe('telemetry vocabulary and record sanitization', () => {
         expect(record).not.toHaveProperty(field);
       }
     }
+  });
+
+  it('accepts every fixed provider failure stage only on provider responses', () => {
+    for (const providerFailureStage of PROVIDER_FAILURE_STAGES) {
+      const record = sanitizeTelemetry({
+        ...MINIMAL_RECORD,
+        name: GENERATION_FAILURE_PROVIDER_RESPONSE,
+        providerFailureStage
+      });
+      expect(record).toMatchObject({
+        name: GENERATION_FAILURE_PROVIDER_RESPONSE,
+        providerFailureStage
+      });
+    }
+  });
+
+  it('rejects missing, forged, arbitrary, and misplaced provider failure stages', () => {
+    expectValidation(
+      { ...MINIMAL_RECORD, name: GENERATION_FAILURE_PROVIDER_RESPONSE },
+      'invalid-field'
+    );
+    expectValidation(
+      { ...MINIMAL_RECORD, name: GENERATION_FAILURE_PROVIDER_RESPONSE, providerFailureStage: undefined },
+      'invalid-field'
+    );
+    for (const value of [
+      'provider_stage_canary',
+      'HTTP',
+      1,
+      null,
+      Object.create(null),
+      new String('http')
+    ]) {
+      expectValidation(
+        { ...MINIMAL_RECORD, name: GENERATION_FAILURE_PROVIDER_RESPONSE, providerFailureStage: value },
+        undefined
+      );
+    }
+
+    expectValidation(
+      { ...MINIMAL_RECORD, name: TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE, providerFailureStage: 'http' },
+      'invalid-field'
+    );
+    expectValidation(
+      { ...MINIMAL_RECORD, providerFailureStage: 'http' },
+      'invalid-field'
+    );
+
+    let accessorReads = 0;
+    const accessor = {
+      ...MINIMAL_RECORD,
+      name: GENERATION_FAILURE_PROVIDER_RESPONSE
+    };
+    Object.defineProperty(accessor, 'providerFailureStage', {
+      enumerable: true,
+      get: () => {
+        accessorReads += 1;
+        throw new Error('provider stage accessor canary');
+      }
+    });
+    expectValidation(accessor, 'accessor');
+    expect(accessorReads).toBe(0);
+
+    const hostileProxy = new Proxy(
+      {
+        ...MINIMAL_RECORD,
+        name: GENERATION_FAILURE_PROVIDER_RESPONSE,
+        providerFailureStage: 'http'
+      },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('provider stage proxy canary');
+        }
+      }
+    );
+    expectValidation(hostileProxy, 'input-shape');
+  });
+
+  it('requires provider failure stages through the strict export boundary', () => {
+    const exportRecord = {
+      ...MINIMAL_RECORD,
+      name: GENERATION_FAILURE_PROVIDER_RESPONSE,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      providerFailureStage: 'http'
+    };
+    expect(sanitizeTelemetryForExport(exportRecord, DEPLOYMENT_SLOTS.DEV)).toMatchObject(
+      exportRecord
+    );
+
+    expectExportValidation(
+      { ...exportRecord, providerFailureStage: undefined },
+      'invalid-field'
+    );
+    expectExportValidation(
+      { ...exportRecord, providerFailureStage: 'forged-stage' },
+      'invalid-field'
+    );
+    expectExportValidation(
+      { ...exportRecord, providerFailureStage: undefined },
+      'invalid-field'
+    );
+    expectExportValidation(
+      {
+        ...exportRecord,
+        providerFailureStage: new Proxy({}, { get: () => 'http' })
+      },
+      'invalid-field'
+    );
+
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expectExportValidation(
+      { ...exportRecord, providerFailureStage: revoked.proxy },
+      'input-shape'
+    );
+    expectExportValidation(
+      { ...MINIMAL_RECORD, name: GENERATION_FAILURE_PROVIDER_RESPONSE, deploymentSlot: 'dev', count: 1 },
+      'invalid-field'
+    );
+
+    let reads = 0;
+    const accessor = { ...exportRecord };
+    Object.defineProperty(accessor, 'providerFailureStage', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return 'http';
+      }
+    });
+    expectExportValidation(accessor, 'accessor');
+    expect(reads).toBe(0);
+
+    expectExportValidation(
+      {
+        ...exportRecord,
+        name: TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE
+      },
+      'invalid-field'
+    );
+  });
+
+  it('exports every metric name with its exact value shape', () => {
+    const latencyNames = new Set<string>([
+      TELEMETRY_METRIC_NAMES.TRANSCRIPTION_FIRST_PARTIAL_LATENCY,
+      TELEMETRY_METRIC_NAMES.TRANSCRIPTION_FINAL_LATENCY,
+      TELEMETRY_METRIC_NAMES.TRANSLATION_LATENCY,
+      TELEMETRY_METRIC_NAMES.SUGGESTION_LATENCY
+    ]);
+    const audioNames = new Set<string>([
+      TELEMETRY_METRIC_NAMES.AUDIO_ACCEPTED_SAMPLES,
+      TELEMETRY_METRIC_NAMES.AUDIO_DUPLICATE_SAMPLES,
+      TELEMETRY_METRIC_NAMES.AUDIO_REJECTED_SAMPLES
+    ]);
+
+    for (const name of Object.values(TELEMETRY_METRIC_NAMES)) {
+      const record = {
+        ...MINIMAL_RECORD,
+        name,
+        deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+        ...(latencyNames.has(name)
+          ? { durationMs: 12 }
+          : audioNames.has(name)
+            ? { sampleCount: 160 }
+            : { count: 1 }),
+        ...(name === GENERATION_FAILURE_PROVIDER_RESPONSE
+          ? { providerFailureStage: 'unknown' }
+          : {})
+      };
+      expect(sanitizeTelemetryForExport(record, DEPLOYMENT_SLOTS.DEV).name).toBe(name);
+    }
+  });
+
+  it('allows the canonical Azure OpenAI provider/version pair at export', () => {
+    const record = sanitizeTelemetryForExport(
+      {
+        ...MINIMAL_RECORD,
+        name: TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE,
+        deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+        count: 1,
+        providerId: 'azure-openai-chat',
+        providerVersion: '1.0.0'
+      },
+      DEPLOYMENT_SLOTS.DEV
+    );
+    expect(record.providerId).toBe('azure-openai-chat');
+    expect(record.providerVersion).toBe('1.0.0');
   });
 
   it('accepts both target languages', () => {

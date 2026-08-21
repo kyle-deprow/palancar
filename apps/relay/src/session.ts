@@ -26,6 +26,7 @@ import {
   createAcceptedTargetTurn,
   GenerationError,
   GenerationService,
+  trustedGenerationProviderFailureStage,
   type GenerationCompletion
 } from '@palancar/generation';
 import {
@@ -60,7 +61,8 @@ import type {
   RelayAsyncEvent,
   RelayLanguageBoundaryMode,
   RelayMetricSink,
-  RelayProductionMetricInput,
+  RelayMetricName,
+  RelayProductionMetricInputForName,
   GenerationCompletedMessages
 } from './types.js';
 
@@ -131,6 +133,11 @@ type GenerationFailureMetricName =
   | 'generation.failure.invalid_generated_language'
   | 'generation.failure.language_validation'
   | 'generation.failure.internal';
+
+type RelayMetricObservationInput<Name extends RelayMetricName> =
+  Omit<RelayProductionMetricInputForName<Name>, 'timestamp' | 'targetLanguage'> & {
+    readonly targetLanguage?: TargetLanguage;
+  };
 
 const GENERATION_SERVICE_PROVIDER_GETTER = Object.getOwnPropertyDescriptor(
   GenerationService.prototype,
@@ -1596,20 +1603,16 @@ export class RelaySessionCore {
     return adapter;
   }
 
-  #recordMetric(
-    input: Omit<RelayProductionMetricInput, 'timestamp' | 'targetLanguage'> & {
-      readonly targetLanguage?: TargetLanguage;
-    }
-  ): void {
+  #recordMetric<Name extends RelayMetricName>(input: RelayMetricObservationInput<Name>): void {
     if (this.#recordingMetric) return;
     this.#recordingMetric = true;
     try {
       const targetLanguage = input.targetLanguage ?? this.#selectedTargetLanguage;
-      const record: RelayProductionMetricInput = Object.freeze({
+      const record = Object.freeze({
         ...input,
         timestamp: this.#clock.nowIso(),
         ...(targetLanguage === undefined ? {} : { targetLanguage })
-      });
+      }) as RelayProductionMetricInputForName<Name>;
       this.#metricSink.record(record);
     } catch {
       // Telemetry is observational and must never affect protocol behavior.
@@ -1804,15 +1807,27 @@ export class RelaySessionCore {
     active.generationFailureMetricRecorded = true;
     const name = generationFailureMetricName(error);
     const provider = this.#providerIdentitySnapshot();
-    this.#recordMetric({
-      name,
-      count: 1,
-      operation: 'generation',
-      outcome: 'failure',
-      ...(provider === undefined
-        ? {}
-        : { providerId: provider.id, providerVersion: provider.version })
-    });
+    const providerFields = provider === undefined
+      ? {}
+      : { providerId: provider.id, providerVersion: provider.version };
+    if (name === 'generation.failure.provider_response') {
+      this.#recordMetric({
+        name,
+        count: 1,
+        operation: 'generation',
+        outcome: 'failure',
+        providerFailureStage: trustedGenerationProviderFailureStage(error) ?? 'unknown',
+        ...providerFields
+      });
+    } else {
+      this.#recordMetric({
+        name,
+        count: 1,
+        operation: 'generation',
+        outcome: 'failure',
+        ...providerFields
+      });
+    }
     if (name === 'generation.failure.provider_response') {
       this.#recordProviderFailure(active, 'provider', provider);
     }

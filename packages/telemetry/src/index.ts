@@ -9,6 +9,36 @@ const MAX_GRAPH_OBJECTS = 2_048;
 const MAX_GRAPH_PROPERTIES = 16_384;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
+/** Canonical low-cardinality provider failure stages on the telemetry wire. */
+export const TELEMETRY_PROVIDER_FAILURE_STAGES = Object.freeze([
+  'identity',
+  'timeout',
+  'transport',
+  'auth',
+  'rate_limit',
+  'http',
+  'response_size',
+  'response_envelope',
+  'finish_length',
+  'finish_other',
+  'completion_json',
+  'completion_schema',
+  'unknown'
+] as const);
+
+export type TelemetryProviderFailureStage =
+  (typeof TELEMETRY_PROVIDER_FAILURE_STAGES)[number];
+
+const TELEMETRY_PROVIDER_FAILURE_STAGE_VALUES = new Set<string>(
+  TELEMETRY_PROVIDER_FAILURE_STAGES
+);
+
+export function isTelemetryProviderFailureStage(
+  value: unknown
+): value is TelemetryProviderFailureStage {
+  return typeof value === 'string' && TELEMETRY_PROVIDER_FAILURE_STAGE_VALUES.has(value);
+}
+
 /** Canonical low-cardinality metric and event names. */
 export const TELEMETRY_METRIC_NAMES = Object.freeze({
   SESSION_START: 'session.start',
@@ -156,8 +186,7 @@ export type ErrorCategory = TelemetryErrorCategory;
 export const TELEMETRY_PROTOCOL_VERSION = 1 as const;
 export type TelemetryProtocolVersion = typeof TELEMETRY_PROTOCOL_VERSION;
 
-export interface TelemetryRecordInput {
-  readonly name: TelemetryMetricName;
+interface TelemetryRecordFields {
   readonly timestamp: string;
   readonly protocolVersion?: TelemetryProtocolVersion;
   readonly durationMs?: number;
@@ -188,10 +217,23 @@ export interface TelemetryRecordInput {
   readonly errorId?: string;
 }
 
-export interface SanitizedTelemetryRecord extends Readonly<TelemetryRecordInput> {
-  readonly name: TelemetryMetricName;
-  readonly timestamp: string;
-}
+type TelemetryRecordForName<Name extends TelemetryMetricName> =
+  TelemetryRecordFields &
+  (Name extends typeof TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE
+    ? {
+        readonly name: Name;
+        readonly providerFailureStage: TelemetryProviderFailureStage;
+      }
+    : {
+        readonly name: Name;
+        readonly providerFailureStage?: never;
+      });
+
+export type TelemetryRecordInput = {
+  [Name in TelemetryMetricName]: TelemetryRecordForName<Name>;
+}[TelemetryMetricName];
+
+export type SanitizedTelemetryRecord = Readonly<TelemetryRecordInput>;
 
 export type TelemetryValidationReason =
   | 'input-shape'
@@ -286,6 +328,7 @@ const OUTPUT_KEYS = new Set<string>([
   'outcome',
   'providerId',
   'providerVersion',
+  'providerFailureStage',
   'deploymentSlot',
   'reconnectReason',
   'errorCategory',
@@ -541,7 +584,9 @@ function hasKey(descriptors: ReadonlyMap<string, PropertyDescriptor>, key: strin
   return descriptors.has(key);
 }
 
-function validateKnownFields(descriptors: ReadonlyMap<string, PropertyDescriptor>): void {
+function validateKnownFields(
+  descriptors: ReadonlyMap<string, PropertyDescriptor>,
+): void {
   const name = descriptorValue(descriptors, 'name');
   const timestamp = descriptorValue(descriptors, 'timestamp');
   if (!isAllowedValue(name, METRIC_NAME_VALUES)) {
@@ -584,6 +629,21 @@ function validateKnownFields(descriptors: ReadonlyMap<string, PropertyDescriptor
     }
   }
 
+  const providerFailureStagePresent = hasKey(descriptors, 'providerFailureStage');
+  if (name === TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE) {
+    if (
+      !providerFailureStagePresent ||
+      (providerFailureStagePresent &&
+        !isTelemetryProviderFailureStage(
+          descriptorValue(descriptors, 'providerFailureStage')
+        ))
+    ) {
+      fail('invalid-field');
+    }
+  } else if (providerFailureStagePresent) {
+    fail('invalid-field');
+  }
+
   for (const key of ['providerId', 'providerVersion'] as const) {
     if (hasKey(descriptors, key) && descriptorValue(descriptors, key) !== undefined) {
       if (!isProviderToken(descriptorValue(descriptors, key))) {
@@ -615,6 +675,7 @@ const EXPORT_PROVIDER_VERSIONS = new Map<string, string>([
   ['deterministic-mock', '1.0.0'],
   ['deterministic-mock-generation', '1.0.0'],
   ['azure-realtime', 'ga-transcription-websocket'],
+  ['azure-openai-chat', '1.0.0'],
   ['litellm-chat', '1.1.0']
 ]);
 

@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
-import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
 import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-import { ManagedIdentityCredential } from '@azure/identity';
+import type { AzureTokenProvider } from '@palancar/azure-auth';
 import {
   DEFAULT_NEGOTIATED_LIMITS,
   WEBSOCKET_SUBPROTOCOL,
@@ -55,7 +55,7 @@ import {
   TEST_CREDENTIAL,
   createTestHostSecurityComposition,
   createTestOptions,
-  createRelayHost as createRelayHostProduction,
+  createRelayHost as createRelayHostImplementation,
   createDevelopmentProvisionalLanguageBoundary,
   createFailClosedDeployedTextLanguageClassifier,
   isDevelopmentProvisionalGeneratedLanguageValidator,
@@ -76,8 +76,20 @@ const CONFIG_CANARY = 'relay-host-config-canary-invalid-origin';
 const PENDING_CREDENTIAL = 'C'.repeat(42) + 'E';
 const RELAY_MAIN_PATH = fileURLToPath(new URL('../dist/main.js', import.meta.url));
 
+function createRelayHostProduction(config: RelayHostConfig): RelayHost {
+  return createRelayHostImplementation(
+    config.generationProvider === undefined
+      ? { ...config, generationProvider: 'mock' }
+      : config
+  );
+}
+
 function createRelayHost(config: RelayHostConfig): RelayHost {
-  if (config.languageBoundaryMode === 'deny-all' || config.generationReadiness?.provider === 'litellm') {
+  if (
+    config.languageBoundaryMode === 'deny-all' ||
+    config.generationProvider === 'azure-openai' ||
+    config.generationReadiness?.provider === 'azure-openai-chat'
+  ) {
     const {
       securityFactory,
       metricSinkFactory,
@@ -811,82 +823,7 @@ function createBlockedDeliveryAdapter(): {
   };
 }
 
-const LITELLM_API_KEY = 'relay-host-test-litellm-key';
-const LITELLM_MODEL = 'palancar-generation';
 const READINESS_CANARY = 'relay-host-readiness-provider-canary';
-
-interface ReadinessFixtureOptions {
-  readonly catalogStatus?: number;
-  readonly catalogBody?: unknown;
-  readonly hangCatalog?: boolean;
-  readonly redirectCatalog?: boolean;
-}
-
-interface ReadinessFixture {
-  readonly server: HttpServer;
-  readonly baseUrl: string;
-  readonly getCatalogAuthorization: () => string | undefined;
-  readonly getCatalogRedirectAuthorization: () => string | undefined;
-  readonly getCatalogRedirectRequests: () => number;
-  close(): Promise<void>;
-}
-
-async function startReadinessFixture(options: ReadinessFixtureOptions = {}): Promise<ReadinessFixture> {
-  let catalogAuthorization: string | undefined;
-  let catalogRedirectAuthorization: string | undefined;
-  let catalogRedirectRequests = 0;
-  const server = createHttpServer((request, response) => {
-    if (request.url === '/v1/models') {
-      catalogAuthorization = request.headers.authorization;
-      if (options.hangCatalog === true) {
-        return;
-      }
-      if (options.redirectCatalog === true) {
-        response.statusCode = 302;
-        response.setHeader('location', '/v1/models-redirect-target');
-        response.end(READINESS_CANARY);
-        return;
-      }
-      const body = options.catalogBody ?? { data: [{ id: LITELLM_MODEL }] };
-      const text = typeof body === 'string' ? body : JSON.stringify(body);
-      response.statusCode = options.catalogStatus ?? 200;
-      response.setHeader('content-type', 'application/json');
-      response.end(text);
-      return;
-    }
-    if (request.url === '/v1/models-redirect-target') {
-      catalogRedirectRequests += 1;
-      catalogRedirectAuthorization = request.headers.authorization;
-      response.statusCode = 200;
-      response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ data: [{ id: LITELLM_MODEL }] }));
-      return;
-    }
-    response.statusCode = 404;
-    response.end();
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(4000, '127.0.0.1', () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
-  });
-  return {
-    server,
-    baseUrl: 'http://127.0.0.1:4000',
-    getCatalogAuthorization: () => catalogAuthorization,
-    getCatalogRedirectAuthorization: () => catalogRedirectAuthorization,
-    getCatalogRedirectRequests: () => catalogRedirectRequests,
-    close: () => new Promise<void>((resolve, reject) => {
-      if (!server.listening) {
-        resolve();
-        return;
-      }
-      server.close((error) => error === undefined ? resolve() : reject(error));
-    })
-  };
-}
 
 function mockEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
@@ -897,7 +834,7 @@ function mockEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   };
 }
 
-function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+function azureEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     PALANCAR_SECURITY_MODE: 'azure-table',
     PALANCAR_RELAY_BIND_HOST: '0.0.0.0',
@@ -907,11 +844,10 @@ function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEn
     PALANCAR_SECURITY_STATE_TABLE: 'SecurityState',
     PALANCAR_RATE_STATE_TABLE: 'RateState',
     AZURE_CLIENT_ID: '11111111-1111-4111-8111-111111111111',
-    PALANCAR_GENERATION_PROVIDER: 'litellm',
+    PALANCAR_GENERATION_PROVIDER: 'azure-openai',
     PALANCAR_TRANSCRIPTION_PROVIDER: 'mock',
-    PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000',
-    PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY,
-    PALANCAR_LITELLM_MODEL: LITELLM_MODEL,
+    PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com',
+    PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'gpt-5.6-luna',
     PALANCAR_DEPLOYMENT_SLOT: 'dev',
     APPLICATIONINSIGHTS_CONNECTION_STRING:
       'InstrumentationKey=11111111-1111-4111-8111-111111111111;' +
@@ -922,12 +858,130 @@ function litellmEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEn
   };
 }
 
+const VALID_AZURE_TRANSCRIPTION_ENDPOINT =
+  'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription';
+
+const allowedPalancarEnvironmentCases: ReadonlyArray<{
+  readonly name: string;
+  readonly environment: NodeJS.ProcessEnv;
+}> = [
+  { name: 'PALANCAR_RELAY_ORIGIN', environment: mockEnvironment({ PALANCAR_RELAY_ORIGIN: 'wss://127.0.0.1' }) },
+  {
+    name: 'PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON',
+    environment: mockEnvironment({ PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON: '["https://app.example"]' })
+  },
+  {
+    name: 'PALANCAR_ALLOW_NULL_BROWSER_ORIGIN',
+    environment: mockEnvironment({ PALANCAR_ALLOW_NULL_BROWSER_ORIGIN: 'true' })
+  },
+  { name: 'PALANCAR_SECURITY_MODE', environment: mockEnvironment({ PALANCAR_SECURITY_MODE: 'local-mock' }) },
+  {
+    name: 'PALANCAR_SECURITY_STATE_TABLE',
+    environment: azureEnvironment({ PALANCAR_SECURITY_STATE_TABLE: 'SecurityState' })
+  },
+  {
+    name: 'PALANCAR_RATE_STATE_TABLE',
+    environment: azureEnvironment({ PALANCAR_RATE_STATE_TABLE: 'RateState' })
+  },
+  {
+    name: 'PALANCAR_GENERATION_PROVIDER',
+    environment: mockEnvironment({ PALANCAR_GENERATION_PROVIDER: 'mock' })
+  },
+  {
+    name: 'PALANCAR_TRANSCRIPTION_PROVIDER',
+    environment: mockEnvironment({ PALANCAR_TRANSCRIPTION_PROVIDER: 'mock' })
+  },
+  {
+    name: 'PALANCAR_RELAY_ENVIRONMENT',
+    environment: azureEnvironment({ PALANCAR_RELAY_ENVIRONMENT: ENVIRONMENT })
+  },
+  {
+    name: 'PALANCAR_RELAY_BIND_HOST',
+    environment: mockEnvironment({ PALANCAR_RELAY_BIND_HOST: '127.0.0.1' })
+  },
+  {
+    name: 'PALANCAR_GATE_POLICY_VERSION',
+    environment: mockEnvironment({ PALANCAR_GATE_POLICY_VERSION: GATE_POLICY_VERSION })
+  },
+  {
+    name: 'PALANCAR_WORKLOAD_TABLE_ENDPOINT',
+    environment: azureEnvironment({
+      PALANCAR_WORKLOAD_TABLE_ENDPOINT: 'https://palancartest.table.core.windows.net'
+    })
+  },
+  {
+    name: 'PALANCAR_DEPLOYMENT_SLOT',
+    environment: azureEnvironment({ PALANCAR_DEPLOYMENT_SLOT: 'dev' })
+  },
+  {
+    name: 'PALANCAR_LANGUAGE_BOUNDARY_MODE',
+    environment: azureEnvironment({ PALANCAR_LANGUAGE_BOUNDARY_MODE: 'deny-all' })
+  },
+  {
+    name: 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT',
+    environment: azureEnvironment({
+      PALANCAR_TRANSCRIPTION_PROVIDER: 'azure-realtime',
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: VALID_AZURE_TRANSCRIPTION_ENDPOINT,
+      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT: 'palancar-transcription'
+    })
+  },
+  {
+    name: 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT',
+    environment: azureEnvironment({
+      PALANCAR_TRANSCRIPTION_PROVIDER: 'azure-realtime',
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: VALID_AZURE_TRANSCRIPTION_ENDPOINT,
+      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT: 'palancar-transcription'
+    })
+  },
+  {
+    name: 'PALANCAR_AZURE_GENERATION_ENDPOINT',
+    environment: azureEnvironment({
+      PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com'
+    })
+  },
+  {
+    name: 'PALANCAR_AZURE_GENERATION_DEPLOYMENT',
+    environment: azureEnvironment({
+      PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'gpt-5.6-luna'
+    })
+  }
+];
+
+const unknownPalancarEnvironmentCases: ReadonlyArray<{
+  readonly mode: 'local-mock' | 'deployed';
+  readonly name: string;
+  readonly value: string | undefined;
+  readonly environment: NodeJS.ProcessEnv;
+}> = [
+  'PALANCAR_TRANSCRIPTION_API_KEY',
+  'PALANCAR_TRANSCRIPTION_ENDPOINT',
+  'PALANCAR_RELAY_PORT',
+  'PALANCAR_OPENAI_API_KEY',
+  'PALANCAR_relay_origin',
+  'PALANCAR_RÉLAY_ORIGIN',
+  'PALANCAR_RELAY_ORIGIN＿',
+  'PALANCAR_RELAY_ORIGIN\u200B',
+  'PALANCAR_RELAY_ORIG\u0406N',
+  'PALANCAR_😀',
+  'PALANCAR_RELAY_ORIGIN_EXTRA',
+  'PALANCAR_'
+].flatMap((name) => [
+  {
+    mode: 'local-mock' as const,
+    name,
+    value: 'namespace-secret',
+    environment: mockEnvironment({ [name]: 'namespace-secret' })
+  },
+  {
+    mode: 'deployed' as const,
+    name,
+    value: 'namespace-secret',
+    environment: azureEnvironment({ [name]: 'namespace-secret' })
+  }
+]);
+
 function hostPort(host: RelayHost): number {
   return (host.server.address() as { readonly port: number }).port;
-}
-
-function expectedLiteLLMReadiness(upstreamReady: boolean): JsonObject {
-  return { ready: upstreamReady };
 }
 
 function createReadinessAdapter(
@@ -941,19 +995,10 @@ function createReadinessAdapter(
   };
 }
 
-async function expectFailedLiteLLMReadiness(host: RelayHost): Promise<void> {
-  const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
-  expect(ready.status).toBe(503);
-  const readyBody = await responseJson(ready);
-  expect(readyBody).toEqual(expectedLiteLLMReadiness(false));
-  expect(JSON.stringify(readyBody)).not.toContain(READINESS_CANARY);
-  expect(JSON.stringify(readyBody)).not.toContain(LITELLM_API_KEY);
-}
-
 describe('relay host configuration and readiness', () => {
   it('selects fixture only for the exact local composition and deny-all for deployment', () => {
     const local = parseRelayHostConfig(mockEnvironment());
-    const deployed = parseRelayHostConfig(litellmEnvironment());
+    const deployed = parseRelayHostConfig(azureEnvironment());
 
     expect(local.languageBoundaryMode).toBe('fixture');
     expect(local.generationService?.validator).toEqual({
@@ -961,14 +1006,14 @@ describe('relay host configuration and readiness', () => {
       version: '1.0.0'
     });
     expect(deployed.languageBoundaryMode).toBe('deny-all');
-    expect(deployed.generationService?.validator).toEqual({
-      id: 'fail-closed-generated-language',
-      version: '1.0.0'
-    });
+    expect(deployed.generationProvider).toBe('azure-openai');
+    expect(deployed.azureGenerationEndpoint).toBe('https://palancar.openai.azure.com');
+    expect(deployed.azureGenerationDeployment).toBe('gpt-5.6-luna');
+    expect(deployed.generationService).toBeUndefined();
   });
 
   it('enables the branded provisional boundary only through an explicit dev setting', () => {
-    const config = parseRelayHostConfig(litellmEnvironment({
+    const config = parseRelayHostConfig(azureEnvironment({
       PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
     }));
     expect(config.languageBoundaryMode).toBe('development-provisional');
@@ -979,16 +1024,14 @@ describe('relay host configuration and readiness', () => {
         config.developmentProvisionalGenerationValidator
       )
     ).toBe(true);
-    expect(config.generationService?.languageValidationMode).toBe(
-      'development-provisional'
-    );
+    expect(config.generationService).toBeUndefined();
     expect(() => createRelayHost(config)).not.toThrow();
   });
 
   it.each(['staging', 'production'] as const)(
     'rejects the provisional boundary in the %s deployment slot',
     (deploymentSlot) => {
-      expect(() => parseRelayHostConfig(litellmEnvironment({
+      expect(() => parseRelayHostConfig(azureEnvironment({
         PALANCAR_DEPLOYMENT_SLOT: deploymentSlot,
         PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
       }))).toThrow('Invalid relay host configuration.');
@@ -998,7 +1041,7 @@ describe('relay host configuration and readiness', () => {
   it.each(['dev', 'staging', 'production'] as const)(
     'accepts an exact deny-all boundary in the %s deployment slot',
     (deploymentSlot) => {
-      const config = parseRelayHostConfig(litellmEnvironment({
+      const config = parseRelayHostConfig(azureEnvironment({
         PALANCAR_DEPLOYMENT_SLOT: deploymentSlot,
         PALANCAR_LANGUAGE_BOUNDARY_MODE: 'deny-all'
       }));
@@ -1033,14 +1076,11 @@ describe('relay host configuration and readiness', () => {
     });
     try {
       const isolatedHost = await import('../src/host.js');
-      const config = isolatedHost.parseRelayHostConfig(litellmEnvironment({
+      const config = isolatedHost.parseRelayHostConfig(azureEnvironment({
         PALANCAR_LANGUAGE_BOUNDARY_MODE: 'deny-all'
       }));
       expect(config.languageBoundaryMode).toBe('deny-all');
-      expect(config.generationService?.validator).toEqual({
-        id: 'fail-closed-generated-language',
-        version: '1.0.0'
-      });
+      expect(config.generationService).toBeUndefined();
       expect(boundaryFactory).not.toHaveBeenCalled();
     } finally {
       vi.doUnmock('../src/provisional-language-boundary.js');
@@ -1049,7 +1089,7 @@ describe('relay host configuration and readiness', () => {
   });
 
   it('requires the exact branded provisional validator identity used by GenerationService', () => {
-    const base = parseRelayHostConfig(litellmEnvironment({
+    const base = parseRelayHostConfig(azureEnvironment({
       PALANCAR_LANGUAGE_BOUNDARY_MODE: 'development-provisional'
     }));
     const trusted = base.developmentProvisionalGenerationValidator;
@@ -1068,7 +1108,7 @@ describe('relay host configuration and readiness', () => {
     }));
     const service = new GenerationService({
       provider: {
-        id: 'litellm-chat',
+        id: 'azure-openai-chat',
         version: '1.0.0',
         complete
       },
@@ -1085,7 +1125,7 @@ describe('relay host configuration and readiness', () => {
     const exactBoundary = createDevelopmentProvisionalLanguageBoundary();
     const exactService = new GenerationService({
       provider: new DeterministicMockProvider({
-        id: 'litellm-chat',
+        id: 'azure-openai-chat',
         complete: { result: {
           englishTranslation: 'unused',
           suggestions: [
@@ -1100,18 +1140,142 @@ describe('relay host configuration and readiness', () => {
     expect(exactService.usesValidator(exactBoundary.generatedLanguageValidator)).toBe(true);
   });
 
-  it('does not perform fetch or managed-identity token work while parsing', () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch');
-    const tokenSpy = vi.spyOn(ManagedIdentityCredential.prototype, 'getToken');
-    try {
-      expect(() => parseRelayHostConfig(litellmEnvironment())).not.toThrow();
-      expect(fetchSpy).not.toHaveBeenCalled();
-      expect(tokenSpy).not.toHaveBeenCalled();
-    } finally {
-      fetchSpy.mockRestore();
-      tokenSpy.mockRestore();
+  it('rejects caller-owned Azure generation service and readiness contracts', () => {
+    const base = parseRelayHostConfig(azureEnvironment());
+    const service = new GenerationService({
+      provider: {
+        id: 'azure-openai-chat',
+        version: '1.0.0',
+        complete: async () => ({
+          englishTranslation: 'unused',
+          suggestions: [
+            { englishText: 'unused', selectedTargetText: 'unused' },
+            { englishText: 'unused', selectedTargetText: 'unused' }
+          ]
+        })
+      },
+      validator: new FailClosedGeneratedLanguageValidator()
+    });
+    expect(() => createRelayHostImplementation({
+      ...base,
+      generationService: service
+    })).toThrow('Invalid relay host configuration.');
+    expect(() => createRelayHostImplementation({
+      ...base,
+      generationReadiness: {
+        provider: 'azure-openai-chat',
+        providerId: 'azure-openai-chat',
+        model: 'gpt-5.6-luna',
+        check: async () => true
+      }
+    })).toThrow('Invalid relay host configuration.');
+  });
+
+  it('rejects a missing explicit generation mode before executable composition', () => {
+    const config = {
+      environment: 'local-mock',
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: {
+        ...createTestHostSecurityComposition(),
+        mode: 'local-mock' as const
+      },
+      languageBoundaryMode: 'fixture' as const
+    };
+    expect(() => createRelayHostImplementation(config)).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it('rejects unsafe Azure factory results without invoking hostile fields or leaking rollback state', () => {
+    const base = parseRelayHostConfig(azureEnvironment());
+    const complete = async (): Promise<GenerationProviderCompletion> => ({
+      englishTranslation: 'unused',
+      suggestions: [
+        { englishText: 'unused', selectedTargetText: 'unused' },
+        { englishText: 'unused', selectedTargetText: 'unused' }
+      ]
+    });
+    const candidates: Array<{
+      readonly name: string;
+      readonly value: () => unknown;
+      readonly invoked: () => boolean;
+    }> = [];
+    candidates.push({
+      name: 'proxy',
+      value: () => new Proxy({ id: 'azure-openai-chat', version: '1.0.0', complete }, {}),
+      invoked: () => false
+    });
+    for (const field of ['id', 'version', 'complete'] as const) {
+      let invoked = false;
+      const candidate: Record<string, unknown> = {
+        id: 'azure-openai-chat',
+        version: '1.0.0',
+        complete
+      };
+      Object.defineProperty(candidate, field, {
+        enumerable: true,
+        get: () => {
+          invoked = true;
+          throw new Error('factory field canary');
+        }
+      });
+      candidates.push({ name: `${field} accessor`, value: () => candidate, invoked: () => invoked });
+    }
+
+    for (const candidate of candidates) {
+      const tokenClose = vi.fn();
+      expect(() => createRelayHostImplementation({
+        ...base,
+        azureTokenSourceFactory: () => ({
+          tokenProvider: async () => ({
+            token: 'unused',
+            expiresOnTimestamp: Date.now() + 600_000
+          }),
+          close: tokenClose
+        }),
+        azureGenerationProviderFactory: () => candidate.value() as GenerationProvider
+      })).toThrow('Invalid relay host configuration.');
+      expect(candidate.invoked(), candidate.name).toBe(false);
+      expect(tokenClose, candidate.name).toHaveBeenCalledTimes(1);
     }
   });
+
+  it('does not perform fetch or token-source work while parsing', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    try {
+      expect(() => parseRelayHostConfig(azureEnvironment())).not.toThrow();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it.each(allowedPalancarEnvironmentCases)(
+    'accepts the supported PALANCAR_ namespace key: $name',
+    ({ environment }) => {
+      expect(() => parseRelayHostConfig(environment)).not.toThrow();
+    }
+  );
+
+  it.each(unknownPalancarEnvironmentCases)(
+    'rejects the unknown $mode PALANCAR_ namespace key: $name',
+    ({ environment, name, value }) => {
+      let thrown: unknown;
+      try {
+        parseRelayHostConfig(environment);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(TypeError);
+      expect(thrown).toMatchObject({ message: 'Invalid relay host configuration.' });
+      if (thrown instanceof Error) {
+        expect(thrown.message).not.toContain(name);
+        expect(thrown.message).not.toContain(value);
+      }
+    }
+  );
 
   it.each([
     ['boundary selector', { PALANCAR_LANGUAGE_BOUNDARY_MODE: 'production-approved' }],
@@ -1129,9 +1293,171 @@ describe('relay host configuration and readiness', () => {
     ['raw OTLP exporter', { PALANCAR_OTLP_ENDPOINT: 'http://127.0.0.1:4317' }],
     ['Azure transcription API key', { PALANCAR_AZURE_TRANSCRIPTION_API_KEY: 'secret' }]
   ])('rejects deployed environment contamination: %s', (_label, override) => {
-    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
+    expect(() => parseRelayHostConfig(azureEnvironment(override))).toThrow(
       'Invalid relay host configuration.'
     );
+  });
+
+  it('accepts only the fixed Azure generation environment and defers provider construction', () => {
+    const config = parseRelayHostConfig(azureEnvironment());
+    expect(config.generationProvider).toBe('azure-openai');
+    expect(config.azureGenerationEndpoint).toBe('https://palancar.openai.azure.com');
+    expect(config.azureGenerationDeployment).toBe('gpt-5.6-luna');
+    expect(config.generationService).toBeUndefined();
+    expect(config.generationReadiness).toBeUndefined();
+  });
+
+  it.each([
+    ['missing endpoint', { PALANCAR_AZURE_GENERATION_ENDPOINT: undefined }],
+    ['uppercase scheme', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'HTTPS://palancar.openai.azure.com' }],
+    ['uppercase host', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://Palancar.openai.azure.com' }],
+    ['trailing slash', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com/' }],
+    ['port', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com:443' }],
+    ['path', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com/openai' }],
+    ['query', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com?x=1' }],
+    ['fragment', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com#x' }],
+    ['userinfo', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://user@palancar.openai.azure.com' }],
+    ['wrong suffix', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.net' }],
+    ['doubled suffix', { PALANCAR_AZURE_GENERATION_ENDPOINT: 'https://palancar.openai.azure.com.openai.azure.com' }],
+    ['whitespace', { PALANCAR_AZURE_GENERATION_ENDPOINT: ' https://palancar.openai.azure.com' }]
+  ])('rejects Azure generation endpoint lookalike: %s', (_label, override) => {
+    expect(() => parseRelayHostConfig(azureEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it.each([
+    ['missing deployment', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: undefined }],
+    ['wrong model', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'gpt-5.6-luna2' }],
+    ['wrong case', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'GPT-5.6-LUNA' }],
+    ['trailing whitespace', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'gpt-5.6-luna ' }],
+    ['leading whitespace', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: ' gpt-5.6-luna' }],
+    ['version lookalike', { PALANCAR_AZURE_GENERATION_DEPLOYMENT: 'gpt-5.6-luna-2026-07-09' }]
+  ])('rejects Azure generation deployment lookalike: %s', (_label, override) => {
+    expect(() => parseRelayHostConfig(azureEnvironment(override))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it.each([
+    'PALANCAR_LITELLM_API_KEY',
+    'PALANCAR_LITELLM_BASE_URL',
+    'OPENROUTER_API_KEY',
+    'OPENROUTER_BASE_URL',
+    'LITELLM_MASTER_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_API_VERSION',
+    'OPENAI_SCOPE',
+    'OPENAI_BASE_URL',
+    'OPENAI_ORGANIZATION',
+    'OPENAI_MODEL',
+    'AZURE_OPENAI_API_KEY',
+    'AZURE_OPENAI_API_VERSION',
+    'AZURE_OPENAI_SCOPE',
+    'AZURE_OPENAI_ENDPOINT',
+    'AZURE_OPENAI_DEPLOYMENT',
+    'AZURE_OPENAI_RESOURCE',
+    'AZURE_API_KEY',
+    'PALANCAR_GENERATION_ENDPOINT',
+    'PALANCAR_GENERATION_DEPLOYMENT',
+    'PALANCAR_GENERATION_MODEL',
+    'PALANCAR_GENERATION_API_KEY',
+    'PALANCAR_AZURE_GENERATION_SCOPE',
+    'PALANCAR_AZURE_GENERATION_API_VERSION',
+    'PALANCAR_GENERATION_SCOPE',
+    'PALANCAR_GENERATION_API_VERSION',
+    'PALANCAR_AZURE_GENERATION_API_KEY',
+    'PALANCAR_AZURE_GENERATION_MODEL'
+  ])('rejects retired keys and configurable Azure generation names in deployed parsing: %s', (name) => {
+    expect(() => parseRelayHostConfig(azureEnvironment({ [name]: 'secret' }))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it.each([
+    'PALANCAR_LITELLM_API_KEY',
+    'OPENROUTER_API_KEY',
+    'OPENROUTER_MODEL',
+    'LITELLM_MASTER_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_API_VERSION',
+    'OPENAI_SCOPE',
+    'AZURE_OPENAI_API_KEY',
+    'AZURE_OPENAI_ENDPOINT',
+    'AZURE_OPENAI_DEPLOYMENT',
+    'AZURE_API_KEY',
+    'PALANCAR_GENERATION_ENDPOINT',
+    'PALANCAR_GENERATION_DEPLOYMENT',
+    'PALANCAR_AZURE_GENERATION_SCOPE'
+  ])('rejects retired keys and configurable Azure generation names in local parsing: %s', (name) => {
+    expect(() => parseRelayHostConfig(mockEnvironment({ [name]: 'secret' }))).toThrow(
+      'Invalid relay host configuration.'
+    );
+  });
+
+  it('permits only the explicit generation provider selector in the generation namespace', () => {
+    expect(() => parseRelayHostConfig(mockEnvironment({
+      PALANCAR_GENERATION_PROVIDER: 'mock'
+    }))).not.toThrow();
+    expect(() => parseRelayHostConfig(azureEnvironment({
+      PALANCAR_GENERATION_PROVIDER: 'azure-openai'
+    }))).not.toThrow();
+  });
+
+  it.each([
+    'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT',
+    'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT'
+  ])('rejects Azure transcription settings for mock transcription: %s', (name) => {
+    expect(() => parseRelayHostConfig(azureEnvironment({
+      [name]: name.endsWith('ENDPOINT')
+        ? 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription'
+        : 'palancar-transcription'
+    }))).toThrow('Invalid relay host configuration.');
+  });
+
+  it('permits the exact Azure transcription pair only for azure-realtime', () => {
+    const config = parseRelayHostConfig(azureEnvironment({
+      PALANCAR_TRANSCRIPTION_PROVIDER: 'azure-realtime',
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: VALID_AZURE_TRANSCRIPTION_ENDPOINT,
+      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT: 'palancar-transcription'
+    }));
+    expect(config.transcriptionProvider).toBe('azure-realtime');
+    expect(config.azureTranscriptionDeployment).toBe('palancar-transcription');
+  });
+
+  it('enforces the 63-character Azure transcription DNS label boundary', () => {
+    const endpointForLabel = (label: string): string =>
+      `wss://${label}.openai.azure.com/openai/v1/realtime?intent=transcription`;
+    const acceptedEndpoint = endpointForLabel('a'.repeat(63));
+    const rejectedEndpoint = endpointForLabel('a'.repeat(64));
+    const base = {
+      PALANCAR_TRANSCRIPTION_PROVIDER: 'azure-realtime' as const,
+      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT: 'palancar-transcription'
+    };
+
+    const accepted = parseRelayHostConfig(azureEnvironment({
+      ...base,
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: acceptedEndpoint
+    }));
+    expect(accepted.azureTranscriptionEndpoint).toBe(acceptedEndpoint);
+    expect(() => parseRelayHostConfig(azureEnvironment({
+      ...base,
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: rejectedEndpoint
+    }))).toThrow('Invalid relay host configuration.');
+  });
+
+  it.each([
+    ['uppercase scheme', 'WSS://palancar.openai.azure.com/openai/v1/realtime?intent=transcription'],
+    ['uppercase host', 'wss://Palancar.openai.azure.com/openai/v1/realtime?intent=transcription'],
+    ['wrong suffix', 'wss://palancar.openai.azure.net/openai/v1/realtime?intent=transcription'],
+    ['wrong path', 'wss://palancar.openai.azure.com/openai/v1/realtime'],
+    ['wrong query', 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=generation']
+  ])('preserves canonical Azure transcription endpoint rules: %s', (_label, endpoint) => {
+    expect(() => parseRelayHostConfig(azureEnvironment({
+      PALANCAR_TRANSCRIPTION_PROVIDER: 'azure-realtime',
+      PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT: endpoint,
+      PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT: 'palancar-transcription'
+    }))).toThrow('Invalid relay host configuration.');
   });
 
   it('parses an explicit mock generation provider', () => {
@@ -1149,7 +1475,7 @@ describe('relay host configuration and readiness', () => {
   });
 
   it('rejects fixture and fail-closed identities from future production-approved injection', () => {
-    const base = parseRelayHostConfig(litellmEnvironment());
+    const base = parseRelayHostConfig(azureEnvironment());
     const fixture = parseRelayHostConfig(mockEnvironment());
     const classifier = createFailClosedDeployedTextLanguageClassifier();
     const fixtureGenerationService = fixture.generationService;
@@ -1326,13 +1652,13 @@ describe('relay host configuration and readiness', () => {
 
   it('rejects executable configuration without an explicit generation provider generically', () => {
     expect(() => parseRelayHostConfig({})).toThrow('Invalid relay host configuration.');
-    expect(() => parseRelayHostConfig({})).not.toThrow(LITELLM_API_KEY);
+    expect(() => parseRelayHostConfig({})).not.toThrow('secret');
   });
 
   it.each([
     ['non-loopback bind', { PALANCAR_RELAY_BIND_HOST: '0.0.0.0' }],
     ['non-loopback origin', { PALANCAR_RELAY_ORIGIN: 'wss://relay.example' }],
-    ['LiteLLM setting', { PALANCAR_LITELLM_API_KEY: LITELLM_API_KEY }],
+    ['retired provider setting', { PALANCAR_LITELLM_API_KEY: 'secret' }],
     ['Azure setting', { AZURE_CLIENT_ID: '11111111-1111-4111-8111-111111111111' }]
   ])('rejects local-mock composition with %s', (_name, override) => {
     expect(() => parseRelayHostConfig(mockEnvironment(override))).toThrow(
@@ -1346,174 +1672,9 @@ describe('relay host configuration and readiness', () => {
     ['RateState name', { PALANCAR_RATE_STATE_TABLE: 'Wrong' }],
     ['runtime UAMI', { AZURE_CLIENT_ID: undefined }]
   ])('rejects azure-table composition with invalid %s', (_name, override) => {
-    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
+    expect(() => parseRelayHostConfig(azureEnvironment(override))).toThrow(
       'Invalid relay host configuration.'
     );
-  });
-
-  it('creates LiteLLM provider identity without exposing its API key', () => {
-    const config = parseRelayHostConfig(litellmEnvironment());
-
-    expect(config.generationService?.provider).toEqual({ id: 'litellm-chat', version: '1.1.0' });
-    expect(JSON.stringify(config)).not.toContain(LITELLM_API_KEY);
-  });
-
-  it.each([
-    ['missing base URL', { PALANCAR_LITELLM_BASE_URL: undefined }],
-    ['missing API key', { PALANCAR_LITELLM_API_KEY: undefined }],
-    ['missing model', { PALANCAR_LITELLM_MODEL: undefined }],
-    ['malformed base URL', { PALANCAR_LITELLM_BASE_URL: 'not-a-url' }],
-    ['localhost alias', { PALANCAR_LITELLM_BASE_URL: 'http://localhost:4000' }],
-    ['HTTPS', { PALANCAR_LITELLM_BASE_URL: 'https://127.0.0.1:4000' }],
-    ['path', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000/v1' }],
-    ['trailing slash', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4000/' }],
-    ['wrong port', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.1:4001' }],
-    ['wrong host', { PALANCAR_LITELLM_BASE_URL: 'http://127.0.0.2:4000' }],
-    ['wrong model', { PALANCAR_LITELLM_MODEL: 'other-generation' }],
-    ['malformed timeout', { PALANCAR_LITELLM_TIMEOUT_MS: 'not-a-number' }]
-  ])('rejects %s with a generic config error', (_name, override) => {
-    expect(() => parseRelayHostConfig(litellmEnvironment(override))).toThrow(
-      'Invalid relay host configuration.'
-    );
-  });
-
-  it('rejects noncanonical programmatic LiteLLM readiness before acquisition', () => {
-    const securityFactory = vi.fn(() => testSecurityWith());
-    const metricSinkFactory = vi.fn(() => productionTestMetricSink());
-    const generationService = new GenerationService({
-      provider: {
-        id: 'litellm-chat',
-        version: '1.0.0',
-        complete: async () => {
-          throw new Error('unused');
-        }
-      },
-      validator: new FailClosedGeneratedLanguageValidator()
-    });
-    expect(() => createRelayHostProduction({
-      environment: ENVIRONMENT,
-      origin: ORIGIN,
-      port: 0,
-      gatePolicyVersion: GATE_POLICY_VERSION,
-      securityMode: 'azure-table',
-      securityFactory,
-      languageBoundaryMode: 'deny-all',
-      generationService,
-      generationReadiness: {
-        provider: 'litellm',
-        providerId: 'litellm-chat',
-        baseUrl: 'http://localhost:4000' as 'http://127.0.0.1:4000',
-        model: 'palancar-generation',
-        check: async () => true
-      },
-      metricSinkFactory
-    })).toThrow('Invalid relay host configuration.');
-    expect(securityFactory).not.toHaveBeenCalled();
-    expect(metricSinkFactory).not.toHaveBeenCalled();
-  });
-
-  it('keeps health process-only while LiteLLM readiness is failing', async () => {
-    const fixture = await startReadinessFixture({
-      catalogStatus: 503,
-      catalogBody: JSON.stringify({ error: READINESS_CANARY })
-    });
-    let host: RelayHost | undefined;
-    try {
-      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
-        PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
-      })));
-      await host.start();
-      const health = await fetch(`http://127.0.0.1:${hostPort(host)}/healthz`);
-      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
-
-      expect(health.status).toBe(200);
-      expect(await responseJson(health)).toEqual({ ok: true });
-      expect(ready.status).toBe(503);
-      const readyBody = await responseJson(ready);
-      expect(readyBody).toEqual(expectedLiteLLMReadiness(false));
-      expect(JSON.stringify(readyBody)).not.toContain(READINESS_CANARY);
-      expect(JSON.stringify(readyBody)).not.toContain(LITELLM_API_KEY);
-    } finally {
-      await host?.stop();
-      await fixture.close();
-    }
-  });
-
-  it('returns content-free ready status for one authenticated LiteLLM alias', async () => {
-    const fixture = await startReadinessFixture();
-    let host: RelayHost | undefined;
-    try {
-      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
-        PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
-      })));
-      await host.start();
-      const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
-
-      expect(ready.status).toBe(200);
-      expect(await responseJson(ready)).toEqual(expectedLiteLLMReadiness(true));
-      expect(fixture.getCatalogAuthorization()).toBe(`Bearer ${LITELLM_API_KEY}`);
-    } finally {
-      await host?.stop();
-      await fixture.close();
-    }
-  });
-
-  it.each([
-    ['catalog non-2xx', {
-      catalogStatus: 503,
-      catalogBody: { data: [{ id: LITELLM_MODEL }] }
-    }],
-    ['catalog timeout', { hangCatalog: true }],
-    ['catalog malformed JSON', { catalogBody: `{not-json:${READINESS_CANARY}` }],
-    ['catalog body over 16 KiB', {
-      catalogBody: JSON.stringify({
-        data: [{ id: LITELLM_MODEL }],
-        padding: `${READINESS_CANARY}${'x'.repeat(16_384)}`
-      })
-    }],
-    ['duplicate alias', {
-      catalogBody: {
-        data: [{ id: LITELLM_MODEL }, { id: LITELLM_MODEL }],
-        error: READINESS_CANARY
-      }
-    }],
-    ['missing alias', {
-      catalogBody: { data: [{ id: 'other-model' }], error: READINESS_CANARY }
-    }]
-  ])('returns exact content-free 503 for LiteLLM readiness failure: %s', async (_name, options) => {
-    const fixture = await startReadinessFixture(options);
-    let host: RelayHost | undefined;
-    try {
-      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
-        PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
-      })));
-      await host.start();
-      await expectFailedLiteLLMReadiness(host);
-    } finally {
-      await host?.stop();
-      await fixture.close();
-    }
-  });
-
-  it('rejects a redirect from the LiteLLM models endpoint without forwarding the bearer key', async () => {
-    const fixture = await startReadinessFixture({ redirectCatalog: true });
-    let host: RelayHost | undefined;
-    try {
-      host = createRelayHost(parseRelayHostConfig(litellmEnvironment({
-        PORT: '0',
-        PALANCAR_LITELLM_BASE_URL: fixture.baseUrl
-      })));
-      await host.start();
-      await expectFailedLiteLLMReadiness(host);
-      expect(fixture.getCatalogRedirectRequests()).toBe(0);
-      expect(fixture.getCatalogRedirectAuthorization()).toBeUndefined();
-    } finally {
-      await host?.stop();
-      await fixture.close();
-    }
   });
 
   it('returns content-free ready status for mock generation', async () => {
@@ -2144,10 +2305,13 @@ describe('relay host configuration and readiness', () => {
     expect(firstOrder).toEqual(['token', 'telemetry']);
 
     const order: string[] = [];
-    const tokenProvider = async () => ({
-      token: 'unused',
-      expiresOnTimestamp: Date.now() + 600_000
-    });
+    const tokenProvider: AzureTokenProvider = async (signal) => {
+      void signal;
+      return {
+        token: 'unused',
+        expiresOnTimestamp: Date.now() + 600_000
+      };
+    };
     const adapter = new AzureRealtimeTranscriptionAdapter({
       endpoint: 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
       deployment: 'palancar-transcription',
@@ -2186,12 +2350,79 @@ describe('relay host configuration and readiness', () => {
     expect(order).toEqual(['telemetry']);
   });
 
+  it('rolls back the shared token source when Azure generation construction fails', async () => {
+    const sensitiveMessage = 'managed identity token and generation endpoint details';
+    const tokenClose = vi.fn();
+    const tokenProvider: AzureTokenProvider = async (signal) => {
+      void signal;
+      return {
+        token: 'unused',
+        expiresOnTimestamp: Date.now() + 600_000
+      };
+    };
+    const tokenFactory = vi.fn(() => ({
+      tokenProvider,
+      close: tokenClose
+    }));
+    const generationFactory = vi.fn((options: {
+      readonly endpoint: string;
+      readonly deployment: 'gpt-5.6-luna';
+      readonly tokenProvider: AzureTokenProvider;
+    }) => {
+      expect(options.endpoint).toBe('https://palancar.openai.azure.com');
+      expect(options.deployment).toBe('gpt-5.6-luna');
+      expect(options.tokenProvider).toBe(tokenProvider);
+      throw new Error(sensitiveMessage);
+    });
+    const adapterFactory = vi.fn(() => {
+      throw new Error('transcription adapter must not be constructed');
+    });
+    let thrown: unknown;
+
+    try {
+      createRelayHostProduction({
+        environment: ENVIRONMENT,
+        origin: ORIGIN,
+        port: 0,
+        gatePolicyVersion: GATE_POLICY_VERSION,
+        security: testSecurityWith(),
+        languageBoundaryMode: 'deny-all',
+        generationProvider: 'azure-openai',
+        azureGenerationEndpoint: 'https://palancar.openai.azure.com',
+        azureGenerationDeployment: 'gpt-5.6-luna',
+        transcriptionProvider: 'azure-realtime',
+        managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+        azureTranscriptionEndpoint:
+          'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
+        azureTranscriptionDeployment: 'palancar-transcription',
+        azureTokenSourceFactory: tokenFactory,
+        azureGenerationProviderFactory: generationFactory,
+        azureTranscriptionAdapterFactory: adapterFactory,
+        metricSinkFactory: () => productionTestMetricSink()
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe('Invalid relay host configuration.');
+    expect((thrown as Error).message).not.toContain(sensitiveMessage);
+    expect(tokenFactory).toHaveBeenCalledTimes(1);
+    expect(generationFactory).toHaveBeenCalledTimes(1);
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(tokenClose).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(tokenClose).toHaveBeenCalledTimes(1));
+  });
+
   it('composes real Azure factories once, deduplicates shared readiness, and shuts telemetry last', async () => {
     const order: string[] = [];
-    const tokenProvider = async () => ({
-      token: 'unused',
-      expiresOnTimestamp: Date.now() + 600_000
-    });
+    const tokenProvider: AzureTokenProvider = async (signal) => {
+      void signal;
+      return {
+        token: 'unused',
+        expiresOnTimestamp: Date.now() + 600_000
+      };
+    };
     const adapter = new AzureRealtimeTranscriptionAdapter({
       endpoint: 'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
       deployment: 'palancar-transcription',
@@ -2205,11 +2436,32 @@ describe('relay host configuration and readiness', () => {
       value: () => order.push('adapter-close'),
       enumerable: true
     });
+    const tokenClose = vi.fn(() => order.push('token-close'));
     const tokenFactory = vi.fn(() => ({
       tokenProvider,
-      close: () => order.push('token-close')
+      close: tokenClose
     }));
-    const adapterFactory = vi.fn(() => adapter);
+    let generationTokenProvider: typeof tokenProvider | undefined;
+    const generationComplete = vi.fn(async () => {
+      throw new Error('generation must not run during readiness');
+    });
+    const generationFactory = vi.fn((options: {
+      readonly endpoint: string;
+      readonly deployment: 'gpt-5.6-luna';
+      readonly tokenProvider: AzureTokenProvider;
+    }) => {
+      generationTokenProvider = options.tokenProvider;
+      return {
+        id: 'azure-openai-chat',
+        version: '1.0.0',
+        complete: generationComplete
+      };
+    });
+    let adapterTokenProvider: AzureTokenProvider | undefined;
+    const adapterFactory = vi.fn((options: { readonly tokenProvider: AzureTokenProvider }) => {
+      adapterTokenProvider = options.tokenProvider;
+      return adapter;
+    });
     const metricFactory = vi.fn(() => ({
       record: () => undefined,
       checkReadiness: async () => {
@@ -2227,12 +2479,16 @@ describe('relay host configuration and readiness', () => {
       gatePolicyVersion: GATE_POLICY_VERSION,
       security: testSecurityWith(),
       languageBoundaryMode: 'deny-all',
+      generationProvider: 'azure-openai',
+      azureGenerationEndpoint: 'https://palancar.openai.azure.com',
+      azureGenerationDeployment: 'gpt-5.6-luna',
       transcriptionProvider: 'azure-realtime',
       managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
       azureTranscriptionEndpoint:
         'wss://palancar.openai.azure.com/openai/v1/realtime?intent=transcription',
       azureTranscriptionDeployment: 'palancar-transcription',
       azureTokenSourceFactory: tokenFactory,
+      azureGenerationProviderFactory: generationFactory,
       azureTranscriptionAdapterFactory: adapterFactory,
       metricSinkFactory: metricFactory
     });
@@ -2240,11 +2496,76 @@ describe('relay host configuration and readiness', () => {
     const ready = await fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
     expect(ready.status).toBe(200);
     expect(tokenFactory).toHaveBeenCalledTimes(1);
+    expect(generationFactory).toHaveBeenCalledTimes(1);
+    expect(generationComplete).not.toHaveBeenCalled();
     expect(adapterFactory).toHaveBeenCalledTimes(1);
+    expect(generationTokenProvider).toBe(tokenProvider);
+    expect(adapterTokenProvider).toBe(tokenProvider);
     expect(metricFactory).toHaveBeenCalledTimes(1);
     expect(adapterReadiness).toHaveBeenCalledTimes(1);
     await host.stop();
     expect(order.slice(-3)).toEqual(['adapter-close', 'token-close', 'telemetry-shutdown']);
+    expect(tokenClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts hanging Azure token readiness before exactly-once close across repeated concurrent stops', async () => {
+    const order: string[] = [];
+    let observedSignal: AbortSignal | undefined;
+    const tokenClose = vi.fn(() => {
+      expect(observedSignal?.aborted).toBe(true);
+      order.push('token-close');
+    });
+    const generationComplete = vi.fn(async () => {
+      throw new Error('generation completion must remain unused');
+    });
+    const host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      security: testSecurityWith(),
+      languageBoundaryMode: 'deny-all',
+      generationProvider: 'azure-openai',
+      azureGenerationEndpoint: 'https://palancar.openai.azure.com',
+      azureGenerationDeployment: 'gpt-5.6-luna',
+      azureGenerationProviderFactory: () => ({
+        id: 'azure-openai-chat',
+        version: '1.0.0',
+        complete: generationComplete
+      }),
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTokenSourceFactory: () => ({
+        tokenProvider: async (signal) => {
+          observedSignal = signal;
+          return new Promise(() => undefined);
+        },
+        close: tokenClose
+      }),
+      metricSink: {
+        record: () => undefined,
+        checkReadiness: async () => true,
+        shutdown: async () => {
+          order.push('telemetry-shutdown');
+        }
+      } as NonNullable<RelayHostConfig['metricSink']>
+    });
+    await host.start();
+    const readiness = fetch(`http://127.0.0.1:${hostPort(host)}/readyz`);
+    await vi.waitFor(() => expect(observedSignal).toBeDefined());
+
+    const firstStop = host.stop();
+    const secondStop = host.stop();
+    const thirdStop = host.stop();
+    expect(secondStop).toBe(firstStop);
+    expect(thirdStop).toBe(firstStop);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(tokenClose).not.toHaveBeenCalled();
+    await Promise.all([firstStop, secondStop, thirdStop]);
+    await expect(readiness).resolves.toMatchObject({ status: 503 });
+    expect(generationComplete).not.toHaveBeenCalled();
+    expect(tokenClose).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['token-close', 'telemetry-shutdown']);
+    expect(host.lifecycleState).toBe('stopped');
   });
 
   it('invokes all five readiness dependencies concurrently and single-flights callers', async () => {
@@ -2286,15 +2607,8 @@ describe('relay host configuration and readiness', () => {
         })) as unknown as GeneratedLanguageValidationEvidence['checks']
       })
     };
-    const generationService = new GenerationService({
-      provider: {
-        id: 'litellm-chat',
-        version: '1.0.0',
-        complete: async () => {
-          throw new Error('generation must not run during readiness');
-        }
-      },
-      validator
+    const generationComplete = vi.fn(async () => {
+      throw new Error('generation must not run during readiness');
     });
     const classifierThenable = {
       then(resolve: () => void, reject: (error: unknown) => void): Promise<void> {
@@ -2322,18 +2636,24 @@ describe('relay host configuration and readiness', () => {
         ready: classifierThenable,
         classify: async () => ({ status: 'unavailable', detectorVersion: 'approved-future' })
       },
-      generationService,
       productionApprovedGenerationValidator: validator,
-      generationReadiness: {
-        provider: 'litellm',
-        providerId: 'litellm-chat',
-        baseUrl: 'http://127.0.0.1:4000',
-        model: 'palancar-generation',
-        check: async () => {
+      generationProvider: 'azure-openai',
+      azureGenerationEndpoint: 'https://palancar.openai.azure.com',
+      azureGenerationDeployment: 'gpt-5.6-luna',
+      azureGenerationProviderFactory: () => ({
+        id: 'azure-openai-chat',
+        version: '1.0.0',
+        complete: generationComplete
+      }),
+      managedIdentityClientId: '11111111-1111-4111-8111-111111111111',
+      azureTokenSourceFactory: () => ({
+        tokenProvider: async () => {
           started.push('generation');
-          return generationReady.promise;
-        }
-      },
+          await generationReady.promise;
+          return { token: 'unused', expiresOnTimestamp: Date.now() + 600_000 };
+        },
+        close: () => undefined
+      }),
       metricSink: {
         record: () => undefined,
         checkReadiness: async () => {
@@ -2364,6 +2684,7 @@ describe('relay host configuration and readiness', () => {
     expect((await first).status).toBe(200);
     expect((await second).status).toBe(200);
     expect(started).toHaveLength(6);
+    expect(generationComplete).not.toHaveBeenCalled();
     await host.stop();
   });
 

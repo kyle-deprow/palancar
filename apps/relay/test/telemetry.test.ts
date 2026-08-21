@@ -13,6 +13,7 @@ import {
   TELEMETRY_METRIC_NAMES,
   TELEMETRY_OPERATIONS,
   TELEMETRY_OUTCOMES,
+  TELEMETRY_PROVIDER_FAILURE_STAGES,
   TELEMETRY_PROTOCOL_VERSION,
   type TelemetryMetricName
 } from '@palancar/telemetry';
@@ -103,6 +104,9 @@ function recordFor(name: TelemetryMetricName): Record<string, unknown> {
     record.sampleCount = 160;
   } else {
     record.count = 3;
+  }
+  if (name === TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE) {
+    record.providerFailureStage = 'unknown';
   }
   return record;
 }
@@ -730,6 +734,78 @@ describe('record', () => {
       'palancar.reconnect.reason': 'network'
     });
     expect(Object.keys(harness.measurements[0]?.attributes ?? {})).toHaveLength(8);
+  });
+
+  it.each(TELEMETRY_PROVIDER_FAILURE_STAGES)(
+    'exports the exact provider failure stage attribute for %s',
+    (providerFailureStage) => {
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+    sink.record({
+      name: TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      operation: TELEMETRY_OPERATIONS.GENERATION,
+      outcome: TELEMETRY_OUTCOMES.FAILURE,
+      providerId: 'azure-openai-chat',
+      providerVersion: '1.0.0',
+      providerFailureStage
+    });
+
+    expect(harness.measurements).toHaveLength(1);
+    expect(harness.measurements[0]?.attributes).toEqual({
+      'palancar.operation': 'generation',
+      'palancar.outcome': 'failure',
+      'palancar.provider.id': 'azure-openai-chat',
+      'palancar.provider.version': '1.0.0',
+      'palancar.provider.failure_stage': providerFailureStage
+    });
+    }
+  );
+
+  it('rejects missing, invalid, accessor, revoked-proxy, and misplaced stages', () => {
+    const base = {
+      name: TELEMETRY_METRIC_NAMES.GENERATION_FAILURE_PROVIDER_RESPONSE,
+      timestamp: TIMESTAMP,
+      deploymentSlot: DEPLOYMENT_SLOTS.DEV,
+      count: 1,
+      operation: TELEMETRY_OPERATIONS.GENERATION,
+      outcome: TELEMETRY_OUTCOMES.FAILURE,
+      providerId: 'azure-openai-chat',
+      providerVersion: '1.0.0'
+    };
+    const harness = createHarness();
+    const sink = createProductionRelayMetricSink(validConfig(), harness.runtime);
+
+    sink.record(base);
+    sink.record({ ...base, providerFailureStage: undefined });
+    sink.record({ ...base, providerFailureStage: 'forged-stage' });
+    sink.record({ ...base, providerFailureStage: new Proxy({}, {}) });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    sink.record({ ...base, providerFailureStage: revoked.proxy });
+
+    let reads = 0;
+    const accessor = { ...base };
+    Object.defineProperty(accessor, 'providerFailureStage', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return 'http';
+      }
+    });
+    sink.record(accessor);
+    sink.record({
+      ...base,
+      name: TELEMETRY_METRIC_NAMES.PROVIDER_FAILURE,
+      operation: TELEMETRY_OPERATIONS.PROVIDER,
+      providerFailureStage: 'http'
+    });
+
+    expect(reads).toBe(0);
+    expect(harness.measurements).toHaveLength(0);
   });
 
   it('exports bounded provisional language metadata without source text', () => {

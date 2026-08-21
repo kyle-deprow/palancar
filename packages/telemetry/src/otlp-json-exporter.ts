@@ -297,6 +297,14 @@ function pointAttributes(record: SanitizedTelemetryRecord): OtlpAttribute[] {
   if (record.providerVersion !== undefined) {
     attributes.push(stringAttribute('palancar.provider.version', record.providerVersion));
   }
+  if (
+    record.name === 'generation.failure.provider_response' &&
+    record.providerFailureStage !== undefined
+  ) {
+    attributes.push(
+      stringAttribute('palancar.provider.failure_stage', record.providerFailureStage)
+    );
+  }
   if (record.reconnectReason !== undefined) {
     attributes.push(stringAttribute('palancar.reconnect.reason', record.reconnectReason));
   }

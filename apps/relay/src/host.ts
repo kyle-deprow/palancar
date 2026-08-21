@@ -23,21 +23,24 @@ import {
   type ServerControlMessage
 } from '@palancar/contracts';
 import {
+  AzureOpenAIChatGenerationProvider,
   DeterministicFixtureLanguageValidator,
   DeterministicMockProvider,
   FailClosedGeneratedLanguageValidator,
   GenerationService,
-  LiteLLMChatGenerationProvider,
   isDeterministicFixtureLanguageValidator,
   isFailClosedGeneratedLanguageValidator,
   type GeneratedLanguageValidator,
+  type GenerationProvider,
   type GenerationProviderCompletion,
 } from '@palancar/generation';
 import {
-  AzureRealtimeTranscriptionAdapter,
   createAzureManagedIdentityTokenSource,
+  type AzureTokenProvider
+} from '@palancar/azure-auth';
+import {
+  AzureRealtimeTranscriptionAdapter,
   DeterministicMockTranscriptionAdapter,
-  type AzureTokenProvider,
   type TranscriptionAdapter
 } from '@palancar/transcription';
 import type { TargetLanguage, TextLanguageClassifier } from '@palancar/language-registry';
@@ -111,11 +114,9 @@ const DEFAULT_BIND_HOST = '127.0.0.1' as const;
 const REQUEST_REJECTED_BODY = Object.freeze({ error: 'request_rejected' });
 const RELAY_CONFIGURATION_ERROR = 'Invalid relay host configuration.';
 const READINESS_TIMEOUT_MS = 6_000;
-const READINESS_FETCH_TIMEOUT_MS = 2_000;
 const READINESS_SUCCESS_CACHE_MS = 30_000;
 const READINESS_FAILURE_CACHE_MS = 2_000;
 const DISABLED_RELAY_METRIC_SINK = createDisabledRelayMetricSink();
-const READINESS_MAX_RESPONSE_BYTES = 16_384;
 const SOCKET_CLOSE_WAIT_MS = 1_000;
 const CONNECTION_WORK_DRAIN_TIMEOUT_MS = 6_000;
 const REQUEST_WORK_DRAIN_TIMEOUT_MS = 6_000;
@@ -123,8 +124,7 @@ const DURABLE_CLEANUP_TIMEOUT_MS = 6_000;
 const SHUTDOWN_TELEMETRY_TIMEOUT_MS = 5_000;
 const RESOURCE_ROLLBACK_TIMEOUT_MS = 5_000;
 const BODYLESS_REQUEST_TIMEOUT_MS = 1_000;
-const DEPLOYED_LITELLM_BASE_URL = 'http://127.0.0.1:4000' as const;
-const DEPLOYED_LITELLM_MODEL = 'palancar-generation' as const;
+const AZURE_GENERATION_DEPLOYMENT = 'gpt-5.6-luna' as const;
 const PREFLIGHT_VARY = 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers';
 const DEFAULT_BROWSER_ORIGIN_POLICY: BrowserOriginPolicy = Object.freeze({
   allowedOrigins: Object.freeze([]),
@@ -139,15 +139,14 @@ interface MockGenerationReadiness {
   readonly model: 'mock';
 }
 
-interface LiteLLMGenerationReadiness {
-  readonly provider: 'litellm';
+interface AzureOpenAIGenerationReadiness {
+  readonly provider: 'azure-openai-chat';
   readonly providerId: string;
-  readonly baseUrl: typeof DEPLOYED_LITELLM_BASE_URL;
-  readonly model: typeof DEPLOYED_LITELLM_MODEL;
+  readonly model: typeof AZURE_GENERATION_DEPLOYMENT;
   readonly check: (signal?: AbortSignal) => Promise<boolean>;
 }
 
-export type RelayGenerationReadiness = MockGenerationReadiness | LiteLLMGenerationReadiness;
+export type RelayGenerationReadiness = MockGenerationReadiness | AzureOpenAIGenerationReadiness;
 
 export type RelayHostLifecycleState =
   | 'created'
@@ -173,6 +172,14 @@ export type RelayAzureTranscriptionAdapterFactory = (
   }>
 ) => TranscriptionAdapter;
 
+export type RelayAzureGenerationProviderFactory = (
+  options: Readonly<{
+    readonly endpoint: string;
+    readonly deployment: typeof AZURE_GENERATION_DEPLOYMENT;
+    readonly tokenProvider: AzureTokenProvider;
+  }>
+) => GenerationProvider;
+
 export interface RelayHostConfig {
   readonly environment: string;
   readonly origin: string;
@@ -190,6 +197,10 @@ export interface RelayHostConfig {
   readonly transcriptionAdapters?: Readonly<Record<TargetLanguage, TranscriptionAdapter>>;
   readonly languageClassifier?: TextLanguageClassifier;
   readonly generationService?: GenerationService;
+  readonly generationProvider?: 'mock' | 'azure-openai';
+  readonly azureGenerationEndpoint?: string;
+  readonly azureGenerationDeployment?: string;
+  readonly azureGenerationProviderFactory?: RelayAzureGenerationProviderFactory;
   readonly productionApprovedGenerationValidator?: GeneratedLanguageValidator;
   readonly developmentProvisionalGenerationValidator?: GeneratedLanguageValidator;
   readonly generationReadiness?: RelayGenerationReadiness;
@@ -365,10 +376,10 @@ function defaultGenerationService(
   return service;
 }
 
-function defaultGenerationReadiness(generationService: GenerationService): MockGenerationReadiness {
+function defaultGenerationReadiness(providerId: string): MockGenerationReadiness {
   return Object.freeze({
     provider: 'mock',
-    providerId: generationService.provider.id,
+    providerId,
     model: 'mock'
   });
 }
@@ -406,32 +417,50 @@ function requiredEnvironmentString(env: NodeJS.ProcessEnv, name: string): string
   return value;
 }
 
-function parseOptionalTimeout(value: string | undefined): number | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!/^\d+$/.test(value)) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
-  }
-  const timeoutMs = Number(value);
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60_000) {
-    throw new TypeError(RELAY_CONFIGURATION_ERROR);
-  }
-  return timeoutMs;
-}
-
 const CANONICAL_AZURE_CLIENT_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CANONICAL_AZURE_TRANSCRIPTION_ENDPOINT =
-  /^wss:\/\/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.openai\.azure\.com\/openai\/v1\/realtime\?intent=transcription$/;
+  /^wss:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.openai\.azure\.com\/openai\/v1\/realtime\?intent=transcription$/;
 const CANONICAL_AZURE_TRANSCRIPTION_DEPLOYMENT =
   /^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/;
+const CANONICAL_AZURE_GENERATION_ENDPOINT =
+  /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.openai\.azure\.com$/;
 const APPLICATION_INSIGHTS_REGIONAL_SUFFIX = '.in.applicationinsights.azure.com';
 const APPLICATION_INSIGHTS_CLASSIC_HOST = 'dc.services.visualstudio.com';
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const ALLOWED_PALANCAR_ENVIRONMENT_KEYS = new Set([
+  'PALANCAR_RELAY_ORIGIN',
+  'PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON',
+  'PALANCAR_ALLOW_NULL_BROWSER_ORIGIN',
+  'PALANCAR_SECURITY_MODE',
+  'PALANCAR_SECURITY_STATE_TABLE',
+  'PALANCAR_RATE_STATE_TABLE',
+  'PALANCAR_GENERATION_PROVIDER',
+  'PALANCAR_TRANSCRIPTION_PROVIDER',
+  'PALANCAR_RELAY_ENVIRONMENT',
+  'PALANCAR_RELAY_BIND_HOST',
+  'PALANCAR_GATE_POLICY_VERSION',
+  'PALANCAR_WORKLOAD_TABLE_ENDPOINT',
+  'PALANCAR_DEPLOYMENT_SLOT',
+  'PALANCAR_LANGUAGE_BOUNDARY_MODE',
+  'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT',
+  'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT',
+  'PALANCAR_AZURE_GENERATION_ENDPOINT',
+  'PALANCAR_AZURE_GENERATION_DEPLOYMENT'
+]);
 
 function hasEnvironmentValue(env: NodeJS.ProcessEnv, name: string): boolean {
   return env[name] !== undefined;
+}
+
+function rejectUnknownPalancarEnvironmentKeys(env: NodeJS.ProcessEnv): void {
+  if (
+    Object.keys(env).some(
+      (name) => name.startsWith('PALANCAR_') && !ALLOWED_PALANCAR_ENVIRONMENT_KEYS.has(name)
+    )
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
 }
 
 function rejectEnvironmentKeys(
@@ -470,6 +499,38 @@ function canonicalAzureTranscriptionEndpoint(value: string): string {
 
 function canonicalAzureTranscriptionDeployment(value: string): string {
   if (!CANONICAL_AZURE_TRANSCRIPTION_DEPLOYMENT.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function canonicalAzureGenerationEndpoint(value: string): string {
+  if (!CANONICAL_AZURE_GENERATION_ENDPOINT.test(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.port !== '' ||
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== '' ||
+    parsed.origin !== value
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value;
+}
+
+function canonicalAzureGenerationDeployment(value: string): string {
+  if (value !== AZURE_GENERATION_DEPLOYMENT) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
   return value;
@@ -535,144 +596,6 @@ function validateApplicationInsightsConnectionString(value: string): string {
   return value;
 }
 
-function readinessUrl(baseUrl: string, path: string): string {
-  return `${baseUrl}${path}`;
-}
-
-async function readBoundedReadinessBody(response: Response): Promise<string | undefined> {
-  const contentLength = response.headers.get('content-length');
-  if (contentLength !== null && /^\d+$/.test(contentLength)) {
-    const bytes = Number(contentLength);
-    if (!Number.isSafeInteger(bytes) || bytes > READINESS_MAX_RESPONSE_BYTES) {
-      try {
-        await response.body?.cancel();
-      } catch {
-        // The body is intentionally never surfaced in readiness failures.
-      }
-      return undefined;
-    }
-  }
-
-  if (response.body === null) {
-    try {
-      const text = await response.text();
-      return new TextEncoder().encode(text).byteLength <= READINESS_MAX_RESPONSE_BYTES
-        ? text
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) {
-        break;
-      }
-      if (!(result.value instanceof Uint8Array)) {
-        return undefined;
-      }
-      totalBytes += result.value.byteLength;
-      if (totalBytes > READINESS_MAX_RESPONSE_BYTES) {
-        return undefined;
-      }
-      chunks.push(result.value);
-    }
-    const bytes = new Uint8Array(totalBytes);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    return undefined;
-  } finally {
-    try {
-      await reader.cancel();
-    } catch {
-      // Readiness is content-free and failure is represented only by false.
-    }
-  }
-}
-
-async function fetchReadinessJson(
-  url: string,
-  apiKey?: string,
-  signal?: AbortSignal
-): Promise<unknown | undefined> {
-  const controller = new AbortController();
-  let callerAbortListener: (() => void) | undefined;
-  if (signal !== undefined) {
-    callerAbortListener = () => controller.abort();
-    try {
-      signal.addEventListener('abort', callerAbortListener, { once: true });
-      if (signal.aborted) controller.abort();
-    } catch {
-      controller.abort();
-    }
-  }
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const request = (async (): Promise<unknown | undefined> => {
-    try {
-      const response = await globalThis.fetch(url, {
-        method: 'GET',
-        redirect: 'error',
-        ...(apiKey === undefined
-          ? {}
-          : { headers: { Authorization: `Bearer ${apiKey}` } }),
-        signal: controller.signal
-      });
-      if (!response.ok) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          // The body is intentionally never surfaced in readiness failures.
-        }
-        return undefined;
-      }
-      const body = await readBoundedReadinessBody(response);
-      if (body === undefined) {
-        return undefined;
-      }
-      try {
-        return JSON.parse(body) as unknown;
-      } catch {
-        return undefined;
-      }
-    } catch {
-      return undefined;
-    }
-  })();
-  const timeoutPromise = new Promise<undefined>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new Error('readiness_timeout'));
-      }, READINESS_FETCH_TIMEOUT_MS);
-  });
-
-  try {
-    return await Promise.race([request, timeoutPromise]);
-  } catch {
-    return undefined;
-  } finally {
-    if (timeout !== undefined) {
-      clearTimeout(timeout);
-    }
-    if (callerAbortListener !== undefined && signal !== undefined) {
-      try {
-        signal.removeEventListener('abort', callerAbortListener);
-      } catch {
-        // Readiness is fail-closed and cleanup is best effort.
-      }
-    }
-  }
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   try {
     if (
@@ -707,6 +630,10 @@ const RELAY_HOST_CONFIG_KEYS = new Set<PropertyKey>([
   'transcriptionAdapters',
   'languageClassifier',
   'generationService',
+  'generationProvider',
+  'azureGenerationEndpoint',
+  'azureGenerationDeployment',
+  'azureGenerationProviderFactory',
   'productionApprovedGenerationValidator',
   'developmentProvisionalGenerationValidator',
   'generationReadiness',
@@ -866,16 +793,132 @@ function validateLanguageClassifier(value: unknown): TextLanguageClassifier {
 function validateGeneratedLanguageValidator(value: unknown): GeneratedLanguageValidator {
   const id = optionalDataProperty(value, 'id');
   const version = optionalDataProperty(value, 'version');
+  const validate = optionalDataProperty(value, 'validate');
   if (
     typeof id !== 'string' ||
     id.length === 0 ||
     typeof version !== 'string' ||
     version.length === 0 ||
-    !hasMethods(value, ['validate'])
+    typeof validate !== 'function' ||
+    utilTypes.isProxy(validate)
   ) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
   return value as GeneratedLanguageValidator;
+}
+
+function generatedLanguageValidatorMetadata(value: unknown): Readonly<{
+  readonly id: string;
+  readonly version: string;
+}> {
+  const id = dataProperty(value, 'id');
+  const version = dataProperty(value, 'version');
+  const validate = dataProperty(value, 'validate');
+  if (
+    typeof id !== 'string' ||
+    typeof version !== 'string' ||
+    typeof validate !== 'function' ||
+    utilTypes.isProxy(validate)
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return Object.freeze({ id, version });
+}
+
+interface GenerationServiceMetadata {
+  readonly providerId: string;
+  readonly providerVersion: string;
+  readonly validatorId: string;
+  readonly validatorVersion: string;
+  readonly languageValidationMode: GenerationService['languageValidationMode'];
+  readonly usesValidator: (value: unknown) => boolean;
+}
+
+function generationServiceMetadata(value: unknown): GenerationServiceMetadata {
+  if (!(value instanceof GenerationService) || utilTypes.isProxy(value)) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  try {
+    const providerGetter = Object.getOwnPropertyDescriptor(
+      GenerationService.prototype,
+      'provider'
+    )?.get;
+    const validatorGetter = Object.getOwnPropertyDescriptor(
+      GenerationService.prototype,
+      'validator'
+    )?.get;
+    const modeGetter = Object.getOwnPropertyDescriptor(
+      GenerationService.prototype,
+      'languageValidationMode'
+    )?.get;
+    const usesValidatorMethod = Object.getOwnPropertyDescriptor(
+      GenerationService.prototype,
+      'usesValidator'
+    )?.value;
+    if (
+      providerGetter === undefined ||
+      validatorGetter === undefined ||
+      modeGetter === undefined ||
+      typeof usesValidatorMethod !== 'function'
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const provider = exactOwnDataValues(
+      Reflect.apply(providerGetter, value, []),
+      new Set(['id', 'version'])
+    );
+    const validator = exactOwnDataValues(
+      Reflect.apply(validatorGetter, value, []),
+      new Set(['id', 'version'])
+    );
+    const languageValidationMode = Reflect.apply(modeGetter, value, []);
+    if (
+      Reflect.ownKeys(provider).length !== 2 ||
+      typeof provider.id !== 'string' ||
+      typeof provider.version !== 'string' ||
+      Reflect.ownKeys(validator).length !== 2 ||
+      typeof validator.id !== 'string' ||
+      typeof validator.version !== 'string' ||
+      (languageValidationMode !== 'production-calibrated' &&
+        languageValidationMode !== 'development-provisional')
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    return Object.freeze({
+      providerId: provider.id,
+      providerVersion: provider.version,
+      validatorId: validator.id,
+      validatorVersion: validator.version,
+      languageValidationMode,
+      usesValidator: (candidate: unknown): boolean =>
+        Reflect.apply(usesValidatorMethod, value, [candidate]) === true
+    });
+  } catch {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+}
+
+function validateAzureGenerationProvider(value: unknown): GenerationProvider {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value)
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  const id = dataProperty(value, 'id');
+  const version = dataProperty(value, 'version');
+  const complete = dataProperty(value, 'complete');
+  if (
+    id !== 'azure-openai-chat' ||
+    version !== '1.0.0' ||
+    typeof complete !== 'function' ||
+    utilTypes.isProxy(complete)
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
+  return value as GenerationProvider;
 }
 
 function validateMetricSink(value: unknown): RelayMetricSink & {
@@ -893,7 +936,7 @@ function validateMetricSink(value: unknown): RelayMetricSink & {
 
 function validateGenerationReadiness(
   value: unknown,
-  generationService: GenerationService
+  expectedProviderId: string
 ): RelayGenerationReadiness {
   if (!isPlainObject(value)) throw new TypeError(RELAY_CONFIGURATION_ERROR);
   const provider = dataProperty(value, 'provider');
@@ -901,7 +944,7 @@ function validateGenerationReadiness(
     const values = exactOwnDataValues(value, new Set(['provider', 'providerId', 'model']));
     if (
       Reflect.ownKeys(values).length !== 3 ||
-      values.providerId !== generationService.provider.id ||
+      values.providerId !== expectedProviderId ||
       values.model !== 'mock'
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
@@ -912,26 +955,25 @@ function validateGenerationReadiness(
       model: 'mock'
     });
   }
-  if (provider === 'litellm') {
+  if (provider === 'azure-openai-chat') {
     const values = exactOwnDataValues(
       value,
-      new Set(['provider', 'providerId', 'baseUrl', 'model', 'check'])
+      new Set(['provider', 'providerId', 'model', 'check'])
     );
     if (
-      Reflect.ownKeys(values).length !== 5 ||
-      values.providerId !== generationService.provider.id ||
-      values.baseUrl !== DEPLOYED_LITELLM_BASE_URL ||
-      values.model !== DEPLOYED_LITELLM_MODEL ||
-      typeof values.check !== 'function'
+      Reflect.ownKeys(values).length !== 4 ||
+      values.providerId !== expectedProviderId ||
+      values.model !== AZURE_GENERATION_DEPLOYMENT ||
+      typeof values.check !== 'function' ||
+      utilTypes.isProxy(values.check)
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
     return Object.freeze({
-      provider: 'litellm',
+      provider: 'azure-openai-chat',
       providerId: values.providerId as string,
-      baseUrl: DEPLOYED_LITELLM_BASE_URL,
-      model: DEPLOYED_LITELLM_MODEL,
-      check: values.check as LiteLLMGenerationReadiness['check']
+      model: AZURE_GENERATION_DEPLOYMENT,
+      check: values.check as AzureOpenAIGenerationReadiness['check']
     });
   }
   throw new TypeError(RELAY_CONFIGURATION_ERROR);
@@ -983,14 +1025,25 @@ function snapshotRelayHostConfig(config: RelayHostConfig): RelayHostConfig {
   ) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
+  if (
+    values.generationProvider === undefined ||
+    (values.generationProvider !== 'mock' &&
+      values.generationProvider !== 'azure-openai')
+  ) {
+    throw new TypeError(RELAY_CONFIGURATION_ERROR);
+  }
   for (const key of [
     'securityFactory',
     'metricSinkFactory',
     'azureTokenSourceFactory',
     'azureTranscriptionAdapterFactory',
+    'azureGenerationProviderFactory',
     'beforeServerMessageDelivery'
   ] as const) {
-    if (values[key] !== undefined && typeof values[key] !== 'function') {
+    if (
+      values[key] !== undefined &&
+      (typeof values[key] !== 'function' || utilTypes.isProxy(values[key]))
+    ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
   }
@@ -1029,6 +1082,18 @@ function snapshotRelayHostConfig(config: RelayHostConfig): RelayHostConfig {
     }
     canonicalAzureTranscriptionDeployment(values.azureTranscriptionDeployment);
   }
+  if (values.azureGenerationEndpoint !== undefined) {
+    if (typeof values.azureGenerationEndpoint !== 'string') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    canonicalAzureGenerationEndpoint(values.azureGenerationEndpoint);
+  }
+  if (values.azureGenerationDeployment !== undefined) {
+    if (typeof values.azureGenerationDeployment !== 'string') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    canonicalAzureGenerationDeployment(values.azureGenerationDeployment);
+  }
   if (values.managedIdentityClientId !== undefined) {
     if (typeof values.managedIdentityClientId !== 'string') {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
@@ -1061,33 +1126,6 @@ function normalizeBrowserOriginPolicy(
   } catch {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
-}
-
-function hasExpectedModel(value: unknown, model: string): boolean {
-  if (!isPlainObject(value) || !Array.isArray(value.data)) {
-    return false;
-  }
-  let matches = 0;
-  for (const item of value.data) {
-    if (isPlainObject(item) && item.id === model) {
-      matches += 1;
-    }
-  }
-  return matches === 1;
-}
-
-async function checkLiteLLMReadiness(config: {
-  readonly baseUrl: string;
-  readonly apiKey: string;
-  readonly model: string;
-  readonly signal?: AbortSignal;
-}): Promise<boolean> {
-  const catalog = await fetchReadinessJson(
-    readinessUrl(config.baseUrl, '/v1/models'),
-    config.apiKey,
-    config.signal
-  );
-  return hasExpectedModel(catalog, config.model);
 }
 
 async function boundedReadinessCheck(
@@ -1471,6 +1509,20 @@ function rawDataBuffer(data: unknown): Buffer | undefined {
 
 export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): RelayHostConfig {
   try {
+    rejectUnknownPalancarEnvironmentKeys(env);
+    rejectEnvironmentKeys(env, (name) =>
+      name.startsWith('PALANCAR_LITELLM_') ||
+      name.startsWith('OPENROUTER_') ||
+      name === 'LITELLM_MASTER_KEY' ||
+      name.startsWith('OPENAI_') ||
+      name.startsWith('AZURE_OPENAI_') ||
+      name === 'AZURE_API_KEY' ||
+      (name.startsWith('PALANCAR_GENERATION_') &&
+        name !== 'PALANCAR_GENERATION_PROVIDER') ||
+      (name.startsWith('PALANCAR_AZURE_GENERATION_') &&
+        name !== 'PALANCAR_AZURE_GENERATION_ENDPOINT' &&
+        name !== 'PALANCAR_AZURE_GENERATION_DEPLOYMENT')
+    );
     rejectBoundarySelectionEnvironment(env);
     rejectEnvironmentKeys(env, (name) =>
       name.startsWith('PALANCAR_OTLP') ||
@@ -1494,7 +1546,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
     const generationProvider = env.PALANCAR_GENERATION_PROVIDER;
-    if (generationProvider !== 'mock' && generationProvider !== 'litellm') {
+    if (generationProvider !== 'mock' && generationProvider !== 'azure-openai') {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
     const transcriptionProvider = env.PALANCAR_TRANSCRIPTION_PROVIDER;
@@ -1525,7 +1577,6 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
       }
       rejectEnvironmentKeys(env, (name) =>
-        name.startsWith('PALANCAR_LITELLM_') ||
         name.startsWith('PALANCAR_AZURE_') ||
         name === 'PALANCAR_WORKLOAD_TABLE_ENDPOINT' ||
         name === 'PALANCAR_SECURITY_STATE_TABLE' ||
@@ -1535,9 +1586,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
         name === 'APPLICATIONINSIGHTS_CONNECTION_STRING' ||
         name === 'APPLICATIONINSIGHTS_STATSBEAT_DISABLED' ||
         name === 'APPLICATION_INSIGHTS_NO_STATSBEAT' ||
-        name === 'AZURE_OPENAI_API_KEY' ||
-        name === 'AZURE_API_KEY' ||
-        name === 'OPENAI_API_KEY'
+        name === 'AZURE_API_KEY'
       );
       const generationService = defaultGenerationService('fixture');
       return Object.freeze({
@@ -1550,8 +1599,11 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
         securityMode: 'local-mock' as const,
         languageBoundaryMode: 'fixture' as const,
         transcriptionProvider: 'mock' as const,
+        generationProvider: 'mock' as const,
         generationService,
-        generationReadiness: defaultGenerationReadiness(generationService)
+        generationReadiness: defaultGenerationReadiness(
+          generationServiceMetadata(generationService).providerId
+        )
       });
     }
 
@@ -1561,12 +1613,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
-    rejectEnvironmentKeys(env, (name) =>
-      name === 'PALANCAR_TRANSCRIPTION_API_KEY' ||
-      name === 'AZURE_OPENAI_API_KEY' ||
-      name === 'AZURE_API_KEY' ||
-      name === 'OPENAI_API_KEY'
-    );
+    rejectEnvironmentKeys(env, (name) => name === 'PALANCAR_TRANSCRIPTION_API_KEY');
     const tableEndpoint = requiredEnvironmentString(env, 'PALANCAR_WORKLOAD_TABLE_ENDPOINT');
     const managedIdentityClientId = canonicalAzureClientId(
       requiredEnvironmentString(env, 'AZURE_CLIENT_ID')
@@ -1610,39 +1657,29 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
           requiredEnvironmentString(env, 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT')
         )
       : undefined;
-    if (transcriptionProvider === 'mock') {
-      rejectEnvironmentKeys(env, (name) => name.startsWith('PALANCAR_AZURE_'));
-    } else {
-      rejectEnvironmentKeys(env, (name) =>
-        name.startsWith('PALANCAR_AZURE_') &&
-        name !== 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT' &&
-        name !== 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT'
-      );
+    rejectEnvironmentKeys(env, (name) =>
+      name.startsWith('PALANCAR_AZURE_') &&
+      name !== 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT' &&
+      name !== 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT' &&
+      name !== 'PALANCAR_AZURE_GENERATION_ENDPOINT' &&
+      name !== 'PALANCAR_AZURE_GENERATION_DEPLOYMENT'
+    );
+    if (
+      transcriptionProvider === 'mock' &&
+      (hasEnvironmentValue(env, 'PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT') ||
+        hasEnvironmentValue(env, 'PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT'))
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
-
-    let liteLLMConfiguration: Readonly<{
-      readonly baseUrl: typeof DEPLOYED_LITELLM_BASE_URL;
-      readonly apiKey: string;
-      readonly model: typeof DEPLOYED_LITELLM_MODEL;
-      readonly timeoutMs?: number;
-    }> | undefined;
-    if (generationProvider === 'mock') {
-      rejectEnvironmentKeys(env, (name) => name.startsWith('PALANCAR_LITELLM_'));
-    } else {
-      const baseUrl = requiredEnvironmentString(env, 'PALANCAR_LITELLM_BASE_URL');
-      const model = requiredEnvironmentString(env, 'PALANCAR_LITELLM_MODEL');
-      const timeoutMs = parseOptionalTimeout(env.PALANCAR_LITELLM_TIMEOUT_MS);
-      if (baseUrl !== DEPLOYED_LITELLM_BASE_URL || model !== DEPLOYED_LITELLM_MODEL) {
-        throw new TypeError(RELAY_CONFIGURATION_ERROR);
-      }
-      const apiKey = requiredEnvironmentString(env, 'PALANCAR_LITELLM_API_KEY');
-      liteLLMConfiguration = Object.freeze({
-        baseUrl,
-        apiKey,
-        model,
-        ...(timeoutMs === undefined ? {} : { timeoutMs })
-      });
+    if (generationProvider !== 'azure-openai') {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
+    const azureGenerationEndpoint = canonicalAzureGenerationEndpoint(
+      requiredEnvironmentString(env, 'PALANCAR_AZURE_GENERATION_ENDPOINT')
+    );
+    const azureGenerationDeployment = canonicalAzureGenerationDeployment(
+      requiredEnvironmentString(env, 'PALANCAR_AZURE_GENERATION_DEPLOYMENT')
+    );
 
     const baseConfig: Omit<RelayHostConfig, 'generationService' | 'generationReadiness'> = {
       environment,
@@ -1653,6 +1690,9 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       gatePolicyVersion: env.PALANCAR_GATE_POLICY_VERSION ?? DEFAULT_GATE_POLICY_VERSION,
       securityMode: 'azure-table' as const,
       deploymentSlot,
+      generationProvider: 'azure-openai' as const,
+      azureGenerationEndpoint,
+      azureGenerationDeployment,
       securityFactory: () => createAzureTableSecurityComposition({
         endpoint: tableEndpoint,
         environment,
@@ -1686,54 +1726,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
         applicationInsightsNoStatsbeat: true
       } satisfies RelayMetricSinkConfig)
     };
-    if (generationProvider === 'mock') {
-      const generationService = defaultGenerationService(
-        provisionalBoundary === undefined ? 'deny-all' : 'development-provisional',
-        provisionalBoundary?.generatedLanguageValidator
-      );
-      return Object.freeze({
-        ...baseConfig,
-        generationService,
-        generationReadiness: defaultGenerationReadiness(generationService)
-      });
-    }
-
-    if (liteLLMConfiguration === undefined) {
-      throw new TypeError(RELAY_CONFIGURATION_ERROR);
-    }
-    const { baseUrl, apiKey, model, timeoutMs } = liteLLMConfiguration;
-    const provider = new LiteLLMChatGenerationProvider({
-      baseUrl,
-      apiKey,
-      model,
-      ...(timeoutMs === undefined ? {} : { timeoutMs })
-    });
-    const generationService = new GenerationService({
-      provider,
-      validator:
-        provisionalBoundary?.generatedLanguageValidator ??
-        new FailClosedGeneratedLanguageValidator(),
-      ...(provisionalBoundary === undefined
-        ? {}
-        : { languageValidationMode: 'development-provisional' as const })
-    });
-    const generationReadiness: LiteLLMGenerationReadiness = Object.freeze({
-      provider: 'litellm',
-      providerId: generationService.provider.id,
-      baseUrl,
-      model,
-      check: (signal: AbortSignal | undefined) => checkLiteLLMReadiness({
-        baseUrl,
-        apiKey,
-        model,
-        ...(signal === undefined ? {} : { signal })
-      })
-    });
-    return Object.freeze({
-      ...baseConfig,
-      generationService,
-      generationReadiness
-    });
+    return Object.freeze(baseConfig);
   } catch {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
@@ -1836,7 +1829,15 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       (configuredAdaptersAreAzureShared ? 'azure-realtime' : 'mock');
     const hasTokenFactory = validatedConfig.azureTokenSourceFactory !== undefined;
     const hasAdapterFactory = validatedConfig.azureTranscriptionAdapterFactory !== undefined;
-    if (hasTokenFactory !== hasAdapterFactory) throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    const generationMode = validatedConfig.generationProvider;
+    const generationIsAzure = generationMode === 'azure-openai';
+    if (
+      (hasAdapterFactory && inferredTranscriptionProvider !== 'azure-realtime') ||
+      (!hasTokenFactory && hasAdapterFactory) ||
+      (!generationIsAzure && hasTokenFactory && inferredTranscriptionProvider !== 'azure-realtime')
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
     if (inferredTranscriptionProvider === 'azure-realtime') {
       if (
         configuredAdapters !== undefined ||
@@ -1849,25 +1850,162 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
     } else if (
       validatedConfig.azureTranscriptionEndpoint !== undefined ||
       validatedConfig.azureTranscriptionDeployment !== undefined ||
-      hasTokenFactory ||
       hasAdapterFactory
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
-
-    const generationService = validatedConfig.generationService ??
-      defaultGenerationService(localComposition ? 'fixture' : 'deny-all');
-    const generationReadiness = validatedConfig.generationReadiness === undefined
-      ? defaultGenerationReadiness(generationService)
-      : validateGenerationReadiness(validatedConfig.generationReadiness, generationService);
     if (
-      !explicitFixtureHarness &&
-      ((generationReadiness.provider === 'mock' &&
-        !generationService.provider.id.startsWith('deterministic-mock')) ||
-        (generationReadiness.provider === 'litellm' &&
-          generationService.provider.id !== 'litellm-chat'))
+      generationIsAzure &&
+      (validatedConfig.generationService !== undefined ||
+        validatedConfig.generationReadiness !== undefined)
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (
+      generationIsAzure &&
+      (validatedConfig.azureGenerationEndpoint === undefined ||
+        validatedConfig.azureGenerationDeployment === undefined ||
+        validatedConfig.managedIdentityClientId === undefined)
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    if (
+      !generationIsAzure &&
+      (validatedConfig.azureGenerationEndpoint !== undefined ||
+        validatedConfig.azureGenerationDeployment !== undefined ||
+        validatedConfig.azureGenerationProviderFactory !== undefined)
+    ) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    let generationService!: GenerationService;
+    let generationServiceInfo!: GenerationServiceMetadata;
+    let generationReadiness!: RelayGenerationReadiness;
+    if (!generationIsAzure) {
+      generationService = validatedConfig.generationService ??
+        defaultGenerationService(localComposition ? 'fixture' : 'deny-all');
+      generationServiceInfo = generationServiceMetadata(generationService);
+      generationReadiness = validatedConfig.generationReadiness === undefined
+        ? defaultGenerationReadiness(generationServiceInfo.providerId)
+        : validateGenerationReadiness(
+            validatedConfig.generationReadiness,
+            generationServiceInfo.providerId
+          );
+      if (
+        !explicitFixtureHarness &&
+        (generationReadiness.provider !== 'mock' ||
+          !generationServiceInfo.providerId.startsWith('deterministic-mock'))
+      ) {
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    }
+    let metricSink: ReturnType<typeof validateMetricSink>;
+    if (localComposition) {
+      metricSink = validateMetricSink(DISABLED_RELAY_METRIC_SINK);
+    } else if (configuredMetricSink !== undefined) {
+      metricSink = validateMetricSink(configuredMetricSink);
+      acquiredMetricSink = metricSink;
+    } else {
+      let metricSinkCandidate: unknown;
+      try {
+        metricSinkCandidate = (validatedConfig.metricSinkFactory as () => RelayMetricSink)();
+        if (isDisabledRelayMetricSink(metricSinkCandidate)) {
+          throw new TypeError(RELAY_CONFIGURATION_ERROR);
+        }
+        metricSink = validateMetricSink(metricSinkCandidate);
+        acquiredMetricSink = metricSink;
+      } catch {
+        if (!isDisabledRelayMetricSink(metricSinkCandidate)) {
+          const partialShutdown = optionalDataProperty(metricSinkCandidate, 'shutdown');
+          if (typeof partialShutdown === 'function' && !utilTypes.isProxy(partialShutdown)) {
+            partialMetricCleanup = () => partialShutdown.call(metricSinkCandidate);
+          }
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+    }
+
+    const security = configuredSecurity ??
+      (validatedConfig.securityFactory === undefined
+        ? validateSecurityCompositionShape(
+            createLocalMockSecurityComposition({ audience }),
+            'local-mock'
+          )
+        : validateSecurityCompositionShape(
+            validatedConfig.securityFactory(),
+            securityMode
+          ));
+    if (!localComposition && !isDurableSecurityRuntime(security.runtime)) {
+      throw new TypeError(RELAY_CONFIGURATION_ERROR);
+    }
+    const needsAzureTokenSource = generationIsAzure || inferredTranscriptionProvider === 'azure-realtime';
+    let sharedTokenProvider: AzureTokenProvider | undefined;
+    if (needsAzureTokenSource) {
+      const clientId = validatedConfig.managedIdentityClientId as string;
+      const tokenSourceFactory = validatedConfig.azureTokenSourceFactory ??
+        ((options: Readonly<{ readonly clientId: string }>) =>
+          createAzureManagedIdentityTokenSource(options));
+      const tokenSource = tokenSourceFactory({ clientId });
+      const tokenProvider = optionalDataProperty(tokenSource, 'tokenProvider');
+      const closeTokenSource = optionalDataProperty(tokenSource, 'close');
+      if (
+        typeof tokenProvider !== 'function' ||
+        utilTypes.isProxy(tokenProvider) ||
+        typeof closeTokenSource !== 'function' ||
+        utilTypes.isProxy(closeTokenSource)
+      ) {
+        if (typeof closeTokenSource === 'function' && !utilTypes.isProxy(closeTokenSource)) {
+          invokeResourceCleanup(() => closeTokenSource.call(tokenSource));
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      sharedTokenProvider = tokenProvider as AzureTokenProvider;
+      acquiredCloseables.push(() => closeTokenSource.call(tokenSource));
+    }
+
+    if (generationIsAzure) {
+      const providerFactory = validatedConfig.azureGenerationProviderFactory ??
+        ((options: Parameters<RelayAzureGenerationProviderFactory>[0]) =>
+          new AzureOpenAIChatGenerationProvider(options));
+      let providerCandidate: unknown;
+      try {
+        providerCandidate = providerFactory({
+          endpoint: validatedConfig.azureGenerationEndpoint as string,
+          deployment: validatedConfig.azureGenerationDeployment as typeof AZURE_GENERATION_DEPLOYMENT,
+          tokenProvider: sharedTokenProvider as AzureTokenProvider
+        });
+        const provider = validateAzureGenerationProvider(providerCandidate);
+        generationService = new GenerationService({
+          provider,
+          validator:
+            validatedConfig.developmentProvisionalGenerationValidator ??
+            validatedConfig.productionApprovedGenerationValidator ??
+            new FailClosedGeneratedLanguageValidator(),
+          ...(validatedConfig.developmentProvisionalGenerationValidator === undefined
+            ? {}
+            : { languageValidationMode: 'development-provisional' as const })
+        });
+        generationServiceInfo = generationServiceMetadata(generationService);
+      } catch {
+        const partialClose = optionalDataProperty(providerCandidate, 'close');
+        if (typeof partialClose === 'function' && !utilTypes.isProxy(partialClose)) {
+          invokeResourceCleanup(() => partialClose.call(providerCandidate));
+        }
+        throw new TypeError(RELAY_CONFIGURATION_ERROR);
+      }
+      generationReadiness = Object.freeze({
+        provider: 'azure-openai-chat' as const,
+        providerId: generationServiceInfo.providerId,
+        model: AZURE_GENERATION_DEPLOYMENT,
+        check: async (signal?: AbortSignal): Promise<boolean> => {
+          if (sharedTokenProvider === undefined) return false;
+          try {
+            await sharedTokenProvider(signal ?? new AbortController().signal);
+            return true;
+          } catch {
+            return false;
+          }
+        }
+      });
     }
     const requestedBoundary = validatedConfig.languageBoundaryMode;
     const adaptersWillBeTargetSpecificMocks = configuredAdapters === undefined
@@ -1900,6 +2038,10 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       validatedConfig.productionApprovedGenerationValidator;
     const developmentProvisionalGenerationValidator =
       validatedConfig.developmentProvisionalGenerationValidator;
+    const productionApprovedGenerationValidatorMetadata =
+      productionApprovedGenerationValidator === undefined
+        ? undefined
+        : generatedLanguageValidatorMetadata(productionApprovedGenerationValidator);
 
     if (boundary === 'fixture') {
       if (
@@ -1909,13 +2051,13 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         inferredTranscriptionProvider !== 'mock' ||
         generationReadiness.provider !== 'mock' ||
         (!BUILT_IN_FIXTURE_GENERATION_SERVICES.has(generationService) &&
-          !(explicitFixtureHarness && generationService.validator.id === 'deterministic-language-fixture')) ||
+          !(explicitFixtureHarness && generationServiceInfo.validatorId === 'deterministic-language-fixture')) ||
         (!adaptersWillBeTargetSpecificMocks && !explicitFixtureHarness) ||
         (!isControlledFixtureTextLanguageClassifier(languageClassifier) && !explicitFixtureHarness) ||
         productionApprovedGenerationValidator !== undefined ||
         developmentProvisionalGenerationValidator !== undefined ||
-        generationService.languageValidationMode !== 'production-calibrated' ||
-        generationService.validator.id !== 'deterministic-language-fixture'
+        generationServiceInfo.languageValidationMode !== 'production-calibrated' ||
+        generationServiceInfo.validatorId !== 'deterministic-language-fixture'
       ) {
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
       }
@@ -1925,8 +2067,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         !isFailClosedDeployedTextLanguageClassifier(languageClassifier) ||
         productionApprovedGenerationValidator !== undefined ||
         developmentProvisionalGenerationValidator !== undefined ||
-        generationService.languageValidationMode !== 'production-calibrated' ||
-        generationService.validator.id !== 'fail-closed-generated-language'
+        generationServiceInfo.languageValidationMode !== 'production-calibrated' ||
+        generationServiceInfo.validatorId !== 'fail-closed-generated-language'
       ) {
         throw new TypeError(RELAY_CONFIGURATION_ERROR);
       }
@@ -1940,8 +2082,8 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         !isDevelopmentProvisionalGeneratedLanguageValidator(
           developmentProvisionalGenerationValidator
         ) ||
-        generationService.languageValidationMode !== 'development-provisional' ||
-        !generationService.usesValidator(
+        generationServiceInfo.languageValidationMode !== 'development-provisional' ||
+        !generationServiceInfo.usesValidator(
           developmentProvisionalGenerationValidator
         )
       ) {
@@ -1956,11 +2098,11 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       (productionApprovedGenerationValidator !== undefined &&
         (isDeterministicFixtureLanguageValidator(productionApprovedGenerationValidator) ||
           isFailClosedGeneratedLanguageValidator(productionApprovedGenerationValidator) ||
-          generationService.validator.id !== productionApprovedGenerationValidator.id ||
-          generationService.validator.version !== productionApprovedGenerationValidator.version)) ||
-      generationService.validator.id === 'deterministic-language-fixture' ||
-      generationService.validator.id === 'fail-closed-generated-language' ||
-      generationService.languageValidationMode !== 'production-calibrated'
+          generationServiceInfo.validatorId !== productionApprovedGenerationValidatorMetadata?.id ||
+          generationServiceInfo.validatorVersion !== productionApprovedGenerationValidatorMetadata?.version)) ||
+      generationServiceInfo.validatorId === 'deterministic-language-fixture' ||
+      generationServiceInfo.validatorId === 'fail-closed-generated-language' ||
+      generationServiceInfo.languageValidationMode !== 'production-calibrated'
     ) {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
@@ -1982,66 +2124,12 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       throw new TypeError(RELAY_CONFIGURATION_ERROR);
     }
 
-    let metricSink: ReturnType<typeof validateMetricSink>;
-    if (localComposition) {
-      metricSink = validateMetricSink(DISABLED_RELAY_METRIC_SINK);
-    } else if (configuredMetricSink !== undefined) {
-      metricSink = validateMetricSink(configuredMetricSink);
-      acquiredMetricSink = metricSink;
-    } else {
-      let metricSinkCandidate: unknown;
-      try {
-        metricSinkCandidate = (validatedConfig.metricSinkFactory as () => RelayMetricSink)();
-        if (isDisabledRelayMetricSink(metricSinkCandidate)) {
-          throw new TypeError(RELAY_CONFIGURATION_ERROR);
-        }
-        metricSink = validateMetricSink(metricSinkCandidate);
-        acquiredMetricSink = metricSink;
-      } catch {
-        if (!isDisabledRelayMetricSink(metricSinkCandidate)) {
-          const partialShutdown = optionalDataProperty(metricSinkCandidate, 'shutdown');
-          if (typeof partialShutdown === 'function') {
-            partialMetricCleanup = () => partialShutdown.call(metricSinkCandidate);
-          }
-        }
-        throw new TypeError(RELAY_CONFIGURATION_ERROR);
-      }
-    }
-
-    const security = configuredSecurity ??
-      (validatedConfig.securityFactory === undefined
-        ? validateSecurityCompositionShape(
-            createLocalMockSecurityComposition({ audience }),
-            'local-mock'
-          )
-        : validateSecurityCompositionShape(
-            validatedConfig.securityFactory(),
-            securityMode
-          ));
-    if (!localComposition && !isDurableSecurityRuntime(security.runtime)) {
-      throw new TypeError(RELAY_CONFIGURATION_ERROR);
-    }
-
     let transcriptionAdapters: Readonly<Record<TargetLanguage, TranscriptionAdapter>>;
     if (configuredAdapters !== undefined) {
       transcriptionAdapters = configuredAdapters;
     } else if (inferredTranscriptionProvider === 'azure-realtime') {
-      const clientId = validatedConfig.managedIdentityClientId as string;
       const endpoint = validatedConfig.azureTranscriptionEndpoint as string;
       const deployment = validatedConfig.azureTranscriptionDeployment as string;
-      const tokenSourceFactory = validatedConfig.azureTokenSourceFactory ??
-        ((options: Readonly<{ readonly clientId: string }>) =>
-          createAzureManagedIdentityTokenSource(options));
-      const tokenSource = tokenSourceFactory({ clientId });
-      const tokenProvider = optionalDataProperty(tokenSource, 'tokenProvider');
-      const closeTokenSource = optionalDataProperty(tokenSource, 'close');
-      if (typeof tokenProvider !== 'function' || typeof closeTokenSource !== 'function') {
-        if (typeof closeTokenSource === 'function') {
-          invokeResourceCleanup(() => closeTokenSource.call(tokenSource));
-        }
-        throw new TypeError(RELAY_CONFIGURATION_ERROR);
-      }
-      acquiredCloseables.push(() => closeTokenSource.call(tokenSource));
       const adapterFactory = validatedConfig.azureTranscriptionAdapterFactory ??
         ((options: Parameters<RelayAzureTranscriptionAdapterFactory>[0]) =>
           new AzureRealtimeTranscriptionAdapter(options));
@@ -2051,7 +2139,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         adapterCandidate = adapterFactory({
           endpoint,
           deployment,
-          tokenProvider: tokenProvider as AzureTokenProvider
+          tokenProvider: sharedTokenProvider as AzureTokenProvider
         });
         adapter = validateTranscriptionAdapter(adapterCandidate);
       } catch {

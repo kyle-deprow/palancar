@@ -376,6 +376,19 @@ describe('AzureOpenAIChatGenerationProvider configuration', () => {
     }))).toThrow(TypeError);
   });
 
+  it('accepts a 63-character Azure DNS label and rejects a 64-character label', () => {
+    const acceptedLabel = `a${'b'.repeat(61)}c`;
+    const rejectedLabel = `a${'b'.repeat(62)}c`;
+    expect(acceptedLabel).toHaveLength(63);
+    expect(rejectedLabel).toHaveLength(64);
+    expect(() => new AzureOpenAIChatGenerationProvider(config({
+      endpoint: `https://${acceptedLabel}.openai.azure.com`
+    }))).not.toThrow();
+    expect(() => new AzureOpenAIChatGenerationProvider(config({
+      endpoint: `https://${rejectedLabel}.openai.azure.com`
+    }))).toThrow(TypeError);
+  });
+
   it.each([
     '',
     '-model',

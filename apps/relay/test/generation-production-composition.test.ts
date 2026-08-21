@@ -3,11 +3,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_NEGOTIATED_LIMITS } from '@palancar/contracts';
 import {
   GenerationService,
-  LiteLLMChatGenerationProvider,
+  AzureOpenAIChatGenerationProvider,
   type GeneratedLanguageValidator,
+  type GeneratedLanguageValidationEvidence,
   type GenerationProviderCompletion
 } from '@palancar/generation';
-import { LANGUAGE_REGISTRY_VERSION } from '@palancar/language-registry';
+import {
+  CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+  CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  LANGUAGE_REGISTRY_VERSION,
+  type TextLanguageClassifier
+} from '@palancar/language-registry';
 import type { NormalizedTranscriptionFinal } from '@palancar/transcription';
 
 import {
@@ -125,6 +131,42 @@ function metricSink(): Readonly<{
   return { sink: { record: (input) => records.push(input) }, records };
 }
 
+function productionClassifier(): TextLanguageClassifier {
+  return {
+    ready: Promise.resolve(),
+    classify: async (_text, selectedLanguage) => ({
+      status: 'calibrated' as const,
+      detectorVersion: CONTROLLED_FIXTURE_DETECTOR_VERSION,
+      calibrationVersion: CONTROLLED_FIXTURE_CALIBRATION_VERSION,
+      detectedLanguage: selectedLanguage ?? 'es',
+      confidence: 1
+    })
+  };
+}
+
+function productionValidator(
+  observedMatrices: string[][][]
+): GeneratedLanguageValidator {
+  return {
+    id: 'production-calibrated-deterministic-composition',
+    version: '1.0.0',
+    validate: async (input): Promise<GeneratedLanguageValidationEvidence> => {
+      observedMatrices.push(input.checks.map((check) => [check.slot, check.expectedLanguage]));
+      return {
+        checks: input.checks.map((check) => ({
+          slot: check.slot,
+          expectedLanguage: check.expectedLanguage,
+          detectedLanguage: check.expectedLanguage,
+          verdict: 'match' as const,
+          evidenceType: 'calibrated' as const,
+          confidenceBasisPoints: 10_000,
+          provisionalScoreBasisPoints: null
+        })) as unknown as GeneratedLanguageValidationEvidence['checks']
+      };
+    }
+  };
+}
+
 async function flushAsyncEvents(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -137,30 +179,40 @@ function createComposition(
   options: Readonly<{
     readonly validator?: GeneratedLanguageValidator;
     readonly languageValidationTimeoutMs?: number;
+    readonly validationMode?: 'production-calibrated' | 'development-provisional';
+    readonly classifier?: TextLanguageClassifier;
   }> = {}
 ): Readonly<{
   readonly core: RelaySessionCore;
   readonly service: GenerationService;
   readonly fetch: typeof globalThis.fetch;
 }> {
-  const boundary = createDevelopmentProvisionalLanguageBoundary();
-  const provider = new LiteLLMChatGenerationProvider({
-    baseUrl: 'https://litellm.offline.test',
-    apiKey: 'offline-test-key',
-    model: 'offline-test-model'
+  const validationMode = options.validationMode ?? 'development-provisional';
+  const boundary = validationMode === 'development-provisional'
+    ? createDevelopmentProvisionalLanguageBoundary()
+    : undefined;
+  const provider = new AzureOpenAIChatGenerationProvider({
+    endpoint: 'https://palancar-test.openai.azure.com',
+    deployment: 'gpt-5.6-luna',
+    tokenProvider: async () => ({
+      token: 'composition-test-access-token',
+      expiresOnTimestamp: 2_000_000_000_000
+    })
   });
   const service = new GenerationService({
     provider,
-    validator: options.validator ?? boundary.generatedLanguageValidator,
-    languageValidationMode: 'development-provisional',
+    validator: options.validator ?? boundary?.generatedLanguageValidator ?? productionValidator([]),
+    languageValidationMode: validationMode,
     ...(options.languageValidationTimeoutMs === undefined
       ? {}
       : { languageValidationTimeoutMs: options.languageValidationTimeoutMs })
   });
   const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(completionResponse(response));
   const core = new RelaySessionCore(createTestOptions({
-    languageBoundaryMode: 'development-provisional',
-    languageClassifier: boundary.classifier,
+    languageBoundaryMode: validationMode === 'production-calibrated'
+      ? 'production-approved'
+      : validationMode,
+    languageClassifier: options.classifier ?? boundary?.classifier ?? productionClassifier(),
     generationService: service,
     securityRuntime: createTestSecurityRuntime(),
     metricSink: { record: (input) => records.push(input) }
@@ -174,7 +226,84 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('offline production generation composition', () => {
+describe('production-calibrated deterministic generation composition', () => {
+  it.each([
+    ['es', 2, [
+      ['translation.english', 'en'],
+      ['suggestion[0].english', 'en'],
+      ['suggestion[0].target', 'es'],
+      ['suggestion[1].english', 'en'],
+      ['suggestion[1].target', 'es']
+    ]],
+    ['es', 3, [
+      ['translation.english', 'en'],
+      ['suggestion[0].english', 'en'],
+      ['suggestion[0].target', 'es'],
+      ['suggestion[1].english', 'en'],
+      ['suggestion[1].target', 'es'],
+      ['suggestion[2].english', 'en'],
+      ['suggestion[2].target', 'es']
+    ]],
+    ['tr', 2, [
+      ['translation.english', 'en'],
+      ['suggestion[0].english', 'en'],
+      ['suggestion[0].target', 'tr'],
+      ['suggestion[1].english', 'en'],
+      ['suggestion[1].target', 'tr']
+    ]],
+    ['tr', 3, [
+      ['translation.english', 'en'],
+      ['suggestion[0].english', 'en'],
+      ['suggestion[0].target', 'tr'],
+      ['suggestion[1].english', 'en'],
+      ['suggestion[1].target', 'tr'],
+      ['suggestion[2].english', 'en'],
+      ['suggestion[2].target', 'tr']
+    ]]
+  ] as const)('accepts the calibrated %s/%i evidence matrix', async (
+    target,
+    count,
+    expectedMatrix
+  ) => {
+    const metrics = metricSink();
+    const observedMatrices: string[][][] = [];
+    const { core, service, fetch } = createComposition(
+      target,
+      completionFor(target, count),
+      metrics.records,
+      {
+        validationMode: 'production-calibrated',
+        classifier: productionClassifier(),
+        validator: productionValidator(observedMatrices)
+      }
+    );
+
+    await core.handleTranscriptionEvent(finalEvent(target));
+    await flushAsyncEvents();
+    const released = await core.drainAsyncEvents();
+    expect(released.outgoing.map((message) => message.type)).toEqual([
+      'translation.ready',
+      'suggestions.ready'
+    ]);
+    expect(observedMatrices).toEqual([expectedMatrix]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(service.evidence).toHaveLength(1);
+    expect(service.evidence[0]).toMatchObject({
+      providerId: 'azure-openai-chat',
+      providerVersion: '1.0.0',
+      validatorId: 'production-calibrated-deterministic-composition',
+      validatorVersion: '1.0.0',
+      status: 'success',
+      languageValidationStatus: 'accepted',
+      languageValidationCheckCount: count === 2 ? 5 : 7,
+      languageValidationNonmatchCount: 0
+    });
+    expect(metrics.records.some((record) => record.name.startsWith('generation.failure.')))
+      .toBe(false);
+  });
+});
+
+describe('development-provisional generation composition', () => {
   it.each([
     ['es', 2, 5],
     ['es', 3, 7],
