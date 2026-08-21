@@ -2996,7 +2996,7 @@ const MODEL_BOOTSTRAP_CONTRACT = Object.freeze({
   upgradeOption: "NoAutoUpgrade",
   accountKind: "OpenAI",
   quotaUnit: "Count",
-  quotaLocalizedPrefix: "Tokens Per Minute (thousands) - ",
+  quotaLocalizedPrefix: "One Thousand Tokens Per Minute - ",
 });
 
 function assertKnownKeys(value, keys, code) {
@@ -3027,7 +3027,7 @@ function deploymentIdParts(resourceId, code) {
 }
 
 function validateDeploymentItem(item, outputs, config) {
-  assertKnownKeys(item, ["etag", "id", "name", "properties", "sku", "systemData", "tags", "type"], "deployment-response");
+  assertKnownKeys(item, ["etag", "id", "name", "properties", "resourceGroup", "sku", "systemData", "tags", "type"], "deployment-response");
   assertRequiredKeys(item, ["id", "name", "properties", "sku"], "deployment-response");
   failIf(typeof item.name !== "string" || item.name.length === 0, "deployment-response");
   if (item.type !== undefined) {
@@ -3053,9 +3053,11 @@ function validateDeploymentItem(item, outputs, config) {
     "raiPolicyName",
     "rateLimits",
     "scaleSettings",
+    "spilloverDeploymentName",
     "versionUpgradeOption",
   ], "deployment-response");
-  assertRequiredKeys(item.properties, ["model", "provisioningState", "versionUpgradeOption"], "deployment-response");
+  assertRequiredKeys(item.properties, ["model", "provisioningState", "spilloverDeploymentName", "versionUpgradeOption"], "deployment-response");
+  failIf(item.properties.spilloverDeploymentName !== null, "deployment-spillover");
   assertKnownKeys(item.properties.model, [
     "callRateLimit",
     "format",
@@ -3144,7 +3146,7 @@ function verifyAccountContext(config, outputs) {
     "--output",
     "json",
   ], "account-context");
-  assertKnownKeys(account, ["etag", "id", "identity", "kind", "location", "name", "properties", "sku", "systemData", "tags", "type"], "account-context");
+  assertKnownKeys(account, ["etag", "id", "identity", "kind", "location", "name", "properties", "resourceGroup", "sku", "systemData", "tags", "type"], "account-context");
   assertRequiredKeys(account, ["id", "kind", "location", "name"], "account-context");
   const parts = resourceIdParts(account.id, "account-context");
   failIf(
@@ -3237,8 +3239,10 @@ function validateCatalogItem(item, outputs, config) {
     "isDefaultVersion",
     "lifecycleStatus",
     "maxCapacity",
+    "modelCatalogAssetId",
     "name",
     "publisher",
+    "replacementConfig",
     "skus",
     "source",
     "sourceAccount",
@@ -3252,7 +3256,7 @@ function validateCatalogItem(item, outputs, config) {
       typeof item.model.name !== "string" ||
       typeof item.model.version !== "string" ||
       typeof item.model.lifecycleStatus !== "string" ||
-      item.model.name !== item.name ||
+      item.name !== `${item.model.format}.${item.model.name}.${item.model.version}` ||
       !Array.isArray(item.model.skus),
     "model-catalog",
   );
@@ -3315,8 +3319,8 @@ function verifyCatalog(config, outputs, accountContext) {
 }
 
 function validateQuotaItem(item) {
-  assertKnownKeys(item, ["currentValue", "limit", "name", "unit"], "model-quota");
-  assertRequiredKeys(item, ["currentValue", "limit", "name", "unit"], "model-quota");
+  assertKnownKeys(item, ["currentValue", "limit", "name", "nextResetTime", "quotaPeriod", "status", "unit"], "model-quota");
+  assertRequiredKeys(item, ["currentValue", "limit", "name", "status", "unit"], "model-quota");
   assertKnownKeys(item.name, ["localizedValue", "value"], "model-quota");
   assertRequiredKeys(item.name, ["localizedValue", "value"], "model-quota");
   failIf(
@@ -3326,12 +3330,17 @@ function validateQuotaItem(item) {
       !Number.isSafeInteger(item.currentValue) ||
       !Number.isSafeInteger(item.limit) ||
       item.currentValue < 0 ||
-      item.limit < item.currentValue,
+      item.limit < item.currentValue ||
+      item.status !== null,
     "model-quota",
   );
   const match = /^([^\.]+)\.([^\.]+)\.(.+)$/.exec(item.name.value);
   failIf(!match, "model-quota");
-  failIf(item.name.localizedValue !== `${MODEL_BOOTSTRAP_CONTRACT.quotaLocalizedPrefix}${match[3]}`, "model-quota");
+  failIf(
+    item.name.localizedValue !==
+      `${MODEL_BOOTSTRAP_CONTRACT.quotaLocalizedPrefix}${match[3]} - ${match[2]}`,
+    "model-quota",
+  );
   return {
     provider: match[1],
     sku: match[2],

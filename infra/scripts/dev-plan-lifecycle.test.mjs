@@ -408,6 +408,7 @@ function makeHarness(overrides = {}) {
               properties: {
                 model: { name: "gpt-5.6-luna", version: "2026-07-09", format: "OpenAI" },
                 provisioningState: "Succeeded",
+                spilloverDeploymentName: null,
                 versionUpgradeOption: "NoAutoUpgrade",
               },
               sku: { name: "GlobalStandard", capacity: 1013 },
@@ -434,6 +435,7 @@ function makeHarness(overrides = {}) {
           properties: {
             model: { name: "gpt-4o-mini-transcribe", version: "2025-12-15", format: "OpenAI" },
             provisioningState: modelCase === "transcription-nonterminal" ? "Creating" : "Succeeded",
+            spilloverDeploymentName: modelCase === "deployment-spillover" ? "gpt-5.6-luna" : null,
             versionUpgradeOption: modelCase === "upgrade-bad" ? "OnceNewDefaultVersionAvailable" : "NoAutoUpgrade",
           },
           sku: {
@@ -460,6 +462,7 @@ function makeHarness(overrides = {}) {
             properties: {
               model: { name: lunaModelName, version: lunaVersion, format: "OpenAI" },
               provisioningState: lunaProvisioningState,
+              spilloverDeploymentName: null,
               versionUpgradeOption: "NoAutoUpgrade",
             },
             sku: { name: lunaSku, capacity: lunaCapacity },
@@ -470,22 +473,29 @@ function makeHarness(overrides = {}) {
       if (request.argv[1] === "model") {
         if (modelCase === "catalog-malformed") return { status: 0, stdout: JSON.stringify({ value: [] }) };
         if (modelCase === "catalog-unknown-shape") return { status: 0, stdout: JSON.stringify({ models: [] }) };
-        const modelEntry = (kind) => ({
-          description: "Synthetic model catalog entry",
-          id: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.CognitiveServices/locations/eastus2/models/gpt-5.6-luna`,
-          kind,
-          location: modelCase === "catalog-wrong-region" ? "westus" : "eastus2",
-          name: "gpt-5.6-luna",
-          skuName: "S0",
-          type: "Microsoft.CognitiveServices/locations/models",
-          model: {
-            name: "gpt-5.6-luna",
-            format: modelCase === "catalog-wrong-format" ? "AzureML" : "OpenAI",
-            version: modelCase === "catalog-bad" || modelCase === "catalog-wrong-version" ? "2026-07-08" : "2026-07-09",
+        const modelEntry = (kind) => {
+          const format = modelCase === "catalog-wrong-format" ? "AzureML" : "OpenAI";
+          const version = modelCase === "catalog-bad" || modelCase === "catalog-wrong-version"
+            ? "2026-07-08"
+            : "2026-07-09";
+          const catalogName = `${format}.gpt-5.6-luna.${version}`;
+          return {
+            description: "Synthetic model catalog entry",
+            id: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.CognitiveServices/locations/eastus2/models/${catalogName}`,
+            kind,
+            location: modelCase === "catalog-wrong-region" ? "westus" : "eastus2",
+            name: catalogName,
+            skuName: "S0",
+            type: "Microsoft.CognitiveServices/locations/models",
+            model: {
+              name: "gpt-5.6-luna",
+              format,
+              version,
             lifecycleStatus: modelCase === "catalog-not-ga" ? "Preview" : "GenerallyAvailable",
             skus: [{ name: modelCase === "catalog-wrong-sku" ? "Standard" : "GlobalStandard" }],
-          },
-        });
+            },
+          };
+        };
         return {
           status: 0,
           stdout: JSON.stringify([
@@ -502,19 +512,27 @@ function makeHarness(overrides = {}) {
         const quota = {
           name: {
             value: `OpenAI.GlobalStandard.${quotaModel}`,
-            localizedValue: `Tokens Per Minute (thousands) - ${quotaModel}`,
+            localizedValue: `One Thousand Tokens Per Minute - ${quotaModel} - GlobalStandard`,
           },
           currentValue: modelCase === "quota-total-only" ? undefined : (modelCase === "quota-bad" ? 1013 : 0),
           limit: modelCase === "quota-current-only" ? undefined : 1013,
+          status: modelCase === "quota-status-blocked"
+            ? "Blocked"
+            : modelCase === "quota-status-overage"
+              ? "InOverage"
+              : modelCase === "quota-status-unknown"
+                ? "Unknown"
+                : null,
           unit: modelCase === "quota-unknown-unit" ? "Tokens" : "Count",
         };
         if (modelCase === "quota-total-only") delete quota.currentValue;
         if (modelCase === "quota-current-only") delete quota.limit;
         const values = modelCase === "quota-unrelated-sufficient"
           ? [{
-              name: { value: "OpenAI.GlobalStandard.gpt-4o", localizedValue: "Tokens Per Minute (thousands) - gpt-4o" },
+              name: { value: "OpenAI.GlobalStandard.gpt-4o", localizedValue: "One Thousand Tokens Per Minute - gpt-4o - GlobalStandard" },
               currentValue: 0,
               limit: 2000,
+              status: null,
               unit: "Count",
             }]
           : [quota];
@@ -1787,6 +1805,7 @@ test("A2 exact deployment, catalog, quota, context, and error-shape checks fail 
     ["transcription-capacity-bad", "transcription-contract"],
     ["upgrade-bad", "transcription-contract"],
     ["deployment-duplicate", "deployment-duplicate"],
+    ["deployment-spillover", "deployment-spillover"],
     ["deployment-malformed", "deployment-response"],
     ["deployment-unknown-shape", "deployment-response"],
     ["deployment-wrong-context", "deployment-context"],
@@ -1806,6 +1825,9 @@ test("A2 exact deployment, catalog, quota, context, and error-shape checks fail 
     ["quota-bad", "quota-unreleased"],
     ["quota-duplicate", "quota-duplicate"],
     ["quota-unknown-unit", "model-quota"],
+    ["quota-status-blocked", "model-quota"],
+    ["quota-status-overage", "model-quota"],
+    ["quota-status-unknown", "model-quota"],
     ["quota-total-only", "model-quota"],
     ["quota-current-only", "model-quota"],
     ["quota-malformed", "model-quota"],
