@@ -4,6 +4,7 @@ import {
   DeterministicFixtureLanguageValidator,
   DeterministicMockProvider,
   GenerationError,
+  GenerationProviderError,
   GenerationService,
   MetadataOnlyEvidenceCollector,
   createGenerationEvidenceRecord,
@@ -25,6 +26,21 @@ import type {
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
 const UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
+const PROVIDER_FAILURE_STAGES = [
+  'identity',
+  'timeout',
+  'transport',
+  'auth',
+  'rate_limit',
+  'http',
+  'response_size',
+  'response_envelope',
+  'finish_length',
+  'finish_other',
+  'completion_json',
+  'completion_schema',
+  'unknown'
+] as const;
 
 function turn(target: 'es' | 'tr' = 'es', revision = 1, targetTranscript?: string): AcceptedTargetTurn {
   return createAcceptedTargetTurn({
@@ -258,6 +274,167 @@ describe('one-call completion', () => {
 });
 
 describe('provider failures, validation, retry, and deduplication', () => {
+  it.each(PROVIDER_FAILURE_STAGES)('propagates the trusted %s provider stage into the typed error and evidence', async (stage) => {
+    const provider = {
+      id: 'staged-provider',
+      version: '1.2.0',
+      complete: async () => {
+        throw new GenerationProviderError(stage);
+      }
+    } satisfies GenerationProvider;
+    const service = serviceWithValidator(provider);
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: stage,
+      message: 'Generation provider failed.'
+    });
+    expect(service.evidence).toMatchObject([{
+      status: 'failure',
+      failureCategory: 'provider-failure',
+      providerFailureStage: stage
+    }]);
+  });
+
+  it('propagates a trusted GenerationError stage and rejects forged provider stages', async () => {
+    const trustedProviderError = new GenerationError('provider-failure', 'identity');
+    const trustedProvider = {
+      id: 'generation-error-provider',
+      version: '1.0.0',
+      complete: async () => {
+        throw trustedProviderError;
+      }
+    } satisfies GenerationProvider;
+    const trustedService = serviceWithValidator(trustedProvider);
+
+    await expect(trustedService.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: 'identity'
+    });
+
+    const getterCanary = 'getter-provider-stage-canary';
+    let getterCalls = 0;
+    const accessorError = {};
+    Object.defineProperty(accessorError, 'providerFailureStage', {
+      get: () => {
+        getterCalls += 1;
+        throw new Error(getterCanary);
+      }
+    });
+    class SubclassProviderError extends GenerationProviderError {}
+    const trustedError = new GenerationProviderError('auth');
+    const hostileErrors: unknown[] = [
+      { providerFailureStage: 'http', message: 'provider payload canary' },
+      new Proxy(trustedError, {
+        get: () => {
+          throw new Error('proxy-provider-stage-canary');
+        }
+      }),
+      new SubclassProviderError('rate_limit'),
+      accessorError
+    ];
+    const provider = {
+      id: 'hostile-stage-provider',
+      version: '1.0.0',
+      complete: async () => {
+        throw hostileErrors.shift();
+      }
+    } satisfies GenerationProvider;
+    const service = serviceWithValidator(provider);
+
+    const hostileErrorCount = hostileErrors.length;
+    for (let index = 0; index < hostileErrorCount; index += 1) {
+      await expect(service.complete(turn())).rejects.toMatchObject({
+        category: 'provider-failure',
+        providerFailureStage: 'unknown',
+        message: 'Generation provider failed.'
+      });
+    }
+    expect(getterCalls).toBe(0);
+    expect(service.evidence).toHaveLength(4);
+    expect(service.evidence.every((record) => record.providerFailureStage === 'unknown')).toBe(true);
+  });
+
+  it('rejects a prototype-normalizing GenerationProviderError subclass as untrusted', async () => {
+    class PrototypeNormalizingProviderError extends GenerationProviderError {
+      constructor(stage: unknown) {
+        super(stage);
+        Object.setPrototypeOf(this, GenerationProviderError.prototype);
+      }
+    }
+    const provider: GenerationProvider = {
+      id: 'prototype-normalizing-provider-error',
+      version: '1.0.0',
+      complete: async () => {
+        throw new PrototypeNormalizingProviderError('auth');
+      }
+    };
+    const service = serviceWithValidator(provider);
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: 'unknown'
+    });
+    expect(service.evidence).toMatchObject([{
+      failureCategory: 'provider-failure',
+      providerFailureStage: 'unknown'
+    }]);
+  });
+
+  it('rejects a prototype-normalizing provider-failure GenerationError subclass as untrusted', async () => {
+    class PrototypeNormalizingGenerationError extends GenerationError {
+      constructor(stage: unknown) {
+        super('provider-failure', stage);
+        Object.setPrototypeOf(this, GenerationError.prototype);
+      }
+    }
+    const provider: GenerationProvider = {
+      id: 'prototype-normalizing-generation-error',
+      version: '1.0.0',
+      complete: async () => {
+        throw new PrototypeNormalizingGenerationError('http');
+      }
+    };
+    const service = serviceWithValidator(provider);
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: 'unknown'
+    });
+    expect(service.evidence).toMatchObject([{
+      failureCategory: 'provider-failure',
+      providerFailureStage: 'unknown'
+    }]);
+  });
+
+  it('normalizes trusted malformed provider stages to unknown', async () => {
+    const providerErrors: unknown[] = [
+      new GenerationProviderError('forged-provider-stage'),
+      new GenerationError('provider-failure', 'forged-generation-stage')
+    ];
+    const provider: GenerationProvider = {
+      id: 'malformed-stage-provider',
+      version: '1.0.0',
+      complete: async () => {
+        throw providerErrors.shift();
+      }
+    };
+    const service = serviceWithValidator(provider);
+
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: 'unknown'
+    });
+    await expect(service.complete(turn())).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: 'unknown'
+    });
+    expect(service.evidence).toMatchObject([
+      { failureCategory: 'provider-failure', providerFailureStage: 'unknown' },
+      { failureCategory: 'provider-failure', providerFailureStage: 'unknown' }
+    ]);
+  });
+
   it('redacts provider failures without retaining a cause and permits retry', async () => {
     const providerFailure = new Error('secret conversation: provider payload');
     const provider = new DeterministicMockProvider({
@@ -275,6 +452,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(GenerationError);
       expect((error as GenerationError).category).toBe('provider-failure');
+      expect((error as GenerationError).providerFailureStage).toBe('unknown');
       expect((error as Error).message).toBe('Generation provider failed.');
       expect((error as Error).message).not.toContain('secret');
       expect(String(error)).not.toContain('secret conversation');
@@ -287,6 +465,10 @@ describe('provider failures, validation, retry, and deduplication', () => {
       englishTranslation: 'Recovered English'
     });
     expect(provider.completeCalls).toBe(2);
+    expect(service.evidence[0]).toMatchObject({
+      failureCategory: 'provider-failure',
+      providerFailureStage: 'unknown'
+    });
   });
 
   it.each([0, 1, 4] as const)('rejects %d suggestions without partial output', async (count) => {
@@ -458,9 +640,13 @@ describe('provider failures, validation, retry, and deduplication', () => {
     await Promise.resolve();
     expect(provider.completeCalls).toBe(1);
     firstController.abort();
-    await expect(firstPromise).rejects.toMatchObject({ category: 'provider-failure' });
+    await expect(firstPromise).rejects.toMatchObject({
+      category: 'provider-failure',
+      providerFailureStage: undefined
+    });
     expect(provider.signals[0]?.aborted).toBe(true);
     expect(service.evidence).toMatchObject([{ operation: 'complete', status: 'cancelled' }]);
+    expect(service.evidence[0]).not.toHaveProperty('providerFailureStage');
   });
 
   it('deduplicates a repeated signal listener, cleans it up, and aborts once', async () => {
@@ -503,7 +689,8 @@ describe('provider failures, validation, retry, and deduplication', () => {
     controller.abort();
 
     await expect(service.complete(turn(), { signal: controller.signal })).rejects.toMatchObject({
-      category: 'provider-failure'
+      category: 'provider-failure',
+      providerFailureStage: undefined
     });
     expect(provider.completeCalls).toBe(0);
     expect(service.evidence).toMatchObject([{ operation: 'complete', status: 'cancelled' }]);
@@ -1328,7 +1515,7 @@ describe('provider snapshots and hostile values', () => {
 describe('metadata-only evidence', () => {
   it.each([
     ['success', {}],
-    ['failure', { failureCategory: 'provider-failure' }],
+    ['failure', { failureCategory: 'provider-failure', providerFailureStage: 'http' }],
     ['cancelled', {}]
   ] as const)('validates and records complete %s evidence as metadata only', (status, extra) => {
     const collector = new MetadataOnlyEvidenceCollector();
@@ -1359,6 +1546,34 @@ describe('metadata-only evidence', () => {
     expect(Object.isFrozen(record)).toBe(true);
     expect(JSON.stringify(record)).not.toContain('transcript');
     expect(Object.keys(record)).not.toContain('sourceText');
+  });
+
+  it.each(PROVIDER_FAILURE_STAGES)('accepts only the fixed provider stage %s in provider-failure evidence', (stage) => {
+    const record = createGenerationEvidenceRecord({
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      segmentId: 'segment-1',
+      acceptedFinalRevision: 1,
+      selectedTargetLanguage: 'es',
+      gatePolicyVersion: '1.0.0',
+      operation: 'complete',
+      status: 'failure',
+      failureCategory: 'provider-failure',
+      providerFailureStage: stage,
+      providerId: 'test-provider',
+      providerVersion: '1.0.0',
+      validatorId: 'test-validator',
+      validatorVersion: '1.0.0',
+      languageValidationStatus: 'not-run',
+      languageValidationCheckCount: 0,
+      languageValidationNonmatchCount: 0,
+      startMonotonicMs: 10,
+      endMonotonicMs: 20,
+      latencyMs: 10
+    });
+
+    expect(record.providerFailureStage).toBe(stage);
   });
 
   it('stores immutable metadata and no conversation content', async () => {
@@ -1509,6 +1724,43 @@ describe('metadata-only evidence', () => {
       ...record,
       failureCategory: 'provider-failure',
       latencyMs: 11
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      failureCategory: 'invalid-provider-result',
+      providerFailureStage: 'http'
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      status: 'success',
+      failureCategory: undefined,
+      providerFailureStage: 'http',
+      languageValidationStatus: 'accepted',
+      languageValidationCheckCount: 5
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      status: 'cancelled',
+      failureCategory: undefined,
+      providerFailureStage: 'http'
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      failureCategory: 'provider-failure',
+      providerFailureStage: 'not-a-stage'
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      failureCategory: 'provider-failure',
+      providerFailureStage: undefined
+    } as never)).toThrow(GenerationError);
+    expect(() => createGenerationEvidenceRecord({
+      ...record,
+      status: 'success',
+      failureCategory: undefined,
+      providerFailureStage: undefined,
+      languageValidationStatus: 'accepted',
+      languageValidationCheckCount: 5
     } as never)).toThrow(GenerationError);
   });
 

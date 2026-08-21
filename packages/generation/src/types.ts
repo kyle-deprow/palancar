@@ -18,6 +18,21 @@ import type {
 
 export type GenerationOperation = 'complete' | 'translate' | 'suggest';
 
+export type GenerationProviderFailureStage =
+  | 'identity'
+  | 'timeout'
+  | 'transport'
+  | 'auth'
+  | 'rate_limit'
+  | 'http'
+  | 'response_size'
+  | 'response_envelope'
+  | 'finish_length'
+  | 'finish_other'
+  | 'completion_json'
+  | 'completion_schema'
+  | 'unknown';
+
 export type GenerationErrorCategory =
   | 'invalid-input'
   | 'forged-value'
@@ -104,6 +119,7 @@ export interface GenerationEvidenceRecord extends GenerationCorrelation {
   readonly operation: GenerationOperation;
   readonly status: 'success' | 'failure' | 'cancelled';
   readonly failureCategory?: GenerationErrorCategory;
+  readonly providerFailureStage?: GenerationProviderFailureStage;
   readonly providerId: string;
   readonly providerVersion: string;
   readonly validatorId: string;

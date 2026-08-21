@@ -1,5 +1,8 @@
 import { isAcceptedTargetTurn } from './accepted.js';
-import { GenerationError } from './errors.js';
+import {
+  GenerationError,
+  trustedGenerationProviderFailureStage
+} from './errors.js';
 import { MetadataOnlyEvidenceCollector } from './evidence.js';
 import {
   DEFAULT_LANGUAGE_VALIDATION_TIMEOUT_MS,
@@ -25,6 +28,7 @@ import type {
   GenerationProvider,
   GenerationProviderCompletion,
   GenerationProviderCompletionInput,
+  GenerationProviderFailureStage,
   GenerationServiceOptions,
   MetadataOnlyEvidenceCollectorLike,
   SuggestionPhrasePair
@@ -70,6 +74,11 @@ function invalid(category: 'forged-value' | 'invalid-provider'): never {
 
 function invalidProviderResult(): never {
   throw new GenerationError('invalid-provider-result');
+}
+
+function providerFailureFrom(error: unknown): GenerationError {
+  const stage = trustedGenerationProviderFailureStage(error) ?? 'unknown';
+  return new GenerationError('provider-failure', stage);
 }
 
 function descriptorFor(value: object, key: string): PropertyDescriptor | undefined {
@@ -651,6 +660,7 @@ export class GenerationService {
     const start = now();
     let status: GenerationEvidenceRecord['status'] = 'failure';
     let failureCategory: GenerationEvidenceRecord['failureCategory'];
+    let providerFailureStage: GenerationProviderFailureStage | undefined;
     let languageValidationStatus: GeneratedLanguageValidationStatus = 'not-run';
     let languageValidationCheckCount: 0 | 5 | 7 = 0;
     let languageValidationNonmatchCount = 0;
@@ -665,8 +675,13 @@ export class GenerationService {
       let raw: GenerationProviderCompletion;
       try {
         raw = await this.#provider.complete(input, { signal: controller.signal });
-      } catch {
-        throw new GenerationError('provider-failure');
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new GenerationError('provider-failure');
+        }
+        const normalized = providerFailureFrom(error);
+        providerFailureStage = normalized.providerFailureStage;
+        throw normalized;
       }
       if (controller.signal.aborted) {
         throw new GenerationError('provider-failure');
@@ -728,6 +743,7 @@ export class GenerationService {
       if (callerCancelled) {
         status = 'cancelled';
         failureCategory = undefined;
+        providerFailureStage = undefined;
         if (languageValidationCheckCount !== 0) {
           languageValidationStatus = 'cancelled';
           languageValidationNonmatchCount = 0;
@@ -751,6 +767,7 @@ export class GenerationService {
           operation: 'complete',
           status,
           ...(failureCategory === undefined ? {} : { failureCategory }),
+          ...(providerFailureStage === undefined ? {} : { providerFailureStage }),
           providerId: this.#provider.id,
           providerVersion: this.#provider.version,
           validatorId: this.#validator.id,

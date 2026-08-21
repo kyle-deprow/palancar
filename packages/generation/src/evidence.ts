@@ -1,5 +1,9 @@
 import { VERSION_PATTERN } from '@palancar/contracts';
-import type { GenerationErrorCategory } from './types.js';
+import type {
+  GenerationErrorCategory,
+  GenerationProviderFailureStage
+} from './types.js';
+import { isGenerationProviderFailureStage } from './errors.js';
 import { isTargetLanguage } from '@palancar/language-registry';
 
 import { GenerationError } from './errors.js';
@@ -27,6 +31,7 @@ const ALLOWED_KEYS = new Set([
   'operation',
   'status',
   'failureCategory',
+  'providerFailureStage',
   'providerId',
   'providerVersion',
   'validatorId',
@@ -196,6 +201,15 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
   ) {
     invalid();
   }
+  const hasProviderFailureStage = Object.hasOwn(snapshot, 'providerFailureStage');
+  if (
+    hasProviderFailureStage &&
+    (snapshot.status !== 'failure' ||
+      snapshot.failureCategory !== 'provider-failure' ||
+      !isGenerationProviderFailureStage(snapshot.providerFailureStage))
+  ) {
+    invalid();
+  }
   if (
     (snapshot.status === 'success' && snapshot.languageValidationStatus !== 'accepted') ||
     (snapshot.status === 'failure' &&
@@ -232,6 +246,9 @@ export function createGenerationEvidenceRecord(input: unknown): GenerationEviden
     operation: snapshot.operation,
     status: snapshot.status,
     ...(snapshot.failureCategory === undefined ? {} : { failureCategory: snapshot.failureCategory }),
+    ...(!hasProviderFailureStage
+      ? {}
+      : { providerFailureStage: snapshot.providerFailureStage as GenerationProviderFailureStage }),
     providerId: snapshot.providerId,
     providerVersion: snapshot.providerVersion,
     validatorId: snapshot.validatorId,
