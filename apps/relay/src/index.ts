@@ -16,3 +16,18 @@ export {
 } from './provisional-language-boundary.js';
 export type { DevelopmentProvisionalLanguageBoundary } from './provisional-language-boundary.js';
 export type * from './types.js';
+export {
+  AZURE_GENERATION_DIAGNOSTIC_FAILURE_STAGES,
+  AZURE_GENERATION_DIAGNOSTIC_STAGES,
+  runAzureGenerationDiagnostic
+} from './azure-generation-diagnostic.js';
+export type {
+  AzureGenerationDiagnosticDependencies,
+  AzureGenerationDiagnosticEnvironment,
+  AzureGenerationDiagnosticExitCode,
+  AzureGenerationDiagnosticFailureStage,
+  AzureGenerationDiagnosticOutput,
+  AzureGenerationDiagnosticStage,
+  AzureGenerationDiagnosticTimer,
+  AzureGenerationDiagnosticTokenSource
+} from './azure-generation-diagnostic.js';

@@ -36,6 +36,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json",
+    "diagnostic": "node dist/azure-generation-diagnostic.js",
     "start": "node dist/main.js",
     "container:build": "docker build -f Dockerfile -t palancar-relay:local ../..",
     "container:smoke": "node scripts/smoke-container.mjs"

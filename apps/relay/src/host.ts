@@ -483,7 +483,7 @@ function rejectBoundarySelectionEnvironment(env: NodeJS.ProcessEnv): void {
   });
 }
 
-function canonicalAzureClientId(value: string): string {
+export function canonicalAzureClientId(value: string): string {
   if (value !== value.toLowerCase() || !CANONICAL_AZURE_CLIENT_ID.test(value)) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
@@ -504,7 +504,7 @@ function canonicalAzureTranscriptionDeployment(value: string): string {
   return value;
 }
 
-function canonicalAzureGenerationEndpoint(value: string): string {
+export function canonicalAzureGenerationEndpoint(value: string): string {
   if (!CANONICAL_AZURE_GENERATION_ENDPOINT.test(value)) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }
@@ -529,7 +529,7 @@ function canonicalAzureGenerationEndpoint(value: string): string {
   return value;
 }
 
-function canonicalAzureGenerationDeployment(value: string): string {
+export function canonicalAzureGenerationDeployment(value: string): string {
   if (value !== AZURE_GENERATION_DEPLOYMENT) {
     throw new TypeError(RELAY_CONFIGURATION_ERROR);
   }

@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY apps/relay/package.json apps/relay/package.json
 COPY packages/audio/package.json packages/audio/package.json
+COPY packages/azure-auth/package.json packages/azure-auth/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/generation/package.json packages/generation/package.json
 COPY packages/language-registry/package.json packages/language-registry/package.json
@@ -21,6 +22,8 @@ COPY apps/relay/src apps/relay/src
 COPY apps/relay/tsconfig*.json apps/relay/
 COPY packages/audio/src packages/audio/src
 COPY packages/audio/tsconfig*.json packages/audio/
+COPY packages/azure-auth/src packages/azure-auth/src
+COPY packages/azure-auth/tsconfig*.json packages/azure-auth/
 COPY packages/contracts/src packages/contracts/src
 COPY packages/contracts/tsconfig*.json packages/contracts/
 COPY packages/generation/src packages/generation/src
@@ -36,6 +39,7 @@ COPY packages/transcription/tsconfig*.json packages/transcription/
 
 RUN npm run build -w @palancar/contracts \
   && npm run build -w @palancar/audio \
+  && npm run build -w @palancar/azure-auth \
   && npm run build -w @palancar/language-registry \
   && npm run build -w @palancar/transcription \
   && npm run build -w @palancar/generation \
@@ -61,6 +65,8 @@ COPY --from=builder --chown=node:node /app/apps/relay/package.json apps/relay/pa
 COPY --from=builder --chown=node:node /app/apps/relay/dist apps/relay/dist
 COPY --from=builder --chown=node:node /app/packages/audio/package.json packages/audio/package.json
 COPY --from=builder --chown=node:node /app/packages/audio/dist packages/audio/dist
+COPY --from=builder --chown=node:node /app/packages/azure-auth/package.json packages/azure-auth/package.json
+COPY --from=builder --chown=node:node /app/packages/azure-auth/dist packages/azure-auth/dist
 COPY --from=builder --chown=node:node /app/packages/contracts/package.json packages/contracts/package.json
 COPY --from=builder --chown=node:node /app/packages/contracts/dist packages/contracts/dist
 COPY --from=builder --chown=node:node /app/packages/generation/package.json packages/generation/package.json
