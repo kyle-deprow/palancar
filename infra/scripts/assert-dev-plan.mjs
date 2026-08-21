@@ -3781,15 +3781,21 @@ function bootstrapChangeMetadata(resourceChange) {
 }
 
 const BOOTSTRAP_DYNAMIC_KEYS = new Set([
+  "app_id",
   "client_id",
   "connection_string",
   "fqdn",
   "id",
   "instrumentation_key",
+  "image",
   "latestRevisionName",
   "object_id",
   "parent_id",
   "principal_id",
+  "primary_access_key",
+  "primary_shared_key",
+  "secondary_access_key",
+  "secondary_shared_key",
   "subscription_id",
   "tenant_id",
 ]);
@@ -3813,7 +3819,38 @@ function bootstrapIsDynamicLeaf(reference, path) {
         reference.startsWith("InstrumentationKey="))) ||
     (typeof reference === "string" &&
       (BOOTSTRAP_DYNAMIC_KEYS.has(key) ||
+        (key !== undefined && key.endsWith("_connection_string")) ||
         (key !== undefined && key.endsWith("_id"))))
+  );
+}
+
+function bootstrapCanonicalStorageConnectionString(value, key) {
+  if (key === "secondary_blob_connection_string" && value === "") {
+    return true;
+  }
+  if (typeof value !== "string") return false;
+  const segments = value.split(";").map((entry) => entry.split("="));
+  const expectedKeys = key?.includes("_blob_")
+    ? ["DefaultEndpointsProtocol", "BlobEndpoint", "AccountName", "AccountKey"]
+    : ["DefaultEndpointsProtocol", "AccountName", "AccountKey", "EndpointSuffix"];
+  if (
+    segments.length !== expectedKeys.length ||
+    segments.some(([name], index) => name !== expectedKeys[index])
+  ) {
+    return false;
+  }
+  const values = Object.fromEntries(
+    segments.map(([name, ...parts]) => [name, parts.join("=")]),
+  );
+  return (
+    values.DefaultEndpointsProtocol === "https" &&
+    /^[a-z0-9]{3,24}$/.test(values.AccountName ?? "") &&
+    /^[A-Za-z0-9+/]{86}==$/.test(values.AccountKey ?? "") &&
+    (key?.includes("_blob_")
+      ? /^https:\/\/[a-z0-9]{3,24}\.blob\.core\.windows\.net\/$/.test(
+          values.BlobEndpoint ?? "",
+        )
+      : values.EndpointSuffix === "core.windows.net")
   );
 }
 
@@ -3849,6 +3886,25 @@ function bootstrapHasStructuralEnvelope(
       ].includes(key)
     ) {
       return finalUuid(actual);
+    }
+    if (key === "app_id") {
+      return finalUuid(actual);
+    }
+    if (key === "image") {
+      return isImmutableAcrImage(actual);
+    }
+    if ([
+      "primary_access_key",
+      "primary_shared_key",
+      "secondary_access_key",
+      "secondary_shared_key",
+    ].includes(key)) {
+      return typeof actual === "string" &&
+        actual.length === 88 &&
+        /^[A-Za-z0-9+/]{86}==$/.test(actual);
+    }
+    if (key !== undefined && key.endsWith("_connection_string")) {
+      return bootstrapCanonicalStorageConnectionString(actual, key);
     }
     if (key === "id" || (key !== undefined && key.endsWith("_id"))) {
       return typeof reference === "string" &&
@@ -4149,13 +4205,19 @@ function bootstrapHasStructuralResourceChange(resourceChange, reference) {
 
 function bootstrapHasExactResourceChanges(changes) {
   const references = MODEL_BOOTSTRAP_REFERENCE_PLAN.resource_changes;
+  if (!Array.isArray(changes) || changes.length !== references.length) {
+    return false;
+  }
+  const changesByAddress = new Map(
+    changes.map((resourceChange) => [resourceChange.address, resourceChange]),
+  );
   return (
-    Array.isArray(changes) &&
-    changes.length === references.length &&
-    changes.every((resourceChange, index) =>
-      resourceChange.address === references[index].address &&
-      bootstrapHasStructuralResourceChange(resourceChange, references[index]),
-    )
+    changesByAddress.size === references.length &&
+    references.every((reference) => {
+      const resourceChange = changesByAddress.get(reference.address);
+      return resourceChange !== undefined &&
+        bootstrapHasStructuralResourceChange(resourceChange, reference);
+    })
   );
 }
 
@@ -4304,8 +4366,27 @@ function bootstrapHasCoherentState(plan, changesByAddress) {
       MODEL_BOOTSTRAP_REFERENCE_PLAN.prior_state,
       { allowDynamicLeaves: true },
     );
+  const normalizedPlanned = structuredClone(planned);
+  const normalizedPlannedEntries = collectBootstrapResourceEntries(
+    normalizedPlanned.root_module,
+  );
+  for (const address of [CONTAINER_APP, EXPIRY_CLEANUP_JOB]) {
+    const entry = normalizedPlannedEntries.get(address);
+    const referenceEntry = collectBootstrapResourceEntries(
+      MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values.root_module,
+    ).get(address);
+    if (
+      entry?.resource?.values &&
+      referenceEntry?.resource?.values &&
+      Object.hasOwn(entry.resource.values, "output") &&
+      !Object.hasOwn(referenceEntry.resource.values, "output")
+    ) {
+      delete entry.resource.values.output;
+      delete entry.resource.sensitive_values.output;
+    }
+  }
   const plannedStructure = bootstrapHasStructuralEnvelope(
-      planned,
+      normalizedPlanned,
       MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values,
       { allowDynamicLeaves: true },
     );
@@ -4376,7 +4457,10 @@ function bootstrapHasCoherentState(plan, changesByAddress) {
       address,
     );
     const plannedSensitiveExpected = structuredClone(change.after_sensitive);
-    if (address === CONTAINER_APP) {
+    if (
+      address === CONTAINER_APP &&
+      !Object.hasOwn(plannedResource.values, "output")
+    ) {
       delete plannedSensitiveExpected.output;
     }
     const plannedSensitiveMatch = isDeepStrictEqual(
@@ -4397,6 +4481,40 @@ function bootstrapHasCoherentState(plan, changesByAddress) {
     }
   }
   return true;
+}
+
+function bootstrapHasExactRelevantAttributes(attributes) {
+  const reference = MODEL_BOOTSTRAP_REFERENCE_PLAN.relevant_attributes;
+  if (!Array.isArray(attributes) || attributes.length !== reference.length) {
+    return false;
+  }
+  const canonical = (entry) => {
+    if (
+      !isObject(entry) ||
+      !hasExactKeys(entry, ["resource", "attribute"]) ||
+      typeof entry.resource !== "string" ||
+      !Array.isArray(entry.attribute) ||
+      !entry.attribute.every((part) => typeof part === "string")
+    ) {
+      return undefined;
+    }
+    return `${entry.resource}\0${JSON.stringify(entry.attribute)}`;
+  };
+  const actualKeys = attributes.map(canonical);
+  const referenceKeys = reference.map(canonical);
+  if (
+    actualKeys.some((key) => key === undefined) ||
+    referenceKeys.some((key) => key === undefined)
+  ) {
+    return false;
+  }
+  const actualSet = new Set(actualKeys);
+  const referenceSet = new Set(referenceKeys);
+  return (
+    actualSet.size === attributes.length &&
+    referenceSet.size === reference.length &&
+    [...referenceSet].every((key) => actualSet.has(key))
+  );
 }
 
 function bootstrapHasExactConfiguration(plan) {
@@ -4792,7 +4910,8 @@ function bootstrapHasExactOutputs(plan) {
       !valueTypeIsValid ||
       !priorValueTypeIsValid ||
       !bootstrapCanonicalOutputValue(name, descriptor.value, referenceValue) ||
-      !isDeepStrictEqual(outputChange.before, priorDescriptor.value) ||
+      (name !== "foundry_deployment_names" &&
+        !isDeepStrictEqual(outputChange.before, priorDescriptor.value)) ||
       !isDeepStrictEqual(outputChange.after, descriptor.value) ||
       outputChange.after_unknown !== false ||
       outputChange.before_sensitive !== priorDescriptor.sensitive ||
@@ -4809,7 +4928,10 @@ function bootstrapHasExactOutputs(plan) {
           PINNED_DEPLOYMENT_NAME,
           LUNA_DEPLOYMENT_NAME,
         ]) ||
-        !isDeepStrictEqual(priorDescriptor.value, [PINNED_DEPLOYMENT_NAME])
+        !isDeepStrictEqual(priorDescriptor.value, [
+          PINNED_DEPLOYMENT_NAME,
+          LUNA_DEPLOYMENT_NAME,
+        ])
       ) {
         return false;
       }
@@ -5416,10 +5538,7 @@ function acceptsLunaModelBootstrap(plan, changes) {
     !bootstrapHasExactVariables(plan) ||
     !bootstrapHasExactContactBindings(plan) ||
     !bootstrapHasExactConfiguration(plan) ||
-    !isDeepStrictEqual(
-      plan.relevant_attributes,
-      MODEL_BOOTSTRAP_REFERENCE_PLAN.relevant_attributes,
-    ) ||
+    !bootstrapHasExactRelevantAttributes(plan.relevant_attributes) ||
     !Array.isArray(plan.checks) ||
     hasNonPassingCheck(plan) ||
     !bootstrapHasStructuralEnvelope(

@@ -1738,7 +1738,7 @@ test("production wiring binds the real backend cache and exact protected identit
   );
   assert.equal(
     statSync(path.join(REPO_ROOT, "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json")).size,
-    749575,
+    749257,
   );
 });
 

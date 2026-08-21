@@ -8786,7 +8786,8 @@
         "foundry_deployment_names": {
           "sensitive": false,
           "value": [
-            "gpt-4o-mini-transcribe"
+            "gpt-4o-mini-transcribe",
+            "gpt-5.6-luna"
           ],
           "type": [
             "list",
@@ -15473,12 +15474,6 @@
       ]
     },
     {
-      "resource": "azurerm_resource_group.foundation",
-      "attribute": [
-        "id"
-      ]
-    },
-    {
       "resource": "module.container_app_workload[0].azapi_resource.this",
       "attribute": [
         "id"
@@ -15677,16 +15672,6 @@
       "attribute": [
         "id"
       ]
-    },
-    {
-      "resource": "module.container_app_workload[0].azapi_resource.this",
-      "attribute": [
-        "body"
-      ]
-    },
-    {
-      "resource": "module.foundry.azurerm_cognitive_deployment.this",
-      "attribute": []
     }
   ],
   "checks": [

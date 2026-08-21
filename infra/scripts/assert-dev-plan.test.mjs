@@ -5379,6 +5379,59 @@ test("luna-model-bootstrap binds output order, values, sensitivity, and actions"
   });
 });
 
+test("luna-model-bootstrap accepts resource changes in Terraform emission order", () => {
+  const candidate = lunaBootstrapPlan();
+  candidate.resource_changes.sort((left, right) =>
+    left.address.localeCompare(right.address),
+  );
+  candidate.relevant_attributes.reverse();
+  assert.equal(runCli(["--mode=luna-model-bootstrap"], JSON.stringify(candidate)), 0);
+});
+
+test("luna-model-bootstrap requires the exact unique relevant-attribute set", () => {
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.relevant_attributes.pop();
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.relevant_attributes[0] = clone(candidate.relevant_attributes[1]);
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    candidate.relevant_attributes[0].attribute = ["unexpected"];
+  });
+});
+
+test("luna-model-bootstrap rejects malformed coordinated provider-computed values", () => {
+  const mutateEveryStateCopy = (candidate, address, key, value) => {
+    const change = lunaBootstrapChange(candidate, address).change;
+    change.before[key] = value;
+    change.after[key] = value;
+    lunaBootstrapValueResource(
+      candidate.planned_values.root_module,
+      address,
+    ).values[key] = value;
+    lunaBootstrapValueResource(
+      candidate.prior_state.values.root_module,
+      address,
+    ).values[key] = value;
+  };
+  rejectsLunaBootstrapMutation((candidate) => {
+    mutateEveryStateCopy(
+      candidate,
+      "module.workload_state.azurerm_storage_account.this",
+      "primary_access_key",
+      "not-an-azure-storage-key",
+    );
+  });
+  rejectsLunaBootstrapMutation((candidate) => {
+    mutateEveryStateCopy(
+      candidate,
+      "module.observability.azurerm_application_insights.this",
+      "app_id",
+      "not-an-application-id",
+    );
+  });
+});
+
 test("luna-model-bootstrap CLI usage is exact and content-free", () => {
   const text = JSON.stringify(lunaBootstrapPlan());
   assert.equal(runCli(["--mode=luna-model-bootstrap"], text), 0);
