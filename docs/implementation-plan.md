@@ -28,11 +28,11 @@ Build Palancar as an npm-workspace TypeScript monorepo with four independently t
 The first supported wearer language is English. The target language is selected per session from Spanish (`es`) or Turkish (`tr`). Core code is registry-driven; neither language receives a special branch outside its registry data and conformance fixtures.
 
 The production transcription adapter is deliberately undecided until the
-candidate mini-transcribe deployment passes the realtime spike. Generation is
-provided now through LiteLLM/OpenRouter. Azure generation is only an optional
-future managed-identity mode and is not a required deployment. Client,
-protocol, mocked relay, language gate, fixtures, and most infrastructure can be
-built in parallel without waiting for the transcription result.
+candidate mini-transcribe deployment passes the realtime spike. Generation
+uses direct Azure OpenAI authenticated by the relay runtime's Entra-managed
+identity. Client, protocol, mocked relay, language gate, fixtures, and most
+infrastructure can be built in parallel without waiting for the transcription
+result.
 
 ## Recommended technology baseline
 
@@ -44,8 +44,9 @@ built in parallel without waiting for the transcription result.
 - Transcription: a provider interface with Azure Realtime and Azure Speech adapters; only the spike winner becomes active in production configuration.
 - Audio normalization: a provider capability. The Azure Realtime adapter owns one stateful, production-quality 16 kHz to 24 kHz resampler per active utterance; a provider that accepts native 16 kHz bypasses it. Select and pin the concrete native or WASM implementation only after continuity, image-build, and accuracy tests.
 - Translation and suggestions: one validated combined completion through the
-  LiteLLM/OpenRouter generation path, with independently deliverable translation
-  and suggestions. Azure generation is a future optional managed-identity mode.
+  direct Azure OpenAI generation path, authenticated with the relay runtime's
+  Entra-managed identity, with independently deliverable translation and
+  suggestions.
 - IaC: Terraform with pinned AzureRM and AzAPI providers. Prefer AzureRM
   resources; use AzAPI only where current Azure functionality is not represented
   by AzureRM.
@@ -90,7 +91,7 @@ palancar/
 │   ├── language-registry/           # registry, classifier interface, gate policy
 │   ├── audio/                       # framing, offsets, queues, resampler abstraction
 │   ├── transcription/               # provider contract and Azure adapters
-│   ├── generation/                  # LiteLLM/OpenRouter request/result schemas and service
+│   ├── generation/                  # Azure OpenAI request/result schemas and service
 │   ├── telemetry/                   # metric names, traces, redaction helpers
 │   └── test-fixtures/               # PCM and es/tr/en transcript/audio corpora
 ├── tools/
@@ -359,7 +360,8 @@ speech. Spike evidence is metadata-only under the allow-list above.
 
 `packages/generation` exposes one typed combined-completion method for an
 accepted final turn. It returns the English translation and two or three concise
-`{ english, targetLanguage }` pairs in one LiteLLM/OpenRouter provider call;
+`{ english, targetLanguage }` pairs in one direct Azure OpenAI call authenticated
+with the relay runtime's Entra-managed identity;
 translation and suggestions may still be emitted as independent protocol events
 after that response is validated. The request includes selected target language,
 accepted final revision, and bounded conversational context, with strict runtime
@@ -399,24 +401,24 @@ The dev environment has two explicit applies. The foundation apply composes modu
 - A separate runtime identity with least-privilege access to the selected
   transcription service and Storage Table Data Contributor on the workload-state
   account. Application configuration names this identity's client ID; application
-  code never requests tokens through the image-pull identity. LiteLLM/OpenRouter
-  is the current generation boundary. Azure generation is only a future optional
-  managed-identity mode. Table RBAC is complete before workload readiness.
+  code never requests tokens through the image-pull identity. Direct Azure
+  OpenAI is the current generation boundary, authenticated through the relay
+  runtime's Entra-managed identity. Table RBAC is complete before workload
+  readiness.
 - A managed daily expiry-cleanup Container Apps Job for expired `SecurityState`
   and `RateState` rows.
 - The mini-transcribe candidate deployment, only after budget and alerts exist.
-  No Azure generation deployment is required by the current LiteLLM/OpenRouter
-  path.
+  The fixed Azure OpenAI generation endpoint and deployment are required by the
+  current Entra-authenticated path.
 - Key Vault only for a credential that cannot use managed identity; the module stays disabled otherwise.
 - Optional VNet, private endpoints, private DNS, custom domain, and managed certificate after networking and DNS decisions are made.
 
 After a relay image is pushed, a provisional workload apply creates the candidate Container App with both identities assigned for their separate platform/runtime purposes, external HTTPS/WebSocket ingress, health probes, single revision mode, minimum one replica, development maximum one replica, explicit immutable image digest, and candidate heartbeat/session configuration. Container Apps `identitySettings` sets the ACR-pull identity lifecycle to `None` and the runtime identity to `Main`, so workload code cannot obtain an ACR-pull token. ADR 0005 verifies this negative control as well as successful runtime-identity access. If the candidate passes, the same resource is promoted as the dev workload; if it fails, it is destroyed and the immutable relay image is deployed to the next compute candidate.
 
 AzureRM/AzAPI own the selected transcription resources only where required by
-the realtime provider contract. The current generation path is LiteLLM through
-OpenRouter and has no Azure generation deployment prescription. A future Azure
-generation mode may be added only as an explicitly optional managed-identity
-mode; it must not become a prerequisite for the current plan. The pinned
+the realtime provider contract. The current generation path is direct Azure
+OpenAI authenticated through the relay runtime's Entra-managed identity, with
+the fixed endpoint and deployment in the deployment contract. The pinned
 provider owns the cleanup Container Apps Job when it exposes every required
 property; otherwise AzAPI owns that entire Job resource. AzureRM owns the relay
 Container App only if the pinned provider exposes required `identitySettings`;
@@ -437,9 +439,8 @@ Terraform provisions ACR before the first relay image exists. The deployment seq
 2. Apply the dev foundation in dependency order: budget/alerts and observability;
    separate workload-state Storage with `SecurityState`/`RateState`; ACR;
    image-pull/runtime identities and ACR/Table RBAC; Container Apps environment;
-   managed daily expiry-cleanup Job; then only the selected transcription
-   resources. LiteLLM/OpenRouter generation is configured separately and does
-   not require an Azure generation deployment.
+   managed daily expiry-cleanup Job; then the selected transcription and Azure
+   OpenAI generation resources.
 3. Build, test, scan, and push the relay image with an immutable digest.
 4. Provision a provisional candidate Container App workload with that digest and
    pre-created identities only after Table RBAC and state readiness pass.
@@ -451,10 +452,9 @@ Terraform provisions ACR before the first relay image exists. The deployment seq
 
 Terraform outputs include only non-secret integration values: relay origin, ACR
 server, workload Table endpoint/names, cleanup Job name, selected transcription
-endpoint/deployment names, Key Vault URI when enabled, observability identifiers,
-and managed-identity IDs. LiteLLM/OpenRouter configuration is supplied through
-its reviewed provider configuration; application builds do not parse arbitrary
-Terraform state.
+endpoint/deployment names, Azure OpenAI endpoint/deployment names, Key Vault URI
+when enabled, observability identifiers, and managed-identity IDs. Application
+builds do not parse arbitrary Terraform state.
 
 ## Dependency and phase graph
 
@@ -574,10 +574,10 @@ Exit evidence: physical G2 useful partial under 1.5 seconds p95, final under 1.2
 
 ### Phase 5: translation and response suggestions
 
-Work: integrate the LiteLLM/OpenRouter generation path, strict schemas,
-independent translation/suggestion events, target-language response checks,
-phrase limits, timeouts, and cost telemetry. Keep Azure generation as an
-optional future managed-identity mode, not a current deployment dependency.
+Work: integrate the direct Azure OpenAI generation path authenticated through
+the relay runtime's Entra-managed identity, strict schemas, independent
+translation/suggestion events, target-language response checks, phrase limits,
+timeouts, and cost telemetry.
 
 Exit evidence: English translation arrives independently; two or three validated responses use the selected target language; malformed or late results cannot overwrite a newer turn.
 

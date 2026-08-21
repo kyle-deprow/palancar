@@ -67,9 +67,9 @@ the minimum required application-host configuration files.
   classification, or generated-language validation is absent or unready.
 - Forward partial transcripts only after the ADR 0002 calibration profile is
   approved; a final target decision alone may invoke generation.
-- Compose the existing LiteLLM/OpenRouter provider and mandatory generated-text
-  validator without retaining prompts, transcripts, translations, or provider
-  bodies in telemetry.
+- Compose the direct Azure OpenAI provider through the relay runtime's
+  Entra-managed identity and the mandatory generated-text validator without
+  retaining prompts, transcripts, translations, or provider bodies in telemetry.
 - Drive the transport-free telemetry exporter through a bounded host adapter
   using managed identity for Azure Monitor ingestion. Shutdown drains for at
   most the reviewed five-second window.
@@ -78,14 +78,15 @@ the minimum required application-host configuration files.
 
 After relay and cleanup interfaces settle:
 
-- Propagate immutable relay, LiteLLM proxy, and cleanup image digests through
+- Propagate the immutable relay and cleanup image digests through
   `infra/environments/dev`.
 - Add the exact transcription, classifier/validator, and telemetry environment
   contracts without adding secrets to Terraform state.
 - Wire observability and expiry-cleanup modules and extend the native plan
   guard/tests for every new resource and environment invariant.
-- Keep OpenRouter as the current generation backend. Azure generation remains
-  swappable but is not a deployment prerequisite.
+- Use direct Azure OpenAI as the current generation backend, authenticated by
+  the relay runtime's Entra-managed identity and requiring its fixed endpoint
+  and deployment contract.
 
 ## Serialized integration and verification
 
@@ -100,7 +101,7 @@ After relay and cleanup interfaces settle:
 6. Build each image once from the final commit, push immutable digests, and
    apply the reviewed Azure development plan.
 7. Run health/readiness, authenticated HTTPS ticket, authenticated WSS,
-   Spanish/Turkish mocked-flow, OpenRouter generation, cleanup-job, and
+   Spanish/Turkish mocked-flow, direct Azure OpenAI generation, cleanup-job, and
    telemetry/alert smoke checks. Remove any temporary pairing/test state.
 8. Run a final independent GPT-5.6 Sol adversarial readiness review and fix all
    release-critical findings.
