@@ -509,6 +509,7 @@ function makeHarness(overrides = {}) {
   let diagnosticExecutionStatus = "Succeeded";
   let diagnosticStartStatus = "success";
   let diagnosticRestMode = "empty";
+  let diagnosticExecutionMutator = (value) => value;
   let diagnosticJobMutator = (value) => value;
   let diagnosticRuntimeIdentityShowCount = 0;
   let diagnosticRuntimeIdentityMutator = (value) => value;
@@ -844,7 +845,7 @@ function makeHarness(overrides = {}) {
       if (request.argv[0] === "containerapp" && request.argv[1] === "job" && request.argv[2] === "execution" && request.argv[3] === "show") {
         return {
           status: 0,
-          stdout: JSON.stringify({
+          stdout: JSON.stringify(diagnosticExecutionMutator({
             id: `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/providers/Microsoft.App/jobs/cleanup-job/executions/${diagnosticExecutionName}`,
             name: diagnosticExecutionName,
             properties: {
@@ -852,9 +853,11 @@ function makeHarness(overrides = {}) {
               exitCode: diagnosticExecutionStatus === "Succeeded" ? 0 : 20,
               result: diagnosticExecutionStatus === "Succeeded" ? "passed" : "failed",
               template: {
+                initContainers: [],
                 containers: [{
                   name: "expiry-cleanup",
                   image: REVIEWED_RELAY_IMAGE,
+                  imageType: "ContainerImage",
                   command: ["node"],
                   args: ["apps/relay/dist/azure-generation-diagnostic.js"],
                   env: [
@@ -865,11 +868,11 @@ function makeHarness(overrides = {}) {
                     { name: "PALANCAR_DIAGNOSTIC_RUN_ID", value: diagnosticRunId },
                     { name: "PALANCAR_DIAGNOSTIC_PLAN_SHA256", value: diagnosticPlanSha },
                   ],
-                  resources: { cpu: 0.25, memory: "0.5Gi" },
+                  resources: { cpu: 0.25, memory: "0.5Gi", ephemeralStorage: "" },
                 }],
               },
             },
-          }),
+          })),
         };
       }
       if (request.argv[0] === "rest") {
@@ -881,9 +884,11 @@ function makeHarness(overrides = {}) {
             exitCode: diagnosticExecutionStatus === "Succeeded" ? 0 : 20,
             result: diagnosticExecutionStatus === "Succeeded" ? "passed" : "failed",
             template: {
+              initContainers: [],
               containers: [{
                 name: "expiry-cleanup",
                 image: REVIEWED_RELAY_IMAGE,
+                imageType: "ContainerImage",
                 command: ["node"],
                 args: ["apps/relay/dist/azure-generation-diagnostic.js"],
                 env: [
@@ -894,14 +899,15 @@ function makeHarness(overrides = {}) {
                   { name: "PALANCAR_DIAGNOSTIC_RUN_ID", value: diagnosticRunId },
                   { name: "PALANCAR_DIAGNOSTIC_PLAN_SHA256", value: diagnosticPlanSha },
                 ],
-                resources: { cpu: 0.25, memory: "0.5Gi" },
+                resources: { cpu: 0.25, memory: "0.5Gi", ephemeralStorage: "" },
               }],
             },
           },
         };
+        const observedDiagnosticExecution = diagnosticExecutionMutator(diagnosticExecution);
         const restUrl = request.argv[request.argv.indexOf("--url") + 1] ?? "";
         if (diagnosticRestMode === "absolute-match" && restUrl.includes("$skiptoken=next")) {
-          return { status: 0, stdout: JSON.stringify({ value: [diagnosticExecution], nextLink: null }) };
+          return { status: 0, stdout: JSON.stringify({ value: [observedDiagnosticExecution], nextLink: null }) };
         }
         if (diagnosticRestMode === "cycle") {
           return {
@@ -929,7 +935,7 @@ function makeHarness(overrides = {}) {
           return {
             status: 0,
             stdout: JSON.stringify({
-              value: page === 0 ? [diagnosticExecution] : [],
+              value: page === 0 ? [observedDiagnosticExecution] : [],
               nextLink: `https://management.azure.com/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/providers/Microsoft.App/jobs/cleanup-job/executions?api-version=2025-07-01&$skiptoken=${page + 1}`,
             }),
           };
@@ -1220,6 +1226,7 @@ function makeHarness(overrides = {}) {
     setDiagnosticStatus(value) { diagnosticExecutionStatus = value; },
     setDiagnosticStartStatus(value) { diagnosticStartStatus = value; },
     setDiagnosticRestMode(value) { diagnosticRestMode = value; },
+    setDiagnosticExecutionMutator(value) { diagnosticExecutionMutator = value; },
     setDiagnosticJobMutator(value) { diagnosticJobMutator = value; },
     setDiagnosticRuntimeIdentityMutator(value) { diagnosticRuntimeIdentityMutator = value; },
     setDiagnosticImagePullIdentityMutator(value) { diagnosticImagePullIdentityMutator = value; },
@@ -2208,6 +2215,151 @@ test("diagnostic invoking is a durable exactly-once fence and reconciles absolut
     assert.equal(harness.calls.filter((call) => call.argv[2] === "start").length, 1);
   } finally {
     harness.cleanup();
+  }
+});
+
+test("diagnostic execution template requires the exact Azure CLI 2.83 schema", () => {
+  const mutations = [
+    {
+      label: "missing template initContainers",
+      mutate: (execution) => { delete execution.properties.template.initContainers; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "additional template key",
+      mutate: (execution) => { execution.properties.template.volumes = []; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "nonempty initContainers",
+      mutate: (execution) => { execution.properties.template.initContainers = [{}]; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing template containers",
+      mutate: (execution) => { delete execution.properties.template.containers; },
+      reconciliationSafe: false,
+    },
+    {
+      label: "extra container",
+      mutate: (execution) => { execution.properties.template.containers.push(structuredClone(execution.properties.template.containers[0])); },
+      reconciliationSafe: false,
+    },
+    {
+      label: "missing container key",
+      mutate: (execution) => { delete execution.properties.template.containers[0].args; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "additional container key",
+      mutate: (execution) => { execution.properties.template.containers[0].probes = []; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing imageType",
+      mutate: (execution) => { delete execution.properties.template.containers[0].imageType; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed imageType",
+      mutate: (execution) => { execution.properties.template.containers[0].imageType = "Docker"; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed name",
+      mutate: (execution) => { execution.properties.template.containers[0].name = "unexpected"; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed image",
+      mutate: (execution) => { execution.properties.template.containers[0].image = CLEANUP_IMAGE; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed command",
+      mutate: (execution) => { execution.properties.template.containers[0].command = ["sh"]; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed args",
+      mutate: (execution) => { execution.properties.template.containers[0].args = ["unexpected"]; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed env",
+      mutate: (execution) => { execution.properties.template.containers[0].env[0].value = "unexpected"; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing resources",
+      mutate: (execution) => { delete execution.properties.template.containers[0].resources; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing cpu",
+      mutate: (execution) => { delete execution.properties.template.containers[0].resources.cpu; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed cpu",
+      mutate: (execution) => { execution.properties.template.containers[0].resources.cpu = 0.5; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing memory",
+      mutate: (execution) => { delete execution.properties.template.containers[0].resources.memory; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed memory",
+      mutate: (execution) => { execution.properties.template.containers[0].resources.memory = "1Gi"; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "missing ephemeralStorage",
+      mutate: (execution) => { delete execution.properties.template.containers[0].resources.ephemeralStorage; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "changed ephemeralStorage",
+      mutate: (execution) => { execution.properties.template.containers[0].resources.ephemeralStorage = "1Gi"; },
+      reconciliationSafe: true,
+    },
+    {
+      label: "additional resource key",
+      mutate: (execution) => { execution.properties.template.containers[0].resources.extra = "unexpected"; },
+      reconciliationSafe: true,
+    },
+  ];
+  const assertRejected = (mutate, reconciliation, label) => {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      if (reconciliation) {
+        harness.setDiagnosticStartStatus("ambiguous");
+        harness.setDiagnosticRestMode("absolute-match");
+      }
+      harness.setDiagnosticExecutionMutator((execution) => {
+        const next = structuredClone(execution);
+        mutate(next);
+        return next;
+      });
+      assert.throws(
+        () => harness.lifecycle.diagnostic("runtime-cutover", runId),
+        (error) => error?.code === "diagnostic-execution-template",
+        label,
+      );
+      assert.equal(existsSync(harness.paths(runId).diagnostic), false, label);
+      assert.equal(harness.calls.filter((call) =>
+        call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "start").length, 1, label);
+    } finally {
+      harness.cleanup();
+    }
+  };
+
+  for (const { mutate, label } of mutations) assertRejected(mutate, false, label);
+  for (const { mutate, label, reconciliationSafe } of mutations) {
+    if (reconciliationSafe) assertRejected(mutate, true, `${label} reconciliation`);
   }
 });
 

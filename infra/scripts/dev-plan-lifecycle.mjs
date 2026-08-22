@@ -5633,13 +5633,21 @@ function diagnosticExecutionState(value, job, code) {
 function diagnosticExecutionTemplate(value, expectedEnv, expectedImage, code) {
   failIf(!isObject(value) || !isObject(value.properties), code);
   const template = value.properties.template;
-  failIf(!isObject(template) || !Array.isArray(template.containers) || template.containers.length !== 1, code);
+  assertKnownKeys(template, ["containers", "initContainers"], code);
+  assertRequiredKeys(template, ["containers", "initContainers"], code);
+  failIf(!Array.isArray(template.containers) || template.containers.length !== 1 ||
+    !Array.isArray(template.initContainers) || template.initContainers.length !== 0, code);
   const container = template.containers[0];
-  assertKnownKeys(container, ["name", "image", "env", "resources", "command", "args"], code);
-  assertRequiredKeys(container, ["name", "image", "env", "resources", "command", "args"], code);
+  assertKnownKeys(container, ["args", "command", "env", "image", "imageType", "name", "resources"], code);
+  assertRequiredKeys(container, ["args", "command", "env", "image", "imageType", "name", "resources"], code);
   failIf(container.name !== DIAGNOSTIC_CONTAINER_NAME || container.image !== expectedImage ||
+    container.imageType !== "ContainerImage" ||
     !same(container.command, [DIAGNOSTIC_COMMAND[0]]) || !same(container.args, [DIAGNOSTIC_COMMAND[1]]) ||
-    !same(container.env, expectedEnv) || !same(container.resources, { cpu: 0.25, memory: "0.5Gi" }), code);
+    !same(container.env, expectedEnv), code);
+  const resources = container.resources;
+  assertKnownKeys(resources, ["cpu", "memory", "ephemeralStorage"], code);
+  assertRequiredKeys(resources, ["cpu", "memory", "ephemeralStorage"], code);
+  failIf(!same(resources, { cpu: 0.25, memory: "0.5Gi", ephemeralStorage: "" }), code);
   return container;
 }
 
