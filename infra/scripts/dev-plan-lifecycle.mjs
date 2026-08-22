@@ -25,6 +25,7 @@ import {
   statSync,
 } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -336,6 +337,47 @@ const DIAGNOSTIC_MAX_POLLS = 150;
 const DIAGNOSTIC_POLL_DELAY_MS = 2000;
 const DIAGNOSTIC_JOB_TIMEOUT_MS = 300 * 1000;
 const DIAGNOSTIC_REQUEST_VERSION = 1;
+const DIAGNOSTIC_JOB_TAGS = Object.freeze({
+  application: "palancar",
+  environment: "dev",
+  "managed-by": "terraform",
+  "data-classification": "operational-metadata",
+});
+const DIAGNOSTIC_JOB_ADDRESS = "module.expiry_cleanup_job[0].azapi_resource.this";
+const DIAGNOSTIC_JOB_MODULE_ADDRESS = "module.expiry_cleanup_job[0]";
+const DIAGNOSTIC_JOB_ENV_NAMES = Object.freeze([
+  "AZURE_CLIENT_ID",
+  "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+  "PALANCAR_SECURITY_STATE_TABLE",
+  "PALANCAR_RATE_STATE_TABLE",
+  "PALANCAR_RELAY_ENVIRONMENT",
+  "PALANCAR_RELAY_ORIGIN",
+  "PALANCAR_EXPIRY_CLEANUP_LIMIT",
+  "PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS",
+]);
+// IANA's IPv4 special-purpose registry, plus the non-unicast class ranges.
+// Keep these as explicit CIDRs: 192.0/16 is not a special-purpose block.
+const DIAGNOSTIC_NON_GLOBAL_IPV4_CIDRS = Object.freeze([
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.0.0.0/24",
+  "192.0.2.0/24",
+  "192.31.196.0/24",
+  "192.52.193.0/24",
+  "192.88.99.0/24",
+  "192.168.0.0/16",
+  "192.175.48.0/24",
+  "198.18.0.0/15",
+  "198.51.100.0/24",
+  "203.0.113.0/24",
+  "224.0.0.0/4",
+  "240.0.0.0/4",
+  "255.255.255.255/32",
+]);
 const REVOCATION_FIXED_FILES = Object.freeze([
   "openrouter-revocation-state.json",
   "openrouter-revocation-raw-response.json",
@@ -1718,7 +1760,7 @@ function commandResult(command, args, options, processRunner) {
 function runCommand(config, command, args, options = {}) {
   const request = { cwd: config.workdir, env: config.childEnvironment, ...options };
   const execute = () => commandResult(command, args, request, config.processRunner);
-  if (!cacheableCommand(command, args)) return execute();
+  if (!cacheableCommand(command, args) || options.fresh === true) return execute();
   return testSnapshot(
     `command:${commandSnapshotKey(command, args, request)}`,
     execute,
@@ -4110,8 +4152,8 @@ function runtimeIdentityPrincipalFromAccountRole(config, outputs) {
   return assignment.principalId;
 }
 
-function azJson(config, args, code) {
-  return parseCommandJson(runCommand(config, AZ_PATH, args), code);
+function azJson(config, args, code, options = {}) {
+  return parseCommandJson(runCommand(config, AZ_PATH, args, options), code);
 }
 
 const MODEL_BOOTSTRAP_CONTRACT = Object.freeze({
@@ -4830,18 +4872,213 @@ function canonicalRuntimeShape(value, code) {
   };
 }
 
+function diagnosticPlanEnvironment(entries, code) {
+  failIf(!Array.isArray(entries) || entries.length !== DIAGNOSTIC_JOB_ENV_NAMES.length, code);
+  const names = new Set();
+  return entries.map((entry, index) => {
+    assertKnownKeys(entry, ["name", "value"], code);
+    assertRequiredKeys(entry, ["name", "value"], code);
+    failIf(
+      entry.name !== DIAGNOSTIC_JOB_ENV_NAMES[index] ||
+        names.has(entry.name) ||
+        typeof entry.value !== "string" ||
+        entry.value.length === 0 ||
+        entry.value.trim() !== entry.value,
+      code,
+    );
+    names.add(entry.name);
+    if (entry.name === "AZURE_CLIENT_ID") {
+      failIf(!UUID_RE.test(entry.value), code);
+    } else if (entry.name === "PALANCAR_WORKLOAD_TABLE_ENDPOINT") {
+      let endpoint;
+      try {
+        endpoint = new URL(entry.value);
+      } catch {
+        reject(code);
+      }
+      failIf(
+        endpoint.protocol !== "https:" ||
+          endpoint.username ||
+          endpoint.password ||
+          endpoint.search ||
+          endpoint.hash ||
+          !/^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?\.table\.core\.windows\.net$/i.test(endpoint.hostname) ||
+          (endpoint.pathname !== "/" && endpoint.pathname !== ""),
+        code,
+      );
+    } else if (entry.name === "PALANCAR_SECURITY_STATE_TABLE") {
+      failIf(entry.value !== "SecurityState", code);
+    } else if (entry.name === "PALANCAR_RATE_STATE_TABLE") {
+      failIf(entry.value !== "RateState", code);
+    } else if (entry.name === "PALANCAR_RELAY_ENVIRONMENT") {
+      failIf(entry.value !== "dev", code);
+    } else if (entry.name === "PALANCAR_RELAY_ORIGIN") {
+      let origin;
+      try {
+        origin = new URL(entry.value);
+      } catch {
+        reject(code);
+      }
+      failIf(
+        origin.protocol !== "wss:" ||
+          origin.username ||
+          origin.password ||
+          origin.search ||
+          origin.hash ||
+          origin.pathname !== "/" ||
+          !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+azurecontainerapps\.io$/i.test(origin.hostname),
+        code,
+      );
+    } else if (entry.name === "PALANCAR_EXPIRY_CLEANUP_LIMIT") {
+      failIf(entry.value !== "1000", code);
+    } else if (entry.name === "PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS") {
+      failIf(entry.value !== "240000", code);
+    }
+    return { name: entry.name, value: entry.value };
+  });
+}
+
+function diagnosticPlanCleanupJob(value, code) {
+  assertKnownKeys(value, [
+    "body", "create_headers", "create_query_parameters", "delete_headers", "delete_query_parameters",
+    "id", "identity", "ignore_body_changes", "ignore_casing", "ignore_missing_property",
+    "ignore_null_property", "ignore_other_items_in_list", "list_unique_id_property", "location", "locks",
+    "name", "output", "parent_id", "read_headers", "read_query_parameters", "replace_triggers_external_values",
+    "replace_triggers_refs", "response_export_values", "retry", "schema_validation_enabled", "sensitive_body",
+    "sensitive_body_version", "tags", "timeouts", "type", "update_headers", "update_query_parameters",
+  ], code);
+  assertRequiredKeys(value, [
+    "body", "create_headers", "create_query_parameters", "delete_headers", "delete_query_parameters",
+    "id", "identity", "ignore_body_changes", "ignore_casing", "ignore_missing_property",
+    "ignore_null_property", "ignore_other_items_in_list", "list_unique_id_property", "location", "locks",
+    "name", "output", "parent_id", "read_headers", "read_query_parameters", "replace_triggers_external_values",
+    "replace_triggers_refs", "response_export_values", "retry", "schema_validation_enabled", "sensitive_body",
+    "sensitive_body_version", "tags", "timeouts", "type", "update_headers", "update_query_parameters",
+  ], code);
+  failIf(
+    typeof value.id !== "string" ||
+      value.type !== "Microsoft.App/jobs@2026-01-01" ||
+      typeof value.name !== "string" ||
+      typeof value.location !== "string" ||
+      typeof value.parent_id !== "string" ||
+      !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value.name) ||
+      !/^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+$/.test(value.parent_id) ||
+      value.id !== `${value.parent_id}/providers/Microsoft.App/jobs/${value.name}`,
+    code,
+  );
+  assertDiagnosticJobTags(value.tags, code);
+  const identity = value.identity;
+  failIf(!Array.isArray(identity) || identity.length !== 1, code);
+  assertKnownKeys(identity[0], ["identity_ids", "principal_id", "tenant_id", "type"], code);
+  assertRequiredKeys(identity[0], ["identity_ids", "principal_id", "tenant_id", "type"], code);
+  failIf(
+    identity[0].type !== "UserAssigned" ||
+      identity[0].principal_id !== "" ||
+      identity[0].tenant_id !== "" ||
+      !Array.isArray(identity[0].identity_ids) ||
+      identity[0].identity_ids.length !== 2,
+    code,
+  );
+  const identityIds = identity[0].identity_ids.map(identityKey);
+  failIf(new Set(identityIds).size !== identityIds.length, code);
+  const body = value.body;
+  assertKnownKeys(body, ["properties"], code);
+  assertRequiredKeys(body, ["properties"], code);
+  const properties = body.properties;
+  assertKnownKeys(properties, ["environmentId", "configuration", "template"], code);
+  assertRequiredKeys(properties, ["environmentId", "configuration", "template"], code);
+  failIf(typeof properties.environmentId !== "string", code);
+  const configuration = properties.configuration;
+  assertKnownKeys(configuration, [
+    "triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout",
+    "registries", "identitySettings",
+  ], code);
+  assertRequiredKeys(configuration, [
+    "triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout",
+    "registries", "identitySettings",
+  ], code);
+  failIf(configuration.triggerType !== "Schedule" || configuration.replicaRetryLimit !== 0 || configuration.replicaTimeout !== 300, code);
+  const schedule = configuration.scheduleTriggerConfig;
+  assertKnownKeys(schedule, ["cronExpression", "replicaCompletionCount", "parallelism"], code);
+  assertRequiredKeys(schedule, ["cronExpression", "replicaCompletionCount", "parallelism"], code);
+  failIf(schedule.cronExpression !== "0 3 * * *" || schedule.replicaCompletionCount !== 1 || schedule.parallelism !== 1, code);
+  failIf(!Array.isArray(configuration.registries) || configuration.registries.length !== 1, code);
+  const registry = configuration.registries[0];
+  assertKnownKeys(registry, ["server", "identity"], code);
+  assertRequiredKeys(registry, ["server", "identity"], code);
+  failIf(
+    typeof registry.server !== "string" ||
+      !/^[a-z0-9-]{5,50}\.azurecr\.io$/i.test(registry.server) ||
+      identityKey(registry.identity) !== identityIds[0],
+    code,
+  );
+  failIf(!Array.isArray(configuration.identitySettings) || configuration.identitySettings.length !== 2, code);
+  const identitySettings = configuration.identitySettings.map((setting) => {
+    assertKnownKeys(setting, ["identity", "lifecycle"], code);
+    assertRequiredKeys(setting, ["identity", "lifecycle"], code);
+    return { identity: identityKey(setting.identity), lifecycle: setting.lifecycle };
+  });
+  failIf(!same(identitySettings, [
+    { identity: identityIds[0], lifecycle: "None" },
+    { identity: identityIds[1], lifecycle: "Main" },
+  ]), code);
+  const template = properties.template;
+  assertKnownKeys(template, ["containers"], code);
+  assertRequiredKeys(template, ["containers"], code);
+  failIf(!Array.isArray(template.containers) || template.containers.length !== 1, code);
+  const container = template.containers[0];
+  assertKnownKeys(container, ["name", "image", "resources", "env"], code);
+  assertRequiredKeys(container, ["name", "image", "resources", "env"], code);
+  failIf(container.name !== "expiry-cleanup" || typeof container.image !== "string", code);
+  const resources = container.resources;
+  assertKnownKeys(resources, ["cpu", "memory"], code);
+  assertRequiredKeys(resources, ["cpu", "memory"], code);
+  failIf(resources.cpu !== 0.25 || resources.memory !== "0.5Gi", code);
+  const env = diagnosticPlanEnvironment(container.env, code);
+  failIf(!new RegExp(`^${registry.server.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/palancar-expiry-cleanup@sha256:[a-f0-9]{64}$`, "i").test(container.image), code);
+  return {
+    id: value.id,
+    name: value.name,
+    location: value.location,
+    resourceGroup: value.parent_id.split("/")[4],
+    image: container.image,
+    env,
+    registryServer: registry.server,
+    identityIds,
+  };
+}
+
+function reviewedDiagnosticJobShape(show, stateAddress) {
+  const changeEntries = Array.isArray(show.resource_changes)
+    ? show.resource_changes.filter((entry) => entry?.address === DIAGNOSTIC_JOB_ADDRESS)
+    : [];
+  failIf(changeEntries.length !== 1, "diagnostic-plan-topology");
+  const change = changeEntries[0]?.change;
+  failIf(!isObject(change) || !same(change.actions, ["no-op"]) || !isObject(change.before) || !isObject(change.after), "diagnostic-plan-topology");
+  const prior = stateAddress(show.prior_state?.values?.root_module, DIAGNOSTIC_JOB_ADDRESS, DIAGNOSTIC_JOB_MODULE_ADDRESS, "diagnostic-plan-topology");
+  const planned = stateAddress(show.planned_values?.root_module, DIAGNOSTIC_JOB_ADDRESS, DIAGNOSTIC_JOB_MODULE_ADDRESS, "diagnostic-plan-topology");
+  failIf(prior === undefined || planned === undefined || !isObject(prior.values) || !isObject(planned.values), "diagnostic-plan-topology");
+  failIf(!same(change.before, change.after) || !same(change.before, prior.values) || !same(change.before, planned.values), "diagnostic-plan-topology");
+  const before = diagnosticPlanCleanupJob(change.before, "diagnostic-plan-topology");
+  const after = diagnosticPlanCleanupJob(change.after, "diagnostic-plan-topology");
+  failIf(!same(before, after), "diagnostic-plan-topology");
+  const variableDigest = show.variables?.expiry_cleanup_image_digest?.value;
+  failIf(variableDigest !== after.image, "diagnostic-plan-image");
+  return after;
+}
+
 function reviewedRuntimeShapes(artifacts, phase) {
   failIf(!["runtime-cutover", "credential-cleanup", "terminal"].includes(phase), "diagnostic-plan-phase");
   const show = parseJsonText(boundedFileText(artifacts.show, JSON_MAX_BYTES, "show-json"), "show-json");
   const address = "module.container_app_workload[0].azapi_resource.this";
   const moduleAddress = "module.container_app_workload[0]";
-  const stateAddress = (root, code) => {
+  const stateAddress = (root, targetAddress, targetModuleAddress, code) => {
     failIf(!isObject(root), code);
-    const rootMatches = (root.resources ?? []).filter((resource) => resource?.address === address);
+    const rootMatches = (root.resources ?? []).filter((resource) => resource?.address === targetAddress);
     const moduleMatches = (root.child_modules ?? [])
-      .filter((module) => module?.address === moduleAddress)
+      .filter((module) => module?.address === targetModuleAddress)
       .flatMap((module) => (module.resources ?? []).filter((resource) =>
-        resource?.address === address || resource?.address === "azapi_resource.this"));
+        resource?.address === targetAddress || resource?.address === "azapi_resource.this"));
     const matches = [...rootMatches, ...moduleMatches];
     failIf(matches.length !== 1, code);
     return matches[0];
@@ -4853,8 +5090,8 @@ function reviewedRuntimeShapes(artifacts, phase) {
   const change = changeEntries[0]?.change;
   const expectedActions = phase === "runtime-cutover" ? ["update"] : ["no-op"];
   failIf(!isObject(change) || !same(change.actions, expectedActions) || !isObject(change.before) || !isObject(change.after), "diagnostic-plan-topology");
-  const prior = stateAddress(show.prior_state?.values?.root_module, "diagnostic-plan-topology");
-  const planned = stateAddress(show.planned_values?.root_module, "diagnostic-plan-topology");
+  const prior = stateAddress(show.prior_state?.values?.root_module, address, moduleAddress, "diagnostic-plan-topology");
+  const planned = stateAddress(show.planned_values?.root_module, address, moduleAddress, "diagnostic-plan-topology");
   failIf(prior === undefined || planned === undefined || !isObject(prior.values) || !isObject(planned.values), "diagnostic-plan-topology");
   const before = canonicalRuntimeShape(change.before, "diagnostic-plan-topology");
   const after = canonicalRuntimeShape(change.after, "diagnostic-plan-topology");
@@ -4868,7 +5105,8 @@ function reviewedRuntimeShapes(artifacts, phase) {
   const variableDigest = show.variables?.relay_image_digest?.value;
   const relay = after.containers.find((container) => container.name === "relay");
   failIf(relay === undefined || variableDigest !== relay.image, "diagnostic-plan-image");
-  return { before, after, image: relay.image };
+  const cleanupJob = reviewedDiagnosticJobShape(show, stateAddress);
+  return { before, after, image: relay.image, cleanupJob };
 }
 
 function reviewedRuntimeImage(artifacts) {
@@ -5001,34 +5239,53 @@ function diagnosticJobIdentity(outputs, config, code = "diagnostic-job") {
   return { name: outputs.expiryCleanupJobName, id: outputs.expiryCleanupJobId };
 }
 
-function diagnosticIdentity(config, outputs, manifest, job) {
+function diagnosticManagedIdentity(config, identityId, expected = {}, code = "diagnostic-identity", fresh = false) {
   const value = azJson(config, [
-    "identity", "show", "--ids", outputs.runtimeIdentityId,
+    "identity", "show", "--ids", identityId,
     "--subscription", config.account.subscription, "--output", "json",
-  ], "diagnostic-identity");
-  failIf(!isObject(value), "diagnostic-identity");
+  ], code, { fresh });
+  failIf(!isObject(value), code);
   const identity = {
     resourceId: value.id ?? value.resourceId,
     principalId: value.principalId,
     clientId: value.clientId,
-    planSha256: manifest.planSha256,
-    job,
   };
-  failIf(identity.resourceId !== outputs.runtimeIdentityId ||
-    !UUID_RE.test(identity.principalId ?? "") || identity.principalId !== manifest.bindings.runtimeIdentityPrincipalId ||
-    !UUID_RE.test(identity.clientId ?? "") || identity.clientId !== manifest.bindings.runtimeIdentityClientId,
-    "diagnostic-identity",
+  failIf(
+    identity.resourceId !== identityId ||
+      !UUID_RE.test(identity.principalId ?? "") ||
+      !UUID_RE.test(identity.clientId ?? "") ||
+      (expected.principalId !== undefined && identity.principalId !== expected.principalId) ||
+      (expected.clientId !== undefined && identity.clientId !== expected.clientId),
+    code,
   );
   return identity;
 }
 
-function diagnosticOpenAiRole(config, manifest) {
+function diagnosticIdentity(config, outputs, manifest, job, proof = undefined, fresh = false) {
+  const identity = proof ?? diagnosticManagedIdentity(
+    config,
+    outputs.runtimeIdentityId,
+    {
+      principalId: manifest.bindings.runtimeIdentityPrincipalId,
+      clientId: outputs.runtimeIdentityClientId,
+    },
+    "diagnostic-identity",
+    fresh,
+  );
+  return {
+    ...identity,
+    planSha256: manifest.planSha256,
+    job,
+  };
+}
+
+function diagnosticOpenAiRole(config, manifest, fresh = false) {
   const assignments = azJson(config, [
     "role", "assignment", "list", "--scope", manifest.bindings.accountId,
     "--assignee-object-id", manifest.bindings.runtimeIdentityPrincipalId,
     "--fill-principal-name", "false", "--fill-role-definition-name", "false",
     "-o", "json",
-  ], "diagnostic-openai-role");
+  ], "diagnostic-openai-role", { fresh });
   failIf(!Array.isArray(assignments), "diagnostic-openai-role");
   const projected = assignments.filter((assignment) => isObject(assignment)).map(projectRoleAssignmentSecurityFields);
   const expectedId = manifest.bindings.runtimeOpenAiRoleAssignmentId;
@@ -5048,44 +5305,218 @@ function diagnosticEnvironment(outputs, manifest, requestId) {
   ];
 }
 
-function diagnosticJobContract(value, outputs, reviewed, config) {
-  assertKnownKeys(value, ["id", "name", "location", "type", "identity", "properties", "tags", "systemData"], "diagnostic-job");
-  assertRequiredKeys(value, ["id", "name", "identity", "properties"], "diagnostic-job");
+function diagnosticIpv4Address(value) {
+  return isIP(value) === 4;
+}
+
+function diagnosticIpv4ToInteger(value) {
+  const [first, second, third, fourth] = value.split(".").map(Number);
+  return ((((first * 256) + second) * 256 + third) * 256 + fourth) >>> 0;
+}
+
+function diagnosticGlobalIpv4Address(value) {
+  if (!diagnosticIpv4Address(value)) return false;
+  const address = diagnosticIpv4ToInteger(value);
+  return !DIAGNOSTIC_NON_GLOBAL_IPV4_CIDRS.some((cidr) => {
+    const [network, prefixText] = cidr.split("/");
+    const prefix = Number(prefixText);
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    const first = (diagnosticIpv4ToInteger(network) & mask) >>> 0;
+    const last = first + (2 ** (32 - prefix)) - 1;
+    return address >= first && address <= last;
+  });
+}
+
+function assertDiagnosticEventStreamEndpoint(value, outputs, job, config, code) {
+  failIf(typeof value !== "string" || value.length === 0 || value.trim() !== value, code);
+  let endpoint;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    reject(code);
+  }
+  failIf(
+    endpoint.protocol !== "https:" ||
+      endpoint.port !== "" ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.azurecontainerapps\.dev$/i.test(endpoint.hostname) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash ||
+      endpoint.pathname !== `/subscriptions/${config.account.subscription}/resourceGroups/${outputs.resourceGroup}/containerApps/${job.name}/eventstream`,
+    code,
+  );
+}
+
+function assertDiagnosticJobTags(value, code) {
+  assertKnownKeys(value, Object.keys(DIAGNOSTIC_JOB_TAGS), code);
+  assertRequiredKeys(value, Object.keys(DIAGNOSTIC_JOB_TAGS), code);
+  failIf(!same(value, DIAGNOSTIC_JOB_TAGS), code);
+}
+
+function assertDiagnosticSystemData(value, code) {
+  const keys = [
+    "createdAt", "createdBy", "createdByType",
+    "lastModifiedAt", "lastModifiedBy", "lastModifiedByType",
+  ];
+  assertKnownKeys(value, keys, code);
+  assertRequiredKeys(value, keys, code);
+  failIf(keys.some((key) => !validRevocationString(value[key], 256) || /[\u0080-\u009f]/u.test(value[key])), code);
+  const isoTimestamp = /^(?:\d{4})-(?:\d{2})-(?:\d{2})T(?:\d{2}):(?:\d{2}):(?:\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+  const createdAt = Date.parse(value.createdAt);
+  const lastModifiedAt = Date.parse(value.lastModifiedAt);
+  failIf(
+    value.createdByType !== "User" ||
+      value.lastModifiedByType !== "User" ||
+      !isoTimestamp.test(value.createdAt) ||
+      !isoTimestamp.test(value.lastModifiedAt) ||
+      !Number.isFinite(createdAt) ||
+      !Number.isFinite(lastModifiedAt) ||
+      createdAt > lastModifiedAt ||
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.createdBy) ||
+      value.createdBy !== value.lastModifiedBy,
+    code,
+  );
+}
+
+function diagnosticJobContract(value, outputs, reviewed, config, identityProofs) {
+  assertKnownKeys(value, ["id", "name", "location", "resourceGroup", "type", "identity", "properties", "tags", "systemData"], "diagnostic-job");
+  assertRequiredKeys(value, ["id", "name", "location", "resourceGroup", "identity", "properties", "tags", "systemData"], "diagnostic-job");
   const job = diagnosticJobIdentity(outputs, config);
-  failIf(value.id !== job.id || value.name !== job.name || value.type !== "Microsoft.App/jobs", "diagnostic-job");
+  const guardedJob = reviewed.cleanupJob;
+  failIf(!isObject(guardedJob), "diagnostic-job");
+  failIf(
+    value.id !== job.id ||
+      value.name !== job.name ||
+      value.location !== outputs.region ||
+      value.resourceGroup !== outputs.resourceGroup ||
+      value.type !== "Microsoft.App/jobs",
+    "diagnostic-job",
+  );
+  failIf(
+    guardedJob.id !== value.id ||
+      guardedJob.name !== value.name ||
+      guardedJob.location !== value.location ||
+      guardedJob.resourceGroup !== value.resourceGroup ||
+      !same(guardedJob.identityIds.slice().sort(), [
+        identityKey(outputs.imagePullIdentityId),
+        identityKey(outputs.runtimeIdentityId),
+      ].sort()) ||
+      guardedJob.registryServer !== reviewed.after.registries[0]?.server,
+    "diagnostic-job",
+  );
+  assertDiagnosticJobTags(value.tags, "diagnostic-job");
+  assertDiagnosticSystemData(value.systemData, "diagnostic-job");
   const properties = value.properties;
-  assertKnownKeys(properties, ["environmentId", "configuration", "template", "provisioningState", "runningStatus", "eventStreamEndpoint"], "diagnostic-job");
-  assertRequiredKeys(properties, ["environmentId", "configuration", "template", "provisioningState"], "diagnostic-job");
-  failIf(properties.environmentId !== outputs.containerAppEnvironmentId || properties.provisioningState !== "Succeeded", "diagnostic-job");
+  assertKnownKeys(properties, ["environmentId", "configuration", "template", "provisioningState", "runningStatus", "eventStreamEndpoint", "outboundIpAddresses", "workloadProfileName"], "diagnostic-job");
+  assertRequiredKeys(properties, ["environmentId", "configuration", "template", "provisioningState", "runningStatus", "eventStreamEndpoint", "outboundIpAddresses", "workloadProfileName"], "diagnostic-job");
+  failIf(
+    properties.environmentId !== outputs.containerAppEnvironmentId ||
+      properties.provisioningState !== "Succeeded" ||
+      properties.runningStatus !== "Ready" ||
+      properties.workloadProfileName !== null ||
+      !Array.isArray(properties.outboundIpAddresses) ||
+      properties.outboundIpAddresses.length !== 1 ||
+      new Set(properties.outboundIpAddresses).size !== properties.outboundIpAddresses.length ||
+      !properties.outboundIpAddresses.every(diagnosticGlobalIpv4Address),
+    "diagnostic-job",
+  );
+  assertDiagnosticEventStreamEndpoint(properties.eventStreamEndpoint, outputs, job, config, "diagnostic-job");
   const identity = value.identity;
   assertKnownKeys(identity, ["type", "userAssignedIdentities"], "diagnostic-job");
   assertRequiredKeys(identity, ["type", "userAssignedIdentities"], "diagnostic-job");
   failIf(identity.type !== "UserAssigned" || !isObject(identity.userAssignedIdentities), "diagnostic-job");
   const identityIds = Object.keys(identity.userAssignedIdentities).map(identityKey).sort();
   failIf(!same(identityIds, [identityKey(outputs.imagePullIdentityId), identityKey(outputs.runtimeIdentityId)].sort()), "diagnostic-job");
+  failIf(!isObject(identityProofs) || !isObject(identityProofs.imagePull) || !isObject(identityProofs.runtime), "diagnostic-job");
+  const expectedIdentityProofs = new Map([
+    [identityKey(outputs.imagePullIdentityId), identityProofs.imagePull],
+    [identityKey(outputs.runtimeIdentityId), identityProofs.runtime],
+  ]);
+  for (const identityId of identityIds) {
+    const metadata = identity.userAssignedIdentities[Object.keys(identity.userAssignedIdentities).find((key) => identityKey(key) === identityId)];
+    assertKnownKeys(metadata, ["clientId", "principalId"], "diagnostic-job");
+    assertRequiredKeys(metadata, ["clientId", "principalId"], "diagnostic-job");
+    const proof = expectedIdentityProofs.get(identityId);
+    failIf(
+      !isObject(proof) ||
+        metadata.clientId !== proof.clientId ||
+        metadata.principalId !== proof.principalId ||
+        !UUID_RE.test(metadata.clientId) ||
+        !UUID_RE.test(metadata.principalId),
+      "diagnostic-job",
+    );
+  }
   const configuration = properties.configuration;
-  assertKnownKeys(configuration, ["triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings"], "diagnostic-job");
-  assertRequiredKeys(configuration, ["triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings"], "diagnostic-job");
-  failIf(configuration.triggerType !== "Schedule" || configuration.replicaRetryLimit !== 0 || configuration.replicaTimeout !== 300, "diagnostic-job");
+  assertKnownKeys(configuration, ["dapr", "eventTriggerConfig", "manualTriggerConfig", "triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings", "secrets"], "diagnostic-job");
+  assertRequiredKeys(configuration, ["dapr", "eventTriggerConfig", "manualTriggerConfig", "triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings", "secrets"], "diagnostic-job");
+  failIf(
+    configuration.dapr !== null ||
+      configuration.eventTriggerConfig !== null ||
+      configuration.manualTriggerConfig !== null ||
+      configuration.secrets !== null ||
+      configuration.triggerType !== "Schedule" ||
+      configuration.replicaRetryLimit !== 0 ||
+      configuration.replicaTimeout !== 300,
+    "diagnostic-job",
+  );
+  const schedule = configuration.scheduleTriggerConfig;
+  assertKnownKeys(schedule, ["cronExpression", "replicaCompletionCount", "parallelism"], "diagnostic-job");
+  assertRequiredKeys(schedule, ["cronExpression", "replicaCompletionCount", "parallelism"], "diagnostic-job");
+  failIf(
+    schedule.cronExpression !== "0 3 * * *" ||
+      schedule.replicaCompletionCount !== 1 ||
+      schedule.parallelism !== 1,
+    "diagnostic-job",
+  );
   failIf(!Array.isArray(configuration.registries) || configuration.registries.length !== 1, "diagnostic-job");
   const registry = configuration.registries[0];
   assertKnownKeys(registry, ["server", "identity", "username", "passwordSecretRef"], "diagnostic-job");
-  assertRequiredKeys(registry, ["server", "identity"], "diagnostic-job");
-  failIf(Object.hasOwn(registry, "username") || Object.hasOwn(registry, "passwordSecretRef") ||
-    registry.server !== reviewed.after.registries[0]?.server || identityKey(registry.identity) !== identityKey(outputs.imagePullIdentityId), "diagnostic-job");
-  failIf(configuration.identitySettings.length !== 2 ||
-    !same(configuration.identitySettings.map((setting) => ({ identity: identityKey(setting.identity), lifecycle: setting.lifecycle })), [
+  assertRequiredKeys(registry, ["server", "identity", "username", "passwordSecretRef"], "diagnostic-job");
+  failIf(
+    registry.username !== "" ||
+      registry.passwordSecretRef !== "" ||
+      registry.server !== reviewed.after.registries[0]?.server ||
+      identityKey(registry.identity) !== identityKey(outputs.imagePullIdentityId),
+    "diagnostic-job",
+  );
+  failIf(!Array.isArray(configuration.identitySettings) || configuration.identitySettings.length !== 2 ||
+    !same(configuration.identitySettings.map((setting) => {
+      assertKnownKeys(setting, ["identity", "lifecycle"], "diagnostic-job");
+      assertRequiredKeys(setting, ["identity", "lifecycle"], "diagnostic-job");
+      return { identity: identityKey(setting.identity), lifecycle: setting.lifecycle };
+    }), [
       { identity: identityKey(outputs.imagePullIdentityId), lifecycle: "None" },
       { identity: identityKey(outputs.runtimeIdentityId), lifecycle: "Main" },
     ]), "diagnostic-job");
-  assertContainerTemplate(properties.template, "diagnostic-job");
-  failIf(properties.template.containers.length !== 1, "diagnostic-job");
-  const container = properties.template.containers[0];
-  assertKnownKeys(container, ["name", "image", "env", "resources", "probes", "command", "args"], "diagnostic-job");
-  assertRequiredKeys(container, ["name", "image", "env", "resources"], "diagnostic-job");
-  failIf(container.name !== "expiry-cleanup" || !/^.+@sha256:[a-f0-9]{64}$/i.test(container.image), "diagnostic-job");
-  failIf((container.env ?? []).some((entry) => entry.secretRef !== undefined), "diagnostic-job");
-  failIf(container.resources.cpu !== 0.25 || container.resources.memory !== "0.5Gi", "diagnostic-job");
+  const template = properties.template;
+  assertKnownKeys(template, ["containers", "initContainers", "volumes"], "diagnostic-job");
+  assertRequiredKeys(template, ["containers", "initContainers", "volumes"], "diagnostic-job");
+  failIf(template.initContainers !== null || template.volumes !== null ||
+    !Array.isArray(template.containers) || template.containers.length !== 1, "diagnostic-job");
+  const container = template.containers[0];
+  assertKnownKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], "diagnostic-job");
+  assertRequiredKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], "diagnostic-job");
+  failIf(
+    container.name !== "expiry-cleanup" ||
+      container.imageType !== "ContainerImage" ||
+      container.command !== null ||
+      container.args !== null ||
+      container.probes !== null,
+    "diagnostic-job",
+  );
+  const environment = assertEnvironmentEntries(container.env, "diagnostic-job");
+  failIf(environment.some((entry) => Object.hasOwn(entry, "secretRef")), "diagnostic-job");
+  failIf(!same(environment, guardedJob.env) || container.image !== guardedJob.image, "diagnostic-job");
+  const resources = container.resources;
+  assertKnownKeys(resources, ["cpu", "memory", "ephemeralStorage"], "diagnostic-job");
+  assertRequiredKeys(resources, ["cpu", "memory", "ephemeralStorage"], "diagnostic-job");
+  failIf(resources.cpu !== 0.25 || resources.memory !== "0.5Gi" || resources.ephemeralStorage !== "1Gi", "diagnostic-job");
+  const expectedServer = reviewed.after.registries[0]?.server;
+  const escapedServer = typeof expectedServer === "string"
+    ? expectedServer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    : "";
+  failIf(!new RegExp(`^${escapedServer}/palancar-expiry-cleanup@sha256:[a-f0-9]{64}$`, "i").test(container.image), "diagnostic-job");
   return { value, job };
 }
 
@@ -7111,13 +7542,31 @@ function createLifecycleInternal(options = {}, internal = {}) {
       const job = diagnosticJobIdentity(outputs, providerConfig);
       const reviewed = reviewedRuntimeShapes(run.artifacts, phase);
       const reviewedDigest = reviewedRuntimeDigest(manifest, run.artifacts);
+      const runtimeIdentityProof = diagnosticManagedIdentity(
+        providerConfig,
+        outputs.runtimeIdentityId,
+        {
+          principalId: manifest.bindings.runtimeIdentityPrincipalId,
+          clientId: outputs.runtimeIdentityClientId,
+        },
+        "diagnostic-identity",
+      );
+      const imagePullIdentityProof = diagnosticManagedIdentity(
+        providerConfig,
+        outputs.imagePullIdentityId,
+        undefined,
+        "diagnostic-image-pull-identity",
+      );
       const jobResponse = azJson(providerConfig, [
         "containerapp", "job", "show", "--name", job.name,
         "--resource-group", outputs.resourceGroup,
         "--subscription", bindings.backend.subscription_id,
         "--output", "json",
       ], "diagnostic-job");
-      diagnosticJobContract(jobResponse, outputs, reviewed, providerConfig);
+      diagnosticJobContract(jobResponse, outputs, reviewed, providerConfig, {
+        imagePull: imagePullIdentityProof,
+        runtime: runtimeIdentityProof,
+      });
 
       if (existsSync(run.artifacts.diagnostic)) {
         requiredDiagnostic({ manifest, artifacts: run.artifacts });
@@ -7137,7 +7586,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         const identity = diagnosticIdentity(providerConfig, outputs, manifest, {
           requestId,
           executionName: null,
-        });
+        }, runtimeIdentityProof);
         const openAiRole = diagnosticOpenAiRole(providerConfig, manifest);
         const unsigned = {
           version: DIAGNOSTIC_REQUEST_VERSION,
@@ -7278,8 +7727,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
       const afterIdentity = diagnosticIdentity(providerConfig, outputs, manifest, {
         requestId,
         executionName,
-      });
-      const afterRole = diagnosticOpenAiRole(providerConfig, manifest);
+      }, undefined, true);
+      const afterRole = diagnosticOpenAiRole(providerConfig, manifest, true);
       const identityWithoutExecution = (value) => {
         const { job, ...identity } = value;
         void job;

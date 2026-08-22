@@ -120,6 +120,29 @@ const IMAGE_PULL_CLIENT = "00000000-0000-0000-0000-000000000010";
 const IMAGE_PULL_PRINCIPAL = "00000000-0000-0000-0000-000000000011";
 const RUNTIME_CLIENT = "00000000-0000-0000-0000-000000000012";
 const RUNTIME_PRINCIPAL = "00000000-0000-0000-0000-000000000013";
+const CLEANUP_IMAGE = "palancardevacraeeacd8c.azurecr.io/palancar-expiry-cleanup@sha256:" + "c".repeat(64);
+const CLEANUP_JOB_PARENT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime`;
+const CLEANUP_ENV = Object.freeze([
+  { name: "AZURE_CLIENT_ID", value: RUNTIME_CLIENT },
+  { name: "PALANCAR_WORKLOAD_TABLE_ENDPOINT", value: "https://palancardevstateaeeacd8c.table.core.windows.net" },
+  { name: "PALANCAR_SECURITY_STATE_TABLE", value: "SecurityState" },
+  { name: "PALANCAR_RATE_STATE_TABLE", value: "RateState" },
+  { name: "PALANCAR_RELAY_ENVIRONMENT", value: "dev" },
+  { name: "PALANCAR_RELAY_ORIGIN", value: "wss://ca-palancar-dev-relay-aeeacd8c.graysmoke-757a2980.eastus2.azurecontainerapps.io" },
+  { name: "PALANCAR_EXPIRY_CLEANUP_LIMIT", value: "1000" },
+  { name: "PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS", value: "240000" },
+]);
+const CLEANUP_TAGS = Object.freeze({
+  application: "palancar",
+  environment: "dev",
+  "managed-by": "terraform",
+  "data-classification": "operational-metadata",
+});
+const SYSTEM_DATA_ACTOR = "synthetic-user";
+
+function cleanupEnvironment() {
+  return CLEANUP_ENV.map((entry) => ({ ...entry }));
+}
 const GENERATION_PATHS = [
   "packages/generation/src/azure-openai.ts",
   "packages/generation/src/errors.ts",
@@ -352,19 +375,89 @@ function reviewedRuntimeShow(phase = "runtime-cutover") {
     address: "module.container_app_workload[0].azapi_resource.this",
     values: { body: { identity: app.identity, properties: app.properties } },
   });
+  const cleanupJob = {
+    body: {
+      properties: {
+        environmentId: CONTAINER_ENV_ID,
+        configuration: {
+          triggerType: "Schedule",
+          scheduleTriggerConfig: { cronExpression: "0 3 * * *", replicaCompletionCount: 1, parallelism: 1 },
+          replicaRetryLimit: 0,
+          replicaTimeout: 300,
+          registries: [{ server: "palancardevacraeeacd8c.azurecr.io", identity: IMAGE_PULL_ID }],
+          identitySettings: [
+            { identity: IMAGE_PULL_ID.replace("resourceGroups", "resourcegroups"), lifecycle: "None" },
+            { identity: RUNTIME_ID.replace("resourceGroups", "resourcegroups"), lifecycle: "Main" },
+          ],
+        },
+        template: {
+          containers: [{
+            name: "expiry-cleanup",
+            image: CLEANUP_IMAGE,
+            resources: { cpu: 0.25, memory: "0.5Gi" },
+            env: cleanupEnvironment(),
+          }],
+        },
+      },
+    },
+    create_headers: null,
+    create_query_parameters: null,
+    delete_headers: null,
+    delete_query_parameters: null,
+    id: `${CLEANUP_JOB_PARENT_ID}/providers/Microsoft.App/jobs/cleanup-job`,
+    identity: [{ identity_ids: [IMAGE_PULL_ID, RUNTIME_ID], principal_id: "", tenant_id: "", type: "UserAssigned" }],
+    ignore_body_changes: null,
+    ignore_casing: false,
+    ignore_missing_property: true,
+    ignore_null_property: false,
+    ignore_other_items_in_list: null,
+    list_unique_id_property: null,
+    location: "eastus2",
+    locks: null,
+    name: "cleanup-job",
+    output: null,
+    parent_id: CLEANUP_JOB_PARENT_ID,
+    read_headers: null,
+    read_query_parameters: null,
+    replace_triggers_external_values: null,
+    replace_triggers_refs: null,
+    response_export_values: null,
+    retry: null,
+    schema_validation_enabled: true,
+    sensitive_body: null,
+    sensitive_body_version: null,
+    tags: CLEANUP_TAGS,
+    timeouts: null,
+    type: "Microsoft.App/jobs@2026-01-01",
+    update_headers: null,
+    update_query_parameters: null,
+  };
+  const addressedCleanupJob = {
+    address: "module.expiry_cleanup_job[0].azapi_resource.this",
+    values: cleanupJob,
+  };
   return {
     format_version: "1.2",
-    variables: { relay_image_digest: { value: REVIEWED_RELAY_IMAGE } },
-    resource_changes: [{
-      address: "module.container_app_workload[0].azapi_resource.this",
-      change: {
-        actions: [phase === "credential-cleanup" || phase === "terminal" ? "no-op" : "update"],
-        before: addressed(before).values,
-        after: addressed(after).values,
+    variables: {
+      relay_image_digest: { value: REVIEWED_RELAY_IMAGE },
+      expiry_cleanup_image_digest: { value: CLEANUP_IMAGE },
+    },
+    resource_changes: [
+      {
+        address: "module.container_app_workload[0].azapi_resource.this",
+        change: {
+          actions: [phase === "credential-cleanup" || phase === "terminal" ? "no-op" : "update"],
+          before: addressed(before).values,
+          after: addressed(after).values,
+        },
       },
-    }],
-    prior_state: { values: { root_module: { resources: [addressed(before)] } } },
-    planned_values: { root_module: { resources: [addressed(after)] } },
+      {
+        address: "module.expiry_cleanup_job[0].azapi_resource.this",
+        change: { actions: ["no-op"], before: cleanupJob, after: structuredClone(cleanupJob) },
+      },
+    ],
+    prior_state: { values: { root_module: { resources: [addressed(before), addressedCleanupJob] } } },
+    planned_values: { root_module: { resources: [addressed(after), addressedCleanupJob] } },
   };
 }
 
@@ -417,6 +510,9 @@ function makeHarness(overrides = {}) {
   let diagnosticStartStatus = "success";
   let diagnosticRestMode = "empty";
   let diagnosticJobMutator = (value) => value;
+  let diagnosticRuntimeIdentityShowCount = 0;
+  let diagnosticRuntimeIdentityMutator = (value) => value;
+  let diagnosticPostRuntimeIdentityStatus = "success";
   let diagnosticStartClockAdvanceMs = 0;
   let diagnosticRequestId;
   let diagnosticRunId;
@@ -630,9 +726,27 @@ function makeHarness(overrides = {}) {
         return { status: 0, stdout: JSON.stringify(values) };
       }
       if (request.argv[0] === "identity" && request.argv[1] === "show") {
+        const identityId = request.argv[request.argv.indexOf("--ids") + 1];
+        if (identityId === IMAGE_PULL_ID) {
+          return {
+            status: 0,
+            stdout: JSON.stringify({ id: IMAGE_PULL_ID, clientId: IMAGE_PULL_CLIENT, principalId: IMAGE_PULL_PRINCIPAL }),
+          };
+        }
+        diagnosticRuntimeIdentityShowCount += 1;
+        if (diagnosticRuntimeIdentityShowCount >= 2 && diagnosticPostRuntimeIdentityStatus !== "success") {
+          return diagnosticPostRuntimeIdentityStatus === "ambiguous"
+            ? { status: null, exitCode: null, stdout: "", stderr: "" }
+            : { status: 1, exitCode: 1, stdout: "", stderr: "identity unavailable\n" };
+        }
+        const runtimeIdentity = diagnosticRuntimeIdentityMutator({
+          id: RUNTIME_ID,
+          clientId: RUNTIME_CLIENT,
+          principalId: RUNTIME_PRINCIPAL,
+        }, diagnosticRuntimeIdentityShowCount);
         return {
           status: 0,
-          stdout: JSON.stringify({ id: RUNTIME_ID, clientId: RUNTIME_CLIENT, principalId: RUNTIME_PRINCIPAL }),
+          stdout: JSON.stringify(runtimeIdentity),
         };
       }
       if (request.argv[0] === "containerapp" && request.argv[1] === "job" && request.argv[2] === "show") {
@@ -641,30 +755,65 @@ function makeHarness(overrides = {}) {
           stdout: JSON.stringify(diagnosticJobMutator({
             id: `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/providers/Microsoft.App/jobs/cleanup-job`,
             name: "cleanup-job",
+            location: "eastus2",
+            resourceGroup: "rg-runtime",
             type: "Microsoft.App/jobs",
+            tags: {
+              application: "palancar",
+              environment: "dev",
+              "managed-by": "terraform",
+              "data-classification": "operational-metadata",
+            },
+            systemData: {
+              createdAt: "2026-08-22T00:00:00Z",
+              createdBy: SYSTEM_DATA_ACTOR,
+              createdByType: "User",
+              lastModifiedAt: "2026-08-22T00:00:00Z",
+              lastModifiedBy: SYSTEM_DATA_ACTOR,
+              lastModifiedByType: "User",
+            },
             identity: {
               type: "UserAssigned",
               userAssignedIdentities: {
-                [IMAGE_PULL_ID]: {},
-                [RUNTIME_ID]: {},
+                [IMAGE_PULL_ID]: { clientId: IMAGE_PULL_CLIENT, principalId: IMAGE_PULL_PRINCIPAL },
+                [RUNTIME_ID]: { clientId: RUNTIME_CLIENT, principalId: RUNTIME_PRINCIPAL },
               },
             },
             properties: {
               environmentId: CONTAINER_ENV_ID,
               provisioningState: "Succeeded",
+              runningStatus: "Ready",
+              eventStreamEndpoint: "https://eastus2.azurecontainerapps.dev/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream",
+              outboundIpAddresses: ["20.42.8.12"],
+              workloadProfileName: null,
               configuration: {
+                dapr: null,
+                eventTriggerConfig: null,
+                manualTriggerConfig: null,
                 triggerType: "Schedule",
                 scheduleTriggerConfig: { cronExpression: "0 3 * * *", replicaCompletionCount: 1, parallelism: 1 },
                 replicaRetryLimit: 0,
                 replicaTimeout: 300,
-                registries: [{ server: "palancardevacraeeacd8c.azurecr.io", identity: IMAGE_PULL_ID }],
+                registries: [{ server: "palancardevacraeeacd8c.azurecr.io", identity: IMAGE_PULL_ID, username: "", passwordSecretRef: "" }],
                 identitySettings: [
                   { identity: IMAGE_PULL_ID, lifecycle: "None" },
                   { identity: RUNTIME_ID, lifecycle: "Main" },
                 ],
+                secrets: null,
               },
               template: {
-                containers: [{ name: "expiry-cleanup", image: "palancardevacraeeacd8c.azurecr.io/palancar-expiry-cleanup@sha256:" + "e".repeat(64), env: [], resources: { cpu: 0.25, memory: "0.5Gi" } }],
+                initContainers: null,
+                volumes: null,
+                containers: [{
+                  name: "expiry-cleanup",
+                  image: CLEANUP_IMAGE,
+                  imageType: "ContainerImage",
+                  env: cleanupEnvironment(),
+                  resources: { cpu: 0.25, memory: "0.5Gi", ephemeralStorage: "1Gi" },
+                  probes: null,
+                  command: null,
+                  args: null,
+                }],
               },
             },
           })),
@@ -1066,6 +1215,8 @@ function makeHarness(overrides = {}) {
     setDiagnosticStartStatus(value) { diagnosticStartStatus = value; },
     setDiagnosticRestMode(value) { diagnosticRestMode = value; },
     setDiagnosticJobMutator(value) { diagnosticJobMutator = value; },
+    setDiagnosticRuntimeIdentityMutator(value) { diagnosticRuntimeIdentityMutator = value; },
+    setDiagnosticPostRuntimeIdentityStatus(value) { diagnosticPostRuntimeIdentityStatus = value; },
     setDiagnosticStartClockAdvance(value) { diagnosticStartClockAdvanceMs = value; },
     setReviewedShowMutator(value) { reviewedShowMutator = value; },
     advance(ms) { tick += ms; },
@@ -2053,6 +2204,77 @@ test("diagnostic invoking is a durable exactly-once fence and reconciles absolut
   }
 });
 
+test("diagnostic refreshes runtime identity after terminal execution and never replays start", () => {
+  const harness = makeHarness();
+  try {
+    const runId = prepareRuntimeGuarded(harness);
+    const diagnosticCallStart = harness.calls.length;
+    harness.setDiagnosticRestMode("absolute-match");
+    assert.deepEqual(harness.lifecycle.diagnostic("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "diagnostic-passed",
+      execution: "diagnostic-execution-1",
+    });
+    const diagnosticCalls = harness.calls.slice(diagnosticCallStart);
+    const identityShows = diagnosticCalls.filter((call) =>
+      call.argv[0] === "identity" && call.argv[1] === "show" && call.argv[call.argv.indexOf("--ids") + 1] === RUNTIME_ID);
+    const jobShowIndex = diagnosticCalls.findIndex((call) =>
+      call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "show");
+    const executionShowIndex = diagnosticCalls.findIndex((call) =>
+      call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "execution");
+    const startCalls = diagnosticCalls.filter((call) =>
+      call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "start");
+    const roleQueries = diagnosticCalls.filter((call) =>
+      call.argv[0] === "role" && call.argv[1] === "assignment" && call.argv[2] === "list" &&
+      call.argv.includes("--assignee-object-id"));
+    assert.equal(identityShows.length, 2);
+    assert.ok(identityShows[0] !== undefined);
+    assert.ok(identityShows[1] !== undefined);
+    assert.ok(diagnosticCalls.indexOf(identityShows[0]) < jobShowIndex);
+    assert.ok(jobShowIndex < executionShowIndex);
+    assert.ok(executionShowIndex < diagnosticCalls.indexOf(identityShows[1]));
+    assert.equal(roleQueries.length, 2);
+    assert.ok(startCalls[0] !== undefined);
+    assert.ok(diagnosticCalls.indexOf(roleQueries[0]) < diagnosticCalls.indexOf(startCalls[0]));
+    assert.ok(executionShowIndex < diagnosticCalls.indexOf(roleQueries[1]));
+    assert.equal(startCalls.length, 1);
+  } finally {
+    harness.cleanup();
+  }
+
+  for (const failure of [
+    {
+      configure(harness) {
+        harness.setDiagnosticRuntimeIdentityMutator((identity, count) => count === 2
+          ? { ...identity, principalId: "00000000-0000-0000-0000-000000000099" }
+          : identity);
+      },
+    },
+    {
+      configure(harness) { harness.setDiagnosticPostRuntimeIdentityStatus("missing"); },
+    },
+    {
+      configure(harness) { harness.setDiagnosticPostRuntimeIdentityStatus("ambiguous"); },
+    },
+  ]) {
+    const failed = makeHarness();
+    try {
+      const failedRunId = prepareRuntimeGuarded(failed);
+      failed.setDiagnosticRestMode("absolute-match");
+      failure.configure(failed);
+      expectCode(() => failed.lifecycle.diagnostic("runtime-cutover", failedRunId), "diagnostic-identity");
+      assert.equal(failed.calls.filter((call) =>
+        call.argv[0] === "identity" && call.argv[1] === "show" && call.argv[call.argv.indexOf("--ids") + 1] === RUNTIME_ID).length, 2);
+      assert.equal(failed.calls.filter((call) =>
+        call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "start").length, 1);
+      assert.equal(existsSync(failed.paths(failedRunId).diagnostic), false);
+    } finally {
+      failed.cleanup();
+    }
+  }
+});
+
 test("diagnostic reconciliation rejects a canonical nextLink cycle without retrying start", () => {
   const harness = makeHarness();
   try {
@@ -2068,11 +2290,80 @@ test("diagnostic reconciliation rejects a canonical nextLink cycle without retry
   }
 });
 
-test("diagnostic Job contract requires readiness and identity-only registry credentials", () => {
+test("diagnostic Job contract requires the complete Azure CLI live schema before intent or start", () => {
   for (const mutate of [
     (job) => { job.properties.provisioningState = "Creating"; },
-    (job) => { job.properties.configuration.registries[0].username = null; },
-    (job) => { job.properties.configuration.registries[0].passwordSecretRef = ""; },
+    (job) => { job.properties.runningStatus = "Running"; },
+    (job) => { job.properties.runningState = "Running"; },
+    (job) => { job.resourceGroup = "rg-other"; },
+    (job) => { job.tags.environment = "prod"; },
+    (job) => { job.tags.forged = "unexpected"; },
+    (job) => { job.properties.outboundIpAddresses = []; },
+    (job) => { job.properties.outboundIpAddresses = ["not-an-ip"]; },
+    (job) => { job.properties.outboundIpAddresses = ["20.42.8.12", "20.42.8.13"]; },
+    ...[
+      "10.1.2.3", "172.16.1.1", "192.168.1.1", "127.0.0.1", "169.254.1.1",
+      "100.64.1.1", "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1",
+      "192.31.196.0", "192.31.196.255", "192.52.193.0", "192.52.193.255",
+      "192.175.48.0", "192.175.48.255", "224.0.0.1", "240.0.0.1", "0.0.0.0", "255.255.255.255",
+    ].map((address) => (job) => { job.properties.outboundIpAddresses = [address]; }),
+    (job) => { job.properties.eventStreamEndpoint = "not-an-endpoint"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://attacker.example.invalid/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://eastus2.azurecontainerapps.dev/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/jobs/cleanup-job/eventstream"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://eastus2.azurecontainerapps.dev:444/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://user:password@eastus2.azurecontainerapps.dev/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://eastus2.azurecontainerapps.dev/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream?unexpected=1"; },
+    (job) => { job.properties.eventStreamEndpoint = "https://eastus2.azurecontainerapps.dev/subscriptions/" + SUBSCRIPTION + "/resourceGroups/rg-runtime/containerApps/cleanup-job/eventstream#unexpected"; },
+    (job) => { delete job.systemData; },
+    (job) => { delete job.systemData.createdAt; },
+    (job) => { job.systemData.password = "unexpected"; },
+    (job) => { job.systemData.createdAt = "not-a-time"; },
+    (job) => { job.systemData.lastModifiedAt = "2026-08-21T23:59:59Z"; },
+    (job) => { job.systemData.createdByType = "Application"; },
+    (job) => { job.systemData.lastModifiedByType = "ServicePrincipal"; },
+    (job) => { job.systemData.createdBy = "00000000-0000-4000-8000-000000000003"; },
+    (job) => { job.systemData.lastModifiedBy = "different-user"; },
+    (job) => { job.properties.configuration.scheduleTriggerConfig.cronExpression = "0 * * * *"; },
+    (job) => { job.properties.configuration.dapr = {}; },
+    (job) => { job.properties.configuration.eventTriggerConfig = {}; },
+    (job) => { job.properties.configuration.manualTriggerConfig = {}; },
+    (job) => { job.properties.configuration.secrets = []; },
+    (job) => { job.properties.configuration.registries[0].username = "unexpected"; },
+    (job) => { job.properties.configuration.registries[0].passwordSecretRef = "unexpected"; },
+    (job) => { job.properties.template.containers[0].env[0].value = "00000000-0000-0000-0000-000000000099"; },
+    (job) => { job.properties.template.containers[0].env[5].value = "wss://attacker.example.invalid"; },
+    (job) => { job.properties.template.containers[0].env[6].value = "1001"; },
+    (job) => { job.properties.template.containers[0].env.pop(); },
+    (job) => { job.properties.template.containers[0].env.push({ name: "PASSWORD", value: "unexpected" }); },
+    (job) => { job.properties.template.containers[0].image = "palancardevacraeeacd8c.azurecr.io/other@sha256:" + "c".repeat(64); },
+    (job) => { job.identity.userAssignedIdentities[IMAGE_PULL_ID].clientId = "00000000-0000-0000-0000-000000000099"; },
+    (job) => { job.identity.userAssignedIdentities[RUNTIME_ID].principalId = "00000000-0000-0000-0000-000000000099"; },
+    (job) => { job.identity.userAssignedIdentities[RUNTIME_ID].extra = "unexpected"; },
+    (job) => { job.properties.template.initContainers = []; },
+    (job) => { job.properties.template.volumes = []; },
+    (job) => { job.properties.template.containers[0].imageType = "Docker"; },
+    (job) => { job.properties.template.containers[0].command = []; },
+    (job) => { job.properties.template.containers[0].args = []; },
+    (job) => { job.properties.template.containers[0].probes = []; },
+    (job) => { job.properties.template.containers[0].resources.ephemeralStorage = "2Gi"; },
+    (job) => { job.properties.workloadProfileName = "Consumption"; },
+    (job) => { delete job.resourceGroup; },
+    (job) => { delete job.properties.outboundIpAddresses; },
+    (job) => {
+      delete job.location;
+      delete job.resourceGroup;
+      delete job.tags;
+      delete job.systemData;
+      delete job.properties.runningStatus;
+      delete job.properties.eventStreamEndpoint;
+      delete job.properties.outboundIpAddresses;
+      delete job.properties.workloadProfileName;
+      delete job.properties.configuration.dapr;
+      delete job.properties.configuration.secrets;
+      delete job.properties.template.initContainers;
+      delete job.properties.template.volumes;
+      delete job.properties.template.containers[0].imageType;
+    },
   ]) {
     const harness = makeHarness();
     try {
@@ -2083,6 +2374,37 @@ test("diagnostic Job contract requires readiness and identity-only registry cred
         return next;
       });
       expectCode(() => harness.lifecycle.diagnostic("runtime-cutover", runId), "diagnostic-job");
+      assert.equal(existsSync(harness.paths(runId).diagnosticIntent), false);
+      assert.equal(harness.calls.some((call) => call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "start"), false);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("diagnostic Job contract accepts only adjacent globally routable IPv4 boundaries", () => {
+  for (const address of [
+    "192.0.1.1",
+    "192.31.195.255", "192.31.197.1",
+    "192.52.192.255", "192.52.194.1",
+    "192.175.47.255", "192.175.49.1",
+    "198.17.255.255", "198.20.0.1",
+  ]) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      harness.setDiagnosticJobMutator((job) => {
+        const next = structuredClone(job);
+        next.properties.outboundIpAddresses = [address];
+        return next;
+      });
+      harness.setDiagnosticRestMode("absolute-match");
+      assert.deepEqual(harness.lifecycle.diagnostic("runtime-cutover", runId), {
+        runId,
+        phase: "runtime-cutover",
+        status: "diagnostic-passed",
+        execution: "diagnostic-execution-1",
+      });
     } finally {
       harness.cleanup();
     }
@@ -2315,6 +2637,27 @@ test("real credential cleanup plan is phase-bound to an exact no-op topology", (
       (entry) => entry.address === "module.container_app_workload[0].azapi_resource.this",
     ).change.actions = ["update"];
     replaceExisting(showPath, update);
+    expectCode(
+      () => reviewedRuntimeShapes({ show: showPath }, "credential-cleanup"),
+      "diagnostic-plan-topology",
+    );
+
+    const cleanupUpdate = structuredClone(REVIEWED_CREDENTIAL_FIXTURE);
+    cleanupUpdate.resource_changes.find(
+      (entry) => entry.address === "module.expiry_cleanup_job[0].azapi_resource.this",
+    ).change.actions = ["update"];
+    replaceExisting(showPath, cleanupUpdate);
+    expectCode(
+      () => reviewedRuntimeShapes({ show: showPath }, "credential-cleanup"),
+      "diagnostic-plan-topology",
+    );
+
+    const cleanupEnvDrift = structuredClone(REVIEWED_CREDENTIAL_FIXTURE);
+    cleanupEnvDrift.resource_changes.find(
+      (entry) => entry.address === "module.expiry_cleanup_job[0].azapi_resource.this",
+    ).change.after.body.properties.template.containers[0].env[0].value =
+      "00000000-0000-0000-0000-000000000099";
+    replaceExisting(showPath, cleanupEnvDrift);
     expectCode(
       () => reviewedRuntimeShapes({ show: showPath }, "credential-cleanup"),
       "diagnostic-plan-topology",
@@ -2730,7 +3073,7 @@ test("scoped role-assignment proofs use exact-scope argv at every lifecycle call
       execution: "diagnostic-execution-1",
     });
     const calls = roleAssignmentCalls(diagnostic, start);
-    assert.equal(calls.filter((call) => call.argv.includes("--assignee-object-id")).length, 1);
+    assert.equal(calls.filter((call) => call.argv.includes("--assignee-object-id")).length, 2);
     for (const call of calls) {
       assertExactScopedRoleAssignmentArgv(
         call,
