@@ -35,7 +35,23 @@ This plan is read-only during implementation. Terraform, reviewed-plan canonical
    - revision scale defaults are null, not the app response's 300/30 values;
    - revision containers must not contain the app-only `ephemeralStorage` response field.
 5. Reconcile traffic only after validating the revision list. Accept exactly one 100% traffic entry using either `latestRevision=true` or a concrete revision name. Resolve it to the sole healthy, provisioned, running active revision; require latest/latest-ready names and FQDNs to agree.
-6. Accept `maxInactiveRevisions` only as numeric `1` or deferred `null`. Project null to reviewed `1` only after proving single-revision mode, one active revision, at most one exact inactive predecessor, zero inactive traffic/replicas, matching predecessor template, and successful traffic reconciliation.
+6. Pass the lifecycle phase into revision reconciliation and apply the exact
+   phase-specific inactive-revision contract:
+   - runtime preflight requires the reviewed `before` configuration to omit
+     `maxInactiveRevisions`, the reviewed `after` configuration to contain
+     numeric `1`, the live value to be exactly `null`, exactly one active
+     revision, and no inactive revision; project live `null` to omission only
+     for the reviewed-before topology comparison;
+   - runtime post-reconciliation requires the same reviewed omission-to-`1`
+     transition and accepts live `null` or `1` only with exactly one
+     manifest-bound inactive predecessor whose name, zero traffic/replicas,
+     and reviewed template match are proven;
+   - credential-cleanup and terminal require reviewed `before` and `after`
+     values of `1` and accept live `null` or `1` only with the cryptographically
+     bound exact inactive predecessor and its zero-state/template proof.
+   Never apply a broad at-most rule, mutate raw or normalized source objects,
+   or authorize topology before the phase-specific predecessor and active/
+   inactive proofs complete.
 7. Compare the resulting strict internal projection to the reviewed Terraform before/after topology. Preserve raw Azure objects for evidence.
 
 ## Tests

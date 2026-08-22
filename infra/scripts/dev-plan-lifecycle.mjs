@@ -5791,6 +5791,17 @@ function reviewedRuntimeShapes(artifacts, phase, showOverride = undefined) {
   const priorShape = canonicalRuntimeShape(prior.values, "diagnostic-plan-topology");
   const plannedShape = canonicalRuntimeShape(planned.values, "diagnostic-plan-topology");
   if (phase === "runtime-cutover") {
+    failIf(
+      Object.hasOwn(before, "maxInactiveRevisions") || after.maxInactiveRevisions !== 1,
+      "diagnostic-plan-topology",
+    );
+  } else {
+    failIf(
+      before.maxInactiveRevisions !== 1 || after.maxInactiveRevisions !== 1,
+      "diagnostic-plan-topology",
+    );
+  }
+  if (phase === "runtime-cutover") {
     failIf(!same(before, priorShape) || !same(after, plannedShape), "diagnostic-plan-topology");
   } else {
     failIf(!same(before, after) || !same(before, priorShape) || !same(before, plannedShape), "diagnostic-plan-topology");
@@ -7443,14 +7454,59 @@ function normalizeLiveRevision(value, app, outputs, code) {
   };
 }
 
-function assertRevisionResponse(value, app, reviewed, expectedRevision, expectedInactiveRevision, mode, code, options = {}) {
+function assertRevisionResponse(value, app, reviewed, expectedRevision, expectedInactiveRevision, mode, phase, code, options = {}) {
+  const allowedModes = {
+    "runtime-cutover": new Set(["pre", "post"]),
+    "credential-cleanup": new Set(["post"]),
+    terminal: new Set(["post"]),
+  };
+  failIf(!Object.hasOwn(allowedModes, phase) || !allowedModes[phase].has(mode), `${code}-phase`);
+  failIf(!isObject(reviewed.before) || !isObject(reviewed.after), `${code}-inactive`);
+  const runtimePre = phase === "runtime-cutover" && mode === "pre";
+  if (phase === "runtime-cutover") {
+    failIf(
+      Object.hasOwn(reviewed.before, "maxInactiveRevisions") ||
+        reviewed.after.maxInactiveRevisions !== 1,
+      `${code}-inactive`,
+    );
+  } else {
+    failIf(
+      reviewed.before.maxInactiveRevisions !== 1 || reviewed.after.maxInactiveRevisions !== 1,
+      `${code}-inactive`,
+    );
+  }
   failIf(!Array.isArray(value) || value.length === 0, code);
   const revisions = value.map((revision) => normalizeLiveRevision(revision, app, app.outputs, code));
   const active = revisions.filter(({ properties }) => properties.active === true);
   failIf(active.length !== 1, `${code}-active`);
   const inactive = revisions.filter(({ properties }) => properties.active === false);
-  failIf(inactive.length > 1, `${code}-set`);
+  if (runtimePre) {
+    failIf(inactive.length !== 0, `${code}-set`);
+  } else {
+    failIf(inactive.length !== 1, `${code}-set`);
+  }
   const retainedPredecessor = options.inactiveRevisionContract;
+  if (retainedPredecessor !== undefined) {
+    failIf(
+      !isObject(retainedPredecessor) ||
+        typeof retainedPredecessor.revisionName !== "string" ||
+        !isObject(retainedPredecessor.reviewed),
+      `${code}-inactive`,
+    );
+  }
+  if (runtimePre) {
+    failIf(retainedPredecessor !== undefined || expectedInactiveRevision !== undefined, `${code}-inactive`);
+  } else {
+    const boundInactiveRevision = retainedPredecessor?.revisionName ?? expectedInactiveRevision;
+    failIf(typeof boundInactiveRevision !== "string" || boundInactiveRevision.length === 0, `${code}-inactive`);
+    failIf(
+      retainedPredecessor !== undefined &&
+        expectedInactiveRevision !== undefined &&
+        retainedPredecessor.revisionName !== expectedInactiveRevision,
+      `${code}-inactive`,
+    );
+    failIf(inactive[0]?.revision.name !== boundInactiveRevision, `${code}-inactive`);
+  }
   const selected = active[0];
   const selectedName = selected.revision.name;
   failIf(expectedRevision !== undefined && selectedName !== expectedRevision, `${code}-traffic`);
@@ -7473,22 +7529,6 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
   if (mode === "post") {
     assertPostCutoverTemplateSecurity(app, selected.properties.template, reviewed);
   }
-  if (retainedPredecessor !== undefined) {
-    failIf(
-      !isObject(retainedPredecessor) ||
-        typeof retainedPredecessor.revisionName !== "string" ||
-        !isObject(retainedPredecessor.reviewed),
-      `${code}-inactive`,
-    );
-    failIf(
-      inactive.length !== 1 ||
-        inactive[0].revision.name !== retainedPredecessor.revisionName,
-      `${code}-inactive`,
-    );
-  } else if (expectedInactiveRevision !== undefined) {
-    failIf(typeof expectedInactiveRevision !== "string" || expectedInactiveRevision.length === 0, `${code}-inactive`);
-    failIf(inactive.length !== 1 || inactive[0].revision.name !== expectedInactiveRevision, `${code}-inactive`);
-  }
   for (const candidate of inactive) {
     failIf(candidate.properties.trafficWeight !== 0, `${code}-inactive`);
     if (candidate.properties.reportedReplicas !== undefined) failIf(candidate.properties.reportedReplicas !== 0, `${code}-inactive`);
@@ -7507,13 +7547,19 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
     ),
     `${code}-template`,
   );
-  failIf(expectedTemplate.maxInactiveRevisions !== 1 || app.configuration.activeRevisionsMode !== "Single", `${code}-inactive`);
-  failIf(app.configuration.maxInactiveRevisions !== 1 && app.configuration.maxInactiveRevisions !== null, `${code}-inactive`);
+  failIf(app.configuration.activeRevisionsMode !== "Single", `${code}-inactive`);
+  if (runtimePre) {
+    failIf(app.configuration.maxInactiveRevisions !== null, `${code}-inactive`);
+  } else {
+    failIf(expectedTemplate.maxInactiveRevisions !== 1, `${code}-inactive`);
+    failIf(app.configuration.maxInactiveRevisions !== 1 && app.configuration.maxInactiveRevisions !== null, `${code}-inactive`);
+  }
   const projectedConfiguration = {
     ...app.configuration,
     maxInactiveRevisions: 1,
     ingress: { ...app.configuration.ingress, traffic: reconciledTraffic },
   };
+  if (runtimePre) delete projectedConfiguration.maxInactiveRevisions;
   const projectedProperties = {
     ...app.properties,
     configuration: projectedConfiguration,
@@ -7566,6 +7612,7 @@ function parseContainerAppAndRevisions(config, outputs, request, mode) {
     expectedRevision,
     expectedInactiveRevision,
     mode,
+    request.phase,
     mode === "pre" ? "runtime-revisions" : "credential-revisions",
     {
       inactiveRevisionContract: request.inactiveRevisionContract,

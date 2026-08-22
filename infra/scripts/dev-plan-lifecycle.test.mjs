@@ -43,7 +43,7 @@ const instrumentedSource = `${productionSource
   .replace(
     cachePathDeclaration,
     `const LIFECYCLE_CACHE_ROOT = ${JSON.stringify(instrumentedCacheRoot)};`,
-)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision };\n`;
+)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision, assertRevisionResponse };\n`;
 const instrumentedFd = openSync(instrumentedPath, "wx", 0o600);
 try {
   writeSync(instrumentedFd, instrumentedSource, 0, "utf8");
@@ -75,6 +75,7 @@ const {
   runCliForTests,
   assertInactiveRevisionTemplate,
   assertContainerAppResponse,
+  assertRevisionResponse,
   normalizeLiveRevision,
   reviewedRuntimeShapes,
   sha256File,
@@ -497,6 +498,7 @@ function reviewedRuntimeShow(phase = "runtime-cutover") {
   const after = phase === "credential-cleanup" || phase === "terminal"
     ? structuredClone(before)
     : liveContainerApp("post", "revision-after");
+  if (phase === "runtime-cutover") delete before.properties.configuration.maxInactiveRevisions;
   for (const app of [before, after]) {
     app.properties.configuration.ingress.traffic = [{ latestRevision: true, weight: 100 }];
   }
@@ -3452,11 +3454,10 @@ test("live Azure Container Apps schema normalizes exact CLI defaults and rejects
       next.properties.configuration.maxInactiveRevisions = 1;
       return next;
     });
-    assert.deepEqual(numericLimit.lifecycle.preflight("runtime-cutover", runId), {
-      runId,
-      phase: "runtime-cutover",
-      status: "preflighted",
-    });
+    expectCode(
+      () => numericLimit.lifecycle.preflight("runtime-cutover", runId),
+      "runtime-revisions-inactive",
+    );
   } finally {
     numericLimit.cleanup();
   }
@@ -3851,9 +3852,320 @@ test("null maxInactiveRevisions proof rejects active divergence and inactive pre
       predecessor.properties.trafficWeight = 1;
       return [active, predecessor];
     });
-    expectCode(() => inactiveDrift.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-inactive");
+    expectCode(() => inactiveDrift.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-set");
   } finally {
     inactiveDrift.cleanup();
+  }
+});
+
+test("maxInactiveRevisions compatibility is phase-specific and preserves live evidence", () => {
+  const runtimePre = makeHarness();
+  try {
+    const runId = prepareRuntime(runtimePre);
+    assert.deepEqual(runtimePre.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    runtimePre.cleanup();
+  }
+
+  for (const liveLimit of [null, 1]) {
+    const runtimePost = makeHarness();
+    try {
+      const runId = prepareRuntimeReconcile(runtimePost);
+      runtimePost.setTopology("post");
+      runtimePost.setSerial(8);
+      runtimePost.setLiveAppMutator((app) => {
+        const next = structuredClone(app);
+        next.properties.configuration.maxInactiveRevisions = liveLimit;
+        return next;
+      });
+      assert.deepEqual(runtimePost.lifecycle.reconcile("runtime-cutover", runId), {
+        runId,
+        phase: "runtime-cutover",
+        status: "applied",
+        state: "runtime-applied",
+      });
+    } finally {
+      runtimePost.cleanup();
+    }
+  }
+
+  for (const liveLimit of [null, 1]) {
+    const credential = makeHarness();
+    try {
+      const runId = prepareCredential(credential);
+      credential.setLiveAppMutator((app) => {
+        const next = structuredClone(app);
+        next.properties.configuration.maxInactiveRevisions = liveLimit;
+        return next;
+      });
+      assert.deepEqual(credential.lifecycle.preflight("credential-cleanup", runId), {
+        runId,
+        phase: "credential-cleanup",
+        status: "preflighted",
+      });
+    } finally {
+      credential.cleanup();
+    }
+  }
+
+  for (const liveLimit of [null, 1]) {
+    const terminal = makeHarness();
+    try {
+      const runId = prepareTerminal(terminal);
+      terminal.setLiveAppMutator((app) => {
+        const next = structuredClone(app);
+        next.properties.configuration.maxInactiveRevisions = liveLimit;
+        return next;
+      });
+      terminal.lifecycle.finalize("terminal", runId);
+      const receipt = JSON.parse(readFileSync(terminal.paths(runId).terminal, "utf8"));
+      assert.equal(receipt.phase, "terminal");
+    } finally {
+      terminal.cleanup();
+    }
+  }
+});
+
+test("revision responses reject every phase and mode mismatch", () => {
+  for (const [phase, mode] of [
+    ["runtime-cutover", "credential"],
+    ["credential-cleanup", "pre"],
+    ["terminal", "pre"],
+    ["model-bootstrap", "post"],
+    ["runtime-cutover", undefined],
+  ]) {
+    expectCode(
+      () => assertRevisionResponse([], {}, {}, undefined, undefined, mode, phase, "direct-revisions"),
+      "direct-revisions-phase",
+    );
+  }
+});
+
+test("runtime, credential, and terminal predecessor proofs remain strict for both live limits", () => {
+  const mutations = [
+    ["missing", (active) => [active]],
+    ["extra", (active) => [active, retainedRuntimePredecessorRevision(), retainedRuntimePredecessorRevision()]],
+    ["wrong name", (active) => {
+      const predecessor = retainedRuntimePredecessorRevision();
+      predecessor.name = "revision-other";
+      predecessor.id = predecessor.id.replace(/\/revisions\/[^/]+$/, "/revisions/revision-other");
+      predecessor.properties.fqdn = `revision-other.${RELAY_ENVIRONMENT_SUFFIX}`;
+      return [active, predecessor];
+    }],
+    ["wrong template", (active) => {
+      const predecessor = retainedRuntimePredecessorRevision();
+      predecessor.properties.template.containers[0].image = `${predecessor.properties.template.containers[0].image.slice(0, -64)}${"0".repeat(64)}`;
+      return [active, predecessor];
+    }],
+    ["serving", (active) => {
+      const predecessor = retainedRuntimePredecessorRevision();
+      predecessor.properties.trafficWeight = 1;
+      return [active, predecessor];
+    }],
+    ["replicated", (active) => {
+      const predecessor = retainedRuntimePredecessorRevision();
+      predecessor.properties.replicaCount = 1;
+      return [active, predecessor];
+    }],
+  ];
+  for (const liveLimit of [null, 1]) {
+    for (const [label, revisions] of mutations) {
+      void label;
+      const runtime = makeHarness();
+      try {
+        const runId = prepareRuntimeReconcile(runtime);
+        runtime.setTopology("post");
+        runtime.setSerial(8);
+        runtime.setLiveAppMutator((app) => {
+          const next = structuredClone(app);
+          next.properties.configuration.maxInactiveRevisions = liveLimit;
+          return next;
+        });
+        runtime.setLiveRevisionMutator((active) => revisions(active));
+        assert.throws(() => runtime.lifecycle.reconcile("runtime-cutover", runId));
+      } finally {
+        runtime.cleanup();
+      }
+
+      const credential = makeHarness();
+      try {
+        const runId = prepareCredential(credential);
+        credential.setTopology("post");
+        credential.setLiveAppMutator((app) => {
+          const next = structuredClone(app);
+          next.properties.configuration.maxInactiveRevisions = liveLimit;
+          return next;
+        });
+        credential.setLiveRevisionMutator((active) => revisions(active));
+        assert.throws(() => credential.lifecycle.preflight("credential-cleanup", runId));
+      } finally {
+        credential.cleanup();
+      }
+
+      const terminal = makeHarness();
+      try {
+        const runId = prepareTerminal(terminal);
+        terminal.setLiveAppMutator((app) => {
+          const next = structuredClone(app);
+          next.properties.configuration.maxInactiveRevisions = liveLimit;
+          return next;
+        });
+        terminal.setLiveRevisionMutator((active) => revisions(active));
+        assert.throws(() => terminal.lifecycle.finalize("terminal", runId));
+      } finally {
+        terminal.cleanup();
+      }
+    }
+  }
+});
+
+test("assertRevisionResponse preserves normalized app and revision inputs through pre and post projections", () => {
+  const outputs = {
+    accountId: `/subscriptions/${SUBSCRIPTION}`,
+    resourceGroup: "rg-runtime",
+    region: "eastus2",
+    relayContainerApp: "relay-test",
+    containerAppEnvironmentId: CONTAINER_ENV_ID,
+    imagePullIdentityId: IMAGE_PULL_ID,
+    runtimeIdentityId: RUNTIME_ID,
+    keyVaultUri: KEY_VAULT_URI,
+    foundryEndpoint: FOUNDRY_ENDPOINT,
+    runtimeIdentityClientId: RUNTIME_CLIENT,
+  };
+  const directory = mkdtempSync(path.join(tmpdir(), "palancar-reviewed-revision-projection-"));
+  const showPath = path.join(directory, "show.json");
+  try {
+    writeExclusive(showPath, reviewedRuntimeShow("runtime-cutover"));
+    const reviewed = reviewedRuntimeShapes({ show: showPath }, "runtime-cutover");
+    for (const [mode, appTopology, revisionName, revisions, expectedInactive] of [
+      ["pre", "pre", "revision-before", [liveRevision("revision-before", "pre")], undefined],
+      ["post", "post", "revision-after", [liveRevision("revision-after", "post"), retainedRuntimePredecessorRevision()], "revision-before"],
+    ]) {
+      const rawApp = liveAzureContainerApp(appTopology, revisionName);
+      const app = assertContainerAppResponse(rawApp, outputs, reviewed, `projection-${mode}-app`);
+      app.outputs = outputs;
+      const rawAppSnapshot = structuredClone(app);
+      const appPropertiesReference = app.properties;
+      const rawRevisionSnapshot = structuredClone(revisions);
+      const revisionReferences = revisions.map((revision) => ({
+        properties: revision.properties,
+        template: revision.properties.template,
+      }));
+      assertRevisionResponse(
+        revisions,
+        app,
+        reviewed,
+        revisionName,
+        expectedInactive,
+        mode,
+        "runtime-cutover",
+        `projection-${mode}-revisions`,
+      );
+      assert.deepEqual(app, rawAppSnapshot);
+      assert.strictEqual(app.properties, appPropertiesReference);
+      assert.deepEqual(revisions, rawRevisionSnapshot);
+      for (const [index, revision] of revisions.entries()) {
+        assert.strictEqual(revision.properties, revisionReferences[index].properties);
+        assert.strictEqual(revision.properties.template, revisionReferences[index].template);
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reconciliation preserves raw app and revision responses before and after projection", () => {
+  const cases = [
+    ["runtime-pre", (harness) => {
+      const runId = prepareRuntime(harness);
+      return () => harness.lifecycle.preflight("runtime-cutover", runId);
+    }],
+    ["runtime-post", (harness) => {
+      const runId = prepareRuntimeReconcile(harness);
+      harness.setTopology("post");
+      harness.setSerial(8);
+      return () => harness.lifecycle.reconcile("runtime-cutover", runId);
+    }],
+    ["credential-post", (harness) => {
+      const runId = prepareCredential(harness);
+      harness.setTopology("post");
+      return () => harness.lifecycle.preflight("credential-cleanup", runId);
+    }],
+    ["terminal-post", (harness) => {
+      const runId = prepareTerminal(harness);
+      return () => harness.lifecycle.finalize("terminal", runId);
+    }],
+  ];
+  for (const [label, prepare] of cases) {
+    const harness = makeHarness();
+    let appInput;
+    let appSnapshot;
+    let revisionInputs;
+    let revisionSnapshots;
+    try {
+      const operation = prepare(harness);
+      harness.setLiveAppMutator((value) => {
+        appInput = value;
+        appSnapshot = structuredClone(value);
+        return value;
+      });
+      harness.setLiveRevisionMutator((value) => {
+        const values = label === "runtime-pre"
+          ? [value]
+          : [value, retainedRuntimePredecessorRevision()];
+        revisionInputs = values;
+        revisionSnapshots = values.map((revision) => structuredClone(revision));
+        return values;
+      });
+      operation();
+      assert.ok(appInput, label);
+      assert.ok(revisionInputs, label);
+      assert.deepEqual(appInput, appSnapshot, label);
+      assert.deepEqual(revisionInputs, revisionSnapshots, label);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("reviewed phase limits reject explicit live-style and non-one values", () => {
+  const cases = [
+    ["runtime-cutover", "before", null],
+    ["runtime-cutover", "before", 1],
+    ["runtime-cutover", "after", undefined],
+    ["runtime-cutover", "after", 2],
+    ["credential-cleanup", "before", null],
+    ["credential-cleanup", "before", 2],
+    ["credential-cleanup", "after", null],
+    ["credential-cleanup", "after", 2],
+    ["terminal", "before", null],
+    ["terminal", "before", 2],
+    ["terminal", "after", null],
+    ["terminal", "after", 2],
+  ];
+  for (const [phase, side, value] of cases) {
+    const directory = mkdtempSync(path.join(tmpdir(), "palancar-reviewed-limit-negative-"));
+    const showPath = path.join(directory, "show.json");
+    try {
+      const show = reviewedRuntimeShow(phase);
+      const appChange = show.resource_changes.find(
+        (entry) => entry.address === "module.container_app_workload[0].azapi_resource.this",
+      ).change;
+      const configuration = appChange[side].body.properties.configuration;
+      if (value === undefined) delete configuration.maxInactiveRevisions;
+      else configuration.maxInactiveRevisions = value;
+      writeExclusive(showPath, show);
+      expectCode(
+        () => reviewedRuntimeShapes({ show: showPath }, phase),
+        "diagnostic-plan-topology",
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   }
 });
 
@@ -3874,6 +4186,10 @@ test("reviewed cutover fixtures enforce move-before-delete and direct one-contai
   );
   assert.deepEqual(runtimeApp.change.after.body.properties.configuration.secrets, []);
   assert.equal(runtimeApp.change.after.body.properties.configuration.maxInactiveRevisions, 1);
+  assert.equal(
+    Object.hasOwn(runtimeApp.change.before.body.properties.configuration, "maxInactiveRevisions"),
+    false,
+  );
   assert.deepEqual(runtimeRole.change.actions, ["no-op"]);
   assert.equal(runtimeRole.previous_address, priorRoleAddress);
   assert.deepEqual(credentialApp.change.actions, ["no-op"]);
@@ -4248,7 +4564,7 @@ test("credential cleanup binds the retained predecessor to the completed runtime
   }
 
   for (const [label, mutate, expected] of [
-    ["missing", (revisions) => revisions.slice(0, 1), "credential-revisions-inactive"],
+    ["missing", (revisions) => revisions.slice(0, 1), "credential-revisions-set"],
     ["extra", (revisions) => [...revisions, structuredClone(revisions[1])], "credential-revisions-set"],
   ]) {
     void label;
@@ -6860,7 +7176,7 @@ test("Sol probe: inactive revisions accept only reviewed secret-free structures"
       inactive.properties.template.containers[0].image = `${REVIEWED_RELAY_IMAGE.slice(0, -64)}${"c".repeat(64)}`;
       return [active, inactive];
     });
-    expectCode(() => harness.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-inactive");
+    expectCode(() => harness.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-set");
   } finally {
     harness.cleanup();
   }
