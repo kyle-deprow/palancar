@@ -6723,6 +6723,18 @@ const CUTOVER_IDENTITY_ADDRESSES = new Set([
   "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
   "module.identities_rbac.azurerm_user_assigned_identity.runtime",
 ]);
+const CUTOVER_BENIGN_DRIFT_ADDRESSES = new Set([
+  CUTOVER_CONTAINER_APP,
+  EXPIRY_CLEANUP_JOB,
+]);
+const CUTOVER_BENIGN_DRIFT_CHANGE_KEYS = Object.freeze([
+  "actions",
+  "before",
+  "after",
+  "after_unknown",
+  "before_sensitive",
+  "after_sensitive",
+]);
 
 function cutoverHasForbiddenMetadata(value, path = "") {
   if (Array.isArray(value)) {
@@ -6740,12 +6752,7 @@ function cutoverHasForbiddenMetadata(value, path = "") {
       return true;
     }
     if (key === "resource_drift") {
-      if (
-        path !== "" ||
-        !(child === null || (Array.isArray(child) && child.length === 0))
-      ) {
-        return true;
-      }
+      if (path !== "") return true;
       continue;
     }
     if (key === "deferred_changes") return true;
@@ -6777,6 +6784,7 @@ function cutoverExactPlanEnvelope(plan, applyable) {
     plan.errored === false &&
     !Object.hasOwn(plan.configuration, "target") &&
     !Object.hasOwn(plan.configuration, "generated_config") &&
+    cutoverHasExactBenignResourceDrift(plan) &&
     !cutoverHasForbiddenMetadata(plan)
   );
 }
@@ -6885,9 +6893,9 @@ function cutoverExactResourceEntry(entry, requirePrevious = false) {
   );
 }
 
-function cutoverIsContainerAppIdentityIdsPath(address, path) {
+function cutoverIsUnorderedIdentityIdsPath(address, path) {
   return (
-    address === CUTOVER_CONTAINER_APP &&
+    CUTOVER_BENIGN_DRIFT_ADDRESSES.has(address) &&
     path.length === 3 &&
     path[0] === "identity" &&
     path[1] === 0 &&
@@ -6917,7 +6925,7 @@ function cutoverExactUnorderedArrayEqual(actual, expected) {
 }
 
 function cutoverExactValueEqual(actual, expected, address, path = []) {
-  if (cutoverIsContainerAppIdentityIdsPath(address, path)) {
+  if (cutoverIsUnorderedIdentityIdsPath(address, path)) {
     return cutoverExactUnorderedArrayEqual(actual, expected);
   }
   if (Array.isArray(actual) || Array.isArray(expected)) {
@@ -6960,6 +6968,107 @@ function cutoverHasExactIdentitySet(
     cutoverExactUnorderedArrayEqual(identityIds, expected) &&
     identityIds.every(isUserAssignedIdentity) &&
     identityIds.length === expected.length
+  );
+}
+
+function cutoverHasExactBenignDriftEntry(
+  plan,
+  entry,
+  expectedIdentityIds,
+) {
+  const address = entry?.address;
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === address,
+  );
+  const resourceChange = plan.resource_changes.find(
+    (candidate) => candidate.address === address,
+  );
+  const change = entry?.change;
+  const before = change?.before;
+  const after = change?.after;
+  const beforeIdentityIds = before?.identity?.[0]?.identity_ids;
+  const afterIdentityIds = after?.identity?.[0]?.identity_ids;
+  return (
+    CUTOVER_BENIGN_DRIFT_ADDRESSES.has(address) &&
+    reference !== undefined &&
+    resourceChange !== undefined &&
+    isObject(entry) &&
+    hasExactKeys(entry, Object.keys(reference)) &&
+    cutoverResourceTypeMatchesReference(entry, reference) &&
+    isObject(change) &&
+    hasExactKeys(change, CUTOVER_BENIGN_DRIFT_CHANGE_KEYS) &&
+    isDeepStrictEqual(change.actions, ["update"]) &&
+    isObject(before) &&
+    isObject(after) &&
+    !isDeepStrictEqual(before, after) &&
+    cutoverExactValueEqual(before, after, address) &&
+    cutoverExactValueEqual(
+      before,
+      resourceChange.change.before,
+      address,
+    ) &&
+    cutoverExactValueEqual(
+      after,
+      resourceChange.change.before,
+      address,
+    ) &&
+    cutoverHasExactIdentitySet(
+      beforeIdentityIds,
+      expectedIdentityIds.imagePull,
+      expectedIdentityIds.runtime,
+    ) &&
+    cutoverHasExactIdentitySet(
+      afterIdentityIds,
+      expectedIdentityIds.imagePull,
+      expectedIdentityIds.runtime,
+    ) &&
+    beforeIdentityIds[0] === afterIdentityIds[1] &&
+    beforeIdentityIds[1] === afterIdentityIds[0] &&
+    isDeepStrictEqual(change.after_unknown, {}) &&
+    isDeepStrictEqual(
+      change.before_sensitive,
+      resourceChange.change.before_sensitive,
+    ) &&
+    isDeepStrictEqual(
+      change.after_sensitive,
+      resourceChange.change.before_sensitive,
+    )
+  );
+}
+
+function cutoverHasExactBenignResourceDrift(plan) {
+  const drift = plan.resource_drift;
+  if (drift === undefined || drift === null) return true;
+  if (!Array.isArray(drift)) return false;
+  if (drift.length === 0) return true;
+  // resource_drift is the complete refresh report.  Until a partial real-plan
+  // variant is reviewed, accept both known order-only entries or neither.
+  if (drift.length !== CUTOVER_BENIGN_DRIFT_ADDRESSES.size) return false;
+
+  const addresses = new Set(drift.map((entry) => entry?.address));
+  if (
+    addresses.size !== CUTOVER_BENIGN_DRIFT_ADDRESSES.size ||
+    [...CUTOVER_BENIGN_DRIFT_ADDRESSES].some(
+      (address) => !addresses.has(address),
+    )
+  ) {
+    return false;
+  }
+
+  const expectedIdentityIds = {
+    imagePull: plan.resource_changes.find(
+      (entry) =>
+        entry.address ===
+        "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+    )?.change?.after?.id,
+    runtime: plan.resource_changes.find(
+      (entry) =>
+        entry.address ===
+        "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+    )?.change?.after?.id,
+  };
+  return drift.every((entry) =>
+    cutoverHasExactBenignDriftEntry(plan, entry, expectedIdentityIds),
   );
 }
 
@@ -8934,7 +9043,7 @@ function cutoverSensitiveStructureMatches(
     return cutoverOpaqueSensitiveLeafMatches(actual, reference);
   }
   if (Array.isArray(reference)) {
-    if (cutoverIsContainerAppIdentityIdsPath(address, path)) {
+    if (cutoverIsUnorderedIdentityIdsPath(address, path)) {
       const expected = reference.map((identity) =>
         cutoverRebindReference(identity, bindings),
       );
@@ -9575,10 +9684,14 @@ export function acceptsPlan(plan, mode) {
       : mode === MODEL_SPIKE_MODE
         ? hasNonPassingModelSpikeCheck(plan)
         : hasNonPassingCheck(plan);
+  const modeValidatesItsOwnResourceDrift =
+    mode === FINAL_ROLLOUT_MODE ||
+    mode === AZURE_GENERATION_CUTOVER_MODE ||
+    mode === AZURE_CREDENTIAL_CLEANUP_MODE ||
+    mode === FINAL_ROLLOUT_COMPLETE_MODE;
   if (
     hasInvalidChecks ||
-    (mode !== FINAL_ROLLOUT_MODE &&
-      mode !== FINAL_ROLLOUT_COMPLETE_MODE &&
+    (!modeValidatesItsOwnResourceDrift &&
       hasResourceDrift(plan))
   ) {
     return false;

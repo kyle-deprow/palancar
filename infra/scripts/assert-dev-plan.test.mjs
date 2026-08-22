@@ -5129,7 +5129,7 @@ function cutoverChange(planValue, address) {
   return entry;
 }
 
-function mutateCutoverResourceCopies(planValue, address, mutate) {
+function cutoverResourceCopies(planValue, address) {
   const entry = cutoverChange(planValue, address);
   const planned = finalValueResource(
     planValue.planned_values.root_module,
@@ -5141,14 +5141,16 @@ function mutateCutoverResourceCopies(planValue, address, mutate) {
   );
   assert.ok(planned, `missing planned resource ${address}`);
   assert.ok(prior, `missing prior resource ${address}`);
-  for (const value of [
+  return [
     entry.change.before,
     entry.change.after,
     planned.values,
     prior.values,
-  ]) {
-    mutate(value);
-  }
+  ];
+}
+
+function mutateCutoverResourceCopies(planValue, address, mutate) {
+  for (const value of cutoverResourceCopies(planValue, address)) mutate(value);
 }
 
 function mutateContainerAppCopies(planValue, mutate) {
@@ -5161,10 +5163,40 @@ function setContainerAppIdentityIdsEverywhere(planValue, identityIds) {
   });
 }
 
-function reverseIdentityIdsEverywhere(planValue, address) {
-  mutateCutoverResourceCopies(planValue, address, (value) => {
-    value.identity[0].identity_ids.reverse();
+function makeBenignCutoverResourceDrift(planValue) {
+  return [containerAppAddress, finalCleanupJobAddress].map((address) => {
+    const source = cutoverChange(planValue, address);
+    const entry = clone(source);
+    const before = clone(source.change.before);
+    const after = clone(before);
+    after.identity[0].identity_ids.reverse();
+    entry.change = {
+      actions: ["update"],
+      before,
+      after,
+      after_unknown: {},
+      before_sensitive: clone(source.change.before_sensitive),
+      after_sensitive: clone(source.change.before_sensitive),
+    };
+    return entry;
   });
+}
+
+function reverseBenignDriftDirection(entry) {
+  for (const [beforeKey, afterKey] of [
+    ["before", "after"],
+    ["before_sensitive", "after_sensitive"],
+  ]) {
+    [entry.change[beforeKey], entry.change[afterKey]] = [
+      entry.change[afterKey],
+      entry.change[beforeKey],
+    ];
+  }
+}
+
+function setBenignDriftIdentityIds(entry, identityIds) {
+  entry.change.before.identity[0].identity_ids = clone(identityIds);
+  entry.change.after.identity[0].identity_ids = clone(identityIds).reverse();
 }
 
 function mutateContainerAppOutputs(planValue, mutate) {
@@ -5459,14 +5491,249 @@ test("cutover-family accepts reversed Container App identity sets and fresh meta
   }
 });
 
-test("cutover-family keeps expiry-cleanup Job identity sets ordered", () => {
+test("cutover-family accepts only the exact two-entry benign resource drift permutations", () => {
   for (const [source, mode] of [
     [runtimeCutoverFixture, "azure-generation-cutover"],
     [credentialCleanupFixture, "azure-credential-cleanup"],
     [terminalFixture, "final-rollout-complete"],
   ]) {
+    for (const reverseEntries of [false, true]) {
+      for (let directionMask = 0; directionMask < 4; directionMask += 1) {
+        const candidate = clone(source);
+        mutateContainerAppCopies(candidate, (value) => {
+          value.identity[0].identity_ids.reverse();
+        });
+        candidate.resource_drift = makeBenignCutoverResourceDrift(candidate);
+        candidate.resource_drift.forEach((entry, index) => {
+          if ((directionMask & (1 << index)) !== 0) {
+            reverseBenignDriftDirection(entry);
+          }
+        });
+        if (reverseEntries) candidate.resource_drift.reverse();
+        candidate.relevant_attributes.reverse();
+        candidate.timestamp = "2026-08-22T17:30:00Z";
+        assert.equal(
+          acceptsPlan(candidate, mode),
+          true,
+          `${mode} entries=${reverseEntries} directions=${directionMask}`,
+        );
+      }
+    }
+
+    for (const retainedAddress of [
+      containerAppAddress,
+      finalCleanupJobAddress,
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        candidate.resource_drift = makeBenignCutoverResourceDrift(
+          candidate,
+        ).filter((entry) => entry.address === retainedAddress);
+      });
+    }
+  }
+});
+
+test("cutover-family benign resource drift requires the exact identity set", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    const [imagePullIdentity, runtimeIdentity] = cutoverChange(
+      source,
+      containerAppAddress,
+    ).change.before.identity[0].identity_ids;
+    const wrongIdentity = runtimeIdentity.replace(
+      /id-palancar-dev-runtime$/,
+      "id-palancar-dev-unexpected",
+    );
+    for (const address of [containerAppAddress, finalCleanupJobAddress]) {
+      for (const identityIds of [
+        [imagePullIdentity],
+        [imagePullIdentity, runtimeIdentity, wrongIdentity],
+        [imagePullIdentity, wrongIdentity],
+        [imagePullIdentity, imagePullIdentity],
+      ]) {
+        rejectsCutoverMutation(source, mode, (candidate) => {
+          candidate.resource_drift = makeBenignCutoverResourceDrift(candidate);
+          setBenignDriftIdentityIds(
+            candidate.resource_drift.find(
+              (entry) => entry.address === address,
+            ),
+            identityIds,
+          );
+        });
+      }
+    }
+  }
+});
+
+test("cutover-family benign resource drift rejects structural and metadata drift", () => {
+  const mutations = [
+    (drift) => {
+      const extra = clone(drift[0]);
+      extra.address = "module.unreviewed.azapi_resource.this";
+      drift.push(extra);
+    },
+    (drift) => {
+      drift[1] = clone(drift[0]);
+    },
+    (drift) => {
+      drift[1].address = "module.unreviewed.azapi_resource.this";
+    },
+    (drift) => {
+      drift[0].module_address = "module.container_app_workload[1]";
+    },
+    (drift) => {
+      drift[0].extra = true;
+    },
+    (drift) => {
+      drift[0].change.actions = ["no-op"];
+    },
+    (drift) => {
+      drift[0].change.action_reason = "read_because_config_unknown";
+    },
+    (drift) => {
+      drift[0].change.after_unknown = { identity: true };
+    },
+    (drift) => {
+      drift[0].change.after_sensitive = {};
+    },
+    (drift) => {
+      drift[0].change.before_identity = {
+        id: drift[0].change.before.id,
+        type: null,
+      };
+    },
+    (drift) => {
+      drift[0].change.after_identity = {
+        id: drift[0].change.after.id,
+        type: null,
+      };
+    },
+    (drift) => {
+      drift[0].change.after.identity[0].identity_ids = clone(
+        drift[0].change.before.identity[0].identity_ids,
+      );
+    },
+    (drift) => {
+      drift[0].change.after.body.properties.configuration.activeRevisionsMode =
+        "Multiple";
+    },
+    (drift) => {
+      drift[0].change.after.body.properties.template.containers[0].env[0].value =
+        "unexpected";
+    },
+    (drift) => {
+      drift[0].change.after.body.properties.template.containers[0].image =
+        `${finalAcrLoginServer}/palancar-relay@sha256:${"9".repeat(64)}`;
+    },
+    (drift) => {
+      drift[0].change.after.output.properties.runningStatus = "Stopped";
+    },
+    (drift) => {
+      drift[0].change.after.body.identity = clone(
+        drift[0].change.after.identity,
+      );
+    },
+    (drift) => {
+      drift[0].change.after.tags.additional = "changed";
+    },
+    (drift) => {
+      for (const side of ["before", "after"]) {
+        drift[0].change[side].tags.additional = "coherent-lookalike";
+      }
+    },
+  ];
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    for (const mutate of mutations) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        candidate.resource_drift = makeBenignCutoverResourceDrift(candidate);
+        mutate(candidate.resource_drift);
+      });
+    }
+  }
+});
+
+test("cutover-family accepts expiry-cleanup Job identity set permutations across all copies", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    for (let reversalMask = 0; reversalMask < 16; reversalMask += 1) {
+      const candidate = clone(source);
+      cutoverResourceCopies(candidate, finalCleanupJobAddress).forEach(
+        (value, index) => {
+          if ((reversalMask & (1 << index)) !== 0) {
+            value.identity[0].identity_ids.reverse();
+          }
+        },
+      );
+      assert.equal(
+        acceptsPlan(candidate, mode),
+        true,
+        `${mode} Job reversal mask=${reversalMask}`,
+      );
+    }
+  }
+});
+
+test("cutover-family rejects non-exact expiry-cleanup Job identity sets and path lookalikes", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    const [imagePullIdentity, runtimeIdentity] = cutoverChange(
+      source,
+      finalCleanupJobAddress,
+    ).change.after.identity[0].identity_ids;
+    const wrongIdentity = runtimeIdentity.replace(
+      /id-palancar-dev-runtime$/,
+      "id-palancar-dev-unexpected",
+    );
+    for (const identityIds of [
+      [imagePullIdentity, imagePullIdentity],
+      [imagePullIdentity],
+      [imagePullIdentity, runtimeIdentity, wrongIdentity],
+      [imagePullIdentity, wrongIdentity],
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateCutoverResourceCopies(
+          candidate,
+          finalCleanupJobAddress,
+          (value) => {
+            value.identity[0].identity_ids = clone(identityIds);
+          },
+        );
+      });
+    }
+
     rejectsCutoverMutation(source, mode, (candidate) => {
-      reverseIdentityIdsEverywhere(candidate, finalCleanupJobAddress);
+      mutateCutoverResourceCopies(
+        candidate,
+        finalCleanupJobAddress,
+        (value) => {
+          value.identity.push({
+            ...clone(value.identity[0]),
+            identity_ids: clone(value.identity[0].identity_ids).reverse(),
+          });
+        },
+      );
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateCutoverResourceCopies(
+        candidate,
+        finalCleanupJobAddress,
+        (value) => {
+          value.body.identity = clone(value.identity);
+        },
+      );
     });
   }
 });
@@ -5522,7 +5789,7 @@ test("cutover-family rejects non-exact Container App identity sets", () => {
   }
 });
 
-test("cutover-family keeps registry and identitySettings roles pinned", () => {
+test("cutover-family keeps registry, identitySettings, and client-ID roles pinned", () => {
   for (const [source, mode] of [
     [runtimeCutoverFixture, "azure-generation-cutover"],
     [credentialCleanupFixture, "azure-credential-cleanup"],
@@ -5532,34 +5799,55 @@ test("cutover-family keeps registry and identitySettings roles pinned", () => {
       source,
       containerAppAddress,
     ).change.after.identity[0].identity_ids;
-    rejectsCutoverMutation(source, mode, (candidate) => {
-      mutateContainerAppCopies(candidate, (value) => {
-        value.body.properties.configuration.registries[0].identity =
-          runtimeIdentity;
+    for (const address of [containerAppAddress, finalCleanupJobAddress]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateCutoverResourceCopies(candidate, address, (value) => {
+          value.body.properties.configuration.registries[0].identity =
+            runtimeIdentity;
+        });
       });
-    });
-    rejectsCutoverMutation(source, mode, (candidate) => {
-      mutateContainerAppCopies(candidate, (value) => {
-        const settings = value.body.properties.configuration.identitySettings;
-        [settings[0].identity, settings[1].identity] = [
-          settings[1].identity,
-          settings[0].identity,
-        ];
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateCutoverResourceCopies(candidate, address, (value) => {
+          const settings =
+            value.body.properties.configuration.identitySettings;
+          [settings[0].identity, settings[1].identity] = [
+            settings[1].identity,
+            settings[0].identity,
+          ];
+        });
       });
-    });
-    rejectsCutoverMutation(source, mode, (candidate) => {
-      mutateContainerAppCopies(candidate, (value) => {
-        const settings = value.body.properties.configuration.identitySettings;
-        settings[0].identity = runtimeIdentity.replace(
-          "resourceGroups",
-          "resourcegroups",
-        );
-        settings[1].identity = imagePullIdentity.replace(
-          "resourceGroups",
-          "resourcegroups",
-        );
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateCutoverResourceCopies(candidate, address, (value) => {
+          const settings =
+            value.body.properties.configuration.identitySettings;
+          settings[0].identity = runtimeIdentity.replace(
+            "resourceGroups",
+            "resourcegroups",
+          );
+          settings[1].identity = imagePullIdentity.replace(
+            "resourceGroups",
+            "resourcegroups",
+          );
+        });
       });
-    });
+    }
+
+    const imagePullClientId = cutoverChange(
+      source,
+      "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+    ).change.after.client_id;
+    for (const address of [containerAppAddress, finalCleanupJobAddress]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateCutoverResourceCopies(candidate, address, (value) => {
+          const env =
+            value.body.properties.template.containers[0].env.find(
+              (entry) => entry.name === "AZURE_CLIENT_ID",
+            );
+          assert.ok(env, `missing AZURE_CLIENT_ID for ${address}`);
+          env.value = imagePullClientId;
+        });
+      });
+    }
   }
 });
 
