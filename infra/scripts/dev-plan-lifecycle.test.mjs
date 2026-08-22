@@ -2953,6 +2953,32 @@ test("A3 exact runtime predecessor and diagnostic receipt contracts are fail-clo
   }
 });
 
+test("container app contract canonicalizes Azure CLI display regions and rejects invalid regions", () => {
+  const accepted = makeHarness();
+  try {
+    const runId = prepareRuntime(accepted);
+    accepted.setLiveAppMutator((app) => ({ ...app, location: "East US 2" }));
+    assert.deepEqual(accepted.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    accepted.cleanup();
+  }
+
+  for (const location of ["East-US-2", "westus"]) {
+    const rejected = makeHarness();
+    try {
+      const runId = prepareRuntime(rejected);
+      rejected.setLiveAppMutator((app) => ({ ...app, location }));
+      expectCode(() => rejected.lifecycle.preflight("runtime-cutover", runId), "runtime-containerapp");
+    } finally {
+      rejected.cleanup();
+    }
+  }
+});
+
 test("reviewed cutover fixtures enforce move-before-delete and direct one-container topology", () => {
   const appAddress = "module.container_app_workload[0].azapi_resource.this";
   const roleAddress = "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";

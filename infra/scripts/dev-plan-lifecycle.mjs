@@ -6090,7 +6090,9 @@ function assertContainerTemplate(template, code) {
 function assertContainerAppResponse(value, outputs, reviewed, code) {
   assertKnownKeys(value, ["id", "name", "location", "type", "identity", "properties", "tags", "systemData", "kind", "managedBy", "sku"], code);
   assertRequiredKeys(value, ["id", "name", "location", "type", "identity", "properties"], code);
-  failIf(value.name !== outputs.relayContainerApp || value.location !== outputs.region, code);
+  const liveLocation = canonicalAzureRegion(value.location, code);
+  const outputLocation = canonicalAzureRegion(outputs.region, code);
+  failIf(value.name !== outputs.relayContainerApp || liveLocation !== outputLocation, code);
   failIf(value.type !== "Microsoft.App/containerApps", code);
   failIf(
     typeof value.id !== "string" ||
