@@ -9,7 +9,8 @@ vi.mock('node:fs', () => ({ writeSync: vi.fn() }));
 import {
   GenerationProviderError,
   type GenerationProvider,
-  type GenerationProviderCompletion
+  type GenerationProviderCompletion,
+  type GenerationProviderCompletionInput
 } from '@palancar/generation';
 
 import {
@@ -67,6 +68,86 @@ const TRUSTED_STAGES = [
   'completion_schema',
   'unknown'
 ] as const;
+
+const BASE_DIAGNOSTIC_FAILURE_EVIDENCE = Object.freeze({
+  sessionId: '11111111-1111-4111-8111-111111111111',
+  sessionEpoch: 1,
+  utteranceId: '22222222-2222-4222-8222-222222222222',
+  segmentId: 'azure-diagnostic-1',
+  acceptedFinalRevision: 1,
+  selectedTargetLanguage: 'es',
+  gatePolicyVersion: '1.0.0',
+  operation: 'complete',
+  status: 'failure',
+  failureCategory: 'invalid-generated-language',
+  providerId: 'diagnostic-provider',
+  providerVersion: '1.0.0',
+  validatorId: 'diagnostic-validator',
+  validatorVersion: '1.0.0',
+  languageValidationStatus: 'rejected',
+  languageValidationCheckCount: 5,
+  languageValidationNonmatchCount: 1,
+  startMonotonicMs: 0,
+  endMonotonicMs: 1,
+  latencyMs: 1
+});
+
+function diagnosticFailureEvidence(
+  overrides: Readonly<Record<string, unknown>> = {}
+): Record<string, unknown> {
+  return { ...BASE_DIAGNOSTIC_FAILURE_EVIDENCE, ...overrides };
+}
+
+let mockedEvidenceQueue: unknown[] = [];
+let mockedServiceCompleteCount = 0;
+
+async function withMockedGenerationService(
+  callback: (
+    diagnostic: typeof import('../src/azure-generation-diagnostic.js')
+  ) => Promise<void>
+): Promise<void> {
+  vi.doMock('@palancar/generation', async () => {
+    const actual = await vi.importActual<typeof import('@palancar/generation')>(
+      '@palancar/generation'
+    );
+    class MockGenerationService {
+      readonly #provider: GenerationProvider;
+      readonly #evidence: unknown;
+
+      constructor(options: { readonly provider: GenerationProvider }) {
+        this.#provider = options.provider;
+        const evidence = mockedEvidenceQueue.shift();
+        this.#evidence = evidence === undefined || Array.isArray(evidence)
+          ? evidence
+          : [evidence];
+      }
+
+      get evidence(): readonly unknown[] {
+        return this.#evidence as readonly unknown[];
+      }
+
+      async complete(
+        turn: GenerationProviderCompletionInput,
+        context: { readonly signal: AbortSignal }
+      ): Promise<never> {
+        mockedServiceCompleteCount += 1;
+        await this.#provider.complete(turn, context);
+        throw new Error('mocked-generation-failure');
+      }
+    }
+
+    return { ...actual, GenerationService: MockGenerationService };
+  });
+  vi.resetModules();
+  try {
+    await callback(await import('../src/azure-generation-diagnostic.js'));
+  } finally {
+    mockedEvidenceQueue = [];
+    mockedServiceCompleteCount = 0;
+    vi.doUnmock('@palancar/generation');
+    vi.resetModules();
+  }
+}
 
 interface TimerHarness {
   readonly timer: NonNullable<AzureGenerationDiagnosticDependencies['timer']>;
@@ -320,7 +401,7 @@ describe('azure generation diagnostic', () => {
     expect(timer.clearCount()).toBe(1);
   });
 
-  it('maps wrong-language generated output to validation_failure and never passes', async () => {
+  it('retries one trusted invalid-language failure and then terminates without passing', async () => {
     const timer = timerHarness();
     const source = sourceHarness();
     const provider = providerHarness(async () => ({
@@ -335,8 +416,41 @@ describe('azure generation diagnostic', () => {
     await expect(runAzureGenerationDiagnostic(setup.options)).resolves.toBe(20);
     expect(setup.lines).toEqual(['azure-generation-diagnostic: failed stage=validation_failure\n']);
     expect(setup.lines).not.toContain('azure-generation-diagnostic: passed\n');
-    expect(provider.complete).toHaveBeenCalledTimes(1);
+    expect(provider.complete).toHaveBeenCalledTimes(2);
     expect(source.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a trusted invalid-language failure once and accepts a successful second attempt', async () => {
+    const timer = timerHarness();
+    const source = sourceHarness();
+    let calls = 0;
+    const provider = providerHarness(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          englishTranslation: '¿Dónde está la estación de tren?',
+          suggestions: [
+            { englishText: '¿Podrías ayudarme?', selectedTargetText: 'Where is the train station?' },
+            { englishText: '¿Puedes mostrarme el camino?', selectedTargetText: 'Go to the station.' }
+          ]
+        };
+      }
+      return COMPLETION;
+    });
+    const sourceFactory = vi.fn(() => source.source);
+    const providerFactory = vi.fn(() => provider.provider);
+    const setup = dependencies(timer, source.source, provider.provider, {
+      tokenSourceFactory: sourceFactory,
+      providerFactory
+    });
+
+    await expect(runAzureGenerationDiagnostic(setup.options)).resolves.toBe(0);
+    expect(provider.complete).toHaveBeenCalledTimes(2);
+    expect(sourceFactory).toHaveBeenCalledTimes(1);
+    expect(providerFactory).toHaveBeenCalledTimes(1);
+    expect(source.close).toHaveBeenCalledTimes(1);
+    expect(timer.clearCount()).toBe(1);
+    expect(setup.lines).toEqual(['azure-generation-diagnostic: passed\n']);
   });
 
   it('maps a validator throw to validation_failure and never passes', async () => {
@@ -362,8 +476,56 @@ describe('azure generation diagnostic', () => {
       await expect(diagnostic.runAzureGenerationDiagnostic(setup.options)).resolves.toBe(20);
       expect(setup.lines).toEqual(['azure-generation-diagnostic: failed stage=validation_failure\n']);
       expect(setup.lines).not.toContain('azure-generation-diagnostic: passed\n');
-      expect(provider.complete).toHaveBeenCalledTimes(1);
+      expect(provider.complete).toHaveBeenCalledTimes(2);
       expect(source.close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock('../src/provisional-language-boundary.js');
+      vi.resetModules();
+    }
+  });
+
+  it('retries a validator failure once and accepts a successful second attempt', async () => {
+    let validatorCalls = 0;
+    vi.doMock('../src/provisional-language-boundary.js', async () => {
+      const actual = await vi.importActual<typeof import('../src/provisional-language-boundary.js')>(
+        '../src/provisional-language-boundary.js'
+      );
+      const boundary = actual.createDevelopmentProvisionalLanguageBoundary();
+      const validator = {
+        id: boundary.generatedLanguageValidator.id,
+        version: boundary.generatedLanguageValidator.version,
+        validate: async (
+          input: Parameters<typeof boundary.generatedLanguageValidator.validate>[0],
+          context: Parameters<typeof boundary.generatedLanguageValidator.validate>[1]
+        ) => {
+          validatorCalls += 1;
+          if (validatorCalls === 1) {
+            throw new Error('first validator failure');
+          }
+          return boundary.generatedLanguageValidator.validate(input, context);
+        }
+      };
+      return {
+        createDevelopmentProvisionalLanguageBoundary: () => ({
+          ...boundary,
+          generatedLanguageValidator: validator
+        })
+      };
+    });
+    vi.resetModules();
+    try {
+      const diagnostic = await import('../src/azure-generation-diagnostic.js');
+      const timer = timerHarness();
+      const source = sourceHarness();
+      const provider = providerHarness(async () => COMPLETION);
+      const setup = dependencies(timer, source.source, provider.provider);
+
+      await expect(diagnostic.runAzureGenerationDiagnostic(setup.options)).resolves.toBe(0);
+      expect(validatorCalls).toBe(2);
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+      expect(source.close).toHaveBeenCalledTimes(1);
+      expect(timer.clearCount()).toBe(1);
+      expect(setup.lines).toEqual(['azure-generation-diagnostic: passed\n']);
     } finally {
       vi.doUnmock('../src/provisional-language-boundary.js');
       vi.resetModules();
@@ -385,6 +547,293 @@ describe('azure generation diagnostic', () => {
     expect(source.close).toHaveBeenCalledTimes(1);
     expect(timer.clearCount()).toBe(1);
   });
+
+  it('shares the fixed turn and dependencies across the two sequential attempts', async () => {
+    const timer = timerHarness();
+    const source = sourceHarness();
+    const inputs: unknown[] = [];
+    const signals: AbortSignal[] = [];
+    let calls = 0;
+    const provider = providerHarness(async (input, context) => {
+      inputs.push(input);
+      signals.push(context.signal);
+      calls += 1;
+      if (calls === 1) {
+        return {
+          englishTranslation: '¿Dónde está la estación?',
+          suggestions: [
+            { englishText: 'Can you help me?', selectedTargetText: 'Where is the station?' },
+            { englishText: 'Can you show me?', selectedTargetText: 'Go there.' }
+          ]
+        };
+      }
+      return COMPLETION;
+    });
+    const setup = dependencies(timer, source.source, provider.provider);
+
+    await expect(runAzureGenerationDiagnostic(setup.options)).resolves.toBe(0);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toEqual(inputs[1]);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).not.toBe(signals[1]);
+    expect(signals.every((signal) => !signal.aborted)).toBe(true);
+    expect(timer.clearCount()).toBe(1);
+    expect(source.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed without retrying zero, multiple, mismatched, or malformed evidence', async () => {
+    const accessorEvidence = diagnosticFailureEvidence();
+    Object.defineProperty(accessorEvidence, 'failureCategory', {
+      configurable: true,
+      enumerable: true,
+      get: () => 'invalid-generated-language'
+    });
+    const missingEvidence = diagnosticFailureEvidence();
+    delete missingEvidence.failureCategory;
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+      ['zero evidence', []],
+      ['missing evidence', undefined],
+      ['multiple evidence', [diagnosticFailureEvidence(), diagnosticFailureEvidence()]],
+      ['correlation mismatch', diagnosticFailureEvidence({ sessionEpoch: 2 })],
+      ['extra evidence key', { ...diagnosticFailureEvidence(), extra: 'unexpected' }],
+      ['accessor evidence key', accessorEvidence],
+      ['missing required key', missingEvidence],
+      ['category/status mismatch', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'rejected'
+      })],
+      ['invalid category with zero nonmatches', diagnosticFailureEvidence({
+        languageValidationNonmatchCount: 0
+      })],
+      ['invalid category with failed status', diagnosticFailureEvidence({
+        languageValidationStatus: 'failed'
+      })],
+      ['invalid category with zero checks', diagnosticFailureEvidence({
+        languageValidationCheckCount: 0,
+        languageValidationNonmatchCount: 0
+      })],
+      ['invalid category with seven checks and zero nonmatches', diagnosticFailureEvidence({
+        languageValidationCheckCount: 7,
+        languageValidationNonmatchCount: 0
+      })],
+      ['invalid category with not-run status', diagnosticFailureEvidence({
+        languageValidationStatus: 'not-run',
+        languageValidationNonmatchCount: 0
+      })],
+      ['invalid category with malformed check count', diagnosticFailureEvidence({
+        languageValidationCheckCount: 1
+      })],
+      ['invalid category with excessive nonmatches', diagnosticFailureEvidence({
+        languageValidationNonmatchCount: 6
+      })],
+      ['language failure with nonmatches', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'failed',
+        languageValidationNonmatchCount: 1
+      })],
+      ['language failure with rejected status', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'rejected',
+        languageValidationNonmatchCount: 0
+      })],
+      ['language failure with zero checks', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'failed',
+        languageValidationCheckCount: 0
+      })],
+      ['language failure with seven checks and nonmatches', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'failed',
+        languageValidationCheckCount: 7,
+        languageValidationNonmatchCount: 1
+      })],
+      ['language failure with not-run status', diagnosticFailureEvidence({
+        failureCategory: 'language-validation-failure',
+        languageValidationStatus: 'not-run',
+        languageValidationNonmatchCount: 0
+      })],
+      ['unknown failure category', diagnosticFailureEvidence({
+        failureCategory: 'provider-failure'
+      })],
+      ['provider stage on validation evidence', diagnosticFailureEvidence({
+        providerFailureStage: 'transport'
+      })]
+    ];
+
+    await withMockedGenerationService(async (diagnostic) => {
+      for (const [description, evidence] of cases) {
+        mockedEvidenceQueue = [evidence];
+        mockedServiceCompleteCount = 0;
+        const timer = timerHarness();
+        const source = sourceHarness();
+        const provider = providerHarness(async () => COMPLETION);
+        const setup = dependencies(timer, source.source, provider.provider);
+
+        await expect(
+          diagnostic.runAzureGenerationDiagnostic(setup.options)
+        ).resolves.toBe(20);
+        expect(setup.lines, description).toEqual([UNKNOWN_LINE]);
+        expect(provider.complete, description).toHaveBeenCalledTimes(1);
+        expect(mockedServiceCompleteCount, description).toBe(1);
+        expect(source.close, description).toHaveBeenCalledTimes(1);
+        expect(timer.clearCount(), description).toBe(1);
+      }
+    });
+  });
+
+  it('treats a valid provider stage as terminal without retrying', async () => {
+    const providerEvidence = diagnosticFailureEvidence({
+      failureCategory: 'provider-failure',
+      providerFailureStage: 'transport',
+      languageValidationStatus: 'not-run',
+      languageValidationCheckCount: 0,
+      languageValidationNonmatchCount: 0
+    });
+
+    await withMockedGenerationService(async (diagnostic) => {
+      mockedEvidenceQueue = [providerEvidence];
+      mockedServiceCompleteCount = 0;
+      const timer = timerHarness();
+      const source = sourceHarness();
+      const provider = providerHarness(async () => COMPLETION);
+      const setup = dependencies(timer, source.source, provider.provider);
+
+      await expect(
+        diagnostic.runAzureGenerationDiagnostic(setup.options)
+      ).resolves.toBe(20);
+      expect(setup.lines).toEqual(['azure-generation-diagnostic: failed stage=transport\n']);
+      expect(provider.complete).toHaveBeenCalledTimes(1);
+      expect(mockedServiceCompleteCount).toBe(1);
+      expect(source.close).toHaveBeenCalledTimes(1);
+      expect(timer.clearCount()).toBe(1);
+    });
+  });
+
+  it('retries a valid rejection once before each trusted provider failure and never starts a third attempt', async () => {
+    await withMockedGenerationService(async (diagnostic) => {
+      for (const stage of TRUSTED_STAGES) {
+        mockedEvidenceQueue = [
+          stage === 'identity'
+            ? diagnosticFailureEvidence({ languageValidationCheckCount: 7 })
+            : diagnosticFailureEvidence(),
+          diagnosticFailureEvidence({
+            failureCategory: 'provider-failure',
+            providerFailureStage: stage,
+            languageValidationStatus: 'not-run',
+            languageValidationCheckCount: 0,
+            languageValidationNonmatchCount: 0
+          })
+        ];
+        mockedServiceCompleteCount = 0;
+        const timer = timerHarness();
+        const source = sourceHarness();
+        const provider = providerHarness(async () => COMPLETION);
+        const setup = dependencies(timer, source.source, provider.provider);
+
+        await expect(
+          diagnostic.runAzureGenerationDiagnostic(setup.options)
+        ).resolves.toBe(20);
+        expect(setup.lines, stage).toEqual([
+          `azure-generation-diagnostic: failed stage=${stage}\n`
+        ]);
+        expect(provider.complete, stage).toHaveBeenCalledTimes(2);
+        expect(mockedServiceCompleteCount, stage).toBe(2);
+        expect(source.close, stage).toHaveBeenCalledTimes(1);
+        expect(timer.clearCount(), stage).toBe(1);
+      }
+    });
+  });
+
+  it('uses the one shared watchdog when the retried attempt hangs and aborts its signal exactly once', async () => {
+    await withMockedGenerationService(async (diagnostic) => {
+      mockedEvidenceQueue = [diagnosticFailureEvidence(), diagnosticFailureEvidence()];
+      mockedServiceCompleteCount = 0;
+      const timer = timerHarness();
+      const source = sourceHarness();
+      const signals: AbortSignal[] = [];
+      const provider = providerHarness(async (_input, context) => {
+        signals.push(context.signal);
+        if (signals.length === 1) return COMPLETION;
+        return pending<GenerationProviderCompletion>();
+      });
+      const setup = dependencies(timer, source.source, provider.provider);
+      const operation = diagnostic.runAzureGenerationDiagnostic(setup.options);
+      await flushOneTurn();
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+      expect(mockedServiceCompleteCount).toBe(2);
+
+      timer.fire();
+      await expect(operation).resolves.toBe(20);
+      expect(signals[1]?.aborted).toBe(true);
+      expect(timer.timer.setTimeout).toHaveBeenCalledTimes(1);
+      expect(timer.clearCount()).toBe(0);
+      expect(source.close).toHaveBeenCalledTimes(1);
+      expect(setup.lines).toEqual([TIMEOUT_LINE]);
+      expect(setup.terminated).toEqual([20]);
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+      expect(mockedServiceCompleteCount).toBe(2);
+    });
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'contains a late retried-attempt %s after watchdog timeout without a second output',
+    async (settlement) => {
+      await withMockedGenerationService(async (diagnostic) => {
+        mockedEvidenceQueue = [diagnosticFailureEvidence(), diagnosticFailureEvidence()];
+        mockedServiceCompleteCount = 0;
+        let settleSecond: ((value?: unknown) => void) | undefined;
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown): void => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        try {
+          const timer = timerHarness();
+          const source = sourceHarness();
+          let providerCalls = 0;
+          const signals: AbortSignal[] = [];
+          const provider = providerHarness(async (_input, context) => {
+            signals.push(context.signal);
+            providerCalls += 1;
+            if (providerCalls === 1) return COMPLETION;
+            return new Promise<GenerationProviderCompletion>((resolve, reject) => {
+              settleSecond = (value?: unknown): void => {
+                if (settlement === 'resolve') {
+                  resolve(value as GenerationProviderCompletion);
+                } else {
+                  reject(value);
+                }
+              };
+            });
+          });
+          const setup = dependencies(timer, source.source, provider.provider);
+          const operation = diagnostic.runAzureGenerationDiagnostic(setup.options);
+          await flushOneTurn();
+          expect(provider.complete).toHaveBeenCalledTimes(2);
+          timer.fire();
+
+          await expect(operation).resolves.toBe(20);
+          expect(settleSecond).toBeDefined();
+          expect(signals[1]?.aborted).toBe(true);
+          expect(timer.timer.setTimeout).toHaveBeenCalledTimes(1);
+          if (settlement === 'resolve') {
+            settleSecond?.(COMPLETION);
+          } else {
+            settleSecond?.(new Error('late retried-attempt rejection'));
+          }
+          await flushOneTurn();
+          expect(unhandled).toEqual([]);
+          expect(setup.lines).toEqual([TIMEOUT_LINE]);
+          expect(setup.terminated).toEqual([20]);
+          expect(source.close).toHaveBeenCalledTimes(1);
+          expect(provider.complete).toHaveBeenCalledTimes(2);
+          expect(mockedServiceCompleteCount).toBe(2);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+        }
+      });
+    }
+  );
 
   it('maps forged, hostile, and revoked errors to unknown without leaking content', async () => {
     const errors: unknown[] = [

@@ -561,40 +561,179 @@ function isProviderStage(value: unknown): value is GenerationProviderFailureStag
   return typeof value === 'string' && CANONICAL_STAGE_SET.has(value);
 }
 
-function latestEvidence(service: GenerationService | undefined): GenerationEvidenceRecord | undefined {
+const DIAGNOSTIC_EVIDENCE_KEYS = new Set([
+  'sessionId',
+  'sessionEpoch',
+  'utteranceId',
+  'segmentId',
+  'acceptedFinalRevision',
+  'selectedTargetLanguage',
+  'gatePolicyVersion',
+  'operation',
+  'status',
+  'failureCategory',
+  'providerFailureStage',
+  'providerId',
+  'providerVersion',
+  'validatorId',
+  'validatorVersion',
+  'languageValidationStatus',
+  'languageValidationCheckCount',
+  'languageValidationNonmatchCount',
+  'startMonotonicMs',
+  'endMonotonicMs',
+  'latencyMs'
+]);
+const REQUIRED_DIAGNOSTIC_EVIDENCE_KEYS = new Set([
+  'sessionId',
+  'sessionEpoch',
+  'utteranceId',
+  'segmentId',
+  'acceptedFinalRevision',
+  'selectedTargetLanguage',
+  'gatePolicyVersion',
+  'operation',
+  'status',
+  'failureCategory',
+  'providerId',
+  'providerVersion',
+  'validatorId',
+  'validatorVersion',
+  'languageValidationStatus',
+  'languageValidationCheckCount',
+  'languageValidationNonmatchCount',
+  'startMonotonicMs',
+  'endMonotonicMs',
+  'latencyMs'
+]);
+
+function completeFailureEvidence(
+  service: GenerationService | undefined
+): GenerationEvidenceRecord | undefined {
   if (service === undefined) return undefined;
   try {
     const records = service.evidence;
-    return records.length === 0 ? undefined : records[records.length - 1];
+    if (!Array.isArray(records) || records.length !== 1) return undefined;
+    const evidence = records[0];
+    if (evidence === undefined || typeof evidence !== 'object' || evidence === null) {
+      return undefined;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(evidence);
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== 'string' || !DIAGNOSTIC_EVIDENCE_KEYS.has(key)) {
+        return undefined;
+      }
+      const descriptor = descriptors[key];
+      if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+        return undefined;
+      }
+    }
+    for (const key of REQUIRED_DIAGNOSTIC_EVIDENCE_KEYS) {
+      if (!Object.hasOwn(descriptors, key)) return undefined;
+    }
+    if (
+      evidence.sessionId !== FIXED_TURN.sessionId ||
+      evidence.sessionEpoch !== FIXED_TURN.sessionEpoch ||
+      evidence.utteranceId !== FIXED_TURN.utteranceId ||
+      evidence.segmentId !== FIXED_TURN.segmentId ||
+      evidence.acceptedFinalRevision !== FIXED_TURN.acceptedFinalRevision ||
+      evidence.selectedTargetLanguage !== FIXED_TURN.selectedTargetLanguage ||
+      evidence.gatePolicyVersion !== FIXED_TURN.gatePolicyVersion ||
+      evidence.operation !== 'complete' ||
+      evidence.status !== 'failure' ||
+      typeof evidence.providerId !== 'string' ||
+      evidence.providerId.length === 0 ||
+      typeof evidence.providerVersion !== 'string' ||
+      evidence.providerVersion.length === 0 ||
+      typeof evidence.validatorId !== 'string' ||
+      evidence.validatorId.length === 0 ||
+      typeof evidence.validatorVersion !== 'string' ||
+      evidence.validatorVersion.length === 0 ||
+      (evidence.languageValidationStatus !== 'not-run' &&
+        evidence.languageValidationStatus !== 'rejected' &&
+        evidence.languageValidationStatus !== 'failed') ||
+      (evidence.languageValidationCheckCount !== 0 &&
+        evidence.languageValidationCheckCount !== 5 &&
+        evidence.languageValidationCheckCount !== 7) ||
+      !Number.isSafeInteger(evidence.languageValidationNonmatchCount) ||
+      evidence.languageValidationNonmatchCount < 0 ||
+      evidence.languageValidationNonmatchCount > evidence.languageValidationCheckCount ||
+      typeof evidence.startMonotonicMs !== 'number' ||
+      !Number.isFinite(evidence.startMonotonicMs) ||
+      evidence.startMonotonicMs < 0 ||
+      typeof evidence.endMonotonicMs !== 'number' ||
+      !Number.isFinite(evidence.endMonotonicMs) ||
+      evidence.endMonotonicMs < evidence.startMonotonicMs ||
+      typeof evidence.latencyMs !== 'number' ||
+      !Number.isFinite(evidence.latencyMs) ||
+      evidence.latencyMs !== evidence.endMonotonicMs - evidence.startMonotonicMs
+    ) {
+      return undefined;
+    }
+    return evidence;
   } catch {
     return undefined;
   }
 }
 
-function failureOutcomeFromService(service: GenerationService | undefined): DiagnosticOutcome {
-  const evidence = latestEvidence(service);
-  const providerStage = evidence?.providerFailureStage;
-  if (isProviderStage(providerStage)) {
-    return {
-      exitCode: EXIT_FAILURE,
-      line: `${FAILURE_PREFIX}${providerStage}\n`
-    };
+interface FailureClassification {
+  readonly outcome: DiagnosticOutcome;
+  readonly retryableValidationFailure: boolean;
+}
+
+function classifyFailure(service: GenerationService | undefined): FailureClassification {
+  const evidence = completeFailureEvidence(service);
+  if (evidence === undefined) {
+    return { outcome: unknownFailure(), retryableValidationFailure: false };
   }
+
+  const hasProviderStage = Object.hasOwn(evidence, 'providerFailureStage');
   if (
-    evidence?.failureCategory === 'invalid-generated-language' ||
-    evidence?.failureCategory === 'language-validation-failure' ||
-    evidence?.languageValidationStatus === 'rejected' ||
-    evidence?.languageValidationStatus === 'failed'
+    hasProviderStage &&
+    evidence.failureCategory === 'provider-failure' &&
+    evidence.languageValidationStatus === 'not-run' &&
+    evidence.languageValidationCheckCount === 0 &&
+    evidence.languageValidationNonmatchCount === 0 &&
+    isProviderStage(evidence.providerFailureStage)
   ) {
     return {
-      exitCode: EXIT_FAILURE,
-      line: `${FAILURE_PREFIX}validation_failure\n`
+      outcome: {
+        exitCode: EXIT_FAILURE,
+        line: `${FAILURE_PREFIX}${evidence.providerFailureStage}\n`
+      },
+      retryableValidationFailure: false
     };
   }
-  return {
-    exitCode: EXIT_FAILURE,
-    line: `${FAILURE_PREFIX}unknown\n`
-  };
+
+  if (
+    !hasProviderStage &&
+    (evidence.languageValidationCheckCount === 5 ||
+      evidence.languageValidationCheckCount === 7)
+  ) {
+    const invalidGeneratedLanguage =
+      evidence.failureCategory === 'invalid-generated-language' &&
+      evidence.languageValidationStatus === 'rejected' &&
+      evidence.languageValidationNonmatchCount > 0;
+    const languageValidationFailure =
+      evidence.failureCategory === 'language-validation-failure' &&
+      evidence.languageValidationStatus === 'failed' &&
+      evidence.languageValidationNonmatchCount === 0;
+    if (invalidGeneratedLanguage || languageValidationFailure) {
+      return {
+        outcome: {
+          exitCode: EXIT_FAILURE,
+          line: `${FAILURE_PREFIX}validation_failure\n`
+        },
+        retryableValidationFailure: true
+      };
+    }
+  }
+
+  return { outcome: unknownFailure(), retryableValidationFailure: false };
+}
+
+function failureOutcomeFromService(service: GenerationService | undefined): DiagnosticOutcome {
+  return classifyFailure(service).outcome;
 }
 
 function unknownFailure(): DiagnosticOutcome {
@@ -657,7 +796,7 @@ export async function runAzureGenerationDiagnostic(
   let watchdogHandle: unknown;
   let sourceClose: (() => void) | undefined;
   let sourceClosed = false;
-  let service: GenerationService | undefined;
+  let lastService: GenerationService | undefined;
   let resolveFinished!: (outcome: DiagnosticOutcome) => void;
   const finishedOutcome = new Promise<DiagnosticOutcome>((resolvePromise) => {
     resolveFinished = resolvePromise;
@@ -759,20 +898,50 @@ export async function runAzureGenerationDiagnostic(
 
       const boundary = createDevelopmentProvisionalLanguageBoundary();
       if (finished) return timeoutOutcome();
-      service = new GenerationService({
-        provider,
-        validator: boundary.generatedLanguageValidator,
-        languageValidationMode: 'development-provisional'
-      });
-      if (finished) return timeoutOutcome();
-      await service.complete(FIXED_TURN, { signal: controller.signal });
-      return finished ? timeoutOutcome() : {
-        exitCode: EXIT_OK,
-        line: PASSED_LINE
+
+      const runAttempt = async (): Promise<{
+        readonly outcome: DiagnosticOutcome;
+        readonly retryableValidationFailure: boolean;
+      }> => {
+        let attemptService: GenerationService | undefined;
+        try {
+          if (finished) return { outcome: timeoutOutcome(), retryableValidationFailure: false };
+          attemptService = new GenerationService({
+            provider,
+            validator: boundary.generatedLanguageValidator,
+            languageValidationMode: 'development-provisional'
+          });
+          lastService = attemptService;
+          if (finished) return { outcome: timeoutOutcome(), retryableValidationFailure: false };
+          await attemptService.complete(FIXED_TURN, { signal: controller.signal });
+          return {
+            outcome: finished
+              ? timeoutOutcome()
+              : { exitCode: EXIT_OK, line: PASSED_LINE },
+            retryableValidationFailure: false
+          };
+        } catch {
+          if (finished || timedOut) {
+            return { outcome: timeoutOutcome(), retryableValidationFailure: false };
+          }
+          return classifyFailure(attemptService);
+        }
       };
+
+      const firstAttempt = await runAttempt();
+      if (
+        firstAttempt.outcome.exitCode === EXIT_OK ||
+        !firstAttempt.retryableValidationFailure ||
+        finished
+      ) {
+        return firstAttempt.outcome;
+      }
+
+      const secondAttempt = await runAttempt();
+      return secondAttempt.outcome;
     } catch {
       if (finished || timedOut) return timeoutOutcome();
-      return failureOutcomeFromService(service);
+      return failureOutcomeFromService(lastService);
     } finally {
       if (candidate !== undefined && sourceClose === undefined) {
         sourceClose = dataMethod(candidate as object, 'close');
@@ -783,7 +952,7 @@ export async function runAzureGenerationDiagnostic(
 
   void work().then(
     (outcome) => finishOnce(outcome, false),
-    () => finishOnce(failureOutcomeFromService(service), false)
+    () => finishOnce(failureOutcomeFromService(lastService), false)
   );
   return (await finishedOutcome).exitCode;
 }

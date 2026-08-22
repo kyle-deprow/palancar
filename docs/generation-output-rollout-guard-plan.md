@@ -73,10 +73,20 @@ The diagnostic executable invoked inside the Job is:
 node apps/relay/dist/azure-generation-diagnostic.js
 ```
 
-It takes no arguments, uses `AZURE_CLIENT_ID` plus the Terraform-supplied
-generation settings, makes one bounded request, prints a fixed pass/failure
-line, and exits `0` or `20`. Direct invocation is not a substitute for the
-lifecycle diagnostic operation.
+It takes no arguments and uses `AZURE_CLIENT_ID` plus the Terraform-supplied
+generation settings. It permits at most two sequential model attempts, each
+through a fresh `GenerationService`, only when the first complete failure has
+exactly one trusted, correlation-matched language-validation evidence record:
+`invalid-generated-language`/`rejected` with checks `5` or `7` and a positive
+nonmatch count, or `language-validation-failure`/`failed` with checks `5` or
+`7` and zero nonmatches. Missing, multiple, malformed, inconsistent, provider,
+timeout, cancellation, and unknown evidence is terminal; the second attempt
+is final and there is never a third. `GenerationService` and the session have
+no retry logic. The executable makes one bounded request per model attempt,
+prints one fixed pass/failure line, and exits `0` or `20`. This retry is inside
+the diagnostic process only; the lifecycle still makes exactly one ACA Job
+start. Direct invocation is not a substitute for the lifecycle diagnostic
+operation.
 
 After runtime proof, assert the runtime Key Vault role enabled before the
 cutover, then disable and assert-disabled before creating the credential

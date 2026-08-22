@@ -239,12 +239,19 @@ node apps/relay/dist/azure-generation-diagnostic.js
 The lifecycle supplies `AZURE_CLIENT_ID`,
 `PALANCAR_AZURE_GENERATION_ENDPOINT`, and
 `PALANCAR_AZURE_GENERATION_DEPLOYMENT` from the guarded plan. The executable
-uses Entra, sends one bounded synthetic generation request, and prints only
+uses Entra and permits at most two sequential model attempts, each through a
+fresh `GenerationService`, with retry limited to the two exact trusted,
+correlation-matched complete language-validation evidence shapes. Any
+malformed, missing, multiple, inconsistent, provider, timeout, cancellation,
+or unknown evidence is terminal; attempt two is final and no third attempt is
+allowed. `GenerationService` and the session do not retry. The executable
+makes one bounded synthetic generation request per attempt and prints only
 `azure-generation-diagnostic: passed` or a fixed failure stage. It exits `0`
-on success and `20` on failure, with a 90-second watchdog. Intent, invoking,
-submission, execution, and receipt artifacts are durable and resumable. A
-timeout or ambiguous start is reconciled against the Job execution and never
-submitted again; runtime preflight requires the one-pass receipt bound to the
+on success and `20` on failure, with one 90-second watchdog. This is
+diagnostic-process retry only; the lifecycle still makes one ACA Job start.
+Intent, invoking, submission, execution, and receipt artifacts are durable and
+resumable. A timeout or ambiguous start is reconciled against the Job execution
+and never submitted again; runtime preflight requires the receipt bound to the
 guarded image.
 
 ### Runtime Key Vault role toggle

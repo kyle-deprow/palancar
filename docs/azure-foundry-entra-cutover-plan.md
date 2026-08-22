@@ -68,7 +68,8 @@ read model content, keys, or deployment credentials during this check.
   isolates caller cancellation, aborts a refresh when no waiters remain, and
   is closed exactly once during relay shutdown. If either provider fails
   construction, composition closes the source before failing.
-- Keep one request, no retry, a 15-second deadline, strict JSON Schema,
+- Keep one request per model attempt, with no retry in `GenerationService` or
+  the session, a 15-second deadline, strict JSON Schema,
   `reasoning_effort: low`, `max_completion_tokens: 512`, the 8,192-byte response
   bound, substantive-character checks, and strict Spanish/Turkish generated
   language validation.
@@ -735,8 +736,19 @@ resubmits after an ambiguous start. The Job's inner command is:
 node apps/relay/dist/azure-generation-diagnostic.js
 ```
 
-The executable uses Entra, sends one bounded request, prints only a fixed
-pass/failure line, and exits `0` or `20`. Runtime-role commands are exactly:
+The executable uses Entra and permits at most two sequential model attempts,
+each with a fresh `GenerationService` and the shared provider, validator,
+turn, token source, watchdog, and cancellation boundary. It retries only the
+two exact trusted/correlation-matched complete language-validation evidence
+shapes: `invalid-generated-language`/`rejected` with checks `5` or `7` and
+nonmatch greater than zero, or `language-validation-failure`/`failed` with
+checks `5` or `7` and zero nonmatches. Missing, malformed, multiple,
+inconsistent, provider, timeout, cancellation, and unknown evidence is
+terminal; attempt two is final and no third attempt exists. The retry lives
+only in this diagnostic executable, not in `GenerationService` or the
+session. It makes one bounded request per attempt, prints one fixed
+pass/failure line, and exits `0` or `20`. The lifecycle still sends exactly one
+ACA Job-start request. Runtime-role commands are exactly:
 
 ```sh
 node infra/scripts/set-dev-runtime-secrets-role.mjs assert-enabled
@@ -813,8 +825,9 @@ context only.
    diagnostic executable installs the reviewed process-level 90,000 ms
    watchdog, because the
    Job's unchanged 300-second replica timeout cannot be overridden by the start
-   operation. It sends one fixed synthetic request through the normal
-   parser and generated-language validator. Stdout is exactly
+   operation. The diagnostic permits at most two sequential model attempts and
+   sends one fixed synthetic request per attempt through the normal parser and
+   generated-language validator; its second attempt is final. Stdout is exactly
    `azure-generation-diagnostic: passed` or
    `azure-generation-diagnostic: failed stage=<closed-stage>` where the closed
    set is the provider stages plus `validation_failure`; stderr is fixed and
