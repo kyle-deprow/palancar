@@ -6087,46 +6087,246 @@ function assertContainerTemplate(template, code) {
   return template;
 }
 
-function assertContainerAppResponse(value, outputs, reviewed, code) {
-  assertKnownKeys(value, ["id", "name", "location", "type", "identity", "properties", "tags", "systemData", "kind", "managedBy", "sku"], code);
-  assertRequiredKeys(value, ["id", "name", "location", "type", "identity", "properties"], code);
-  const liveLocation = canonicalAzureRegion(value.location, code);
-  const outputLocation = canonicalAzureRegion(outputs.region, code);
-  failIf(value.name !== outputs.relayContainerApp || liveLocation !== outputLocation, code);
-  failIf(value.type !== "Microsoft.App/containerApps", code);
-  failIf(
-    typeof value.id !== "string" ||
-      value.id !== outputs.relayContainerAppId ||
-      !value.id.startsWith(`/subscriptions/${outputs.accountId ? outputs.accountId.split("/")[2] : ""}/resourceGroups/${outputs.resourceGroup}/providers/Microsoft.App/containerApps/`),
-    code,
-  );
-  const properties = value.properties;
-  assertKnownKeys(properties, [
-    "managedEnvironmentId", "provisioningState", "runningStatus", "latestRevisionName",
-    "latestReadyRevisionName", "configuration", "template", "eventStreamEndpoint",
-    "outboundIpAddresses", "customDomainVerificationId", "workloadProfileName",
-    "workloadProfileType", "delegatedSubnetId", "environmentId",
+const LIVE_FQDN_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+azurecontainerapps\.io$/i;
+
+function assertLiveResourceType(value, expected, code) {
+  failIf(typeof value !== "string", code);
+  const actualParts = value.split("/");
+  const expectedParts = expected.split("/");
+  failIf(actualParts.length !== expectedParts.length ||
+    actualParts.some((part, index) => part.toLowerCase() !== expectedParts[index].toLowerCase()), code);
+  return value;
+}
+
+function assertLiveResourceId(value, outputs, resourceKind, resourceName, code, revisionName) {
+  failIf(typeof value !== "string", code);
+  const segments = value.split("/");
+  const expectedLength = revisionName === undefined ? 9 : 11;
+  failIf(segments.length !== expectedLength || segments[0] !== "", code);
+  failIf(segments[1].toLowerCase() !== "subscriptions" || segments[3].toLowerCase() !== "resourcegroups" ||
+    segments[5].toLowerCase() !== "providers" || segments[6].toLowerCase() !== "microsoft.app", code);
+  const subscription = outputs.accountId?.split("/")[2];
+  failIf(typeof subscription !== "string" || !UUID_RE.test(segments[2]) || segments[2].toLowerCase() !== subscription.toLowerCase(), code);
+  failIf(segments[4] !== outputs.resourceGroup || segments[7].toLowerCase() !== resourceKind.toLowerCase() ||
+    segments[8] !== resourceName, code);
+  if (revisionName !== undefined) {
+    failIf(segments[9].toLowerCase() !== "revisions" || segments[10] !== revisionName, code);
+  }
+  return value;
+}
+
+function assertLiveManagedEnvironmentId(value, outputs, code) {
+  const expected = outputs.containerAppEnvironmentId;
+  failIf(typeof expected !== "string", code);
+  const expectedSegments = expected.split("/");
+  failIf(expectedSegments.length !== 9 || expectedSegments[8].length === 0, code);
+  assertLiveResourceId(expected, outputs, "managedEnvironments", expectedSegments[8], code);
+  assertLiveResourceId(value, outputs, "managedEnvironments", expectedSegments[8], code);
+  const normalizeIdentity = (candidate) => candidate.split("/").map((segment, index) =>
+    [1, 2, 3, 5, 6, 7].includes(index) ? segment.toLowerCase() : segment,
+  ).join("/");
+  failIf(normalizeIdentity(value) !== normalizeIdentity(expected), code);
+}
+
+function reviewedRelayFqdn(reviewed, code) {
+  const relay = reviewed?.after?.containers?.find((container) => container.name === "relay");
+  const entry = relay?.env?.find((candidate) => candidate.name === "PALANCAR_RELAY_ORIGIN");
+  failIf(!entry || typeof entry.value !== "string", code);
+  let origin;
+  try {
+    origin = new URL(entry.value);
+  } catch {
+    reject(code);
+  }
+  failIf(origin.protocol !== "wss:" || origin.username || origin.password || origin.port ||
+    origin.search || origin.hash || (origin.pathname !== "/" && origin.pathname !== ""), code);
+  failIf(!LIVE_FQDN_RE.test(origin.hostname), code);
+  return origin.hostname;
+}
+
+function assertLiveFqdn(value, expected, code) {
+  failIf(typeof value !== "string" || value !== value.trim() || value.endsWith("."), code);
+  const canonical = value.toLowerCase();
+  const expectedCanonical = typeof expected === "string" ? expected.toLowerCase() : undefined;
+  failIf(!LIVE_FQDN_RE.test(canonical) || canonical !== expectedCanonical, code);
+  return canonical;
+}
+
+function liveEnvironmentSuffix(appFqdn, code) {
+  const canonical = assertLiveFqdn(appFqdn, appFqdn, code);
+  const labels = canonical.split(".");
+  failIf(labels.length < 3, code);
+  return labels.slice(1).join(".");
+}
+
+function liveRevisionFqdn(appFqdn, revisionName, code) {
+  failIf(typeof revisionName !== "string" || revisionName.length === 0 || revisionName.includes("."), code);
+  return `${revisionName}.${liveEnvironmentSuffix(appFqdn, code)}`;
+}
+
+function normalizeLiveResourceTuple(resources, code, requireStorage) {
+  assertKnownKeys(resources, ["cpu", "memory", "ephemeralStorage"], code);
+  assertRequiredKeys(resources, ["cpu", "memory"], code);
+  const expectedStorage = resources.cpu === 0.25 && resources.memory === "0.5Gi"
+    ? "1Gi"
+    : resources.cpu === 0.75 && resources.memory === "1.5Gi"
+      ? "4Gi"
+      : undefined;
+  failIf(expectedStorage === undefined, code);
+  if (requireStorage) assertRequiredKeys(resources, ["ephemeralStorage"], code);
+  if (requireStorage) {
+    failIf(resources.ephemeralStorage !== expectedStorage, code);
+  } else {
+    failIf(Object.hasOwn(resources, "ephemeralStorage"), code);
+  }
+  return { cpu: resources.cpu, memory: resources.memory };
+}
+
+function normalizeLiveProbe(probe, code) {
+  assertKnownKeys(probe, [
+    "failureThreshold", "initialDelaySeconds", "periodSeconds", "tcpSocket", "httpGet", "timeoutSeconds", "type",
   ], code);
-  assertRequiredKeys(properties, ["configuration", "template", "provisioningState", "runningStatus"], code);
-  failIf(properties.provisioningState !== "Succeeded" || properties.runningStatus !== "Running", code);
-  const configuration = properties.configuration;
-  assertKnownKeys(configuration, ["activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets"], code);
-  assertRequiredKeys(configuration, ["activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets"], code);
-  failIf(configuration.activeRevisionsMode !== "Single" || configuration.maxInactiveRevisions !== 1, code);
-  const ingress = configuration.ingress;
-  assertKnownKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], code);
-  assertRequiredKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], code);
+  assertRequiredKeys(probe, ["failureThreshold", "periodSeconds", "timeoutSeconds", "type"], code);
+  failIf(!["Liveness", "Readiness", "Startup"].includes(probe.type) ||
+    !Number.isInteger(probe.failureThreshold) || probe.failureThreshold < 1 ||
+    !Number.isInteger(probe.periodSeconds) || probe.periodSeconds < 1 ||
+    !Number.isInteger(probe.timeoutSeconds) || probe.timeoutSeconds < 1, code);
+  if (Object.hasOwn(probe, "initialDelaySeconds")) {
+    failIf(!Number.isInteger(probe.initialDelaySeconds) || probe.initialDelaySeconds < 0, code);
+  }
+  const hasTcp = Object.hasOwn(probe, "tcpSocket");
+  const hasHttp = Object.hasOwn(probe, "httpGet");
+  failIf(hasTcp === hasHttp, code);
+  if (hasTcp) {
+    assertKnownKeys(probe.tcpSocket, ["port"], code);
+    assertRequiredKeys(probe.tcpSocket, ["port"], code);
+    failIf(!Number.isInteger(probe.tcpSocket.port) || probe.tcpSocket.port < 1 || probe.tcpSocket.port > 65535, code);
+  } else {
+    assertKnownKeys(probe.httpGet, ["path", "port"], code);
+    assertRequiredKeys(probe.httpGet, ["path", "port"], code);
+    failIf(typeof probe.httpGet.path !== "string" || probe.httpGet.path.length === 0 ||
+      !Number.isInteger(probe.httpGet.port) || probe.httpGet.port < 1 || probe.httpGet.port > 65535, code);
+  }
+  return structuredClone(probe);
+}
+
+function normalizeLiveCommand(value, code) {
+  if (value === null || value === undefined) return undefined;
+  failIf(!Array.isArray(value) || value.some((item) => typeof item !== "string"), code);
+  return [...value];
+}
+
+function normalizeLiveContainer(container, code, source) {
+  assertKnownKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], code);
+  assertRequiredKeys(container, ["name", "image", "env", "resources", "probes", ...(source === "app" ? ["imageType"] : [])], code);
+  failIf(typeof container.name !== "string" || typeof container.image !== "string", code);
+  const env = assertEnvironmentEntries(container.env, code).map((entry) => ({ ...entry }));
+  failIf(!Array.isArray(container.probes) || container.probes.length === 0, code);
+  const probes = container.probes.map((probe) => normalizeLiveProbe(probe, code));
+  const command = normalizeLiveCommand(container.command, code);
+  const args = normalizeLiveCommand(container.args, code);
+  if (source === "app") {
+    failIf(container.imageType !== "ContainerImage", code);
+  } else {
+    failIf(Object.hasOwn(container, "imageType"), code);
+  }
+  const resources = container.resources === undefined
+    ? undefined
+    : normalizeLiveResourceTuple(container.resources, code, source === "app");
+  return {
+    name: container.name,
+    image: container.image,
+    env,
+    probes,
+    ...(command === undefined ? {} : { command }),
+    ...(args === undefined ? {} : { args }),
+    ...(resources === undefined ? {} : { resources }),
+  };
+}
+
+function normalizeLiveScale(scale, code) {
+  if (scale === undefined) return undefined;
+  assertKnownKeys(scale, ["minReplicas", "maxReplicas", "cooldownPeriod", "pollingInterval", "rules"], code);
+  assertRequiredKeys(scale, ["minReplicas", "maxReplicas"], code);
+  if (Object.hasOwn(scale, "cooldownPeriod")) failIf(scale.cooldownPeriod !== 300, code);
+  if (Object.hasOwn(scale, "pollingInterval")) failIf(scale.pollingInterval !== 30, code);
+  if (Object.hasOwn(scale, "rules")) failIf(scale.rules !== null, code);
+  return { minReplicas: scale.minReplicas, maxReplicas: scale.maxReplicas };
+}
+
+function normalizeLiveTemplate(template, code, source) {
+  const allowedKeys = ["containers", "initContainers", "scale", "revisionSuffix", "volumes", "serviceBinds", "terminationGracePeriodSeconds"];
+  if (source === "app") allowedKeys.push("customMetricsSettings");
+  assertKnownKeys(template, allowedKeys, code);
+  assertRequiredKeys(template, ["containers"], code);
+  failIf(!Array.isArray(template.containers) || template.containers.length === 0, code);
+  if (Object.hasOwn(template, "initContainers")) failIf(template.initContainers !== null, code);
+  if (Object.hasOwn(template, "volumes")) failIf(template.volumes !== null, code);
+  for (const key of ["serviceBinds", "terminationGracePeriodSeconds", ...(source === "app" ? ["customMetricsSettings"] : [])]) {
+    if (Object.hasOwn(template, key)) failIf(template[key] !== null, code);
+  }
+  if (Object.hasOwn(template, "revisionSuffix")) {
+    failIf(template.revisionSuffix !== (source === "app" ? "" : null), code);
+  }
+  const containers = template.containers.map((container) => normalizeLiveContainer(container, code, source));
+  let scale;
+  if (source === "revision") {
+    assertRequiredKeys(template, ["scale"], code);
+    assertKnownKeys(template.scale, ["minReplicas", "maxReplicas", "cooldownPeriod", "pollingInterval", "rules"], code);
+    assertRequiredKeys(template.scale, ["minReplicas", "maxReplicas", "cooldownPeriod", "pollingInterval", "rules"], code);
+    failIf(template.scale.cooldownPeriod !== null || template.scale.pollingInterval !== null || template.scale.rules !== null, code);
+    scale = { minReplicas: template.scale.minReplicas, maxReplicas: template.scale.maxReplicas };
+  } else {
+    scale = normalizeLiveScale(template.scale, code);
+  }
+  return { containers, ...(scale === undefined ? {} : { scale }) };
+}
+
+function normalizeLiveIngress(ingress, expectedFqdn, code) {
+  assertKnownKeys(ingress, [
+    "external", "targetPort", "transport", "allowInsecure", "traffic", "fqdn", "exposedPort",
+    "clientCertificateMode", "corsPolicy", "customDomains", "ipSecurityRestrictions", "stickySessions",
+    "additionalPortMappings", "targetPortHttpScheme",
+  ], code);
+  assertRequiredKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic", "fqdn", "exposedPort"], code);
   failIf(ingress.external !== true || ingress.targetPort !== 8787 || ingress.transport !== "Http" || ingress.allowInsecure !== false, code);
+  if (Object.hasOwn(ingress, "fqdn")) assertLiveFqdn(ingress.fqdn, expectedFqdn, code);
+  if (Object.hasOwn(ingress, "exposedPort")) failIf(ingress.exposedPort !== 0, code);
+  for (const key of ["clientCertificateMode", "corsPolicy", "customDomains", "ipSecurityRestrictions", "stickySessions", "additionalPortMappings", "targetPortHttpScheme"]) {
+    if (Object.hasOwn(ingress, key)) failIf(ingress[key] !== null, code);
+  }
   failIf(!Array.isArray(ingress.traffic) || ingress.traffic.length !== 1, code);
-  ingress.traffic.forEach((traffic) => {
-    assertKnownKeys(traffic, ["revisionName", "weight", "latestRevision"], code);
-    assertRequiredKeys(traffic, ["revisionName", "weight"], code);
-    failIf(typeof traffic.revisionName !== "string" || traffic.weight !== 100, code);
-  });
+  const traffic = ingress.traffic[0];
+  assertKnownKeys(traffic, ["revisionName", "weight", "latestRevision"], code);
+  assertRequiredKeys(traffic, ["weight"], code);
+  failIf(traffic.weight !== 100, code);
+  if (traffic.latestRevision === true) {
+    failIf(Object.hasOwn(traffic, "revisionName"), code);
+    return { external: ingress.external, targetPort: ingress.targetPort, transport: ingress.transport, allowInsecure: ingress.allowInsecure, traffic: [{ latestRevision: true, weight: 100 }] };
+  }
+  failIf(typeof traffic.revisionName !== "string" || traffic.revisionName.length === 0 ||
+    Object.hasOwn(traffic, "latestRevision"), code);
+  return { external: ingress.external, targetPort: ingress.targetPort, transport: ingress.transport, allowInsecure: ingress.allowInsecure, traffic: [{ revisionName: traffic.revisionName, weight: 100 }] };
+}
+
+function normalizeLiveConfiguration(configuration, outputs, reviewed, expectedFqdn, code) {
+  assertKnownKeys(configuration, [
+    "activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets",
+    "dapr", "runtime", "service", "revisionTransitionThreshold", "targetLabel",
+  ], code);
+  assertRequiredKeys(configuration, ["activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets"], code);
+  failIf(configuration.activeRevisionsMode !== "Single" || (configuration.maxInactiveRevisions !== 1 && configuration.maxInactiveRevisions !== null), code);
+  for (const key of ["dapr", "runtime", "service", "revisionTransitionThreshold"]) {
+    if (Object.hasOwn(configuration, key)) failIf(configuration[key] !== null, code);
+  }
+  if (Object.hasOwn(configuration, "targetLabel")) failIf(configuration.targetLabel !== "", code);
+  const ingress = normalizeLiveIngress(configuration.ingress, expectedFqdn, code);
   failIf(!Array.isArray(configuration.registries) || configuration.registries.length !== 1, code);
   const registry = configuration.registries[0];
   assertKnownKeys(registry, ["server", "identity", "username", "passwordSecretRef"], code);
   assertRequiredKeys(registry, ["server", "identity"], code);
+  if (Object.hasOwn(registry, "username")) failIf(registry.username !== "", code);
+  if (Object.hasOwn(registry, "passwordSecretRef")) failIf(registry.passwordSecretRef !== "", code);
   const reviewedRegistry = reviewed.after.registries[0];
   failIf(reviewedRegistry === undefined || registry.server !== reviewedRegistry.server ||
     identityKey(registry.identity) !== reviewedRegistry.identity ||
@@ -6139,16 +6339,51 @@ function assertContainerAppResponse(value, outputs, reviewed, code) {
     return { identity: identityKey(setting.identity), lifecycle: setting.lifecycle };
   });
   const settingMap = new Map(settings.map((setting) => [setting.identity, setting.lifecycle]));
-  failIf(settingMap.get(identityKey(outputs.imagePullIdentityId)) !== "None", code);
-  failIf(settingMap.get(identityKey(outputs.runtimeIdentityId)) !== "Main", code);
-  failIf(
-    settings[0].identity !== identityKey(outputs.imagePullIdentityId) ||
-      settings[0].lifecycle !== "None" ||
-      settings[1].identity !== identityKey(outputs.runtimeIdentityId) ||
-      settings[1].lifecycle !== "Main",
-    code,
-  );
-  const template = assertContainerTemplate(properties.template, code);
+  failIf(settingMap.get(identityKey(outputs.imagePullIdentityId)) !== "None" || settingMap.get(identityKey(outputs.runtimeIdentityId)) !== "Main", code);
+  failIf(settings[0].identity !== identityKey(outputs.imagePullIdentityId) || settings[0].lifecycle !== "None" ||
+    settings[1].identity !== identityKey(outputs.runtimeIdentityId) || settings[1].lifecycle !== "Main", code);
+  failIf(!Array.isArray(configuration.secrets), code);
+  return {
+    activeRevisionsMode: configuration.activeRevisionsMode,
+    ingress,
+    maxInactiveRevisions: configuration.maxInactiveRevisions,
+    registries: [{ server: registry.server, identity: identityKey(registry.identity) }],
+    identitySettings: settings,
+    secrets: configuration.secrets.map((secret) => ({ ...secret })),
+  };
+}
+
+function assertContainerAppResponse(value, outputs, reviewed, code) {
+  assertKnownKeys(value, ["id", "name", "resourceGroup", "location", "type", "identity", "properties", "tags", "systemData", "kind", "managedBy", "sku"], code);
+  assertRequiredKeys(value, ["id", "name", "resourceGroup", "location", "type", "identity", "properties"], code);
+  const liveLocation = canonicalAzureRegion(value.location, code);
+  const outputLocation = canonicalAzureRegion(outputs.region, code);
+  failIf(value.name !== outputs.relayContainerApp || liveLocation !== outputLocation, code);
+  assertLiveResourceType(value.type, "Microsoft.App/containerApps", code);
+  assertLiveResourceId(value.id, outputs, "containerApps", outputs.relayContainerApp, code);
+  failIf(value.resourceGroup !== outputs.resourceGroup, code);
+  const expectedFqdn = reviewedRelayFqdn(reviewed, code);
+  const properties = value.properties;
+  assertKnownKeys(properties, [
+    "managedEnvironmentId", "provisioningState", "runningStatus", "latestRevisionName", "latestReadyRevisionName",
+    "latestRevisionFqdn", "configuration", "template", "eventStreamEndpoint",
+    "outboundIpAddresses", "customDomainVerificationId", "workloadProfileName",
+    "workloadProfileType", "delegatedSubnetId", "environmentId", "delegatedIdentities", "patchingMode",
+  ], code);
+  assertRequiredKeys(properties, ["configuration", "template", "provisioningState", "runningStatus"], code);
+  failIf(properties.provisioningState !== "Succeeded" || properties.runningStatus !== "Running", code);
+  if (Object.hasOwn(properties, "managedEnvironmentId")) assertLiveManagedEnvironmentId(properties.managedEnvironmentId, outputs, code);
+  if (Object.hasOwn(properties, "environmentId")) assertLiveManagedEnvironmentId(properties.environmentId, outputs, code);
+  if (Object.hasOwn(properties, "delegatedIdentities")) failIf(!Array.isArray(properties.delegatedIdentities) || properties.delegatedIdentities.length !== 0, code);
+  if (Object.hasOwn(properties, "patchingMode")) failIf(properties.patchingMode !== "Automatic", code);
+  const latestKeys = ["latestRevisionName", "latestReadyRevisionName", "latestRevisionFqdn"];
+  assertRequiredKeys(properties, latestKeys, code);
+  {
+    failIf(typeof properties.latestRevisionName !== "string" || typeof properties.latestReadyRevisionName !== "string", code);
+    assertLiveFqdn(properties.latestRevisionFqdn, liveRevisionFqdn(expectedFqdn, properties.latestRevisionName, code), code);
+  }
+  const configuration = normalizeLiveConfiguration(properties.configuration, outputs, reviewed, expectedFqdn, code);
+  const template = normalizeLiveTemplate(properties.template, code, "app");
   const identity = value.identity;
   assertKnownKeys(identity, ["type", "userAssignedIdentities"], code);
   assertRequiredKeys(identity, ["type", "userAssignedIdentities"], code);
@@ -6162,7 +6397,35 @@ function assertContainerAppResponse(value, outputs, reviewed, code) {
     assertRequiredKeys(identity.userAssignedIdentities[actual], ["clientId", "principalId"], code);
     failIf(!UUID_RE.test(identity.userAssignedIdentities[actual].clientId) || !UUID_RE.test(identity.userAssignedIdentities[actual].principalId), code);
   }
-  return { value, properties, configuration, ingress, template, identity };
+  const normalizedProperties = {
+    provisioningState: properties.provisioningState,
+    runningStatus: properties.runningStatus,
+    configuration,
+    template,
+    ...(Object.hasOwn(properties, "latestRevisionName") ? {
+      latestRevisionName: properties.latestRevisionName,
+      latestReadyRevisionName: properties.latestReadyRevisionName,
+      latestRevisionFqdn: properties.latestRevisionFqdn,
+    } : {}),
+  };
+  const normalizedValue = {
+    id: value.id,
+    name: value.name,
+    location: value.location,
+    type: value.type,
+    identity: structuredClone(identity),
+    properties: normalizedProperties,
+  };
+  return {
+    value: normalizedValue,
+    properties: normalizedProperties,
+    configuration,
+    ingress: configuration.ingress,
+    template,
+    identity: normalizedValue.identity,
+    location: liveLocation,
+    fqdn: expectedFqdn,
+  };
 }
 
 function assertSecretConfiguration(configuration, outputs, mode, code) {
@@ -6352,6 +6615,44 @@ function assertPostCutoverTopology(app, outputs, reviewed, expectedRevision) {
   return { relay, imageDigest: relay.image, revisionName: expectedRevision };
 }
 
+function assertPostCutoverTemplateSecurity(app, template, reviewed) {
+  assertNoRetiredReferences(template, "credential-secret-reference");
+  assertNoRetiredProviderText(template, "credential-topology");
+  failIf(template.containers.length !== 1 || template.containers[0].name !== "relay", "credential-topology");
+  const env = environmentMap(template.containers[0], "credential-topology");
+  const reviewedRelay = reviewed.after.containers.find((container) => container.name === "relay");
+  const reviewedEnv = environmentMap({ env: reviewedRelay?.env }, "credential-topology");
+  const directAzureNames = new Set([
+    "PALANCAR_GENERATION_PROVIDER",
+    "PALANCAR_AZURE_GENERATION_ENDPOINT",
+    "PALANCAR_AZURE_GENERATION_DEPLOYMENT",
+    "AZURE_CLIENT_ID",
+    "PALANCAR_TRANSCRIPTION_PROVIDER",
+    "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+    "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+  ]);
+  for (const [name, expectedEntry] of reviewedEnv) {
+    const actualEntry = env.get(name);
+    if (!directAzureNames.has(name)) {
+      failIf(actualEntry?.value !== expectedEntry.value || actualEntry?.secretRef !== expectedEntry.secretRef, "credential-topology");
+    }
+  }
+  const generationEndpoint = assertHttpsEndpoint(app.outputs.foundryEndpoint, "credential-direct-azure");
+  failIf(
+    env.get("PALANCAR_GENERATION_PROVIDER")?.value !== "azure-openai" ||
+      env.get("PALANCAR_AZURE_GENERATION_ENDPOINT")?.value !== generationEndpoint ||
+      env.get("PALANCAR_AZURE_GENERATION_DEPLOYMENT")?.value !== MODEL_BOOTSTRAP_CONTRACT.lunaDeployment ||
+      env.get("AZURE_CLIENT_ID")?.value !== app.outputs.runtimeIdentityClientId ||
+      env.get("PALANCAR_TRANSCRIPTION_PROVIDER")?.value !== "azure-realtime" ||
+      env.get("PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT")?.value !== expectedRealtimeEndpoint(app.outputs, "credential-topology") ||
+      env.get("PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT")?.value !== MODEL_BOOTSTRAP_CONTRACT.transcriptionDeployment,
+    "credential-direct-azure",
+  );
+  for (const entry of env.values()) {
+    failIf(/(?:API[_-]?KEY|INFERENCE[_-]?SCOPE|GENERATION[_-]?API[_-]?VERSION)/i.test(entry.name), "credential-topology");
+  }
+}
+
 function assertInactiveRevisionTemplate(template, reviewed, mode, code) {
   assertContainerTemplate(template, code);
   assertKnownKeys(template, ["containers", "scale"], code);
@@ -6367,24 +6668,66 @@ function assertInactiveRevisionTemplate(template, reviewed, mode, code) {
   failIf(!same(template.scale, expected.scale), code);
 }
 
+function normalizeLiveRevision(value, app, outputs, code) {
+  assertKnownKeys(value, ["id", "name", "resourceGroup", "type", "properties", "location", "tags", "systemData"], code);
+  assertRequiredKeys(value, ["id", "name", "resourceGroup", "type", "properties"], code);
+  failIf(value.resourceGroup !== outputs.resourceGroup, code);
+  assertLiveResourceType(value.type, "Microsoft.App/containerApps/revisions", code);
+  assertLiveResourceId(value.id, outputs, "containerApps", outputs.relayContainerApp, code, value.name);
+  if (Object.hasOwn(value, "location")) {
+    const location = canonicalAzureRegion(value.location, code);
+    failIf(location !== app.location, code);
+  }
+  const properties = value.properties;
+  assertKnownKeys(properties, [
+    "active", "healthState", "provisioningState", "runningState", "trafficWeight", "template",
+    "createdTime", "lastActiveTime", "replicas", "replicaCount", "fqdn",
+  ], code);
+  assertRequiredKeys(properties, ["active", "healthState", "provisioningState", "runningState", "trafficWeight", "template"], code);
+  failIf(typeof value.name !== "string" || typeof properties.active !== "boolean", code);
+  failIf(properties.healthState !== "Healthy" || properties.provisioningState !== "Provisioned" ||
+    (properties.active ? properties.runningState !== "Running" :
+      (properties.runningState !== "Running" && properties.runningState !== "Stopped")), code);
+  failIf(Object.hasOwn(properties, "replicas") && Object.hasOwn(properties, "replicaCount"), code);
+  const reportedReplicas = Object.hasOwn(properties, "replicas") ? properties.replicas : properties.replicaCount;
+  if (reportedReplicas !== undefined) {
+    failIf(!Number.isInteger(reportedReplicas) || reportedReplicas < 0, code);
+    if (properties.active) failIf(reportedReplicas !== 1, code);
+  }
+  if (properties.active) failIf(reportedReplicas !== 1, code);
+  assertRequiredKeys(properties, ["fqdn"], code);
+  assertLiveFqdn(properties.fqdn, liveRevisionFqdn(app.fqdn, value.name, code), code);
+  const sourceTemplate = normalizeLiveTemplate(properties.template, `${code}-template`, "revision");
+  const template = sourceTemplate;
+  return {
+    revision: {
+      id: value.id,
+      name: value.name,
+      type: value.type,
+      properties: {
+        active: properties.active,
+        healthState: properties.healthState,
+        provisioningState: properties.provisioningState,
+        runningState: properties.runningState,
+        trafficWeight: properties.trafficWeight,
+        template,
+      },
+    },
+    properties: {
+      active: properties.active,
+      healthState: properties.healthState,
+      provisioningState: properties.provisioningState,
+      runningState: properties.runningState,
+      trafficWeight: properties.trafficWeight,
+      template,
+      reportedReplicas,
+    },
+  };
+}
+
 function assertRevisionResponse(value, app, reviewed, expectedRevision, expectedInactiveRevision, mode, code, options = {}) {
   failIf(!Array.isArray(value) || value.length === 0, code);
-  const revisions = value.map((revision) => {
-    assertKnownKeys(revision, ["id", "name", "type", "properties", "location", "tags", "systemData"], code);
-    assertRequiredKeys(revision, ["id", "name", "properties"], code);
-    failIf(
-      revision.type !== undefined && revision.type !== "Microsoft.App/containerApps/revisions",
-      code,
-    );
-    failIf(typeof revision.id !== "string" || !revision.id.endsWith(`/revisions/${revision.name}`), code);
-    const properties = revision.properties;
-    assertKnownKeys(properties, ["active", "healthState", "provisioningState", "runningState", "trafficWeight", "template", "createdTime", "lastActiveTime", "replicaCount"], code);
-    assertRequiredKeys(properties, ["active", "healthState", "provisioningState", "runningState", "trafficWeight", "template"], code);
-    failIf(typeof revision.name !== "string" || typeof properties.active !== "boolean", code);
-    failIf(properties.healthState !== "Healthy" || properties.provisioningState !== "Provisioned" || properties.runningState !== "Running", code);
-    assertContainerTemplate(properties.template, code);
-    return { revision, properties };
-  });
+  const revisions = value.map((revision) => normalizeLiveRevision(revision, app, app.outputs, code));
   const active = revisions.filter(({ properties }) => properties.active === true);
   failIf(active.length !== 1, `${code}-active`);
   const inactive = revisions.filter(({ properties }) => properties.active === false);
@@ -6394,28 +6737,24 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
   const selectedName = selected.revision.name;
   failIf(expectedRevision !== undefined && selectedName !== expectedRevision, `${code}-traffic`);
   failIf(selected.properties.trafficWeight !== 100, `${code}-traffic`);
-  failIf(app.ingress.traffic.length !== 1 || app.ingress.traffic[0].revisionName !== selectedName || app.ingress.traffic[0].weight !== 100, `${code}-traffic`);
+  failIf(app.ingress.traffic.length !== 1 || app.ingress.traffic[0].weight !== 100, `${code}-traffic`);
+  const traffic = app.ingress.traffic[0];
+  if (traffic.latestRevision === true) {
+    failIf(Object.hasOwn(traffic, "revisionName"), `${code}-traffic`);
+  } else {
+    failIf(traffic.revisionName !== selectedName, `${code}-traffic`);
+  }
+  const reconciledTraffic = [{ revisionName: selectedName, weight: 100 }];
+  if (app.properties.latestRevisionName !== undefined) {
+    failIf(app.properties.latestRevisionName !== selectedName || app.properties.latestReadyRevisionName !== selectedName ||
+      app.properties.latestRevisionFqdn.toLowerCase() !== liveRevisionFqdn(app.fqdn, selectedName, `${code}-traffic`).toLowerCase(), `${code}-traffic`);
+  }
   const appTemplate = canonicalRuntimeTemplate(app.template, `${code}-template`);
   const revisionTemplate = canonicalRuntimeTemplate(selected.properties.template, `${code}-template`);
   failIf(!same(appTemplate, revisionTemplate), `${code}-template`);
   if (mode === "post") {
-    assertNoRetiredReferences(selected.properties.template, "credential-secret-reference");
-    assertNoRetiredProviderText(selected.properties.template, "credential-topology");
+    assertPostCutoverTemplateSecurity(app, selected.properties.template, reviewed);
   }
-  const topology = mode === "pre"
-    ? assertPreCutoverTopology(app, { ...app.outputs }, reviewed, selectedName)
-    : assertPostCutoverTopology(app, { ...app.outputs }, reviewed, selectedName);
-  const expectedTemplate = mode === "pre" ? reviewed.before : reviewed.after;
-  failIf(
-    !same(
-      projectRuntimeTemplateEnvironment(revisionTemplate, options.compareEnvironmentValues ?? mode === "pre"),
-      projectRuntimeTemplateEnvironment({
-        containers: expectedTemplate.containers,
-        ...(expectedTemplate.scale === undefined ? {} : { scale: expectedTemplate.scale }),
-      }, options.compareEnvironmentValues ?? mode === "pre"),
-    ),
-    `${code}-template`,
-  );
   if (retainedPredecessor !== undefined) {
     failIf(
       !isObject(retainedPredecessor) ||
@@ -6434,13 +6773,43 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
   }
   for (const candidate of inactive) {
     failIf(candidate.properties.trafficWeight !== 0, `${code}-inactive`);
-    if (candidate.properties.replicaCount !== undefined) {
-      failIf(candidate.properties.replicaCount !== 0, `${code}-inactive`);
-    }
+    if (candidate.properties.reportedReplicas !== undefined) failIf(candidate.properties.reportedReplicas !== 0, `${code}-inactive`);
     const inactiveReviewed = retainedPredecessor?.reviewed ?? reviewed;
     const inactiveMode = retainedPredecessor === undefined ? mode : "post";
     assertInactiveRevisionTemplate(candidate.properties.template, inactiveReviewed, inactiveMode, `${code}-inactive`);
   }
+  const expectedTemplate = mode === "pre" ? reviewed.before : reviewed.after;
+  failIf(
+    !same(
+      projectRuntimeTemplateEnvironment(revisionTemplate, options.compareEnvironmentValues ?? mode === "pre"),
+      projectRuntimeTemplateEnvironment({
+        containers: expectedTemplate.containers,
+        ...(expectedTemplate.scale === undefined ? {} : { scale: expectedTemplate.scale }),
+      }, options.compareEnvironmentValues ?? mode === "pre"),
+    ),
+    `${code}-template`,
+  );
+  failIf(expectedTemplate.maxInactiveRevisions !== 1 || app.configuration.activeRevisionsMode !== "Single", `${code}-inactive`);
+  failIf(app.configuration.maxInactiveRevisions !== 1 && app.configuration.maxInactiveRevisions !== null, `${code}-inactive`);
+  const projectedConfiguration = {
+    ...app.configuration,
+    maxInactiveRevisions: 1,
+    ingress: { ...app.configuration.ingress, traffic: reconciledTraffic },
+  };
+  const projectedProperties = {
+    ...app.properties,
+    configuration: projectedConfiguration,
+  };
+  const topologyApp = {
+    ...app,
+    value: { ...app.value, properties: projectedProperties },
+    properties: projectedProperties,
+    configuration: projectedConfiguration,
+    ingress: projectedConfiguration.ingress,
+  };
+  const topology = mode === "pre"
+    ? assertPreCutoverTopology(topologyApp, { ...app.outputs }, reviewed, selectedName)
+    : assertPostCutoverTopology(topologyApp, { ...app.outputs }, reviewed, selectedName);
   return { revisions, selected, topology, revisionName: selectedName };
 }
 

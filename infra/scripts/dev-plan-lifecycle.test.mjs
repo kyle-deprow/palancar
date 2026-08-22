@@ -43,7 +43,7 @@ const instrumentedSource = `${productionSource
   .replace(
     cachePathDeclaration,
     `const LIFECYCLE_CACHE_ROOT = ${JSON.stringify(instrumentedCacheRoot)};`,
-  )}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, reviewedRuntimeShapes, assertInactiveRevisionTemplate };\n`;
+)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision };\n`;
 const instrumentedFd = openSync(instrumentedPath, "wx", 0o600);
 try {
   writeSync(instrumentedFd, instrumentedSource, 0, "utf8");
@@ -74,6 +74,8 @@ const {
   runCli,
   runCliForTests,
   assertInactiveRevisionTemplate,
+  assertContainerAppResponse,
+  normalizeLiveRevision,
   reviewedRuntimeShapes,
   sha256File,
   sha256Bytes,
@@ -116,6 +118,50 @@ const KEY_VAULT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/p
 const KEY_VAULT_URI = "https://kv-test.vault.azure.net";
 const CONTAINER_ENV_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/providers/Microsoft.App/managedEnvironments/cae-test`;
 const FOUNDRY_ENDPOINT = "https://foundry-test.openai.azure.com";
+const RELAY_FQDN = "ca-palancar-dev-relay-test.graysmoke-757a2980.eastus2.azurecontainerapps.io";
+const RELAY_ENVIRONMENT_SUFFIX = RELAY_FQDN.split(".").slice(1).join(".");
+const RELAY_PROBES = [
+  {
+    failureThreshold: 3,
+    initialDelaySeconds: 10,
+    periodSeconds: 10,
+    tcpSocket: { port: 8787 },
+    timeoutSeconds: 3,
+    type: "Liveness",
+  },
+  {
+    failureThreshold: 3,
+    httpGet: { path: "/readyz", port: 8787 },
+    initialDelaySeconds: 5,
+    periodSeconds: 10,
+    timeoutSeconds: 7,
+    type: "Readiness",
+  },
+];
+const PREDECESSOR_PROBES = [
+  {
+    failureThreshold: 3,
+    initialDelaySeconds: 10,
+    periodSeconds: 30,
+    tcpSocket: { port: 4000 },
+    timeoutSeconds: 3,
+    type: "Liveness",
+  },
+  {
+    failureThreshold: 3,
+    httpGet: { path: "/health/readiness", port: 4000 },
+    periodSeconds: 10,
+    timeoutSeconds: 7,
+    type: "Readiness",
+  },
+  {
+    failureThreshold: 10,
+    httpGet: { path: "/health/liveliness", port: 4000 },
+    periodSeconds: 10,
+    timeoutSeconds: 3,
+    type: "Startup",
+  },
+];
 const IMAGE_PULL_CLIENT = "00000000-0000-0000-0000-000000000010";
 const IMAGE_PULL_PRINCIPAL = "00000000-0000-0000-0000-000000000011";
 const RUNTIME_CLIENT = "00000000-0000-0000-0000-000000000012";
@@ -272,6 +318,7 @@ function relayEnvironment(topology) {
     { name: "PALANCAR_TRANSCRIPTION_PROVIDER", value: "azure-realtime" },
     { name: "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT", value: "wss://foundry-test.openai.azure.com/openai/v1/realtime?intent=transcription" },
     { name: "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT", value: "gpt-4o-mini-transcribe" },
+    { name: "PALANCAR_RELAY_ORIGIN", value: `wss://${RELAY_FQDN}` },
   ];
 }
 
@@ -280,6 +327,7 @@ function liveContainerApp(topology, revision) {
     name: "relay",
     image: topology === "pre" ? RELAY_IMAGE : REVIEWED_RELAY_IMAGE,
     env: relayEnvironment(topology),
+    probes: structuredClone(RELAY_PROBES),
     resources: { cpu: 0.25, memory: "0.5Gi" },
   };
   const predecessor = {
@@ -291,6 +339,7 @@ function liveContainerApp(topology, revision) {
       { name: "LEGACY_RUNTIME_SECRET", secretRef: "litellm-master-key" },
       { name: "LEGACY_PROVIDER_SECRET", secretRef: "openrouter-api-key" },
     ],
+    probes: structuredClone(PREDECESSOR_PROBES),
     resources: { cpu: 0.75, memory: "1.5Gi" },
   };
   const containers = topology === "pre" ? [relay, predecessor] : [relay];
@@ -336,11 +385,67 @@ function liveContainerApp(topology, revision) {
   };
 }
 
+function liveAzureContainerApp(topology, revision) {
+  const app = structuredClone(liveContainerApp(topology, revision));
+  app.resourceGroup = "rg-runtime";
+  app.location = "East US 2";
+  app.properties.managedEnvironmentId = CONTAINER_ENV_ID;
+  app.properties.environmentId = CONTAINER_ENV_ID;
+  app.properties.latestRevisionName = revision;
+  app.properties.latestReadyRevisionName = revision;
+  app.properties.latestRevisionFqdn = `${revision}.${RELAY_ENVIRONMENT_SUFFIX}`;
+  app.properties.delegatedIdentities = [];
+  app.properties.patchingMode = "Automatic";
+  app.properties.configuration.dapr = null;
+  app.properties.configuration.runtime = null;
+  app.properties.configuration.service = null;
+  app.properties.configuration.revisionTransitionThreshold = null;
+  app.properties.configuration.targetLabel = "";
+  app.properties.configuration.maxInactiveRevisions = null;
+  app.properties.configuration.registries[0].username = "";
+  app.properties.configuration.registries[0].passwordSecretRef = "";
+  Object.assign(app.properties.configuration.ingress, {
+    fqdn: RELAY_FQDN,
+    exposedPort: 0,
+    clientCertificateMode: null,
+    corsPolicy: null,
+    customDomains: null,
+    ipSecurityRestrictions: null,
+    stickySessions: null,
+    additionalPortMappings: null,
+    targetPortHttpScheme: null,
+  });
+  app.properties.template.initContainers = null;
+  app.properties.template.revisionSuffix = "";
+  app.properties.template.volumes = null;
+  app.properties.template.customMetricsSettings = null;
+  app.properties.template.serviceBinds = null;
+  app.properties.template.terminationGracePeriodSeconds = null;
+  Object.assign(app.properties.template.scale, { cooldownPeriod: 300, pollingInterval: 30, rules: null });
+  for (const container of app.properties.template.containers) {
+    container.imageType = "ContainerImage";
+    container.command = null;
+    container.args = null;
+    container.resources.ephemeralStorage = container.resources.cpu === 0.25 && container.resources.memory === "0.5Gi"
+      ? "1Gi"
+      : "4Gi";
+  }
+  return app;
+}
+
 function liveRevision(revision, topology) {
-  const app = liveContainerApp(topology, revision);
+  const app = liveAzureContainerApp(topology, revision);
+  const template = structuredClone(app.properties.template);
+  delete template.customMetricsSettings;
+  template.scale = { minReplicas: 1, maxReplicas: 1, cooldownPeriod: null, pollingInterval: null, rules: null };
+  template.revisionSuffix = null;
+  for (const container of template.containers) delete container.resources.ephemeralStorage;
+  for (const container of template.containers) delete container.imageType;
   return {
     id: `${app.id}/revisions/${revision}`,
     name: revision,
+    resourceGroup: "rg-runtime",
+    location: "East US 2",
     type: "Microsoft.App/containerApps/revisions",
     properties: {
       active: true,
@@ -348,7 +453,9 @@ function liveRevision(revision, topology) {
       provisioningState: "Provisioned",
       runningState: "Running",
       trafficWeight: 100,
-      template: app.properties.template,
+      fqdn: `${revision}.${RELAY_ENVIRONMENT_SUFFIX}`,
+      replicas: 1,
+      template,
     },
   };
 }
@@ -357,7 +464,9 @@ function retainedRuntimePredecessorRevision() {
   const predecessor = liveRevision("revision-before", "pre");
   predecessor.properties.active = false;
   predecessor.properties.trafficWeight = 0;
+  delete predecessor.properties.replicas;
   predecessor.properties.replicaCount = 0;
+  predecessor.properties.runningState = "Stopped";
   return predecessor;
 }
 
@@ -946,7 +1055,7 @@ function makeHarness(overrides = {}) {
         };
       }
       if (request.argv[0] === "containerapp") {
-        const app = liveAppMutator(liveContainerApp(topology, revision));
+        const app = liveAppMutator(liveAzureContainerApp(topology, revision));
         if (request.argv[1] === "revision") {
           const revisions = liveRevisionMutator(liveRevision(revision, topology));
           return { status: 0, stdout: JSON.stringify(Array.isArray(revisions) ? revisions : [revisions]) };
@@ -2882,19 +2991,29 @@ test("A3 exact runtime predecessor and diagnostic receipt contracts are fail-clo
     ["wrong full image digest", (containers) => {
       containers.find((container) => container.name === "relay").image =
         "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:" + "0".repeat(64);
-    }, "runtime-topology"],
-    ["extra container", (containers) => {
-      containers.push({ name: "helper", image: REVIEWED_RELAY_IMAGE, env: [] });
-    }, "runtime-topology"],
+    }, "runtime-revisions-template"],
+    ["extra container", (containers, source) => {
+      containers.push({
+        name: "helper",
+        image: REVIEWED_RELAY_IMAGE,
+        imageType: "ContainerImage",
+        command: null,
+        args: null,
+        env: [],
+        probes: structuredClone(RELAY_PROBES),
+        resources: { cpu: 0.25, memory: "0.5Gi", ...(source === "app" ? { ephemeralStorage: "1Gi" } : {}) },
+      });
+    }, "runtime-revisions-template"],
     ["unexpected secret", (containers) => {
       containers[1].env.push({ name: "UNEXPECTED_SECRET", secretRef: "retired-secret" });
-    }, "runtime-topology"],
+    }, "runtime-revisions-template"],
   ];
   for (const [label, mutate, code] of topologyCases) {
     const negative = makeHarness();
     try {
       const runId = prepareRuntime(negative);
-      mutateBoth(negative, (value) => mutatePreTopology(value, mutate));
+      negative.setLiveAppMutator((value) => mutatePreTopology(value, (containers) => mutate(containers, "app")));
+      negative.setLiveRevisionMutator((value) => mutatePreTopology(value, (containers) => mutate(containers, "revision")));
       assert.throws(() => negative.lifecycle.preflight("runtime-cutover", runId), (error) => {
         if (error?.code !== code) throw new Error(`${label}: expected ${code}, got ${error?.code}`);
         return true;
@@ -2911,7 +3030,7 @@ test("A3 exact runtime predecessor and diagnostic receipt contracts are fail-clo
         ...structuredClone(value),
         id: value.id.replace(/\/revisions\/[^/]+$/, "/revisions/retired-revision"),
         name: "retired-revision",
-        properties: { ...value.properties, active: true, trafficWeight: 0 },
+        properties: { ...value.properties, fqdn: `retired-revision.${RELAY_ENVIRONMENT_SUFFIX}`, active: true, trafficWeight: 0 },
       },
     ], "runtime-revisions-active"],
     ["unhealthy revision", (value) => ({
@@ -2976,6 +3095,267 @@ test("container app contract canonicalizes Azure CLI display regions and rejects
     } finally {
       rejected.cleanup();
     }
+  }
+});
+
+test("live Azure Container Apps schema normalizes exact CLI defaults and rejects source drift", () => {
+  const concrete = makeHarness();
+  try {
+    const runId = prepareRuntime(concrete);
+    assert.deepEqual(concrete.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    concrete.cleanup();
+  }
+
+  const latest = makeHarness();
+  try {
+    const runId = prepareRuntime(latest);
+    latest.setLiveAppMutator((app) => {
+      const next = structuredClone(app);
+      next.properties.configuration.ingress.traffic = [{ latestRevision: true, weight: 100 }];
+      return next;
+    });
+    assert.deepEqual(latest.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    latest.cleanup();
+  }
+
+  const numericLimit = makeHarness();
+  try {
+    const runId = prepareRuntime(numericLimit);
+    numericLimit.setLiveAppMutator((app) => {
+      const next = structuredClone(app);
+      next.properties.configuration.maxInactiveRevisions = 1;
+      return next;
+    });
+    assert.deepEqual(numericLimit.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    numericLimit.cleanup();
+  }
+
+  const appCases = [
+    ["unknown top-level field", (app) => { app.unexpected = null; }],
+    ["wrong resource group", (app) => { app.resourceGroup = "rg-other"; }],
+    ["foreign subscription ID", (app) => { app.id = app.id.replace(SUBSCRIPTION, "00000000-0000-0000-0000-000000000099"); }],
+    ["foreign provider ID", (app) => { app.id = app.id.replace("/providers/Microsoft.App/", "/providers/Microsoft.Other/"); }],
+    ["foreign app resource ID", (app) => { app.id = app.id.replace("/containerApps/relay-test", "/containerApps/other-app"); }],
+    ["foreign ARM hierarchy", (app) => { app.id = app.id.replace("/containerApps/relay-test", "/jobs/relay-test"); }],
+    ["wrong ingress FQDN", (app) => { app.properties.configuration.ingress.fqdn = "relay.invalid"; }],
+    ["wrong valid latest revision FQDN", (app) => { app.properties.latestRevisionFqdn = `revision-other.${RELAY_ENVIRONMENT_SUFFIX}`; }],
+    ["foreign managed environment ID", (app) => { app.properties.managedEnvironmentId = `${CONTAINER_ENV_ID.slice(0, -8)}other-env`; }],
+    ["malformed managed environment ID", (app) => { app.properties.managedEnvironmentId = "not-an-arm-resource-id"; }],
+    ["foreign environment ID", (app) => { app.properties.environmentId = `${CONTAINER_ENV_ID.slice(0, -8)}other-env`; }],
+    ["malformed environment ID", (app) => { app.properties.environmentId = "not-an-arm-resource-id"; }],
+    ["nonzero exposed port", (app) => { app.properties.configuration.ingress.exposedPort = 1; }],
+    ["unexpected latest-ready FQDN", (app) => {
+      app.properties.latestReadyRevisionFqdn = `${app.properties.latestRevisionName}.${RELAY_ENVIRONMENT_SUFFIX}`;
+    }],
+    ["latest name disagreement", (app) => { app.properties.latestReadyRevisionName = "revision-other"; }, "runtime-revisions-traffic"],
+    ["latest and concrete traffic conflict", (app) => {
+      app.properties.configuration.ingress.traffic = [{ latestRevision: true, revisionName: "revision-before", weight: 100 }];
+    }],
+    ["non-null dapr default", (app) => { app.properties.configuration.dapr = {}; }],
+    ["non-null runtime default", (app) => { app.properties.configuration.runtime = {}; }],
+    ["non-null service default", (app) => { app.properties.configuration.service = {}; }],
+    ["non-null revision transition default", (app) => { app.properties.configuration.revisionTransitionThreshold = 1; }],
+    ["non-empty delegated identities", (app) => { app.properties.delegatedIdentities = [{}]; }],
+    ["wrong patching mode", (app) => { app.properties.patchingMode = "Manual"; }],
+    ["non-empty target label", (app) => { app.properties.configuration.targetLabel = "unexpected"; }],
+    ["non-empty registry placeholder", (app) => { app.properties.configuration.registries[0].username = "unexpected"; }],
+    ["non-empty registry password secret ref", (app) => { app.properties.configuration.registries[0].passwordSecretRef = "unexpected"; }],
+    ["non-null client certificate default", (app) => { app.properties.configuration.ingress.clientCertificateMode = "Ignore"; }],
+    ["non-null cors policy default", (app) => { app.properties.configuration.ingress.corsPolicy = {}; }],
+    ["non-null custom domains default", (app) => { app.properties.configuration.ingress.customDomains = []; }],
+    ["non-null IP restrictions default", (app) => { app.properties.configuration.ingress.ipSecurityRestrictions = []; }],
+    ["non-null sticky sessions default", (app) => { app.properties.configuration.ingress.stickySessions = {}; }],
+    ["non-null additional port mappings default", (app) => { app.properties.configuration.ingress.additionalPortMappings = []; }],
+    ["non-null HTTP scheme default", (app) => { app.properties.configuration.ingress.targetPortHttpScheme = "Https"; }],
+    ["non-null init containers", (app) => { app.properties.template.initContainers = []; }],
+    ["non-null app volumes", (app) => { app.properties.template.volumes = []; }],
+    ["non-null app custom metrics", (app) => { app.properties.template.customMetricsSettings = {}; }],
+    ["non-null app service binds", (app) => { app.properties.template.serviceBinds = []; }],
+    ["non-null app termination grace period", (app) => { app.properties.template.terminationGracePeriodSeconds = 1; }],
+    ["wrong app revision suffix", (app) => { app.properties.template.revisionSuffix = "suffix"; }],
+    ["wrong app cooldown default", (app) => { app.properties.template.scale.cooldownPeriod = 301; }],
+    ["wrong app polling default", (app) => { app.properties.template.scale.pollingInterval = 31; }],
+    ["wrong app rules default", (app) => { app.properties.template.scale.rules = []; }],
+    ["wrong image type", (app) => { app.properties.template.containers[0].imageType = "Docker"; }],
+    ["relay resource tuple mismatch", (app) => { app.properties.template.containers[0].resources.ephemeralStorage = "4Gi"; }],
+    ["predecessor resource tuple mismatch", (app) => { app.properties.template.containers[1].resources.ephemeralStorage = "1Gi"; }],
+    ["invalid inactive limit", (app) => { app.properties.configuration.maxInactiveRevisions = 2; }],
+  ];
+  for (const [label, mutate, expectedCode = "runtime-containerapp"] of appCases) {
+    const negative = makeHarness();
+    try {
+      const runId = prepareRuntime(negative);
+      negative.setLiveAppMutator((app) => {
+        const next = structuredClone(app);
+        mutate(next);
+        return next;
+      });
+      assert.throws(() => negative.lifecycle.preflight("runtime-cutover", runId), (error) => {
+        assert.equal(error?.code, expectedCode, label);
+        return true;
+      });
+    } finally {
+      negative.cleanup();
+    }
+  }
+
+  const revisionCases = [
+    ["unknown revision field", (revision) => { revision.unexpected = null; }, "runtime-revisions"],
+    ["wrong revision resource group", (revision) => { revision.resourceGroup = "rg-other"; }, "runtime-revisions"],
+    ["foreign revision subscription ID", (revision) => { revision.id = revision.id.replace(SUBSCRIPTION, "00000000-0000-0000-0000-000000000099"); }, "runtime-revisions"],
+    ["foreign revision provider ID", (revision) => { revision.id = revision.id.replace("/providers/Microsoft.App/", "/providers/Microsoft.Other/"); }, "runtime-revisions"],
+    ["foreign revision app resource ID", (revision) => { revision.id = revision.id.replace("/containerApps/relay-test/", "/containerApps/other-app/"); }, "runtime-revisions"],
+    ["foreign revision resource ID", (revision) => { revision.id = revision.id.replace("/revisions/revision-before", "/revisions/revision-other"); }, "runtime-revisions"],
+    ["malformed revision ARM ID", (revision) => { revision.id = `${revision.id}/extra`; }, "runtime-revisions"],
+    ["foreign revision resource type", (revision) => { revision.type = "Microsoft.App/containerApps/jobs"; }, "runtime-revisions"],
+    ["revision FQDN disagreement", (revision) => { revision.properties.fqdn = `wrong.${RELAY_FQDN}`; }, "runtime-revisions"],
+    ["active replica count", (revision) => { revision.properties.replicas = 0; }, "runtime-revisions"],
+    ["simultaneous replica fields", (revision) => { revision.properties.replicaCount = 1; }, "runtime-revisions"],
+    ["revision scale is app-shaped", (revision) => {
+      revision.properties.template.scale = { minReplicas: 1, maxReplicas: 1, cooldownPeriod: 300, pollingInterval: 30, rules: null };
+    }, "runtime-revisions-template"],
+    ["non-null revision init containers", (revision) => { revision.properties.template.initContainers = []; }, "runtime-revisions-template"],
+    ["non-null revision volumes", (revision) => { revision.properties.template.volumes = []; }, "runtime-revisions-template"],
+    ["non-null revision service binds", (revision) => { revision.properties.template.serviceBinds = []; }, "runtime-revisions-template"],
+    ["non-null revision termination grace period", (revision) => { revision.properties.template.terminationGracePeriodSeconds = 1; }, "runtime-revisions-template"],
+    ["non-null revision suffix", (revision) => { revision.properties.template.revisionSuffix = ""; }, "runtime-revisions-template"],
+    ["non-null revision cooldown", (revision) => { revision.properties.template.scale.cooldownPeriod = 1; }, "runtime-revisions-template"],
+    ["non-null revision polling", (revision) => { revision.properties.template.scale.pollingInterval = 1; }, "runtime-revisions-template"],
+    ["non-null revision rules", (revision) => { revision.properties.template.scale.rules = []; }, "runtime-revisions-template"],
+    ["revision image type source confusion", (revision) => { revision.properties.template.containers[0].imageType = "ContainerImage"; }, "runtime-revisions-template"],
+    ["revision relay resource storage is forbidden", (revision) => { revision.properties.template.containers[0].resources.ephemeralStorage = "1Gi"; }, "runtime-revisions-template"],
+  ];
+  for (const [label, mutate, expectedCode] of revisionCases) {
+    const negative = makeHarness();
+    try {
+      const runId = prepareRuntime(negative);
+      negative.setLiveRevisionMutator((revision) => {
+        const next = structuredClone(revision);
+        mutate(next);
+        return next;
+      });
+      assert.throws(() => negative.lifecycle.preflight("runtime-cutover", runId), (error) => {
+        assert.equal(error?.code, expectedCode, label);
+        return true;
+      });
+    } finally {
+      negative.cleanup();
+    }
+  }
+});
+
+test("live Azure accepts provider/resource-type casing but preserves exact names", () => {
+  const casing = makeHarness();
+  try {
+    const runId = prepareRuntime(casing);
+    const normalizeArmKeywords = (value) => value
+      .replace("/resourceGroups/", "/RESOURCEGROUPS/")
+      .replace("/providers/", "/PROVIDERS/")
+      .replace("/Microsoft.App/", "/mIcRoSoFt.ApP/")
+      .replace("/containerApps/", "/CONTAINERAPPS/")
+      .replace("/revisions/", "/ReViSiOnS/")
+      .replace("/managedEnvironments/", "/MANAGEDENVIRONMENTS/");
+    casing.setLiveAppMutator((app) => {
+      const next = structuredClone(app);
+      next.type = "mIcRoSoFt.ApP/CONTAINERAPPS";
+      next.id = normalizeArmKeywords(next.id);
+      next.properties.managedEnvironmentId = normalizeArmKeywords(next.properties.managedEnvironmentId);
+      next.properties.environmentId = normalizeArmKeywords(next.properties.environmentId);
+      return next;
+    });
+    casing.setLiveRevisionMutator((revision) => {
+      const next = structuredClone(revision);
+      next.type = "mIcRoSoFt.ApP/CONTAINERAPPS/ReViSiOnS";
+      next.id = normalizeArmKeywords(next.id);
+      return next;
+    });
+    assert.deepEqual(casing.lifecycle.preflight("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "preflighted",
+    });
+  } finally {
+    casing.cleanup();
+  }
+});
+
+test("live Azure normalization does not mutate raw app or revision objects", () => {
+  const outputs = {
+    accountId: `/subscriptions/${SUBSCRIPTION}`,
+    resourceGroup: "rg-runtime",
+    region: "eastus2",
+    relayContainerApp: "relay-test",
+    containerAppEnvironmentId: CONTAINER_ENV_ID,
+    imagePullIdentityId: IMAGE_PULL_ID,
+    runtimeIdentityId: RUNTIME_ID,
+  };
+  const reviewed = {
+    after: {
+      containers: liveContainerApp("post", "revision-after").properties.template.containers,
+      registries: [{ server: "palancardevacraeeacd8c.azurecr.io", identity: IMAGE_PULL_ID.toLowerCase() }],
+    },
+  };
+  const rawApp = liveAzureContainerApp("post", "revision-after");
+  const rawAppSnapshot = structuredClone(rawApp);
+  const appPropertiesReference = rawApp.properties;
+  const appTemplateReference = rawApp.properties.template;
+  const normalizedApp = assertContainerAppResponse(rawApp, outputs, reviewed, "raw-app");
+  assert.deepEqual(rawApp, rawAppSnapshot);
+  assert.strictEqual(rawApp.properties, appPropertiesReference);
+  assert.strictEqual(rawApp.properties.template, appTemplateReference);
+
+  const rawRevision = liveRevision("revision-after", "post");
+  const rawRevisionSnapshot = structuredClone(rawRevision);
+  const revisionPropertiesReference = rawRevision.properties;
+  const revisionTemplateReference = rawRevision.properties.template;
+  normalizeLiveRevision(rawRevision, normalizedApp, outputs, "raw-revision");
+  assert.deepEqual(rawRevision, rawRevisionSnapshot);
+  assert.strictEqual(rawRevision.properties, revisionPropertiesReference);
+  assert.strictEqual(rawRevision.properties.template, revisionTemplateReference);
+});
+
+test("null maxInactiveRevisions proof rejects active divergence and inactive predecessor drift", () => {
+  const activeDivergence = makeHarness();
+  try {
+    const runId = prepareRuntime(activeDivergence);
+    activeDivergence.setLiveAppMutator((app) => {
+      const next = structuredClone(app);
+      next.properties.latestRevisionName = "revision-other";
+      next.properties.latestReadyRevisionName = "revision-other";
+      next.properties.latestRevisionFqdn = `revision-other.${RELAY_ENVIRONMENT_SUFFIX}`;
+      return next;
+    });
+    expectCode(() => activeDivergence.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-traffic");
+  } finally {
+    activeDivergence.cleanup();
+  }
+
+  const inactiveDrift = makeHarness();
+  try {
+    const runId = prepareRuntime(inactiveDrift);
+    inactiveDrift.setLiveRevisionMutator((active) => {
+      const predecessor = retainedRuntimePredecessorRevision();
+      predecessor.properties.trafficWeight = 1;
+      return [active, predecessor];
+    });
+    expectCode(() => inactiveDrift.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-inactive");
+  } finally {
+    inactiveDrift.cleanup();
   }
 });
 
@@ -3286,7 +3666,7 @@ test("A3 exact credential Entra-only topology and cleanup receipts are fail-clos
         negative.setLiveRevisionMutator((value) => {
           const next = structuredClone(value);
           mutate(next);
-          return next;
+          return [next, retainedRuntimePredecessorRevision()];
         });
       }
       expectCode(() => negative.lifecycle.preflight("credential-cleanup", runId), code);
@@ -3341,6 +3721,7 @@ test("credential cleanup binds the retained predecessor to the completed runtime
     ["name", (revision) => {
       revision.name = "revision-substituted";
       revision.id = revision.id.replace(/\/revisions\/[^/]+$/, "/revisions/revision-substituted");
+      revision.properties.fqdn = `revision-substituted.${RELAY_ENVIRONMENT_SUFFIX}`;
     }],
     ["topology", (revision) => {
       revision.properties.template.containers[0].image =
@@ -3418,7 +3799,9 @@ test("active revision validation covers the complete reviewed template in both p
     ["command", (template) => { template.containers[0].command = ["node", "changed"]; }],
     ["args", (template) => { template.containers[0].args = ["changed"]; }],
     ["probe", (template) => { template.containers[0].probes = [{ type: "Readiness", httpGet: { path: "/changed", port: 8787 } }]; }],
-    ["scale", (template) => { template.scale.maxReplicas = 2; }],
+    ["scale", (template) => {
+      template.scale = { minReplicas: 1, maxReplicas: 2, cooldownPeriod: 300, pollingInterval: 30, rules: null };
+    }],
   ];
 
   for (const [label, mutate] of mutations) {
@@ -4782,7 +5165,7 @@ test("phase progression, cleanup evidence, and terminal receipts remain ordered"
   for (const [mutate, code] of [
     [(value) => {
       const next = structuredClone(value);
-      next.properties.template.containers.push({ name: "extra", image: REVIEWED_RELAY_IMAGE, env: [] });
+      next.properties.template.containers.push({ name: "extra", image: REVIEWED_RELAY_IMAGE, env: [], probes: structuredClone(RELAY_PROBES) });
       return next;
     }, "credential-revisions-template"],
     [(value) => {
@@ -5710,6 +6093,7 @@ test("Sol probe: inactive revisions accept only reviewed secret-free structures"
       const inactive = structuredClone(active);
       inactive.name = "revision-inactive";
       inactive.id = inactive.id.replace(/\/revisions\/[^/]+$/, "/revisions/revision-inactive");
+      inactive.properties.fqdn = `revision-inactive.${RELAY_ENVIRONMENT_SUFFIX}`;
       inactive.properties.active = false;
       inactive.properties.trafficWeight = 0;
       inactive.properties.template.containers[0].image = `${REVIEWED_RELAY_IMAGE.slice(0, -64)}${"c".repeat(64)}`;
