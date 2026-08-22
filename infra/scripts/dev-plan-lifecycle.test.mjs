@@ -2345,6 +2345,29 @@ test("diagnostic identity proofs reject changed resource-ID segments and exact U
   }
 });
 
+test("diagnostic Job contract accepts display regions and omitted null container fields", () => {
+  const harness = makeHarness();
+  try {
+    const runId = prepareRuntimeGuarded(harness);
+    harness.setDiagnosticJobMutator((job) => {
+      const next = structuredClone(job);
+      next.location = "East US 2";
+      delete next.properties.template.containers[0].command;
+      delete next.properties.template.containers[0].args;
+      delete next.properties.template.containers[0].probes;
+      return next;
+    });
+    assert.deepEqual(harness.lifecycle.diagnostic("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "diagnostic-passed",
+      execution: "diagnostic-execution-1",
+    });
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test("diagnostic reconciliation rejects a canonical nextLink cycle without retrying start", () => {
   const harness = makeHarness();
   try {
@@ -2365,6 +2388,11 @@ test("diagnostic Job contract requires the complete Azure CLI live schema before
     (job) => { job.properties.provisioningState = "Creating"; },
     (job) => { job.properties.runningStatus = "Running"; },
     (job) => { job.properties.runningState = "Running"; },
+    (job) => { job.location = "westus"; },
+    (job) => { job.location = "East-US-2"; },
+    (job) => { job.location = "East  US 2"; },
+    (job) => { job.location = " East US 2"; },
+    (job) => { job.location = "eastus\u00002"; },
     (job) => { job.resourceGroup = "rg-other"; },
     (job) => { job.tags.environment = "prod"; },
     (job) => { job.tags.forged = "unexpected"; },
@@ -2415,6 +2443,7 @@ test("diagnostic Job contract requires the complete Azure CLI live schema before
     (job) => { job.properties.template.containers[0].command = []; },
     (job) => { job.properties.template.containers[0].args = []; },
     (job) => { job.properties.template.containers[0].probes = []; },
+    (job) => { job.properties.template.containers[0].unexpected = null; },
     (job) => { job.properties.template.containers[0].resources.ephemeralStorage = "2Gi"; },
     (job) => { job.properties.workloadProfileName = "Consumption"; },
     (job) => { delete job.resourceGroup; },

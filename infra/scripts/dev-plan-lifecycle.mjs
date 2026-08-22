@@ -5309,6 +5309,11 @@ function diagnosticIpv4Address(value) {
   return isIP(value) === 4;
 }
 
+function canonicalAzureRegion(value, code) {
+  failIf(typeof value !== "string" || !/^[A-Za-z0-9]+(?: [A-Za-z0-9]+)*$/.test(value), code);
+  return value.toLowerCase().replace(/ /g, "");
+}
+
 function diagnosticIpv4ToInteger(value) {
   const [first, second, third, fourth] = value.split(".").map(Number);
   return ((((first * 256) + second) * 256 + third) * 256 + fourth) >>> 0;
@@ -5385,10 +5390,13 @@ function diagnosticJobContract(value, outputs, reviewed, config, identityProofs)
   const job = diagnosticJobIdentity(outputs, config);
   const guardedJob = reviewed.cleanupJob;
   failIf(!isObject(guardedJob), "diagnostic-job");
+  const liveLocation = canonicalAzureRegion(value.location, "diagnostic-job");
+  const outputLocation = canonicalAzureRegion(outputs.region, "diagnostic-job");
+  const reviewedLocation = canonicalAzureRegion(guardedJob.location, "diagnostic-job");
   failIf(
     value.id !== job.id ||
       value.name !== job.name ||
-      value.location !== outputs.region ||
+      liveLocation !== outputLocation ||
       value.resourceGroup !== outputs.resourceGroup ||
       value.type !== "Microsoft.App/jobs",
     "diagnostic-job",
@@ -5396,7 +5404,7 @@ function diagnosticJobContract(value, outputs, reviewed, config, identityProofs)
   failIf(
     guardedJob.id !== value.id ||
       guardedJob.name !== value.name ||
-      guardedJob.location !== value.location ||
+      reviewedLocation !== liveLocation ||
       guardedJob.resourceGroup !== value.resourceGroup ||
       !same(guardedJob.identityIds.slice().sort(), [
         identityKey(outputs.imagePullIdentityId),
@@ -5496,13 +5504,13 @@ function diagnosticJobContract(value, outputs, reviewed, config, identityProofs)
     !Array.isArray(template.containers) || template.containers.length !== 1, "diagnostic-job");
   const container = template.containers[0];
   assertKnownKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], "diagnostic-job");
-  assertRequiredKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], "diagnostic-job");
+  assertRequiredKeys(container, ["name", "image", "imageType", "env", "resources"], "diagnostic-job");
   failIf(
     container.name !== "expiry-cleanup" ||
       container.imageType !== "ContainerImage" ||
-      container.command !== null ||
-      container.args !== null ||
-      container.probes !== null,
+      (container.command !== undefined && container.command !== null) ||
+      (container.args !== undefined && container.args !== null) ||
+      (container.probes !== undefined && container.probes !== null),
     "diagnostic-job",
   );
   const environment = assertEnvironmentEntries(container.env, "diagnostic-job");
