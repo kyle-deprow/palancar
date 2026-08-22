@@ -3463,6 +3463,7 @@ test("live Azure Container Apps schema normalizes exact CLI defaults and rejects
 
   const appCases = [
     ["unknown top-level field", (app) => { app.unexpected = null; }],
+    ["app running status at max scale", (app) => { app.properties.runningStatus = "RunningAtMaxScale"; }],
     ["wrong resource group", (app) => { app.resourceGroup = "rg-other"; }],
     ["foreign subscription ID", (app) => { app.id = app.id.replace(SUBSCRIPTION, "00000000-0000-0000-0000-000000000099"); }],
     ["foreign provider ID", (app) => { app.id = app.id.replace("/providers/Microsoft.App/", "/providers/Microsoft.Other/"); }],
@@ -3571,6 +3572,187 @@ test("live Azure Container Apps schema normalizes exact CLI defaults and rejects
       });
     } finally {
       negative.cleanup();
+    }
+  }
+});
+
+test("active and inactive revision running states follow the exact Azure membership", () => {
+  for (const state of ["Running", "RunningAtMaxScale"]) {
+    const preflight = makeHarness();
+    try {
+      const runId = prepareRuntime(preflight);
+      preflight.setLiveRevisionMutator((revision) => {
+        const next = structuredClone(revision);
+        next.properties.runningState = state;
+        return next;
+      });
+      assert.deepEqual(preflight.lifecycle.preflight("runtime-cutover", runId), {
+        runId,
+        phase: "runtime-cutover",
+        status: "preflighted",
+      });
+    } finally {
+      preflight.cleanup();
+    }
+  }
+
+  const reconciliation = makeHarness();
+  try {
+    const runId = prepareRuntimeReconcile(reconciliation);
+    reconciliation.setTopology("post");
+    reconciliation.setRevision("revision-after");
+    reconciliation.setSerial(8);
+    reconciliation.setLiveRevisionMutator((active) => {
+      const next = structuredClone(active);
+      next.properties.runningState = "RunningAtMaxScale";
+      return [next, retainedRuntimePredecessorRevision()];
+    });
+    assert.deepEqual(reconciliation.lifecycle.reconcile("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "applied",
+      state: "runtime-applied",
+    });
+  } finally {
+    reconciliation.cleanup();
+  }
+
+  const credential = makeHarness();
+  try {
+    const runId = prepareCredential(credential);
+    credential.setTopology("post");
+    credential.setLiveRevisionMutator((active) => {
+      const next = structuredClone(active);
+      next.properties.runningState = "RunningAtMaxScale";
+      return [next, retainedRuntimePredecessorRevision()];
+    });
+    assert.deepEqual(credential.lifecycle.preflight("credential-cleanup", runId), {
+      runId,
+      phase: "credential-cleanup",
+      status: "preflighted",
+    });
+  } finally {
+    credential.cleanup();
+  }
+
+  const normalized = makeHarness();
+  try {
+    const outputs = {
+      accountId: `/subscriptions/${SUBSCRIPTION}`,
+      resourceGroup: "rg-runtime",
+      region: "eastus2",
+      relayContainerApp: "relay-test",
+      containerAppEnvironmentId: CONTAINER_ENV_ID,
+      imagePullIdentityId: IMAGE_PULL_ID,
+      runtimeIdentityId: RUNTIME_ID,
+    };
+    const reviewed = {
+      after: {
+        containers: liveContainerApp("post", "revision-after").properties.template.containers,
+        registries: [{ server: "palancardevacraeeacd8c.azurecr.io", identity: IMAGE_PULL_ID.toLowerCase() }],
+      },
+    };
+    const app = assertContainerAppResponse(
+      liveAzureContainerApp("post", "revision-after"),
+      outputs,
+      reviewed,
+      "running-state-app",
+    );
+    const revision = liveRevision("revision-after", "post");
+    revision.properties.runningState = "RunningAtMaxScale";
+    const evidence = normalizeLiveRevision(revision, app, outputs, "running-state-revision");
+    assert.equal(evidence.revision.properties.runningState, "RunningAtMaxScale");
+    assert.equal(evidence.properties.runningState, "RunningAtMaxScale");
+  } finally {
+    normalized.cleanup();
+  }
+
+  for (const state of [
+    "Stopped", "running", "RUNNING", "runningatmaxscale", "Running At Max Scale",
+    "Processing", "Degraded", "Failed", "Unknown", "Running (at max)", "Ready", "Paused", "", null,
+  ]) {
+    const negative = makeHarness();
+    try {
+      const runId = prepareRuntime(negative);
+      negative.setLiveRevisionMutator((revision) => {
+        const next = structuredClone(revision);
+        next.properties.runningState = state;
+        return next;
+      });
+      expectCode(() => negative.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions");
+    } finally {
+      negative.cleanup();
+    }
+  }
+
+  for (const [label, mutate, expectedCode] of [
+    ["missing active replicas", (revision) => {
+      revision.properties.runningState = "RunningAtMaxScale";
+      delete revision.properties.replicas;
+    }, "runtime-revisions"],
+    ["zero active replicas", (revision) => {
+      revision.properties.runningState = "RunningAtMaxScale";
+      revision.properties.replicas = 0;
+    }, "runtime-revisions"],
+    ["two active replicas", (revision) => {
+      revision.properties.runningState = "RunningAtMaxScale";
+      revision.properties.replicas = 2;
+    }, "runtime-revisions"],
+    ["active max replicas mismatch", (revision) => {
+      revision.properties.runningState = "RunningAtMaxScale";
+      revision.properties.template.scale.maxReplicas = 2;
+    }, "runtime-revisions-template"],
+  ]) {
+    const negative = makeHarness();
+    try {
+      const runId = prepareRuntime(negative);
+      negative.setLiveRevisionMutator((revision) => {
+        const next = structuredClone(revision);
+        mutate(next);
+        return next;
+      });
+      expectCode(() => negative.lifecycle.preflight("runtime-cutover", runId), expectedCode, label);
+    } finally {
+      negative.cleanup();
+    }
+  }
+
+  for (const state of ["Running", "Stopped"]) {
+    const inactivePositive = makeHarness();
+    try {
+      const runId = prepareCredential(inactivePositive);
+      inactivePositive.setTopology("post");
+      inactivePositive.setLiveRevisionMutator((active) => {
+        const inactive = retainedRuntimePredecessorRevision();
+        inactive.properties.runningState = state;
+        return [active, inactive];
+      });
+      assert.deepEqual(inactivePositive.lifecycle.preflight("credential-cleanup", runId), {
+        runId,
+        phase: "credential-cleanup",
+        status: "preflighted",
+      });
+    } finally {
+      inactivePositive.cleanup();
+    }
+  }
+
+  for (const state of [
+    "RunningAtMaxScale", "running", "RUNNING", "Processing", "Degraded", "Failed", "Unknown",
+    "Running (at max)", "Ready", "Paused", "",
+  ]) {
+    const inactiveNegative = makeHarness();
+    try {
+      const runId = prepareCredential(inactiveNegative);
+      inactiveNegative.setTopology("post");
+      inactiveNegative.setLiveRevisionMutator((active) => {
+        const inactive = retainedRuntimePredecessorRevision();
+        inactive.properties.runningState = state;
+        return [active, inactive];
+      });
+      expectCode(() => inactiveNegative.lifecycle.preflight("credential-cleanup", runId), "credential-revisions");
+    } finally {
+      inactiveNegative.cleanup();
     }
   }
 });

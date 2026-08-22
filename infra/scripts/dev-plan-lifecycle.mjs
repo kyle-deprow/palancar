@@ -7401,9 +7401,11 @@ function normalizeLiveRevision(value, app, outputs, code) {
   ], code);
   assertRequiredKeys(properties, ["active", "healthState", "provisioningState", "runningState", "trafficWeight", "template"], code);
   failIf(typeof value.name !== "string" || typeof properties.active !== "boolean", code);
+  const allowedRunningStates = properties.active
+    ? ["Running", "RunningAtMaxScale"]
+    : ["Running", "Stopped"];
   failIf(properties.healthState !== "Healthy" || properties.provisioningState !== "Provisioned" ||
-    (properties.active ? properties.runningState !== "Running" :
-      (properties.runningState !== "Running" && properties.runningState !== "Stopped")), code);
+    !allowedRunningStates.includes(properties.runningState), code);
   failIf(Object.hasOwn(properties, "replicas") && Object.hasOwn(properties, "replicaCount"), code);
   const reportedReplicas = Object.hasOwn(properties, "replicas") ? properties.replicas : properties.replicaCount;
   if (reportedReplicas !== undefined) {
