@@ -130,6 +130,28 @@ const GENERATION_PATHS = [
   "packages/generation/test/generation.test.ts",
 ];
 
+function fullRoleAssignment(assignment) {
+  const name = assignment.id.slice(assignment.id.lastIndexOf("/") + 1);
+  const roleDefinitionName = assignment.roleDefinitionId.endsWith("4633458b-17de-408a-b874-0445c86b69e6")
+    ? "Key Vault Secrets User"
+    : "Cognitive Services OpenAI User";
+  return {
+    ...assignment,
+    condition: null,
+    conditionVersion: null,
+    createdBy: OBJECT_ID,
+    createdOn: "2026-08-22T00:00:00Z",
+    delegatedManagedIdentityResourceId: null,
+    description: null,
+    name,
+    principalName: "runtime-test",
+    roleDefinitionName,
+    type: "Microsoft.Authorization/roleAssignments",
+    updatedBy: OBJECT_ID,
+    updatedOn: "2026-08-22T00:00:00Z",
+  };
+}
+
 function writeExclusive(filePath, value) {
   const fd = openSync(filePath, "wx", 0o600);
   try {
@@ -388,6 +410,7 @@ function makeHarness(overrides = {}) {
     ? [value, retainedRuntimePredecessorRevision()]
     : value;
   let roleMutator = (value) => value;
+  let roleListMutator = (value) => value;
   let httpMutator = (value) => value;
   let diagnosticExecutionName = "diagnostic-execution-1";
   let diagnosticExecutionStatus = "Succeeded";
@@ -770,39 +793,45 @@ function makeHarness(overrides = {}) {
         return { status: 0, stdout: JSON.stringify(app) };
       }
       if (request.argv[0] === "role" && request.argv[1] === "assignment") {
+        if (request.argv.includes("--all")) {
+          return {
+            status: 2,
+            exitCode: 2,
+            stdout: "",
+            stderr: "group or scope are not required when --all is used\n",
+          };
+        }
         const scope = request.argv[request.argv.indexOf("--scope") + 1];
         const applyRoleMutator = request.argv.includes("--assignee-object-id");
+        const mutateRoleList = (assignments) => roleListMutator(
+          applyRoleMutator ? roleMutator(assignments, request) : assignments,
+          request,
+        );
         if (scope === KEY_VAULT_ID) {
           const assignments = runtimeSecretsEnabled
-            ? [{
+            ? [fullRoleAssignment({
                 id: `${scope}/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000021`,
                 principalId: RUNTIME_PRINCIPAL,
                 principalType: "ServicePrincipal",
                 roleDefinitionId: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6`,
                 scope,
-              }]
+              })]
             : [];
-          return { status: 0, stdout: JSON.stringify(applyRoleMutator ? roleMutator(assignments, request) : assignments) };
+          return { status: 0, stdout: JSON.stringify(mutateRoleList(assignments)) };
         }
         const role = scope === FOUNDry_ACCOUNT_ID
           ? "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
           : undefined;
-        if (role === undefined) return { status: 0, stdout: JSON.stringify(roleMutator([], request)) };
+        if (role === undefined) return { status: 0, stdout: JSON.stringify(mutateRoleList([])) };
         return {
           status: 0,
-          stdout: JSON.stringify(applyRoleMutator ? roleMutator([{
+          stdout: JSON.stringify(mutateRoleList([fullRoleAssignment({
             id: `${scope}/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000020`,
             principalId: RUNTIME_PRINCIPAL,
             principalType: "ServicePrincipal",
             roleDefinitionId: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/${role}`,
             scope,
-          }], request) : [{
-            id: `${scope}/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000020`,
-            principalId: RUNTIME_PRINCIPAL,
-            principalType: "ServicePrincipal",
-            roleDefinitionId: `/subscriptions/${SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/${role}`,
-            scope,
-          }]),
+          })])),
         };
       }
       if (request.argv[0] === "keyvault") return { status: 0, stdout: JSON.stringify([]) };
@@ -1028,6 +1057,7 @@ function makeHarness(overrides = {}) {
     setLiveAppMutator(value) { liveAppMutator = value; },
     setLiveRevisionMutator(value) { liveRevisionMutator = value; },
     setRoleMutator(value) { roleMutator = value; },
+    setRoleListMutator(value) { roleListMutator = value; },
     setHttpMutator(value) { httpMutator = value; },
     setApplyStatus(value) { applyStatus = value; },
     setModelCase(value) { modelCase = value; },
@@ -1062,6 +1092,24 @@ function productionHarness(overrides = {}) {
 
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
+}
+
+function roleAssignmentCalls(harness, start = 0) {
+  return harness.calls.slice(start).filter(
+    (call) => call.command === "/usr/bin/az" &&
+      call.argv[0] === "role" && call.argv[1] === "assignment" && call.argv[2] === "list",
+  );
+}
+
+function assertExactScopedRoleAssignmentArgv(call, scope, principalId = undefined) {
+  assert.deepEqual(call.argv, [
+    "role", "assignment", "list",
+    "--scope", scope,
+    ...(principalId === undefined ? [] : ["--assignee-object-id", principalId]),
+    "--fill-principal-name", "false",
+    "--fill-role-definition-name", "false",
+    "-o", "json",
+  ]);
 }
 
 function assertNoInvalidatedAfterApplying(harness, runId) {
@@ -2656,6 +2704,148 @@ test("protected role flags and the prior apply proof gate lifecycle boundaries",
       expectCode(() => harness.lifecycle.create("credential-cleanup"), "phase-apply-proof");
     } finally {
       harness.cleanup();
+    }
+  }
+});
+
+test("scoped role-assignment proofs use exact-scope argv at every lifecycle call site", () => {
+  const runtime = makeHarness();
+  try {
+    initialize(runtime);
+    const calls = roleAssignmentCalls(runtime);
+    assert.ok(calls.length >= 1);
+    for (const call of calls) assertExactScopedRoleAssignmentArgv(call, FOUNDry_ACCOUNT_ID);
+  } finally {
+    runtime.cleanup();
+  }
+
+  const diagnostic = makeHarness();
+  try {
+    const runId = prepareRuntimeGuarded(diagnostic);
+    const start = diagnostic.calls.length;
+    assert.deepEqual(diagnostic.lifecycle.diagnostic("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "diagnostic-passed",
+      execution: "diagnostic-execution-1",
+    });
+    const calls = roleAssignmentCalls(diagnostic, start);
+    assert.equal(calls.filter((call) => call.argv.includes("--assignee-object-id")).length, 1);
+    for (const call of calls) {
+      assertExactScopedRoleAssignmentArgv(
+        call,
+        FOUNDry_ACCOUNT_ID,
+        call.argv.includes("--assignee-object-id") ? RUNTIME_PRINCIPAL : undefined,
+      );
+    }
+  } finally {
+    diagnostic.cleanup();
+  }
+
+  const credential = makeHarness();
+  try {
+    const runId = prepareCredentialReconcile(credential);
+    const start = credential.calls.length;
+    credential.setSerial(8);
+    assert.deepEqual(credential.lifecycle.reconcile("credential-cleanup", runId), {
+      runId,
+      phase: "credential-cleanup",
+      status: "applied",
+      state: "credentials-and-RBAC-cleaned",
+    });
+    const calls = roleAssignmentCalls(credential, start).filter(
+      (call) => call.argv.includes("--assignee-object-id"),
+    );
+    assert.equal(calls.length, 2);
+    assertExactScopedRoleAssignmentArgv(calls[0], KEY_VAULT_ID, RUNTIME_PRINCIPAL);
+    assertExactScopedRoleAssignmentArgv(calls[1], FOUNDry_ACCOUNT_ID, RUNTIME_PRINCIPAL);
+  } finally {
+    credential.cleanup();
+  }
+
+  const terminal = makeHarness();
+  try {
+    const runId = prepareTerminal(terminal);
+    const start = terminal.calls.length;
+    assert.equal(terminal.lifecycle.finalize("terminal", runId).status, "finalized");
+    const calls = roleAssignmentCalls(terminal, start).filter(
+      (call) => call.argv.includes("--assignee-object-id"),
+    );
+    assert.equal(calls.length, 2);
+    assertExactScopedRoleAssignmentArgv(calls[0], KEY_VAULT_ID, RUNTIME_PRINCIPAL);
+    assertExactScopedRoleAssignmentArgv(calls[1], FOUNDry_ACCOUNT_ID, RUNTIME_PRINCIPAL);
+  } finally {
+    terminal.cleanup();
+  }
+});
+
+test("scoped role-assignment proofs accept full records but reject missing, malformed, or incorrect security fields", () => {
+  const runtimeMutations = [
+    (assignment) => {
+      const next = { ...assignment };
+      delete next.id;
+      return next;
+    },
+    (assignment) => ({ ...assignment, principalId: 42 }),
+    (assignment) => ({ ...assignment, roleDefinitionId: `${assignment.roleDefinitionId}-wrong` }),
+    (assignment) => ({ ...assignment, scope: `${assignment.scope}/wrong` }),
+  ];
+  for (const mutate of runtimeMutations) {
+    const runtime = makeHarness();
+    try {
+      runtime.setRoleListMutator((assignments, request) => request.argv.includes("--assignee-object-id")
+        ? assignments
+        : assignments.map(mutate));
+      expectCode(() => initialize(runtime), "runtime-openai-role");
+    } finally {
+      runtime.cleanup();
+    }
+  }
+
+  const diagnostic = makeHarness();
+  try {
+    const runId = prepareRuntimeGuarded(diagnostic);
+    diagnostic.setRoleMutator((assignments) => assignments.map((assignment) => ({
+      ...assignment,
+      roleDefinitionId: `${assignment.roleDefinitionId}-wrong`,
+    })));
+    expectCode(() => diagnostic.lifecycle.diagnostic("runtime-cutover", runId), "diagnostic-openai-role");
+  } finally {
+    diagnostic.cleanup();
+  }
+
+  const rbacMutations = [
+    (assignment) => {
+      const next = { ...assignment };
+      delete next.principalId;
+      return next;
+    },
+    (assignment) => ({ ...assignment, principalId: 42 }),
+    (assignment) => ({ ...assignment, roleDefinitionId: `${assignment.roleDefinitionId}-wrong` }),
+    (assignment) => ({ ...assignment, scope: `${assignment.scope}/wrong` }),
+  ];
+  for (const mutate of rbacMutations) {
+    const credential = makeHarness();
+    try {
+      const runId = prepareCredentialReconcile(credential);
+      credential.setSerial(8);
+      credential.setRoleMutator((assignments, request) => request.argv.includes("--assignee-object-id")
+        ? assignments.map(mutate)
+        : assignments);
+      expectCode(() => credential.lifecycle.reconcile("credential-cleanup", runId), "reconcile-unknown");
+    } finally {
+      credential.cleanup();
+    }
+
+    const terminal = makeHarness();
+    try {
+      const runId = prepareTerminal(terminal);
+      terminal.setRoleMutator((assignments, request) => request.argv.includes("--assignee-object-id")
+        ? assignments.map(mutate)
+        : assignments);
+      expectCode(() => terminal.lifecycle.finalize("terminal", runId), "terminal-openai-rbac");
+    } finally {
+      terminal.cleanup();
     }
   }
 });

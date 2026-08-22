@@ -62,6 +62,9 @@ const ENTRA_ROLES = Object.freeze({
   monitoringMetricsPublisher: "3913510d-42f4-4e42-8a64-420c390055eb",
   keyVaultSecretsUser: "4633458b-17de-408a-b874-0445c86b69e6",
 });
+const ROLE_ASSIGNMENT_SECURITY_KEYS = Object.freeze([
+  "id", "principalId", "principalType", "roleDefinitionId", "scope",
+]);
 const PRIVATE_HTTP_MAX_BYTES = 256 * 1024;
 const PRIVATE_HTTP_TIMEOUT_MS = 30 * 1000;
 const AZURE_VAULT_SCOPE = "https://vault.azure.net";
@@ -4077,18 +4080,26 @@ function runtimeIdentityPrincipalFromAccountRole(config, outputs) {
   const assignments = azJson(config, [
     "role", "assignment", "list",
     "--scope", outputs.accountId,
-    "--all",
-    "--output", "json",
+    "--fill-principal-name", "false",
+    "--fill-role-definition-name", "false",
+    "-o", "json",
   ], "runtime-openai-role");
   failIf(!Array.isArray(assignments), "runtime-openai-role");
-  const matches = assignments.filter((assignment) => assignment?.id === outputs.runtimeOpenAiRoleAssignmentId);
+  const projected = assignments.map(projectRoleAssignmentSecurityFields);
+  const matches = projected.filter((assignment) => assignment.id === outputs.runtimeOpenAiRoleAssignmentId);
   failIf(matches.length !== 1, "runtime-openai-role");
   const assignment = matches[0];
-  assertKnownKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], "runtime-openai-role");
-  assertRequiredKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], "runtime-openai-role");
+  assertKnownKeys(assignment, ROLE_ASSIGNMENT_SECURITY_KEYS, "runtime-openai-role");
+  assertRequiredKeys(assignment, ROLE_ASSIGNMENT_SECURITY_KEYS, "runtime-openai-role");
   const assignmentPrefix = `${outputs.accountId}/providers/Microsoft.Authorization/roleAssignments/`;
+  const validTypes = typeof assignment.id === "string" &&
+    typeof assignment.principalId === "string" &&
+    typeof assignment.principalType === "string" &&
+    typeof assignment.roleDefinitionId === "string" &&
+    typeof assignment.scope === "string";
   failIf(
-    !assignment.id.startsWith(assignmentPrefix) ||
+    !validTypes ||
+      !assignment.id.startsWith(assignmentPrefix) ||
       !UUID_RE.test(assignment.id.slice(assignmentPrefix.length)) ||
       !UUID_RE.test(assignment.principalId) ||
       assignment.principalType !== "ServicePrincipal" ||
@@ -5015,16 +5026,11 @@ function diagnosticOpenAiRole(config, manifest) {
   const assignments = azJson(config, [
     "role", "assignment", "list", "--scope", manifest.bindings.accountId,
     "--assignee-object-id", manifest.bindings.runtimeIdentityPrincipalId,
-    "--all", "--output", "json",
+    "--fill-principal-name", "false", "--fill-role-definition-name", "false",
+    "-o", "json",
   ], "diagnostic-openai-role");
   failIf(!Array.isArray(assignments), "diagnostic-openai-role");
-  const projected = assignments.filter((assignment) => isObject(assignment)).map((assignment) => ({
-    id: assignment.id,
-    principalId: assignment.principalId,
-    principalType: assignment.principalType,
-    roleDefinitionId: assignment.roleDefinitionId,
-    scope: assignment.scope,
-  }));
+  const projected = assignments.filter((assignment) => isObject(assignment)).map(projectRoleAssignmentSecurityFields);
   const expectedId = manifest.bindings.runtimeOpenAiRoleAssignmentId;
   const match = projected.find((assignment) => assignment.id === expectedId);
   failIf(match === undefined, "diagnostic-openai-role");
@@ -6102,19 +6108,33 @@ function roleDefinitionResourceId(subscription, roleUuid) {
   return `/subscriptions/${subscription}/providers/Microsoft.Authorization/roleDefinitions/${roleUuid}`;
 }
 
+function projectRoleAssignmentSecurityFields(assignment) {
+  if (!isObject(assignment)) return {};
+  return Object.fromEntries(
+    ROLE_ASSIGNMENT_SECURITY_KEYS
+      .filter((key) => Object.hasOwn(assignment, key))
+      .map((key) => [key, assignment[key]]),
+  );
+}
+
 function parseRoleAssignments(value, expected, code) {
   failIf(!Array.isArray(value), code);
-  return value.map((assignment) => {
-    assertKnownKeys(assignment, [
-      "id", "principalId", "principalType", "roleDefinitionId", "scope",
-    ], code);
-    assertRequiredKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], code);
-    const assignmentPrefix = typeof assignment.scope === "string"
+  return value.map((rawAssignment) => {
+    const assignment = projectRoleAssignmentSecurityFields(rawAssignment);
+    assertKnownKeys(assignment, ROLE_ASSIGNMENT_SECURITY_KEYS, code);
+    assertRequiredKeys(assignment, ROLE_ASSIGNMENT_SECURITY_KEYS, code);
+    const validTypes = typeof assignment.id === "string" &&
+      typeof assignment.principalId === "string" &&
+      typeof assignment.principalType === "string" &&
+      typeof assignment.roleDefinitionId === "string" &&
+      typeof assignment.scope === "string";
+    const assignmentPrefix = validTypes
       ? `${assignment.scope}/providers/Microsoft.Authorization/roleAssignments/`
       : "";
-    const assignmentId = typeof assignment.id === "string" && assignment.id.startsWith(assignmentPrefix) &&
+    const assignmentId = validTypes && assignment.id.startsWith(assignmentPrefix) &&
       UUID_RE.test(assignment.id.slice(assignmentPrefix.length));
     failIf(
+        !validTypes ||
         !assignmentId ||
         !UUID_RE.test(assignment.principalId) ||
         assignment.principalId !== expected.principalId ||
@@ -6133,8 +6153,9 @@ function verifyRoleAssignment(config, outputs, principalId, scope, roleUuid, req
     "role", "assignment", "list",
     "--scope", scope,
     "--assignee-object-id", principalId,
-    "--all",
-    "--output", "json",
+    "--fill-principal-name", "false",
+    "--fill-role-definition-name", "false",
+    "-o", "json",
   ], code);
   const assignments = parseRoleAssignments(result, {
     principalId,
