@@ -5497,22 +5497,27 @@ test("cutover-family accepts the app singleton and exact two-entry benign resour
     [credentialCleanupFixture, "azure-credential-cleanup"],
     [terminalFixture, "final-rollout-complete"],
   ]) {
-    for (const reverseIdentity of [false, true]) {
-      const candidate = clone(source);
-      if (reverseIdentity) {
-        mutateContainerAppCopies(candidate, (value) => {
-          value.identity[0].identity_ids.reverse();
-        });
+    for (const singletonAddress of [containerAppAddress, finalCleanupJobAddress]) {
+      for (const reverseIdentity of [false, true]) {
+        for (const reverseDirection of [false, true]) {
+          const candidate = clone(source);
+          if (reverseIdentity) {
+            mutateContainerAppCopies(candidate, (value) => {
+              value.identity[0].identity_ids.reverse();
+            });
+          }
+          candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
+            .filter((entry) => entry.address === singletonAddress);
+          if (reverseDirection) reverseBenignDriftDirection(candidate.resource_drift[0]);
+          candidate.relevant_attributes.reverse();
+          candidate.timestamp = "2026-08-22T17:30:00Z";
+          assert.equal(
+            acceptsPlan(candidate, mode),
+            true,
+            `${mode} singleton=${singletonAddress} reverseIdentity=${reverseIdentity} reverseDirection=${reverseDirection}`,
+          );
+        }
       }
-      candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
-        .filter((entry) => entry.address === containerAppAddress);
-      candidate.relevant_attributes.reverse();
-      candidate.timestamp = "2026-08-22T17:30:00Z";
-      assert.equal(
-        acceptsPlan(candidate, mode),
-        true,
-        `${mode} singleton reverseIdentity=${reverseIdentity}`,
-      );
     }
 
     for (const reverseEntries of [false, true]) {
@@ -5538,11 +5543,6 @@ test("cutover-family accepts the app singleton and exact two-entry benign resour
       }
     }
 
-    rejectsCutoverMutation(source, mode, (candidate) => {
-      candidate.resource_drift = makeBenignCutoverResourceDrift(
-        candidate,
-      ).filter((entry) => entry.address === finalCleanupJobAddress);
-    });
   }
 });
 
@@ -5578,19 +5578,21 @@ test("cutover-family benign resource drift requires the exact identity set", () 
         });
       }
     }
-    for (const identityIds of [
-      [imagePullIdentity],
-      [imagePullIdentity, runtimeIdentity, wrongIdentity],
-      [imagePullIdentity, wrongIdentity],
-      [imagePullIdentity, imagePullIdentity],
-    ]) {
-      rejectsCutoverMutation(source, mode, (candidate) => {
-        const entry = makeBenignCutoverResourceDrift(candidate).find(
-          (driftEntry) => driftEntry.address === containerAppAddress,
-        );
-        setBenignDriftIdentityIds(entry, identityIds);
-        candidate.resource_drift = [entry];
-      });
+    for (const singletonAddress of [containerAppAddress, finalCleanupJobAddress]) {
+      for (const identityIds of [
+        [imagePullIdentity],
+        [imagePullIdentity, runtimeIdentity, wrongIdentity],
+        [imagePullIdentity, wrongIdentity],
+        [imagePullIdentity, imagePullIdentity],
+      ]) {
+        rejectsCutoverMutation(source, mode, (candidate) => {
+          const entry = makeBenignCutoverResourceDrift(candidate).find(
+            (driftEntry) => driftEntry.address === singletonAddress,
+          );
+          setBenignDriftIdentityIds(entry, identityIds);
+          candidate.resource_drift = [entry];
+        });
+      }
     }
   }
 });
@@ -5686,11 +5688,13 @@ test("cutover-family benign resource drift rejects structural and metadata drift
         candidate.resource_drift = makeBenignCutoverResourceDrift(candidate);
         mutate(candidate.resource_drift);
       });
-      rejectsCutoverMutation(source, mode, (candidate) => {
-        candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
-          .filter((entry) => entry.address === containerAppAddress);
-        mutate(candidate.resource_drift);
-      });
+      for (const singletonAddress of [containerAppAddress, finalCleanupJobAddress]) {
+        rejectsCutoverMutation(source, mode, (candidate) => {
+          candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
+            .filter((entry) => entry.address === singletonAddress);
+          mutate(candidate.resource_drift);
+        });
+      }
     }
   }
 });

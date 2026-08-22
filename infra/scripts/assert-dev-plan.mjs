@@ -7041,19 +7041,12 @@ function cutoverHasExactBenignResourceDrift(plan) {
   if (drift === undefined || drift === null) return true;
   if (!Array.isArray(drift)) return false;
   if (drift.length === 0) return true;
-  const expectedAddresses = drift.length === 1
-    ? new Set([CUTOVER_CONTAINER_APP])
-    : drift.length === CUTOVER_BENIGN_DRIFT_ADDRESSES.size
-      ? CUTOVER_BENIGN_DRIFT_ADDRESSES
-      : undefined;
-  if (expectedAddresses === undefined) return false;
+  if (drift.length < 1 || drift.length > CUTOVER_BENIGN_DRIFT_ADDRESSES.size) return false;
 
   const addresses = new Set(drift.map((entry) => entry?.address));
   if (
-    addresses.size !== expectedAddresses.size ||
-    [...expectedAddresses].some(
-      (address) => !addresses.has(address),
-    )
+    addresses.size !== drift.length ||
+    [...addresses].some((address) => !CUTOVER_BENIGN_DRIFT_ADDRESSES.has(address))
   ) {
     return false;
   }
