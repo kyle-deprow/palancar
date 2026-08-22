@@ -12,6 +12,9 @@ const FULL_DEPLOY_MODE = "full-deploy";
 const RUNTIME_ROLLOUT_MODE = "runtime-rollout";
 const FINAL_ROLLOUT_MODE = "final-rollout";
 const LUNA_MODEL_BOOTSTRAP_MODE = "luna-model-bootstrap";
+const AZURE_GENERATION_CUTOVER_MODE = "azure-generation-cutover";
+const AZURE_CREDENTIAL_CLEANUP_MODE = "azure-credential-cleanup";
+const FINAL_ROLLOUT_COMPLETE_MODE = "final-rollout-complete";
 const SUPPORTED_PLAN_FORMAT_VERSION = "1.2";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
 const PINNED_MODEL_VERSION = "2025-12-15";
@@ -45,6 +48,10 @@ const FINAL_RESOURCE_GROUP_ID =
 const FINAL_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
 const FINAL_RELAY_PRIOR_IMAGE =
   `${FINAL_ACR_LOGIN_SERVER}/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`;
+// This is the reviewed live predecessor for the direct-Entra cutover.  It is
+// deliberately independent of prior_state: prior state is an input to be
+// checked, not the source of the rollout contract.
+const CUTOVER_RELAY_PRIOR_IMAGE = FINAL_RELAY_PRIOR_IMAGE;
 const FINAL_TABLE_ACCOUNT = "palancardevstateaeeacd8c";
 const FINAL_TABLE_ENDPOINT = `https://${FINAL_TABLE_ACCOUNT}.table.core.windows.net`;
 const FINAL_TABLE_SERVICE_ID =
@@ -83,11 +90,95 @@ const FINAL_CLEANUP_JOB_NAME = "caj-palancardev-cleanup-aeeacd8c";
 const FINAL_ROLE_DEFINITION_MONITORING_ID =
   "3913510d-42f4-4e42-8a64-420c390055eb";
 const FINAL_GENERATION_MODEL = "openrouter/openai/gpt-5.6-luna";
-const FINAL_REFERENCE_PLAN = JSON.parse(
+const CUTOVER_CONTAINER_APP = CONTAINER_APP;
+const CUTOVER_ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
+const CUTOVER_TRANSCRIPTION_DEPLOYMENT =
+  `module.foundry.azurerm_cognitive_deployment.this["${PINNED_DEPLOYMENT_NAME}"]`;
+const CUTOVER_LUNA_DEPLOYMENT =
+  `module.foundry.azurerm_cognitive_deployment.this["${LUNA_DEPLOYMENT_NAME}"]`;
+const CUTOVER_RUNTIME_SECRETS_USER =
+  "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
+const CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS =
+  "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+const CUTOVER_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
+  "NODE_ENV",
+  "PORT",
+  "PALANCAR_GENERATION_PROVIDER",
+  "PALANCAR_AZURE_GENERATION_ENDPOINT",
+  "PALANCAR_AZURE_GENERATION_DEPLOYMENT",
+  "PALANCAR_RELAY_BIND_HOST",
+  "PALANCAR_RELAY_ENVIRONMENT",
+  "PALANCAR_RELAY_ORIGIN",
+  "PALANCAR_GATE_POLICY_VERSION",
+  "AZURE_CLIENT_ID",
+  "PALANCAR_DEPLOYMENT_SLOT",
+  "APPLICATIONINSIGHTS_CONNECTION_STRING",
+  "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
+  "APPLICATION_INSIGHTS_NO_STATSBEAT",
+  "PALANCAR_SECURITY_MODE",
+  "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+  "PALANCAR_SECURITY_STATE_TABLE",
+  "PALANCAR_RATE_STATE_TABLE",
+  "PALANCAR_TRANSCRIPTION_PROVIDER",
+  "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+  "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+  "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+  "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+  "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+]);
+const CUTOVER_FOUNDATION_NO_OP_ADDRESSES = Object.freeze([
+  "azurerm_resource_group.foundation",
+  "module.budget.azurerm_consumption_budget_resource_group.this",
+  "module.observability.azurerm_log_analytics_workspace.this",
+  "module.observability.azurerm_application_insights.this",
+  "module.workload_state.azurerm_storage_account.this",
+  "module.workload_state.azapi_resource.security",
+  "module.workload_state.azapi_resource.rate",
+  "module.container_registry.azurerm_container_registry.this",
+  "module.container_app_environment.azurerm_container_app_environment.this",
+  "module.foundry.azurerm_cognitive_account.this",
+  "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+  "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  "module.workload_key_vault.azurerm_key_vault.this",
+  "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+  "module.expiry_cleanup_job[0].azapi_resource.this",
+  "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+  "module.identities_rbac.azurerm_role_assignment.runtime_table",
+  "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+  "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
+  "module.identities_rbac.azurerm_role_assignment.operator_security_table",
+  "module.identities_rbac.azurerm_role_assignment.operator_rate_table",
+  "azurerm_monitor_action_group.relay",
+  "module.observability.azurerm_application_insights_workbook.relay_operations",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"provider_failures\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"runtime_activity\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"state_store_failures\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"suggestion_mean\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"transcription_final_mean\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"transcription_first_partial_mean\"]",
+  "module.observability.azurerm_log_analytics_saved_search.relay[\"translation_mean\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"provider_failures\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"state_store_failures\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"suggestion_mean\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"transcription_final_mean\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"transcription_first_partial_mean\"]",
+  "module.observability.azurerm_monitor_scheduled_query_rules_alert_v2.relay[\"translation_mean\"]",
+  CUTOVER_TRANSCRIPTION_DEPLOYMENT,
+  CUTOVER_LUNA_DEPLOYMENT,
+]);
+const CUTOVER_RESOURCE_INVENTORY = new Set([
+  ...CUTOVER_FOUNDATION_NO_OP_ADDRESSES,
+  CUTOVER_CONTAINER_APP,
+  CUTOVER_RUNTIME_SECRETS_USER,
+]);
+const TERMINAL_REFERENCE_PLAN = JSON.parse(
   readFileSync(
     new URL("./fixtures/final-rollout-transition.plan-fixture.json", import.meta.url),
     "utf8",
   ),
+);
+const FINAL_REFERENCE_PLAN = createLegacyFinalReferencePlan(
+  TERMINAL_REFERENCE_PLAN,
 );
 const MODEL_BOOTSTRAP_REFERENCE_PLAN = JSON.parse(
   readFileSync(
@@ -1832,7 +1923,7 @@ function hasExactFinalRelayOrigin(value) {
   );
 }
 
-function hasExactFinalRelayEnvironment(env, runtimeClientId) {
+function hasExactFinalRelayEnvironment(env, runtimeClientId, bindings = {}) {
   const names = [
     "NODE_ENV",
     "PORT",
@@ -1878,25 +1969,34 @@ function hasExactFinalRelayEnvironment(env, runtimeClientId) {
     hasEnvValue(entries, "PALANCAR_GENERATION_PROVIDER", "litellm") &&
     hasEnvValue(entries, "PALANCAR_RELAY_BIND_HOST", "0.0.0.0") &&
     hasEnvValue(entries, "PALANCAR_RELAY_ENVIRONMENT", "dev") &&
-    hasExactFinalRelayOrigin(entries.get("PALANCAR_RELAY_ORIGIN")?.value) &&
+    (bindings.relayOrigin === undefined
+      ? hasExactFinalRelayOrigin(entries.get("PALANCAR_RELAY_ORIGIN")?.value)
+      : hasEnvValue(entries, "PALANCAR_RELAY_ORIGIN", bindings.relayOrigin)) &&
     hasEnvValue(entries, "PALANCAR_GATE_POLICY_VERSION", "1.0.0") &&
     hasEnvValue(entries, "AZURE_CLIENT_ID", runtimeClientId) &&
     hasEnvValue(entries, "PALANCAR_DEPLOYMENT_SLOT", "dev") &&
     hasExactDevelopmentLanguageBoundary(entries) &&
-    hasExactFinalConnectionString(
-      entries.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value,
-    ) &&
+    (bindings.relayConnection === undefined
+      ? hasExactFinalConnectionString(
+          entries.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value,
+        )
+      : entries.get("APPLICATIONINSIGHTS_CONNECTION_STRING")?.value ===
+        bindings.relayConnection) &&
     hasEnvValue(entries, "APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "true") &&
     hasEnvValue(entries, "APPLICATION_INSIGHTS_NO_STATSBEAT", "true") &&
     hasEnvValue(entries, "PALANCAR_SECURITY_MODE", "azure-table") &&
-    hasEnvValue(entries, "PALANCAR_WORKLOAD_TABLE_ENDPOINT", FINAL_TABLE_ENDPOINT) &&
+    hasEnvValue(
+      entries,
+      "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+      bindings.tableEndpoint ?? FINAL_TABLE_ENDPOINT,
+    ) &&
     hasEnvValue(entries, "PALANCAR_SECURITY_STATE_TABLE", "SecurityState") &&
     hasEnvValue(entries, "PALANCAR_RATE_STATE_TABLE", "RateState") &&
     hasEnvValue(entries, "PALANCAR_TRANSCRIPTION_PROVIDER", "azure-realtime") &&
     hasEnvValue(
       entries,
       "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
-      FINAL_FOUNDRY_REALTIME_ENDPOINT,
+      bindings.transcriptionEndpoint ?? FINAL_FOUNDRY_REALTIME_ENDPOINT,
     ) &&
     hasEnvValue(
       entries,
@@ -3546,6 +3646,17 @@ function finalExpectedAfterSensitive(resourceChange) {
   return expected;
 }
 
+function finalExpectedBeforeSensitive(resourceChange) {
+  const reference = FINAL_REFERENCE_CHANGES.get(resourceChange.address).change;
+  const expected = structuredClone(reference.before_sensitive);
+  if (resourceChange.address === FINAL_ACTION_GROUP_ADDRESS) {
+    expected.email_receiver = resourceChange.change.after.email_receiver.map(
+      () => ({}),
+    );
+  }
+  return expected;
+}
+
 function finalChangeEnvelopeKeys(resourceChange) {
   const keys = [
     "actions",
@@ -3644,17 +3755,38 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
       change.after_unknown,
       finalExpectedAfterUnknown(resourceChange),
     );
+    const expectedBeforeSensitive = isCreate(action)
+      ? false
+      : finalExpectedBeforeSensitive(resourceChange);
     const sensitiveMatch = isDeepStrictEqual(
       change.after_sensitive,
       finalExpectedAfterSensitive(resourceChange),
     );
+    const sensitiveValuesValid = isCreate(action)
+      ? cutoverSensitiveMaskValuesValid(
+          change.after,
+          FINAL_REFERENCE_CHANGES.get(address).change.after,
+          change.after_sensitive,
+        )
+      : cutoverSensitiveMaskValuesValid(
+          change.before,
+          FINAL_REFERENCE_CHANGES.get(address).change.before,
+          expectedBeforeSensitive,
+        ) &&
+        cutoverSensitiveMaskValuesValid(
+          change.after,
+          FINAL_REFERENCE_CHANGES.get(address).change.after,
+          change.after_sensitive,
+        );
     if (
       !outerMatch ||
       !envelopeMatch ||
       !actionAllowed ||
       !afterObject ||
       !unknownMatch ||
-      !sensitiveMatch
+      !sensitiveMatch ||
+      !isDeepStrictEqual(change.before_sensitive, expectedBeforeSensitive) ||
+      !sensitiveValuesValid
     ) {
       return false;
     }
@@ -3729,6 +3861,17 @@ function finalHasCoherentResourceChanges(plan, changesByAddress, context) {
   const expectedPrior = [...changesByAddress.values()].filter(
     (entry) => !isCreate(entry.change.actions),
   );
+  const storageAddress = "module.workload_state.azurerm_storage_account.this";
+  if (
+    !cutoverSensitiveStorageContract(
+      changesByAddress.get(storageAddress)?.change.after,
+      TERMINAL_REFERENCE_PLAN.resource_changes.find(
+        (entry) => entry.address === storageAddress,
+      )?.change.after,
+    )
+  ) {
+    return false;
+  }
   const clientConfig = priorResources.get(
     "module.workload_key_vault.data.azurerm_client_config.current",
   );
@@ -4083,9 +4226,6 @@ function bootstrapStateResourceMetadataMatchesChange(
 function bootstrapHasExactStateResourceMetadata(plan) {
   const resourceMetadata = collectBootstrapResourceEntries(
     plan.planned_values?.root_module,
-  );
-  const referenceMetadata = collectBootstrapResourceEntries(
-    MODEL_BOOTSTRAP_REFERENCE_PLAN.planned_values?.root_module,
   );
   const resourceGroup = resourceMetadata.get("azurerm_resource_group.foundation")
     ?.resource?.values;
@@ -5190,7 +5330,7 @@ function bootstrapHasExactRuntimeIdentityBinding(plan, changesByAddress) {
   return outputValues.every((value) => value === ids[0]);
 }
 
-function bootstrapHasExactDynamicResourceBindings(plan, changesByAddress) {
+function bootstrapHasExactDynamicResourceBindings(plan) {
   const subscriptionId = plan.variables?.subscription_id?.value;
   if (!finalUuid(subscriptionId)) {
     return false;
@@ -5564,7 +5704,7 @@ function acceptsLunaModelBootstrap(plan, changes) {
     !bootstrapHasExactRelayImageCrossBinding(plan, changesByAddress) ||
     !bootstrapHasExactFixedNoOpContracts(plan, changesByAddress) ||
     !bootstrapHasExactRuntimeIdentityBinding(plan, changesByAddress) ||
-    !bootstrapHasExactDynamicResourceBindings(plan, changesByAddress) ||
+    !bootstrapHasExactDynamicResourceBindings(plan) ||
     !bootstrapHasExactRoleAssignments(plan, changesByAddress)
   ) {
     return false;
@@ -5676,6 +5816,27 @@ function finalHasExactOutputs(plan) {
     }
 
     const hasPrior = Object.hasOwn(prior, name);
+    const sensitiveOutput =
+      outputChange.before_sensitive === true ||
+      outputChange.after_sensitive === true;
+    if (
+      sensitiveOutput &&
+      (!descriptorHasValue ||
+        !cutoverOpaqueSensitiveLeafMatches(
+          outputChange.before,
+          referenceChange.before,
+        ) ||
+        !cutoverOpaqueSensitiveLeafMatches(
+          outputChange.after,
+          referenceChange.after,
+        ) ||
+        !cutoverOpaqueSensitiveLeafMatches(
+          descriptor.value,
+          referenceDescriptor.value,
+        ))
+    ) {
+      return false;
+    }
     if (hasPrior) {
       expectedPriorNames.push(name);
       if (
@@ -5683,6 +5844,15 @@ function finalHasExactOutputs(plan) {
         !isDeepStrictEqual(
           prior[name].type,
           descriptor.type ?? referencePrior?.type,
+        )
+      ) {
+        return false;
+      }
+      if (
+        sensitiveOutput &&
+        !cutoverOpaqueSensitiveLeafMatches(
+          prior[name].value,
+          referencePrior.value,
         )
       ) {
         return false;
@@ -6035,6 +6205,2672 @@ function acceptsRuntimeRollout(
   );
 }
 
+// `final-rollout` is a retained pre-cutover mode.  Its historical reference
+// is kept in memory so the terminal fixture can describe the post-cleanup
+// Entra-only state without changing the old guard contract.
+export function createLegacyFinalReferencePlan(source) {
+  const plan = structuredClone(source);
+  const appAddress = CUTOVER_CONTAINER_APP;
+  const lunaAddress = CUTOVER_LUNA_DEPLOYMENT;
+  const roleAddress =
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+  const app = plan.resource_changes.find((entry) => entry.address === appAddress);
+  const sourceApp = app?.change?.after;
+  const sourceAppMask = app?.change?.after_sensitive ?? {};
+
+  const findValueResource = (root, address) => {
+    for (const resource of root?.resources ?? []) {
+      if (resource.address === address) return resource;
+    }
+    for (const child of root?.child_modules ?? []) {
+      const resource = findValueResource(child, address);
+      if (resource) return resource;
+    }
+    return undefined;
+  };
+  const removeValueResource = (root, address) => {
+    if (!root) return;
+    if (Array.isArray(root.resources)) {
+      root.resources = root.resources.filter(
+        (resource) => resource.address !== address,
+      );
+    }
+    for (const child of root.child_modules ?? []) {
+      removeValueResource(child, address);
+    }
+  };
+  const addValueResource = (root, moduleAddress, resource) => {
+    const module = (function findModule(current) {
+      if (!moduleAddress) return current;
+      for (const child of current?.child_modules ?? []) {
+        if (child.address === moduleAddress) return child;
+        const nested = findModule(child);
+        if (nested) return nested;
+      }
+      return undefined;
+    })(root);
+    if (module) {
+      module.resources ??= [];
+      module.resources.push(resource);
+    }
+  };
+  const maskFor = (value, mask) => {
+    if (mask === true) return true;
+    if (Array.isArray(value)) {
+      return value.map((entry, index) =>
+        maskFor(entry, Array.isArray(mask) ? mask[index] : undefined),
+      );
+    }
+    if (isObject(value)) {
+      const result = {};
+      for (const [key, child] of Object.entries(value)) {
+        if (isObject(mask) && Object.hasOwn(mask, key)) {
+          result[key] = maskFor(child, mask[key]);
+        }
+      }
+      return result;
+    }
+    return undefined;
+  };
+  const envValues = (entries) => new Map(
+    (entries ?? []).map((entry) => [entry.name, entry]),
+  );
+  const legacyApp = (direct, image) => {
+    const result = structuredClone(direct);
+    const properties = result.body.properties;
+    const configuration = properties.configuration;
+    delete configuration.maxInactiveRevisions;
+    configuration.secrets = [
+      {
+        name: "litellm-master-key",
+        keyVaultUrl: `https://${FINAL_KEY_VAULT_HOST}/secrets/litellm-master-key`,
+        identity: FINAL_RUNTIME_IDENTITY,
+      },
+      {
+        name: "openrouter-api-key",
+        keyVaultUrl: `https://${FINAL_KEY_VAULT_HOST}/secrets/openrouter-api-key`,
+        identity: FINAL_RUNTIME_IDENTITY,
+      },
+    ];
+    const relay = properties.template.containers[0];
+    const relayEntries = envValues(relay.env);
+    const relayNames = [
+      "NODE_ENV",
+      "PORT",
+      "PALANCAR_GENERATION_PROVIDER",
+      "PALANCAR_RELAY_BIND_HOST",
+      "PALANCAR_RELAY_ENVIRONMENT",
+      "PALANCAR_RELAY_ORIGIN",
+      "PALANCAR_GATE_POLICY_VERSION",
+      "AZURE_CLIENT_ID",
+      "PALANCAR_DEPLOYMENT_SLOT",
+      "APPLICATIONINSIGHTS_CONNECTION_STRING",
+      "APPLICATIONINSIGHTS_STATSBEAT_DISABLED",
+      "APPLICATION_INSIGHTS_NO_STATSBEAT",
+      "PALANCAR_SECURITY_MODE",
+      "PALANCAR_WORKLOAD_TABLE_ENDPOINT",
+      "PALANCAR_SECURITY_STATE_TABLE",
+      "PALANCAR_RATE_STATE_TABLE",
+      "PALANCAR_TRANSCRIPTION_PROVIDER",
+      "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+      "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+      "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      "PALANCAR_ALLOW_NULL_BROWSER_ORIGIN",
+    ];
+    relay.env = relayNames.map((name) => structuredClone(relayEntries.get(name)));
+    relay.env[2].value = "litellm";
+    relay.env.push(
+      { name: "PALANCAR_LITELLM_BASE_URL", value: "http://127.0.0.1:4000" },
+      { name: "PALANCAR_LITELLM_MODEL", value: "palancar-generation" },
+      { name: "PALANCAR_LITELLM_API_KEY", secretRef: "litellm-master-key" },
+      {
+        name: "PALANCAR_LANGUAGE_BOUNDARY_MODE",
+        value: EXPECTED_LANGUAGE_BOUNDARY_MODE,
+      },
+    );
+    relay.image = image;
+    const sidecar = {
+      name: "litellm",
+      image: `${FINAL_ACR_LOGIN_SERVER}/palancar-litellm-proxy@sha256:${"b".repeat(64)}`,
+      resources: { cpu: 0.75, memory: "1.5Gi" },
+      env: [
+        { name: "PALANCAR_LITELLM_BACKEND", value: "openrouter" },
+        {
+          name: "PALANCAR_LITELLM_UPSTREAM_MODEL",
+          value: FINAL_GENERATION_MODEL,
+        },
+        { name: "LITELLM_MASTER_KEY", secretRef: "litellm-master-key" },
+        { name: "OPENROUTER_API_KEY", secretRef: "openrouter-api-key" },
+      ],
+      probes: [
+        {
+          failureThreshold: 3,
+          initialDelaySeconds: 10,
+          periodSeconds: 30,
+          tcpSocket: { port: 4000 },
+          timeoutSeconds: 3,
+          type: "Liveness",
+        },
+        {
+          failureThreshold: 3,
+          httpGet: { path: "/health/readiness", port: 4000 },
+          periodSeconds: 10,
+          timeoutSeconds: 7,
+          type: "Readiness",
+        },
+        {
+          failureThreshold: 10,
+          httpGet: { path: "/health/liveliness", port: 4000 },
+          periodSeconds: 10,
+          timeoutSeconds: 3,
+          type: "Startup",
+        },
+      ],
+    };
+    properties.template.containers = [relay, sidecar];
+    return result;
+  };
+
+  const legacyAfter = legacyApp(sourceApp, source.variables.relay_image_digest.value);
+  const legacyBefore = legacyApp(sourceApp, FINAL_RELAY_PRIOR_IMAGE);
+  delete legacyAfter.output;
+  const appMask = (value) => {
+    const result = maskFor(value, sourceAppMask);
+    result.body = {
+      properties: {
+        configuration: {
+          identitySettings: [{}, {}],
+          ingress: { traffic: [{}] },
+          registries: [{}],
+          secrets: value.body.properties.configuration.secrets.map(() => ({})),
+        },
+        template: {
+          containers: value.body.properties.template.containers.map((container) => ({
+            env: container.env.map((entry) =>
+              entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING"
+                ? { value: true }
+                : {},
+            ),
+            probes: container.probes.map((probe) =>
+              Object.hasOwn(probe, "tcpSocket")
+                ? { tcpSocket: {} }
+                : { httpGet: {} },
+            ),
+            resources: {},
+          })),
+          scale: {},
+        },
+      },
+    };
+    result.identity = [{ identity_ids: [false, false] }];
+    result.response_export_values = [false, false, false];
+    result.retry = { error_message_regex: [false] };
+    result.tags = {};
+    return result;
+  };
+  const legacyMask = appMask(legacyAfter);
+  const beforeMask = structuredClone(appMask(legacyBefore));
+  beforeMask.output = { properties: { configuration: { ingress: {} } } };
+  const unknown = {
+    body: {
+      properties: {
+        configuration: {
+          identitySettings: [{}, {}],
+          ingress: { traffic: [{}] },
+          registries: [{}],
+          secrets: [{}, {}],
+        },
+        template: {
+          containers: legacyAfter.body.properties.template.containers.map(
+            (container) => ({
+              env: container.env.map(() => ({})),
+              probes: container.probes.map((probe) =>
+                Object.hasOwn(probe, "tcpSocket")
+                  ? { tcpSocket: {} }
+                  : { httpGet: {} },
+              ),
+              resources: {},
+            }),
+          ),
+          scale: {},
+        },
+      },
+    },
+    identity: [{ identity_ids: [false, false] }],
+    response_export_values: [false, false, false],
+    retry: { error_message_regex: [false] },
+    tags: {},
+  };
+
+  plan.variables = structuredClone(plan.variables);
+  delete plan.variables.enable_runtime_secrets_user_assignment;
+  plan.variables.azure_api_base = { value: "" };
+  plan.variables.azure_api_version = { value: "" };
+  plan.variables.enable_litellm_sidecar = { value: true };
+  plan.variables.litellm_backend = { value: "openrouter" };
+  plan.variables.litellm_image_digest = {
+    value: `${FINAL_ACR_LOGIN_SERVER}/palancar-litellm-proxy@sha256:${"b".repeat(64)}`,
+  };
+  plan.variables.litellm_master_key_secret_url = {
+    value: `https://${FINAL_KEY_VAULT_HOST}/secrets/litellm-master-key`,
+  };
+  plan.variables.litellm_upstream_model = { value: FINAL_GENERATION_MODEL };
+  plan.variables.openrouter_api_key_secret_url = {
+    value: `https://${FINAL_KEY_VAULT_HOST}/secrets/openrouter-api-key`,
+  };
+  plan.variables.foundry_deployments.value = {
+    [PINNED_DEPLOYMENT_NAME]: {
+      capacity: 1,
+      model_format: "OpenAI",
+      model_name: PINNED_DEPLOYMENT_NAME,
+      model_version: PINNED_MODEL_VERSION,
+      sku_name: "GlobalStandard",
+      version_upgrade_option: "NoAutoUpgrade",
+    },
+  };
+
+  plan.resource_changes = plan.resource_changes
+    .filter((entry) => entry.address !== lunaAddress)
+    .map((entry) => {
+      if (entry.address !== appAddress) return entry;
+      entry.change.actions = ["update"];
+      entry.change.before = legacyBefore;
+      entry.change.after = legacyAfter;
+      entry.change.after_unknown = unknown;
+      entry.change.before_sensitive = beforeMask;
+      entry.change.after_sensitive = legacyMask;
+      entry.change.before_identity = {
+        id: legacyBefore.id,
+        type: null,
+      };
+      entry.change.after_identity = {
+        id: legacyAfter.id,
+        type: null,
+      };
+      return entry;
+    });
+  const role = {
+    address: roleAddress,
+    module_address: "module.workload_key_vault",
+    mode: "managed",
+    type: "azurerm_role_assignment",
+    name: "runtime_secrets_user",
+    provider_name: AZURERM_PROVIDER_NAME,
+    change: {
+      actions: ["no-op"],
+      before: {
+        condition: "",
+        condition_version: "",
+        delegated_managed_identity_resource_id: "",
+        description: "",
+        id: `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.KeyVault/vaults/kvpalancardevaeeacd8c/providers/Microsoft.Authorization/roleAssignments/e0913fc6-a326-5228-9c51-09ea847d1803`,
+        name: "e0913fc6-a326-5228-9c51-09ea847d1803",
+        principal_id: "11111111-1111-4111-8111-111111111111",
+        principal_type: "ServicePrincipal",
+        role_definition_id: finalRoleDefinitionId(BOOTSTRAP_ROLE_DEFINITION_IDS.secretsUser),
+        role_definition_name: "Key Vault Secrets User",
+        scope: `${FINAL_RESOURCE_GROUP_ID}/providers/Microsoft.KeyVault/vaults/kvpalancardevaeeacd8c`,
+        skip_service_principal_aad_check: null,
+        timeouts: null,
+      },
+      after_unknown: {},
+      before_sensitive: {},
+      after_sensitive: {},
+    },
+  };
+  role.change.after = structuredClone(role.change.before);
+  plan.resource_changes.push(role);
+
+  for (const root of [
+    plan.planned_values.root_module,
+    plan.prior_state.values.root_module,
+  ]) {
+    removeValueResource(root, lunaAddress);
+    removeValueResource(root, roleAddress);
+  }
+  const plannedApp = findValueResource(plan.planned_values.root_module, appAddress);
+  plannedApp.values = structuredClone(legacyAfter);
+  plannedApp.sensitive_values = structuredClone(legacyMask);
+  const priorApp = findValueResource(plan.prior_state.values.root_module, appAddress);
+  priorApp.values = structuredClone(legacyBefore);
+  priorApp.sensitive_values = structuredClone(beforeMask);
+  const roleValue = {
+    address: roleAddress,
+    mode: "managed",
+    type: "azurerm_role_assignment",
+    name: "runtime_secrets_user",
+    provider_name: AZURERM_PROVIDER_NAME,
+    schema_version: 0,
+    values: structuredClone(role.change.after),
+    sensitive_values: {},
+  };
+  addValueResource(plan.planned_values.root_module, "module.workload_key_vault", structuredClone(roleValue));
+  addValueResource(plan.prior_state.values.root_module, "module.workload_key_vault", structuredClone(roleValue));
+
+  plan.output_changes.foundry_deployment_names = {
+    actions: ["no-op"],
+    before: [PINNED_DEPLOYMENT_NAME],
+    after: [PINNED_DEPLOYMENT_NAME],
+    after_unknown: false,
+    before_sensitive: false,
+    after_sensitive: false,
+  };
+  plan.planned_values.outputs.foundry_deployment_names = {
+    sensitive: false,
+    type: ["list", "string"],
+    value: [PINNED_DEPLOYMENT_NAME],
+  };
+  plan.prior_state.values.outputs.foundry_deployment_names = {
+    sensitive: false,
+    type: ["list", "string"],
+    value: [PINNED_DEPLOYMENT_NAME],
+  };
+  const priorRevision = legacyBefore.output?.properties?.latestRevisionName;
+  plan.output_changes.relay_latest_revision_name = {
+    actions: ["update"],
+    before: priorRevision,
+    after_unknown: true,
+    before_sensitive: false,
+    after_sensitive: false,
+  };
+  plan.planned_values.outputs.relay_latest_revision_name = { sensitive: false };
+  plan.prior_state.values.outputs.relay_latest_revision_name = {
+    sensitive: false,
+    type: "string",
+    value: priorRevision,
+  };
+
+  plan.configuration.root_module.module_calls.container_app_workload.module.resources[0].expressions.body.references = [
+    "var.container_app_environment_id",
+    "var.target_port",
+    "var.acr_login_server",
+    "var.image_pull_identity_id",
+    "var.image_pull_identity_id",
+    "var.runtime_identity_id",
+    "var.enable_litellm_sidecar",
+    "var.litellm_master_key_secret_url",
+    "var.runtime_identity_id",
+    "var.openrouter_api_key_secret_url",
+    "var.runtime_identity_id",
+    "var.image_digest",
+    "var.target_port",
+    "var.enable_litellm_sidecar",
+    "var.environment",
+    "var.relay_origin",
+    "var.gate_policy_version",
+    "var.runtime_identity_client_id",
+    "var.deployment_slot",
+    "local.relay_application_insights_connection_string",
+    "var.security_mode",
+    "var.workload_table_endpoint",
+    "var.security_state_table_name",
+    "var.rate_state_table_name",
+    "var.transcription_provider",
+    "var.transcription_provider",
+    "var.azure_transcription_endpoint",
+    "var.azure_transcription_deployment",
+    "var.browser_allowed_origins",
+    "var.allow_null_browser_origin",
+    "var.enable_litellm_sidecar",
+    "var.language_boundary_mode",
+    "var.enable_litellm_sidecar",
+    "var.litellm_image_digest",
+    "var.litellm_upstream_model",
+    "var.min_replicas",
+  ];
+  const extraChecks = [
+    "litellm_backend",
+    "litellm_image_digest",
+    "litellm_master_key_secret_url",
+    "litellm_upstream_model",
+    "openrouter_api_key_secret_url",
+    "enable_litellm_sidecar",
+    "azure_api_base",
+    "azure_api_version",
+    "runtime_secrets_user_role_assignment_id",
+    "key_vault_uri",
+  ];
+  for (const name of extraChecks) {
+    const check = structuredClone(plan.checks[0]);
+    check.address = {
+      kind: "var",
+      name,
+      to_display: `var.${name}`,
+    };
+    check.instances = [{ address: { to_display: `var.${name}` }, status: "pass" }];
+    plan.checks.push(check);
+  }
+  plan.applyable = true;
+  return plan;
+}
+
+function cutoverExactModelAfter(name) {
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) =>
+      entry.address ===
+      `module.foundry.azurerm_cognitive_deployment.this["${name}"]`,
+  );
+  return reference?.change?.after;
+}
+
+const CUTOVER_RBAC_ADDRESSES = new Set([
+  "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
+  "module.identities_rbac.azurerm_role_assignment.runtime_table",
+  "module.identities_rbac.azurerm_role_assignment.runtime_openai",
+  FINAL_MONITORING_ROLE_ASSIGNMENT,
+  ...OPERATOR_ROLE_ASSIGNMENTS.keys(),
+  "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
+]);
+const CUTOVER_IDENTITY_ADDRESSES = new Set([
+  "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+  "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+]);
+
+function cutoverHasForbiddenMetadata(value, path = "") {
+  if (Array.isArray(value)) {
+    return value.some((entry, index) =>
+      cutoverHasForbiddenMetadata(entry, `${path}[${index}]`),
+    );
+  }
+  if (!isObject(value)) return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      ["action_reason", "deposed", "import", "imports", "importing", "unknown"].includes(
+        key,
+      )
+    ) {
+      return true;
+    }
+    if (key === "resource_drift" || key === "deferred_changes") return true;
+    if (cutoverHasForbiddenMetadata(child, path ? `${path}.${key}` : key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cutoverExactPlanEnvelope(plan, applyable) {
+  return (
+    isObject(plan) &&
+    plan.format_version === SUPPORTED_PLAN_FORMAT_VERSION &&
+    plan.terraform_version === "1.15.8" &&
+    Array.isArray(plan.resource_changes) &&
+    isObject(plan.variables) &&
+    isObject(plan.planned_values) &&
+    isObject(plan.output_changes) &&
+    isObject(plan.prior_state) &&
+    isObject(plan.configuration) &&
+    Array.isArray(plan.relevant_attributes) &&
+    Array.isArray(plan.checks) &&
+    typeof plan.timestamp === "string" &&
+    !Number.isNaN(Date.parse(plan.timestamp)) &&
+    typeof applyable === "boolean" &&
+    plan.applyable === applyable &&
+    plan.complete === true &&
+    plan.errored === false &&
+    !Object.hasOwn(plan.configuration, "target") &&
+    !Object.hasOwn(plan.configuration, "generated_config") &&
+    !cutoverHasForbiddenMetadata(plan)
+  );
+}
+
+function cutoverExactResourceChange(change, expectedKeys = undefined) {
+  const exactKeys = expectedKeys ?? [
+    "actions",
+    "before",
+    "after",
+    "after_unknown",
+    "before_sensitive",
+    "after_sensitive",
+    ...(Object.hasOwn(change ?? {}, "before_identity")
+      ? ["before_identity", "after_identity"]
+      : []),
+  ];
+  return (
+    isObject(change) &&
+    Array.isArray(change.actions) &&
+    change.actions.length > 0 &&
+    change.actions.every((action) => typeof action === "string") &&
+    hasExactKeys(change, exactKeys) &&
+    Object.hasOwn(change, "before") &&
+    Object.hasOwn(change, "after") &&
+    isObject(change.after_unknown) &&
+    !hasUnknownValue(change.after_unknown) &&
+    Object.hasOwn(change, "before_sensitive") &&
+    Object.hasOwn(change, "after_sensitive") &&
+    cutoverHasSensitiveEnvelope(change.before_sensitive) &&
+    cutoverHasSensitiveEnvelope(change.after_sensitive)
+  );
+}
+
+function cutoverHasSensitiveEnvelope(value) {
+  if (typeof value === "boolean") return true;
+  if (Array.isArray(value)) {
+    return value.every((entry) => cutoverHasSensitiveEnvelope(entry));
+  }
+  return (
+    isObject(value) &&
+    Object.values(value).every((entry) => cutoverHasSensitiveEnvelope(entry))
+  );
+}
+
+function cutoverExactResourceEntry(entry, requirePrevious = false) {
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === entry?.address,
+  );
+  const expectedOuterKeys = reference
+    ? Object.keys(reference)
+    : [
+        "address",
+        "module_address",
+        "mode",
+        "type",
+        "name",
+        "provider_name",
+        "change",
+        "index",
+        ...(requirePrevious ? ["previous_address"] : []),
+      ];
+  const expectedChangeKeys = reference
+    ? [
+        ...new Set([
+          ...Object.keys(reference.change),
+          ...(entry?.type === "azapi_resource" &&
+          Object.hasOwn(entry.change, "before_identity") &&
+          Object.hasOwn(entry.change, "after_identity")
+            ? ["before_identity", "after_identity"]
+            : []),
+        ]),
+      ]
+    : [
+        "actions",
+        "before",
+        "after",
+        "after_unknown",
+        "before_sensitive",
+        "after_sensitive",
+      ];
+  return (
+    isObject(entry) &&
+    typeof entry.address === "string" &&
+    hasExactKeys(entry, expectedOuterKeys) &&
+    cutoverExactResourceChange(entry.change, expectedChangeKeys) &&
+    (requirePrevious
+      ? entry.previous_address === CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS
+      : !Object.hasOwn(entry, "previous_address"))
+  );
+}
+
+function cutoverExactNoOp(change) {
+  return (
+    isNoOp(change.actions) &&
+    isDeepStrictEqual(change.before, change.after) &&
+    isDeepStrictEqual(change.after_unknown, {}) &&
+    isDeepStrictEqual(change.before_sensitive, change.after_sensitive)
+  );
+}
+
+function cutoverExactModelChange(change, name, bindings = []) {
+  return (
+    cutoverExactNoOp(change) &&
+    isDeepStrictEqual(
+      change.after,
+      cutoverRebindReference(
+        cutoverExactModelAfter(name),
+        bindings,
+      ),
+    )
+  );
+}
+
+function cutoverCollectValueResources(rootModule) {
+  const resources = new Map();
+  let valid = isObject(rootModule);
+  function visit(module) {
+    if (!isObject(module) || !Array.isArray(module.resources)) {
+      valid = false;
+      return;
+    }
+    for (const resource of module.resources) {
+      if (
+        !isObject(resource) ||
+        typeof resource.address !== "string" ||
+        resources.has(resource.address) ||
+        !Object.hasOwn(resource, "values") ||
+        !Object.hasOwn(resource, "sensitive_values")
+      ) {
+        valid = false;
+        continue;
+      }
+      resources.set(resource.address, resource);
+    }
+    for (const child of module.child_modules ?? []) visit(child);
+  }
+  visit(rootModule);
+  return valid ? resources : undefined;
+}
+
+function cutoverCollectValueResourceLocations(rootModule) {
+  const resources = new Map();
+  let valid = isObject(rootModule);
+
+  function visit(module, moduleAddress) {
+    if (!isObject(module) || !Array.isArray(module.resources)) {
+      valid = false;
+      return;
+    }
+    for (const resource of module.resources) {
+      if (
+        !isObject(resource) ||
+        typeof resource.address !== "string" ||
+        resources.has(resource.address)
+      ) {
+        valid = false;
+        continue;
+      }
+      resources.set(resource.address, { moduleAddress, resource });
+    }
+    if (
+      Object.hasOwn(module, "child_modules") &&
+      !Array.isArray(module.child_modules)
+    ) {
+      valid = false;
+      return;
+    }
+    for (const child of module.child_modules ?? []) {
+      if (!isObject(child) || typeof child.address !== "string") {
+        valid = false;
+        continue;
+      }
+      visit(child, child.address);
+    }
+  }
+
+  visit(rootModule, "");
+  return valid ? resources : undefined;
+}
+
+function cutoverExactModuleHierarchy(actual, reference) {
+  if (
+    !isObject(actual) ||
+    !isObject(reference) ||
+    !hasExactKeys(actual, Object.keys(reference)) ||
+    (Object.hasOwn(reference, "address") &&
+      actual.address !== reference.address) ||
+    !Array.isArray(actual.resources) ||
+    !Array.isArray(reference.resources)
+  ) {
+    return false;
+  }
+  const actualChildren = actual.child_modules;
+  const referenceChildren = reference.child_modules;
+  if (referenceChildren === undefined) {
+    return actualChildren === undefined;
+  }
+  return (
+    Array.isArray(actualChildren) &&
+    actualChildren.length === referenceChildren.length &&
+    actualChildren.every((child, index) =>
+      cutoverExactModuleHierarchy(child, referenceChildren[index]),
+    )
+  );
+}
+
+function cutoverHasExactStateEnvelopes(plan) {
+  return (
+    isObject(plan.planned_values) &&
+    hasExactKeys(plan.planned_values, ["outputs", "root_module"]) &&
+    isObject(plan.planned_values.outputs) &&
+    isObject(plan.planned_values.root_module) &&
+    isObject(plan.prior_state) &&
+    hasExactKeys(plan.prior_state, [
+      "format_version",
+      "terraform_version",
+      "values",
+    ]) &&
+    plan.prior_state.format_version === "1.0" &&
+    plan.prior_state.terraform_version === "1.15.8" &&
+    isObject(plan.prior_state.values) &&
+    hasExactKeys(plan.prior_state.values, ["outputs", "root_module"]) &&
+    isObject(plan.prior_state.values.outputs) &&
+    isObject(plan.prior_state.values.root_module)
+  );
+}
+
+function cutoverExactStructure(actual, expected, path = "") {
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      actual.every((entry, index) =>
+        cutoverExactStructure(entry, expected[index], `${path}[${index}]`),
+      )
+    );
+  }
+  if (isObject(expected)) {
+    return (
+      isObject(actual) &&
+      hasExactKeys(actual, Object.keys(expected)) &&
+      Object.keys(expected).every((key) =>
+        cutoverExactStructure(
+          actual[key],
+          expected[key],
+          path ? `${path}.${key}` : key,
+        ),
+      )
+    );
+  }
+  // Terraform configuration contains defaults for values that are supplied
+  // at plan time.  Those defaults are not a second source of authority, but
+  // their type and location remain part of the reviewed configuration shape.
+  if (
+    path === "root_module.variables.tenant_id.default" &&
+    typeof actual === "string"
+  ) {
+    return finalUuid(actual);
+  }
+  if (
+    [
+      "root_module.variables.relay_image_digest.default",
+      "root_module.variables.expiry_cleanup_image_digest.default",
+    ].includes(path)
+  ) {
+    return actual === "";
+  }
+  return actual === expected;
+}
+
+function cutoverCheckShape(check) {
+  return (
+    isObject(check) &&
+    hasExactKeys(check, ["address", "status", "instances"]) &&
+    isObject(check.address) &&
+    Array.isArray(check.instances) &&
+    check.status === "pass" &&
+    check.instances.every(
+      (instance) =>
+        isObject(instance) &&
+        hasExactKeys(instance, ["address", "status"]) &&
+        isObject(instance.address) &&
+        instance.status === "pass",
+    )
+  );
+}
+
+function cutoverHasExactChecks(plan) {
+  const expected = TERMINAL_REFERENCE_PLAN.checks;
+  return (
+    Array.isArray(plan.checks) &&
+    plan.checks.length === expected.length &&
+    plan.checks.every((check, index) => {
+      const reference = expected[index];
+      return (
+        cutoverCheckShape(check) &&
+        isDeepStrictEqual(check.address, reference.address) &&
+        check.instances.length === reference.instances.length &&
+        check.instances.every((instance, instanceIndex) =>
+          isDeepStrictEqual(
+            instance.address,
+            reference.instances[instanceIndex].address,
+          ),
+        )
+      );
+    })
+  );
+}
+
+function cutoverHasExactRelevantAttributes(plan) {
+  return (
+    Array.isArray(plan.relevant_attributes) &&
+    plan.relevant_attributes.length ===
+      TERMINAL_REFERENCE_PLAN.relevant_attributes.length &&
+    plan.relevant_attributes.every((entry, index) =>
+      isDeepStrictEqual(entry, TERMINAL_REFERENCE_PLAN.relevant_attributes[index]),
+    )
+  );
+}
+
+function cutoverHasExactConfiguration(plan) {
+  return (
+    isObject(plan.configuration) &&
+    cutoverExactStructure(
+      plan.configuration,
+      TERMINAL_REFERENCE_PLAN.configuration,
+    )
+  );
+}
+
+function cutoverReferenceValueResources() {
+  return {
+    planned: cutoverCollectValueResources(
+      TERMINAL_REFERENCE_PLAN.planned_values.root_module,
+    ),
+    prior: cutoverCollectValueResources(
+      TERMINAL_REFERENCE_PLAN.prior_state.values.root_module,
+    ),
+  };
+}
+
+function cutoverHasExactStateResourceMetadata(
+  resource,
+  address,
+  referenceResources,
+) {
+  if (!isObject(resource)) return false;
+  const reference = referenceResources?.get(address);
+  if (reference !== undefined) {
+    return (
+      hasExactKeys(resource, Object.keys(reference)) &&
+      resource.address === address &&
+      resource.mode === reference.mode &&
+      resource.type === reference.type &&
+      resource.name === reference.name &&
+      resource.provider_name === reference.provider_name &&
+      resource.schema_version === reference.schema_version &&
+      (!Object.hasOwn(reference, "index") ||
+        isDeepStrictEqual(resource.index, reference.index)) &&
+      isObject(resource.values) &&
+      isObject(resource.sensitive_values)
+    );
+  }
+  if (
+    address === CUTOVER_RUNTIME_SECRETS_USER ||
+    address === CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS
+  ) {
+    const roleKeys = [
+      "address",
+      "mode",
+      "type",
+      "name",
+      "provider_name",
+      "schema_version",
+      "values",
+      "sensitive_values",
+      "depends_on",
+      ...(address === CUTOVER_RUNTIME_SECRETS_USER ? ["index"] : []),
+    ];
+    return (
+      hasExactKeys(resource, roleKeys) &&
+      resource.address === address &&
+      resource.mode === "managed" &&
+      resource.type === "azurerm_role_assignment" &&
+      resource.name === "runtime_secrets_user" &&
+      resource.provider_name === AZURERM_PROVIDER_NAME &&
+      resource.schema_version === 0 &&
+      (address === CUTOVER_RUNTIME_SECRETS_USER
+        ? resource.index === 0
+        : !Object.hasOwn(resource, "index")) &&
+      isObject(resource.values) &&
+      isObject(resource.sensitive_values)
+    );
+  }
+  return false;
+}
+
+function cutoverExactClientConfig(resource, plan) {
+  const values = resource?.values;
+  return (
+    isObject(resource) &&
+    hasExactKeys(resource, [
+      "address",
+      "mode",
+      "type",
+      "name",
+      "provider_name",
+      "schema_version",
+      "values",
+      "sensitive_values",
+    ]) &&
+    resource.address ===
+      "module.workload_key_vault.data.azurerm_client_config.current" &&
+    resource.mode === "data" &&
+    resource.type === "azurerm_client_config" &&
+    resource.name === "current" &&
+    resource.provider_name === AZURERM_PROVIDER_NAME &&
+    resource.schema_version === 0 &&
+    hasExactKeys(values, [
+      "client_id",
+      "id",
+      "object_id",
+      "subscription_id",
+      "tenant_id",
+      "timeouts",
+    ]) &&
+    finalUuid(values.client_id) &&
+    finalUuid(values.object_id) &&
+    typeof values.id === "string" &&
+    values.id.length > 0 &&
+    values.subscription_id === plan.variables.subscription_id.value &&
+    values.tenant_id === plan.variables.tenant_id.value &&
+    values.timeouts === null &&
+    isDeepStrictEqual(resource.sensitive_values, {})
+  );
+}
+
+function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
+  if (!planned || !prior) return false;
+  if (
+    !cutoverHasExactStateEnvelopes(plan) ||
+    !cutoverExactModuleHierarchy(
+      plan.planned_values.root_module,
+      TERMINAL_REFERENCE_PLAN.planned_values.root_module,
+    ) ||
+    !cutoverExactModuleHierarchy(
+      plan.prior_state.values.root_module,
+      TERMINAL_REFERENCE_PLAN.prior_state.values.root_module,
+    )
+  ) {
+    return false;
+  }
+  const plannedLocations = cutoverCollectValueResourceLocations(
+    plan.planned_values.root_module,
+  );
+  const priorLocations = cutoverCollectValueResourceLocations(
+    plan.prior_state.values.root_module,
+  );
+  const referencePlannedLocations = cutoverCollectValueResourceLocations(
+    TERMINAL_REFERENCE_PLAN.planned_values.root_module,
+  );
+  const referencePriorLocations = cutoverCollectValueResourceLocations(
+    TERMINAL_REFERENCE_PLAN.prior_state.values.root_module,
+  );
+  if (
+    !plannedLocations ||
+    !priorLocations ||
+    !referencePlannedLocations ||
+    !referencePriorLocations
+  ) {
+    return false;
+  }
+  const changeAddresses = new Set(changes.map((entry) => entry.address));
+  const plannedExpected = new Set(changeAddresses);
+  const priorExpected = new Set(changeAddresses);
+  const dataAddress =
+    "module.workload_key_vault.data.azurerm_client_config.current";
+  priorExpected.add(dataAddress);
+  if (mode === AZURE_GENERATION_CUTOVER_MODE) {
+    plannedExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
+    plannedExpected.add(CUTOVER_RUNTIME_SECRETS_USER);
+    priorExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
+    priorExpected.add(CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS);
+  } else if (mode === AZURE_CREDENTIAL_CLEANUP_MODE) {
+    plannedExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
+  }
+  const exactLocations = (actual, reference, extraAddresses) => {
+    if (actual.size !== reference.size + extraAddresses.size) return false;
+    for (const [address, location] of actual) {
+      const expected = reference.get(address);
+      if (expected !== undefined) {
+        if (location.moduleAddress !== expected.moduleAddress) return false;
+      } else if (
+        !extraAddresses.has(address) ||
+        location.moduleAddress !== "module.workload_key_vault"
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const plannedExtra = new Set(
+    mode === AZURE_GENERATION_CUTOVER_MODE
+      ? [CUTOVER_RUNTIME_SECRETS_USER]
+      : [],
+  );
+  const priorExtra = new Set(
+    mode === AZURE_GENERATION_CUTOVER_MODE
+      ? [CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS]
+      : mode === AZURE_CREDENTIAL_CLEANUP_MODE
+        ? [CUTOVER_RUNTIME_SECRETS_USER]
+        : [],
+  );
+  if (
+    !exactLocations(
+      plannedLocations,
+      referencePlannedLocations,
+      plannedExtra,
+    ) ||
+    !exactLocations(priorLocations, referencePriorLocations, priorExtra)
+  ) {
+    return false;
+  }
+  // The indexed Secrets User assignment is the only resource whose prior
+  // address is intentionally different from its change address.
+  const exactSet = (actual, expected) =>
+    actual.size === expected.size &&
+    [...expected].every((address) => actual.has(address));
+  if (!exactSet(new Set(planned.keys()), plannedExpected)) return false;
+  if (!exactSet(new Set(prior.keys()), priorExpected)) return false;
+  if (!cutoverExactClientConfig(prior.get(dataAddress), plan)) return false;
+  const refs = cutoverReferenceValueResources();
+  for (const [address, resource] of planned) {
+    if (address === dataAddress) continue;
+    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.planned)) {
+      return false;
+    }
+  }
+  for (const [address, resource] of prior) {
+    if (address === dataAddress) continue;
+    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.prior)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function cutoverResourceTypeMatchesReference(entry, reference) {
+  return (
+    reference !== undefined &&
+    entry.type === reference.type &&
+    entry.mode === reference.mode &&
+    entry.name === reference.name &&
+    entry.provider_name === reference.provider_name &&
+    (Object.hasOwn(reference, "module_address")
+      ? entry.module_address === reference.module_address
+      : !Object.hasOwn(entry, "module_address")) &&
+    (Object.hasOwn(reference, "index")
+      ? isDeepStrictEqual(entry.index, reference.index)
+      : !Object.hasOwn(entry, "index"))
+  );
+}
+
+function cutoverIndexedRoleMetadata(entry) {
+  return (
+    entry.module_address === "module.workload_key_vault" &&
+    entry.mode === "managed" &&
+    entry.type === "azurerm_role_assignment" &&
+    entry.name === "runtime_secrets_user" &&
+    entry.provider_name === AZURERM_PROVIDER_NAME &&
+    entry.index === 0
+  );
+}
+
+function cutoverExactEntryMetadata(entry) {
+  if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
+    return cutoverIndexedRoleMetadata(entry);
+  }
+  return cutoverResourceTypeMatchesReference(
+    entry,
+    TERMINAL_REFERENCE_PLAN.resource_changes.find(
+      (reference) => reference.address === entry.address,
+    ),
+  );
+}
+
+function cutoverValueResourceMetadataMatches(resource, address) {
+  if (!isObject(resource)) return false;
+  if (
+    address === CUTOVER_RUNTIME_SECRETS_USER ||
+    address === CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS
+  ) {
+    return (
+      resource.address === address &&
+      resource.mode === "managed" &&
+      resource.type === "azurerm_role_assignment" &&
+      resource.name === "runtime_secrets_user" &&
+      resource.provider_name === AZURERM_PROVIDER_NAME &&
+      (address === CUTOVER_RUNTIME_SECRETS_USER
+        ? resource.index === 0
+        : !Object.hasOwn(resource, "index"))
+    );
+  }
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === address,
+  );
+  return (
+    reference !== undefined &&
+    resource.address === address &&
+    resource.mode === reference.mode &&
+    resource.type === reference.type &&
+    resource.name === reference.name &&
+    resource.provider_name === reference.provider_name &&
+    (Object.hasOwn(reference, "index")
+      ? isDeepStrictEqual(resource.index, reference.index)
+      : !Object.hasOwn(resource, "index"))
+  );
+}
+
+function cutoverResourceChangeStateCoherent(plan, entry, planned, prior) {
+  const action = entry.change.actions;
+  const priorAddress = entry.previous_address ?? entry.address;
+  const priorValue = prior?.get(priorAddress);
+  const plannedValue = planned?.get(entry.address);
+  if (
+    isNoOp(action) &&
+    (!isDeepStrictEqual(entry.change.before, entry.change.after) ||
+      !isDeepStrictEqual(
+        entry.change.before_sensitive,
+        entry.change.after_sensitive,
+      ))
+  ) {
+    return false;
+  }
+  if (action[0] === "delete") {
+    return (
+      priorValue !== undefined &&
+      plannedValue === undefined &&
+      cutoverValueResourceMetadataMatches(priorValue, priorAddress) &&
+      isDeepStrictEqual(priorValue.values, entry.change.before) &&
+      isDeepStrictEqual(priorValue.sensitive_values, entry.change.before_sensitive)
+    );
+  }
+  if (
+    plannedValue === undefined ||
+    !cutoverValueResourceMetadataMatches(plannedValue, entry.address)
+  ) return false;
+  if (
+    !isDeepStrictEqual(plannedValue.values, entry.change.after) ||
+    !isDeepStrictEqual(
+      plannedValue.sensitive_values,
+      entry.change.after_sensitive,
+    )
+  ) {
+    return false;
+  }
+  if (isCreate(action)) return priorValue === undefined;
+  return (
+    priorValue !== undefined &&
+    cutoverValueResourceMetadataMatches(priorValue, priorAddress) &&
+    isDeepStrictEqual(priorValue.values, entry.change.before) &&
+    isDeepStrictEqual(
+      priorValue.sensitive_values,
+      entry.change.before_sensitive,
+    )
+  );
+}
+
+function cutoverExactFoundryModels(changesByAddress, bindings = []) {
+  return (
+    cutoverExactModelChange(
+      changesByAddress.get(CUTOVER_TRANSCRIPTION_DEPLOYMENT)?.change,
+      PINNED_DEPLOYMENT_NAME,
+      bindings,
+    ) &&
+    cutoverExactModelChange(
+      changesByAddress.get(CUTOVER_LUNA_DEPLOYMENT)?.change,
+      LUNA_DEPLOYMENT_NAME,
+      bindings,
+    )
+  );
+}
+
+function cutoverParseApplicationInsightsConnection(value, resource) {
+  if (typeof value !== "string" || !isObject(resource)) return undefined;
+  const parts = value.split(";");
+  const parsed = new Map();
+  for (const part of parts) {
+    const separator = part.indexOf("=");
+    if (separator <= 0 || separator === part.length - 1) return undefined;
+    const key = part.slice(0, separator);
+    if (parsed.has(key)) return undefined;
+    parsed.set(key, part.slice(separator + 1));
+  }
+  if (
+    !isDeepStrictEqual([...parsed.keys()], [
+      "InstrumentationKey",
+      "IngestionEndpoint",
+      "LiveEndpoint",
+      "ApplicationId",
+    ])
+  ) {
+    return undefined;
+  }
+  const instrumentationKey = parsed.get("InstrumentationKey")?.toLowerCase();
+  const applicationId = parsed.get("ApplicationId")?.toLowerCase();
+  const ingestionEndpoint = parsed.get("IngestionEndpoint");
+  const liveEndpoint = parsed.get("LiveEndpoint");
+  if (
+    !finalUuid(instrumentationKey) ||
+    !finalUuid(applicationId) ||
+    !/^https:\/\/[a-z0-9.-]+\.in\.applicationinsights\.azure\.com\/$/.test(
+      ingestionEndpoint ?? "",
+    ) ||
+    !/^https:\/\/[a-z0-9.-]+\.livediagnostics\.monitor\.azure\.com\/$/.test(
+      liveEndpoint ?? "",
+    ) ||
+    resource.instrumentation_key?.toLowerCase() !== instrumentationKey ||
+    resource.app_id?.toLowerCase() !== applicationId
+  ) {
+    return undefined;
+  }
+  return {
+    instrumentationKey,
+    applicationId,
+    ingestionEndpoint,
+    liveEndpoint,
+    full: value,
+    relay: `InstrumentationKey=${instrumentationKey};IngestionEndpoint=${ingestionEndpoint.replace(
+      /\/$/,
+      "",
+    )}`,
+  };
+}
+
+function cutoverIdentityContext(
+  changesByAddress,
+  priorResources,
+  operatorPrincipal,
+  tenant,
+) {
+  const imagePull = changesByAddress.get(
+    "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
+  )?.change.after;
+  const runtime = changesByAddress.get(
+    "module.identities_rbac.azurerm_user_assigned_identity.runtime",
+  )?.change.after;
+  const imagePullIdentity = imagePull?.id;
+  const runtimeIdentity = runtime?.id;
+  const cli = priorResources?.get(
+    "module.workload_key_vault.data.azurerm_client_config.current",
+  )?.values?.object_id;
+  const appIdentityIds = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change
+    .after?.identity?.[0]?.identity_ids;
+  const appAfter = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.after;
+  const storageAfter = changesByAddress.get(
+    "module.workload_state.azurerm_storage_account.this",
+  )?.change.after;
+  const environmentAfter = changesByAddress.get(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+  )?.change.after;
+  const registryAfter = changesByAddress.get(
+    "module.container_registry.azurerm_container_registry.this",
+  )?.change.after;
+  const foundryAfter = changesByAddress.get(
+    "module.foundry.azurerm_cognitive_account.this",
+  )?.change.after;
+  const resourceGroupAfter = changesByAddress.get(
+    "azurerm_resource_group.foundation",
+  )?.change.after;
+  const appInsightsAfter = changesByAddress.get(
+    "module.observability.azurerm_application_insights.this",
+  )?.change.after;
+  const defaultDomain = environmentAfter?.default_domain;
+  const tableEndpoint = storageAfter?.primary_table_endpoint;
+  const foundryEndpoint = foundryAfter?.endpoint;
+  const relayOrigin =
+    typeof appAfter?.name === "string" && typeof defaultDomain === "string"
+      ? `wss://${appAfter.name}.${defaultDomain}`
+      : undefined;
+  const appInsightsConnection = cutoverParseApplicationInsightsConnection(
+    appInsightsAfter?.connection_string,
+    appInsightsAfter,
+  );
+  if (
+    !isObject(imagePull) ||
+    !isObject(runtime) ||
+    !finalUuid(imagePull.principal_id) ||
+    !finalUuid(imagePull.client_id) ||
+    !finalUuid(runtime.principal_id) ||
+    !finalUuid(runtime.client_id) ||
+    !finalUuid(runtime.tenant_id) ||
+    !finalUuid(imagePull.tenant_id) ||
+    !finalUuid(tenant) ||
+    runtime.tenant_id !== tenant ||
+    imagePull.tenant_id !== tenant ||
+    !finalUuid(cli) ||
+    !finalUuid(operatorPrincipal) ||
+    !isUserAssignedIdentity(imagePullIdentity) ||
+    !isUserAssignedIdentity(runtimeIdentity) ||
+    !Array.isArray(appIdentityIds) ||
+    appIdentityIds.length !== 2 ||
+    !isUserAssignedIdentity(appIdentityIds[0]) ||
+    !isUserAssignedIdentity(appIdentityIds[1]) ||
+    appIdentityIds[0] !== imagePullIdentity ||
+    appIdentityIds[1] !== runtimeIdentity ||
+    appIdentityIds[0] === appIdentityIds[1] ||
+    imagePull.principal_id === runtime.principal_id ||
+    imagePull.client_id === runtime.client_id ||
+    !isObject(appAfter) ||
+    !isObject(storageAfter) ||
+    !isObject(environmentAfter) ||
+    !isObject(registryAfter) ||
+    !isObject(foundryAfter) ||
+    !isObject(resourceGroupAfter) ||
+    !isObject(appInsightsAfter) ||
+    !isUserAssignedIdentity(imagePull.id) ||
+    !isUserAssignedIdentity(runtime.id) ||
+    imagePull.id !== imagePullIdentity ||
+    runtime.id !== runtimeIdentity ||
+    !isObject(appAfter.output?.properties) ||
+    appAfter.output.properties.configuration?.ingress?.fqdn !==
+      `${appAfter.name}.${defaultDomain}` ||
+    typeof tableEndpoint !== "string" ||
+    !/^https:\/\/[a-z0-9.-]+\.table\.core\.windows\.net\/$/.test(
+      tableEndpoint,
+    ) ||
+    typeof foundryEndpoint !== "string" ||
+    !/^https:\/\/[a-z0-9.-]+\.openai\.azure\.com\/?$/.test(foundryEndpoint) ||
+    typeof registryAfter.login_server !== "string" ||
+    !/^[a-z0-9.-]+\.azurecr\.io$/.test(registryAfter.login_server) ||
+    typeof defaultDomain !== "string" ||
+    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.azurecontainerapps\.io$/.test(
+      defaultDomain,
+    ) ||
+    !isObject(appInsightsConnection)
+  ) {
+    return undefined;
+  }
+  return {
+    imagePullPrincipal: imagePull.principal_id,
+    imagePullClient: imagePull.client_id,
+    runtimePrincipal: runtime.principal_id,
+    runtimeClient: runtime.client_id,
+    tenant: runtime.tenant_id,
+    cliPrincipal: cli,
+    operatorPrincipal,
+    imagePullIdentity,
+    runtimeIdentity,
+    resourceGroupId: resourceGroupAfter.id,
+    resourceGroupName: resourceGroupAfter.name,
+    containerAppId: appAfter.id,
+    containerAppName: appAfter.name,
+    containerEnvironmentId: environmentAfter.id,
+    containerEnvironmentName: environmentAfter.name,
+    defaultDomain,
+    relayOrigin,
+    tableEndpoint: tableEndpoint.replace(/\/$/, ""),
+    workloadTableEndpoint: tableEndpoint,
+    foundryEndpoint: foundryEndpoint.replace(/\/$/, ""),
+    acrLoginServer: registryAfter.login_server,
+    appInsightsId: appInsightsAfter.id,
+    appInsightsName: appInsightsAfter.name,
+    appInsightsConnection,
+  };
+}
+
+function cutoverExpectedRole(address, context) {
+  const legacyAddress =
+    address === CUTOVER_RUNTIME_SECRETS_USER
+      ? "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user"
+      : address;
+  const contract = finalExpectedRole(legacyAddress, context);
+  if (
+    contract &&
+    legacyAddress === FINAL_MONITORING_ROLE_ASSIGNMENT &&
+    context.appInsightsId !== undefined
+  ) {
+    return {
+      ...contract,
+      scope: context.appInsightsId,
+      nameInput: `scope=${context.appInsightsId}|principal_id=${context.runtimePrincipal}|role_definition_id=${contract.role}`,
+    };
+  }
+  return contract;
+}
+
+function cutoverExactRoleChange(entry, context, action) {
+  const contract = cutoverExpectedRole(entry.address, context);
+  if (!contract || !cutoverExactResourceChange(entry.change)) return false;
+  const after = entry.change.after;
+  const before = entry.change.before;
+  const expectedName = uuidV5Url(contract.nameInput);
+  const expected = {
+    name: expectedName,
+    principal_id: contract.principal,
+    principal_type: contract.principalType,
+    role_definition_id: contract.role,
+    scope: contract.scope,
+  };
+  const shape = (value) =>
+    isObject(value) &&
+    Object.entries(expected).every(([key, valuePart]) => value[key] === valuePart) &&
+    finalExactKeys(value, [
+      "condition",
+      "condition_version",
+      "delegated_managed_identity_resource_id",
+      "description",
+      "id",
+      "name",
+      "principal_id",
+      "principal_type",
+      "role_definition_id",
+      "role_definition_name",
+      "scope",
+      "skip_service_principal_aad_check",
+      "timeouts",
+    ]) &&
+    value.condition === "" &&
+    value.condition_version === "" &&
+    value.delegated_managed_identity_resource_id === "" &&
+    value.description === "" &&
+    value.id === finalRoleId(contract.scope, expectedName) &&
+    value.role_definition_name === contract.roleName &&
+    value.skip_service_principal_aad_check === null &&
+    value.timeouts === null;
+  if (action === "delete") {
+    return (
+      isDeepStrictEqual(entry.change.actions, ["delete"]) &&
+      shape(before) &&
+      after === null &&
+      isDeepStrictEqual(entry.change.after_unknown, {})
+    );
+  }
+  return action === "no-op" && cutoverExactNoOp(entry.change) && shape(after);
+}
+
+function cutoverExactIdentityChange(entry, context) {
+  const isImagePull =
+    entry.address ===
+    "module.identities_rbac.azurerm_user_assigned_identity.image_pull";
+  const isRuntime =
+    entry.address ===
+    "module.identities_rbac.azurerm_user_assigned_identity.runtime";
+  const after = entry.change.after;
+  const expectedName = isImagePull ? "image-pull" : "runtime";
+  const expectedResourceName = `id-palancar-dev-${expectedName}`;
+  const expectedId = isImagePull
+    ? context.imagePullIdentity
+    : context.runtimeIdentity;
+  return (
+    (isImagePull || isRuntime) &&
+    cutoverExactNoOp(entry.change) &&
+    isObject(after) &&
+    hasExactKeys(after, [
+      "client_id",
+      "id",
+      "isolation_scope",
+      "location",
+      "name",
+      "principal_id",
+      "resource_group_name",
+      "tags",
+      "tenant_id",
+      "timeouts",
+    ]) &&
+    after.id === expectedId &&
+    after.id.endsWith(`/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${expectedResourceName}`) &&
+    after.location === "eastus2" &&
+    after.name === expectedResourceName &&
+    after.resource_group_name === FINAL_RESOURCE_GROUP_NAME &&
+    after.isolation_scope === "" &&
+    after.timeouts === null &&
+    hasExactFinalTags(after.tags) &&
+    after.tenant_id === context.tenant &&
+    after.client_id ===
+      (isImagePull ? context.imagePullClient : context.runtimeClient) &&
+    after.principal_id ===
+      (isImagePull ? context.imagePullPrincipal : context.runtimePrincipal)
+  );
+}
+
+function cutoverExactDirectApp(after, expectedImage, context) {
+  const properties = after?.body?.properties;
+  const configuration = properties?.configuration;
+  const template = properties?.template;
+  const containers = template?.containers;
+  const container = containers?.[0];
+  const identity = after?.identity?.[0];
+  const identityIds = identity?.identity_ids;
+  const settings = configuration?.identitySettings;
+  const env = valuesByName(container?.env);
+  const expectedEnvironment = new Map([
+    ["NODE_ENV", "production"],
+    ["PORT", "8787"],
+    ["PALANCAR_GENERATION_PROVIDER", "azure-openai"],
+    ["PALANCAR_AZURE_GENERATION_ENDPOINT", context.foundryEndpoint],
+    ["PALANCAR_AZURE_GENERATION_DEPLOYMENT", LUNA_DEPLOYMENT_NAME],
+    ["PALANCAR_RELAY_BIND_HOST", "0.0.0.0"],
+    ["PALANCAR_RELAY_ENVIRONMENT", "dev"],
+    ["PALANCAR_RELAY_ORIGIN", context.relayOrigin],
+    ["PALANCAR_GATE_POLICY_VERSION", "1.0.0"],
+    ["AZURE_CLIENT_ID", context.runtimeClient],
+    ["PALANCAR_DEPLOYMENT_SLOT", "dev"],
+    [
+      "APPLICATIONINSIGHTS_CONNECTION_STRING",
+      context.appInsightsConnection.relay,
+    ],
+    ["APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "true"],
+    ["APPLICATION_INSIGHTS_NO_STATSBEAT", "true"],
+    ["PALANCAR_SECURITY_MODE", "azure-table"],
+    ["PALANCAR_WORKLOAD_TABLE_ENDPOINT", context.tableEndpoint],
+    ["PALANCAR_SECURITY_STATE_TABLE", "SecurityState"],
+    ["PALANCAR_RATE_STATE_TABLE", "RateState"],
+    ["PALANCAR_TRANSCRIPTION_PROVIDER", "azure-realtime"],
+    [
+      "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+      `${context.foundryEndpoint.replace("https://", "wss://")}/openai/v1/realtime?intent=transcription`,
+    ],
+    ["PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT", PINNED_DEPLOYMENT_NAME],
+    [
+      "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
+      JSON.stringify([EXPECTED_BROWSER_ALLOWED_ORIGINS]),
+    ],
+    ["PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"],
+    ["PALANCAR_LANGUAGE_BOUNDARY_MODE", EXPECTED_LANGUAGE_BOUNDARY_MODE],
+  ]);
+  return (
+    isObject(after) &&
+    after.id === context.containerAppId &&
+    after.location === "eastus2" &&
+    after.name === FINAL_CONTAINER_APP_NAME &&
+    after.parent_id === context.resourceGroupId &&
+    after.type === "Microsoft.App/containerApps@2026-01-01" &&
+    isObject(properties) &&
+    properties.managedEnvironmentId === context.containerEnvironmentId &&
+    hasExactKeys(configuration, [
+      "activeRevisionsMode",
+      "identitySettings",
+      "ingress",
+      "maxInactiveRevisions",
+      "registries",
+      "secrets",
+    ]) &&
+    configuration.activeRevisionsMode === "Single" &&
+    configuration.maxInactiveRevisions === 1 &&
+    hasExactIngress(configuration.ingress) &&
+    Array.isArray(configuration.secrets) &&
+    configuration.secrets.length === 0 &&
+    Array.isArray(configuration.registries) &&
+    configuration.registries.length === 1 &&
+    hasExactKeys(configuration.registries[0], ["identity", "server"]) &&
+    isUserAssignedIdentity(configuration.registries[0].identity) &&
+    configuration.registries[0].server === context.acrLoginServer &&
+    Array.isArray(identityIds) &&
+    identityIds.length === 2 &&
+    identity?.type === "UserAssigned" &&
+    identity?.principal_id === "" &&
+    identity?.tenant_id === "" &&
+    isUserAssignedIdentity(identityIds[0]) &&
+    isUserAssignedIdentity(identityIds[1]) &&
+    identityIds[0] !== identityIds[1] &&
+    identityIds[0] === context.imagePullIdentity &&
+    identityIds[1] === context.runtimeIdentity &&
+    configuration.registries[0].identity === identityIds[0] &&
+    Array.isArray(settings) &&
+    settings.length === 2 &&
+    settings[0]?.identity === identityIds[0].replace("resourceGroups", "resourcegroups") &&
+    settings[0]?.lifecycle === "None" &&
+    settings[1]?.identity === identityIds[1].replace("resourceGroups", "resourcegroups") &&
+    settings[1]?.lifecycle === "Main" &&
+    Array.isArray(containers) &&
+    containers.length === 1 &&
+    hasExactKeys(template, ["containers", "scale"]) &&
+    hasExactKeys(container, ["env", "image", "name", "probes", "resources"]) &&
+    container.name === "relay" &&
+    container.image === expectedImage &&
+    isImmutableAcrImage(container.image) &&
+    container.image.startsWith(`${context.acrLoginServer}/palancar-relay@sha256:`) &&
+    hasExactKeys(container.resources, ["cpu", "memory"]) &&
+    container.resources.cpu === 0.25 &&
+    container.resources.memory === "0.5Gi" &&
+    Array.isArray(container.probes) &&
+    container.probes.length === 2 &&
+    hasExactFinalTcpProbe(container.probes[0], {
+      type: "Liveness",
+      port: 8787,
+      initialDelaySeconds: 10,
+      periodSeconds: 10,
+      timeoutSeconds: 3,
+      failureThreshold: 3,
+    }) &&
+    hasExactProbes(container.probes.slice(1), [
+      {
+        type: "Readiness",
+        path: "/readyz",
+        port: 8787,
+        initialDelaySeconds: 5,
+        periodSeconds: 10,
+        timeoutSeconds: 7,
+        failureThreshold: 3,
+      },
+    ]) &&
+    hasExactKeys(template.scale, ["maxReplicas", "minReplicas"]) &&
+    template.scale.maxReplicas === 1 &&
+    template.scale.minReplicas === 1 &&
+    hasExactNamedEntries(env, CUTOVER_RUNTIME_ENVIRONMENT_NAMES) &&
+    [...env.values()].every((entry) => hasExactKeys(entry, ["name", "value"])) &&
+    [...expectedEnvironment].every(([name, value]) => hasEnvValue(env, name, value)) &&
+    !containsHelperTopology(after)
+  );
+}
+
+function cutoverExactPredecessorApp(before, context, predecessorImage) {
+  const properties = before?.body?.properties;
+  const configuration = properties?.configuration;
+  const template = properties?.template;
+  const containers = template?.containers;
+  const identity = before?.identity?.[0];
+  const identityIds = identity?.identity_ids;
+  const relay = containers?.[0];
+  const sidecar = containers?.[1];
+  const secrets = valuesByName(configuration?.secrets);
+  return (
+    isObject(before) &&
+    before.id === context.containerAppId &&
+    before.location === "eastus2" &&
+    before.name === FINAL_CONTAINER_APP_NAME &&
+    before.parent_id === context.resourceGroupId &&
+    before.type === "Microsoft.App/containerApps@2026-01-01" &&
+    hasExactKeys(configuration, [
+      "activeRevisionsMode",
+      "identitySettings",
+      "ingress",
+      "registries",
+      "secrets",
+    ]) &&
+    configuration.activeRevisionsMode === "Single" &&
+    hasExactIngress(configuration.ingress) &&
+    Array.isArray(identityIds) &&
+    identityIds.length === 2 &&
+    identity.type === "UserAssigned" &&
+    identityIds[0] === context.imagePullIdentity &&
+    identityIds[1] === context.runtimeIdentity &&
+    Array.isArray(configuration.registries) &&
+    configuration.registries.length === 1 &&
+    configuration.registries[0].identity === identityIds[0] &&
+    configuration.registries[0].server === context.acrLoginServer &&
+    Array.isArray(configuration.identitySettings) &&
+    configuration.identitySettings.length === 2 &&
+    configuration.identitySettings[0].identity === identityIds[0].replace("resourceGroups", "resourcegroups") &&
+    configuration.identitySettings[0].lifecycle === "None" &&
+    configuration.identitySettings[1].identity === identityIds[1].replace("resourceGroups", "resourcegroups") &&
+    configuration.identitySettings[1].lifecycle === "Main" &&
+    hasExactNamedEntries(secrets, ["litellm-master-key", "openrouter-api-key"]) &&
+    secrets.get("litellm-master-key").identity === context.runtimeIdentity &&
+    secrets.get("openrouter-api-key").identity === context.runtimeIdentity &&
+    secrets.get("litellm-master-key").keyVaultUrl === `https://${FINAL_KEY_VAULT_HOST}/secrets/litellm-master-key` &&
+    secrets.get("openrouter-api-key").keyVaultUrl === `https://${FINAL_KEY_VAULT_HOST}/secrets/openrouter-api-key` &&
+    Array.isArray(containers) &&
+    containers.length === 2 &&
+    hasExactKeys(relay, ["env", "image", "name", "probes", "resources"]) &&
+    hasExactKeys(sidecar, ["env", "image", "name", "probes", "resources"]) &&
+    relay.name === "relay" &&
+    sidecar.name === "litellm" &&
+    relay.image === predecessorImage &&
+    isImmutableAcrImage(predecessorImage) &&
+    predecessorImage.startsWith(`${context.acrLoginServer}/palancar-relay@sha256:`) &&
+    isImmutableAcrImage(sidecar.image) &&
+    sidecar.image.startsWith(`${CUTOVER_ACR_LOGIN_SERVER}/palancar-litellm-proxy@sha256:`) &&
+    relay.resources.cpu === 0.25 &&
+    relay.resources.memory === "0.5Gi" &&
+    sidecar.resources.cpu === 0.75 &&
+    sidecar.resources.memory === "1.5Gi" &&
+    Array.isArray(relay.probes) &&
+    relay.probes.length === 2 &&
+    hasExactFinalTcpProbe(relay.probes[0], {
+      type: "Liveness",
+      port: 8787,
+      initialDelaySeconds: 10,
+      periodSeconds: 10,
+      timeoutSeconds: 3,
+      failureThreshold: 3,
+    }) &&
+    hasExactProbes(relay.probes.slice(1), [
+      {
+        type: "Readiness",
+        path: "/readyz",
+        port: 8787,
+        initialDelaySeconds: 5,
+        periodSeconds: 10,
+        timeoutSeconds: 7,
+        failureThreshold: 3,
+      },
+    ]) &&
+    Array.isArray(sidecar.probes) &&
+    sidecar.probes.length === 3 &&
+    hasExactFinalTcpProbe(sidecar.probes[0], {
+      type: "Liveness",
+      port: 4000,
+      initialDelaySeconds: 10,
+      periodSeconds: 30,
+      timeoutSeconds: 3,
+      failureThreshold: 3,
+    }) &&
+    hasExactProbes(sidecar.probes.slice(1), [
+      {
+        type: "Readiness",
+        path: "/health/readiness",
+        port: 4000,
+        periodSeconds: 10,
+        timeoutSeconds: 7,
+        failureThreshold: 3,
+      },
+      {
+        type: "Startup",
+        path: "/health/liveliness",
+        port: 4000,
+        periodSeconds: 10,
+        timeoutSeconds: 3,
+        failureThreshold: 10,
+      },
+    ]) &&
+    hasExactKeys(template.scale, ["maxReplicas", "minReplicas"]) &&
+    template.scale.maxReplicas === 1 &&
+    template.scale.minReplicas === 1 &&
+    hasExactFinalRelayEnvironment(relay.env, context.runtimeClient, {
+      relayConnection: context.appInsightsConnection.relay,
+      tableEndpoint: context.tableEndpoint,
+      relayOrigin: context.relayOrigin,
+      transcriptionEndpoint: `${context.foundryEndpoint.replace(
+        "https://",
+        "wss://",
+      )}/openai/v1/realtime?intent=transcription`,
+    }) &&
+    hasExactFinalSidecarEnvironment(sidecar.env)
+  );
+}
+
+function cutoverExactCleanupImage(after, expectedImage, acrLoginServer = CUTOVER_ACR_LOGIN_SERVER) {
+  const image = after?.body?.properties?.template?.containers?.[0]?.image;
+  return (
+    typeof expectedImage === "string" &&
+    isImmutableAcrImage(expectedImage) &&
+    expectedImage.startsWith(`${acrLoginServer}/palancar-expiry-cleanup@sha256:`) &&
+    image === expectedImage
+  );
+}
+
+function cutoverParseStorageConnectionString(value, blob) {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const expectedKeys = blob
+    ? ["DefaultEndpointsProtocol", "BlobEndpoint", "AccountName", "AccountKey"]
+    : ["DefaultEndpointsProtocol", "AccountName", "AccountKey", "EndpointSuffix"];
+  const segments = value.split(";");
+  if (
+    segments.length !== expectedKeys.length ||
+    segments.some((segment, index) => {
+      const separator = segment.indexOf("=");
+      return (
+        separator <= 0 ||
+        segment.slice(0, separator) !== expectedKeys[index] ||
+        segment.slice(separator + 1).length === 0
+      );
+    })
+  ) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    segments.map((segment) => {
+      const separator = segment.indexOf("=");
+      return [segment.slice(0, separator), segment.slice(separator + 1)];
+    }),
+  );
+}
+
+function cutoverSensitiveStorageContract(storage, referenceStorage) {
+  if (!isObject(storage) || !isObject(referenceStorage)) return false;
+  const keys = [
+    "primary_access_key",
+    "secondary_access_key",
+    "primary_connection_string",
+    "secondary_connection_string",
+    "primary_blob_connection_string",
+    "secondary_blob_connection_string",
+  ];
+  const rebound = keys.some((key) => storage[key] !== referenceStorage[key]);
+  if (!rebound) return true;
+
+  const primaryKey = storage.primary_access_key;
+  const secondaryKey = storage.secondary_access_key;
+  if (
+    typeof storage.name !== "string" ||
+    !/^[a-z0-9]{3,24}$/.test(storage.name) ||
+    ![primaryKey, secondaryKey].every(
+      (key) => typeof key === "string" && /^[A-Za-z0-9+/]{86}==$/.test(key),
+    )
+  ) {
+    return false;
+  }
+
+  const expected = (key, blob) => ({
+    DefaultEndpointsProtocol: "https",
+    ...(blob
+      ? { BlobEndpoint: `https://${storage.name}.blob.core.windows.net/` }
+      : {}),
+    AccountName: storage.name,
+    AccountKey: key,
+    ...(blob ? {} : { EndpointSuffix: "core.windows.net" }),
+  });
+  for (const [prefix, accessKey] of [
+    ["primary", primaryKey],
+    ["secondary", secondaryKey],
+  ]) {
+    for (const suffix of ["connection_string", "blob_connection_string"]) {
+      const value = storage[`${prefix}_${suffix}`];
+      const parsed = cutoverParseStorageConnectionString(
+        value,
+        suffix.startsWith("blob_"),
+      );
+      if (!isDeepStrictEqual(parsed, expected(accessKey, suffix.startsWith("blob_")))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function cutoverVariablesMatchReference(plan) {
+  const rebound = new Set([
+    "budget_contact_emails",
+    "operator_principal_id",
+    "tenant_id",
+    "relay_image_digest",
+    "expiry_cleanup_image_digest",
+  ]);
+  const result = Object.entries(TERMINAL_REFERENCE_PLAN.variables).every(
+    ([name, reference]) => {
+      const descriptor = plan.variables[name];
+      if (!isObject(descriptor) || !Object.hasOwn(descriptor, "value")) {
+        return false;
+      }
+      if (name === "enable_runtime_secrets_user_assignment") {
+        return typeof descriptor.value === "boolean";
+      }
+      if (rebound.has(name)) {
+        const reboundMatch = name === "budget_contact_emails"
+          ? Array.isArray(descriptor.value)
+          : name === "operator_principal_id" || name === "tenant_id"
+          ? finalUuid(descriptor.value)
+          : (
+          isImmutableAcrImage(descriptor.value) &&
+          descriptor.value.startsWith(
+            `${CUTOVER_ACR_LOGIN_SERVER}/${name === "relay_image_digest" ? "palancar-relay" : "palancar-expiry-cleanup"}@sha256:`,
+          )
+          );
+        return reboundMatch;
+      }
+      return isDeepStrictEqual(descriptor, reference);
+    },
+  );
+  const contacts = plan.variables.budget_contact_emails?.value;
+  const operator = plan.variables.operator_principal_id?.value;
+  return (
+    result &&
+    Array.isArray(contacts) &&
+    contacts.length > 0 &&
+    new Set(contacts).size === contacts.length &&
+    contacts.every(
+      (email) =>
+        typeof email === "string" &&
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
+    ) &&
+    finalUuid(operator) &&
+    operator !== "00000000-0000-0000-0000-000000000000"
+  );
+}
+
+function cutoverStateSections(plan, expectedEnable, expectedApplyable) {
+  if (
+    !cutoverExactPlanEnvelope(plan, expectedApplyable) ||
+    !cutoverHasExactStateEnvelopes(plan) ||
+    !hasExactKeys(
+      plan.variables,
+      Object.keys(TERMINAL_REFERENCE_PLAN.variables),
+    ) ||
+    plan.variables.enable_runtime_secrets_user_assignment?.value !==
+      expectedEnable ||
+    !hasExactKeys(plan.variables.enable_runtime_secrets_user_assignment, ["value"]) ||
+    !cutoverVariablesMatchReference(plan) ||
+    !cutoverHasExactChecks(plan) ||
+    !cutoverHasExactRelevantAttributes(plan) ||
+    !cutoverHasExactConfiguration(plan) ||
+    Object.keys(plan.variables).some((name) => /litellm|openrouter/i.test(name)) ||
+    JSON.stringify(plan.configuration).match(/litellm|openrouter/i) ||
+    !plan.checks.every((check) => check?.status === "pass") ||
+    hasNonPassingCheck(plan)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function cutoverAddBinding(bindings, reference, actual) {
+  if (typeof reference !== "string" || typeof actual !== "string") return;
+  if (reference === actual) return;
+  if (!bindings.some(([source]) => source === reference)) {
+    bindings.push([reference, actual]);
+  }
+}
+
+function cutoverAddPathBinding(bindings, reference, actual, path) {
+  let expected = reference;
+  let observed = actual;
+  for (const part of path) {
+    expected = expected?.[part];
+    observed = observed?.[part];
+  }
+  cutoverAddBinding(bindings, expected, observed);
+}
+
+function cutoverBindings(plan, changesByAddress) {
+  const bindings = [];
+  const referenceVariables = TERMINAL_REFERENCE_PLAN.variables;
+  for (const name of [
+    "subscription_id",
+    "tenant_id",
+    "operator_principal_id",
+    "relay_image_digest",
+    "expiry_cleanup_image_digest",
+  ]) {
+    cutoverAddBinding(
+      bindings,
+      referenceVariables[name]?.value,
+      plan.variables[name]?.value,
+    );
+  }
+  const referenceContacts = referenceVariables.budget_contact_emails?.value;
+  const contacts = plan.variables.budget_contact_emails?.value;
+  if (Array.isArray(referenceContacts) && Array.isArray(contacts)) {
+    referenceContacts.forEach((email, index) =>
+      cutoverAddBinding(bindings, email, contacts[index]),
+    );
+  }
+
+  for (const address of CUTOVER_IDENTITY_ADDRESSES) {
+    const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+      (entry) => entry.address === address,
+    )?.change.after;
+    const actual = changesByAddress.get(address)?.change.after;
+    for (const key of ["id", "principal_id", "client_id", "tenant_id"]) {
+      cutoverAddBinding(bindings, reference?.[key], actual?.[key]);
+      if (key === "id") {
+        cutoverAddBinding(
+          bindings,
+          reference?.[key]?.replace("/resourceGroups/", "/resourcegroups/"),
+          actual?.[key]?.replace("/resourceGroups/", "/resourcegroups/"),
+        );
+      }
+    }
+  }
+
+  for (const referenceEntry of TERMINAL_REFERENCE_PLAN.resource_changes) {
+    if (referenceEntry.type !== "azurerm_role_assignment") continue;
+    const actualEntry = changesByAddress.get(referenceEntry.address);
+    cutoverAddBinding(
+      bindings,
+      referenceEntry.change.after?.id,
+      actualEntry?.change.after?.id,
+    );
+  }
+
+  const referenceAppInsights = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) =>
+      entry.address ===
+      "module.observability.azurerm_application_insights.this",
+  )?.change.after;
+  const appInsights = changesByAddress.get(
+    "module.observability.azurerm_application_insights.this",
+  )?.change.after;
+  // Provider-generated Application Insights secrets are matched through their
+  // exact sensitivity masks below.  They are deliberately not global string
+  // bindings: an identical fixture literal in an unmasked location must not
+  // acquire live meaning by substitution.
+  for (const key of ["id"]) {
+    cutoverAddBinding(bindings, referenceAppInsights?.[key], appInsights?.[key]);
+  }
+
+  const referenceEnvironment = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) =>
+      entry.address ===
+      "module.container_app_environment.azurerm_container_app_environment.this",
+  )?.change.after;
+  const environment = changesByAddress.get(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+  )?.change.after;
+  cutoverAddBinding(bindings, referenceEnvironment?.id, environment?.id);
+  cutoverAddBinding(
+    bindings,
+    referenceEnvironment?.default_domain,
+    environment?.default_domain,
+  );
+
+  const referenceStorage = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === "module.workload_state.azurerm_storage_account.this",
+  )?.change.after;
+  const storage = changesByAddress.get(
+    "module.workload_state.azurerm_storage_account.this",
+  )?.change.after;
+  for (const key of ["id", "primary_table_endpoint", "primary_table_host"]) {
+    cutoverAddBinding(bindings, referenceStorage?.[key], storage?.[key]);
+  }
+
+  const referenceFoundry = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === "module.foundry.azurerm_cognitive_account.this",
+  )?.change.after;
+  const foundry = changesByAddress.get(
+    "module.foundry.azurerm_cognitive_account.this",
+  )?.change.after;
+  for (const key of ["id", "endpoint"]) {
+    cutoverAddBinding(bindings, referenceFoundry?.[key], foundry?.[key]);
+  }
+
+  const referenceApp = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === CUTOVER_CONTAINER_APP,
+  )?.change.after;
+  const app = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.after;
+  for (const key of ["id", "name", "parent_id"]) {
+    cutoverAddBinding(bindings, referenceApp?.[key], app?.[key]);
+  }
+  cutoverAddPathBinding(
+    bindings,
+    referenceApp,
+    app,
+    ["output", "properties", "latestRevisionName"],
+  );
+  cutoverAddPathBinding(
+    bindings,
+    referenceApp,
+    app,
+    ["output", "properties", "configuration", "ingress", "fqdn"],
+  );
+
+  const referenceJob = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === EXPIRY_CLEANUP_JOB,
+  )?.change.after;
+  const job = changesByAddress.get(EXPIRY_CLEANUP_JOB)?.change.after;
+  for (const key of ["id", "name", "parent_id"]) {
+    cutoverAddBinding(bindings, referenceJob?.[key], job?.[key]);
+  }
+  cutoverAddPathBinding(
+    bindings,
+    referenceJob,
+    job,
+    ["output", "eventStreamEndpoint"],
+  );
+  cutoverAddPathBinding(
+    bindings,
+    referenceJob,
+    job,
+    ["output", "properties", "outboundIpAddresses", 0],
+  );
+
+  return bindings.sort((left, right) => right[0].length - left[0].length);
+}
+
+function cutoverRebindReference(value, bindings) {
+  if (typeof value === "string") {
+    return bindings.reduce(
+      (result, [reference, actual]) => result.replaceAll(reference, actual),
+      value,
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => cutoverRebindReference(entry, bindings));
+  }
+  if (isObject(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [
+        cutoverRebindReference(key, bindings),
+        cutoverRebindReference(child, bindings),
+      ]),
+    );
+  }
+  return value;
+}
+
+function cutoverSensitiveMaskChild(mask, key) {
+  if (Array.isArray(mask)) return mask[key] ?? false;
+  if (isObject(mask)) return mask[key] ?? false;
+  return false;
+}
+
+function cutoverOpaqueSensitiveLeafMatches(actual, reference) {
+  if (isDeepStrictEqual(actual, reference)) return true;
+  if (typeof actual !== typeof reference) return false;
+  if (typeof reference === "string") {
+    return actual.length > 0;
+  }
+  return false;
+}
+
+function cutoverSensitiveMaskValuesValid(actual, reference, sensitive) {
+  if (sensitive === true) {
+    return cutoverOpaqueSensitiveLeafMatches(actual, reference);
+  }
+  if (Array.isArray(sensitive)) {
+    if (!sensitive.some(cutoverSensitiveMaskHasMarkedValue)) return true;
+    return (
+      Array.isArray(actual) &&
+      actual.length === sensitive.length &&
+      sensitive.every((child, index) =>
+        cutoverSensitiveMaskValuesValid(actual[index], reference?.[index], child),
+      )
+    );
+  }
+  if (isObject(sensitive)) {
+    if (!Object.values(sensitive).some(cutoverSensitiveMaskHasMarkedValue)) {
+      return true;
+    }
+    return (
+      isObject(actual) &&
+      Object.entries(sensitive).every(([key, child]) =>
+        Object.hasOwn(actual, key) &&
+        cutoverSensitiveMaskValuesValid(actual[key], reference?.[key], child),
+      )
+    );
+  }
+  return true;
+}
+
+function cutoverSensitiveMaskHasMarkedValue(mask) {
+  if (mask === true) return true;
+  if (Array.isArray(mask)) return mask.some(cutoverSensitiveMaskHasMarkedValue);
+  if (isObject(mask)) {
+    return Object.values(mask).some(cutoverSensitiveMaskHasMarkedValue);
+  }
+  return false;
+}
+
+function cutoverSensitiveStructureMatches(
+  actual,
+  reference,
+  sensitive,
+  bindings,
+) {
+  if (sensitive === true) {
+    return cutoverOpaqueSensitiveLeafMatches(actual, reference);
+  }
+  if (Array.isArray(reference)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === reference.length &&
+      reference.every((child, index) =>
+        cutoverSensitiveStructureMatches(
+          actual[index],
+          child,
+          cutoverSensitiveMaskChild(sensitive, index),
+          bindings,
+        ),
+      )
+    );
+  }
+  if (isObject(reference)) {
+    if (!isObject(actual)) return false;
+    const expectedKeys = Object.keys(reference).map((key) =>
+      cutoverRebindReference(key, bindings),
+    );
+    return (
+      new Set(expectedKeys).size === expectedKeys.length &&
+      hasExactKeys(actual, expectedKeys) &&
+      Object.entries(reference).every(([key, child], index) =>
+        cutoverSensitiveStructureMatches(
+          actual[expectedKeys[index]],
+          child,
+          cutoverSensitiveMaskChild(sensitive, key),
+          bindings,
+        ),
+      )
+    );
+  }
+  return isDeepStrictEqual(actual, cutoverRebindReference(reference, bindings));
+}
+
+function cutoverReferenceAfterMatches(actual, reference, bindings) {
+  return (
+    reference !== undefined &&
+    cutoverSensitiveStructureMatches(
+      actual,
+      reference.change.after,
+      reference.change.after_sensitive,
+      bindings,
+    )
+  );
+}
+
+function cutoverExpectedSensitive(entry, bindings) {
+  const address = entry.address;
+  if (address === CUTOVER_RUNTIME_SECRETS_USER) {
+    return {
+      before: {},
+      after: isDeepStrictEqual(entry.change.actions, ["delete"]) ? false : {},
+    };
+  }
+  if (address === CUTOVER_CONTAINER_APP && isUpdate(entry.change.actions)) {
+    const transition = FINAL_REFERENCE_PLAN.resource_changes.find(
+      (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+    )?.change;
+    const terminal = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+      (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+    )?.change;
+    return {
+      before: cutoverRebindReference(transition?.before_sensitive, bindings),
+      after: cutoverRebindReference(terminal?.after_sensitive, bindings),
+    };
+  }
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === address,
+  )?.change;
+  return {
+    before: cutoverRebindReference(reference?.before_sensitive, bindings),
+    after: cutoverRebindReference(reference?.after_sensitive, bindings),
+  };
+}
+
+function cutoverHasExactChangeEnvelope(entry, bindings) {
+  const expected = cutoverExpectedSensitive(entry, bindings);
+  if (
+    !isDeepStrictEqual(entry.change.after_unknown, {}) ||
+    !isDeepStrictEqual(entry.change.before_sensitive, expected.before) ||
+    !isDeepStrictEqual(entry.change.after_sensitive, expected.after)
+  ) {
+    return false;
+  }
+  const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === entry.address,
+  );
+  for (const side of ["before", "after"]) {
+    const identityKey = `${side}_identity`;
+    if (!Object.hasOwn(entry.change, identityKey)) continue;
+    const expectedIdentity =
+      entry.type === "azapi_resource"
+        ? { id: entry.change[side]?.id, type: null }
+        : cutoverRebindReference(reference?.change?.[identityKey], bindings);
+    if (!isDeepStrictEqual(entry.change[identityKey], expectedIdentity)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function cutoverExactSecuritySchema(plan, changesByAddress, context) {
+  const storage = changesByAddress.get(
+    "module.workload_state.azurerm_storage_account.this",
+  )?.change.after;
+  const referenceStorage = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === "module.workload_state.azurerm_storage_account.this",
+  )?.change.after;
+  const tableServiceId = `${storage?.id}/tableServices/default`;
+  const checkTable = (address, tableName) => {
+    const after = changesByAddress.get(address)?.change.after;
+    return (
+      isObject(after) &&
+      hasExactKeys(after, [
+        "body",
+        "create_headers",
+        "create_query_parameters",
+        "delete_headers",
+        "delete_query_parameters",
+        "id",
+        "identity",
+        "ignore_body_changes",
+        "ignore_casing",
+        "ignore_missing_property",
+        "ignore_null_property",
+        "ignore_other_items_in_list",
+        "list_unique_id_property",
+        "location",
+        "locks",
+        "name",
+        "output",
+        "parent_id",
+        "read_headers",
+        "read_query_parameters",
+        "replace_triggers_external_values",
+        "replace_triggers_refs",
+        "response_export_values",
+        "retry",
+        "schema_validation_enabled",
+        "sensitive_body",
+        "sensitive_body_version",
+        "tags",
+        "timeouts",
+        "type",
+        "update_headers",
+        "update_query_parameters",
+      ]) &&
+      after.name === tableName &&
+      after.parent_id === tableServiceId &&
+      after.id === `${tableServiceId}/tables/${tableName}` &&
+      isDeepStrictEqual(after.body, {}) &&
+      Array.isArray(after.identity) &&
+      after.identity.length === 0 &&
+      after.ignore_casing === false &&
+      after.ignore_missing_property === true &&
+      after.ignore_null_property === false &&
+      after.schema_validation_enabled === true &&
+      isObject(after.output) &&
+      hasExactKeys(after.output, ["id", "properties", "type"]) &&
+      after.output.id === after.id &&
+      hasExactKeys(after.output.properties, ["tableName"]) &&
+      after.output.properties.tableName === tableName &&
+      after.output.type === "Microsoft.Storage/storageAccounts/tableServices/tables" &&
+      after.type === "Microsoft.Storage/storageAccounts/tableServices/tables@2025-01-01"
+    );
+  };
+  const applicationInsights = changesByAddress.get(
+    "module.observability.azurerm_application_insights.this",
+  )?.change.after;
+  const appInsightsConnection = cutoverParseApplicationInsightsConnection(
+    applicationInsights?.connection_string,
+    applicationInsights,
+  );
+  const app = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.after;
+  const relay = app?.body?.properties?.template?.containers?.[0];
+  const cleanup = changesByAddress.get(EXPIRY_CLEANUP_JOB)?.change.after;
+  const cleanupEnv = valuesByName(
+    cleanup?.body?.properties?.template?.containers?.[0]?.env,
+  );
+  const budget = changesByAddress.get(
+    "module.budget.azurerm_consumption_budget_resource_group.this",
+  )?.change.after;
+  const actionGroup = changesByAddress.get(FINAL_ACTION_GROUP_ADDRESS)?.change.after;
+  const contacts = plan.variables.budget_contact_emails?.value;
+  return (
+    cutoverSensitiveStorageContract(storage, referenceStorage) &&
+    checkTable("module.workload_state.azapi_resource.security", "SecurityState") &&
+    checkTable("module.workload_state.azapi_resource.rate", "RateState") &&
+    storage?.primary_table_endpoint === context.workloadTableEndpoint &&
+    context.workloadTableEndpoint.endsWith("/") &&
+    isObject(appInsightsConnection) &&
+    appInsightsConnection.full ===
+      plan.planned_values.outputs.application_insights_connection_string?.value &&
+    appInsightsConnection.full ===
+      plan.prior_state.values.outputs.application_insights_connection_string?.value &&
+    relay?.env?.find((entry) => entry.name === "APPLICATIONINSIGHTS_CONNECTION_STRING")
+      ?.value === appInsightsConnection.relay &&
+    cleanupEnv.get("PALANCAR_WORKLOAD_TABLE_ENDPOINT")?.value ===
+      context.tableEndpoint &&
+    Array.isArray(contacts) &&
+    Array.isArray(actionGroup?.email_receiver) &&
+    actionGroup.email_receiver.length === contacts.length &&
+    actionGroup.email_receiver.every(
+      (receiver, index) =>
+        receiver.email_address === contacts[index] &&
+        receiver.name === `budget-contact-${String(index + 1).padStart(4, "0")}` &&
+        receiver.use_common_alert_schema === true,
+    ) &&
+    Array.isArray(budget?.notification) &&
+    budget.notification.length === 4 &&
+    budget.notification.every((notification) =>
+      isDeepStrictEqual(notification.contact_emails, contacts),
+    )
+  );
+}
+
+function cutoverExactAddressSet(changes, expected) {
+  const addresses = changes.map((entry) => entry.address);
+  return (
+    addresses.length === expected.size &&
+    new Set(addresses).size === addresses.length &&
+    addresses.every((address) => expected.has(address))
+  );
+}
+
+function cutoverTerminalNoOp(plan, changes) {
+  const referenceChanges = new Map(
+    TERMINAL_REFERENCE_PLAN.resource_changes.map((entry) => [entry.address, entry]),
+  );
+  if (!cutoverExactAddressSet(changes, new Set(referenceChanges.keys()))) return false;
+  const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
+  const planned = cutoverCollectValueResources(plan.planned_values.root_module);
+  const prior = cutoverCollectValueResources(plan.prior_state.values.root_module);
+  if (!planned || !prior) return false;
+  if (!cutoverHasExactStateInventories(
+    plan,
+    changes,
+    FINAL_ROLLOUT_COMPLETE_MODE,
+    planned,
+    prior,
+  )) return false;
+  const context = cutoverIdentityContext(
+    byAddress,
+    prior,
+    plan.variables.operator_principal_id?.value,
+    plan.variables.tenant_id?.value,
+  );
+  if (!context) return false;
+  const bindings = cutoverBindings(plan, byAddress);
+  if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
+  const images = plan.variables;
+  const relayImage = images.relay_image_digest?.value;
+  if (
+    typeof relayImage !== "string" ||
+    !isImmutableAcrImage(relayImage) ||
+    relayImage !== byAddress.get(CUTOVER_CONTAINER_APP)?.change.after?.body?.properties?.template?.containers?.[0]?.image
+  ) return false;
+  for (const entry of changes) {
+    if (
+      !cutoverExactResourceEntry(entry) ||
+      !isDeepStrictEqual(entry.change.actions, ["no-op"]) ||
+      !cutoverExactNoOp(entry.change) ||
+      !cutoverHasExactChangeEnvelope(entry, bindings)
+    ) return false;
+    const reference = referenceChanges.get(entry.address);
+    if (!cutoverResourceTypeMatchesReference(entry, reference)) return false;
+    if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
+    if (entry.address === CUTOVER_CONTAINER_APP) {
+      if (!cutoverExactDirectApp(entry.change.after, relayImage, context)) return false;
+    } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (entry.address === CUTOVER_LUNA_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (CUTOVER_IDENTITY_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactIdentityChange(entry, context)) return false;
+    } else if (CUTOVER_RBAC_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === EXPIRY_CLEANUP_JOB) {
+      if (!cutoverReferenceAfterMatches(entry.change.after, reference, bindings) || !cutoverExactCleanupImage(entry.change.after, images.expiry_cleanup_image_digest?.value, context.acrLoginServer)) return false;
+    } else if (!cutoverReferenceAfterMatches(entry.change.after, reference, bindings)) {
+      return false;
+    }
+  }
+  return cutoverExactFoundryModels(byAddress, bindings) && cutoverExactOutputs(plan, false, bindings);
+}
+
+function cutoverExactOutputs(plan, terminal, bindings = []) {
+  const expectedNames = Object.keys(TERMINAL_REFERENCE_PLAN.output_changes);
+  if (
+    !hasExactKeys(plan.output_changes, expectedNames) ||
+    !hasExactKeys(plan.planned_values.outputs, expectedNames) ||
+    !hasExactKeys(plan.prior_state.values.outputs, expectedNames)
+  ) return false;
+  for (const name of expectedNames) {
+    const change = plan.output_changes[name];
+    const planned = plan.planned_values.outputs[name];
+    const prior = plan.prior_state.values.outputs[name];
+    const reference = TERMINAL_REFERENCE_PLAN.output_changes[name];
+    const expectedChange = cutoverRebindReference(reference, bindings);
+    const expectedPlanned = cutoverRebindReference(
+      TERMINAL_REFERENCE_PLAN.planned_values.outputs[name],
+      bindings,
+    );
+    const expectedPrior = cutoverRebindReference(
+      TERMINAL_REFERENCE_PLAN.prior_state.values.outputs[name],
+      bindings,
+    );
+    const sensitiveOutput =
+      reference.before_sensitive === true || reference.after_sensitive === true;
+    const outputChangeMatches =
+      isObject(change) &&
+      hasExactKeys(change, [
+        "actions",
+        "before",
+        "after",
+        "after_unknown",
+        "before_sensitive",
+        "after_sensitive",
+      ]) &&
+      isDeepStrictEqual(
+        {
+          ...change,
+          before: undefined,
+          after: undefined,
+        },
+        {
+          ...expectedChange,
+          before: undefined,
+          after: undefined,
+        },
+      ) &&
+      (sensitiveOutput
+        ? cutoverOpaqueSensitiveLeafMatches(change.before, reference.before) &&
+          cutoverOpaqueSensitiveLeafMatches(change.after, reference.after)
+        : isDeepStrictEqual(change.before, expectedChange.before) &&
+          isDeepStrictEqual(change.after, expectedChange.after));
+    const plannedMatches =
+      isObject(planned) &&
+      (sensitiveOutput
+        ? hasExactKeys(planned, Object.keys(expectedPlanned)) &&
+          isDeepStrictEqual(
+            { ...planned, value: undefined },
+            { ...expectedPlanned, value: undefined },
+          ) &&
+          cutoverOpaqueSensitiveLeafMatches(planned.value, expectedPlanned.value)
+        : isDeepStrictEqual(planned, expectedPlanned));
+    const priorMatches =
+      isObject(prior) &&
+      (sensitiveOutput
+        ? hasExactKeys(prior, Object.keys(expectedPrior)) &&
+          isDeepStrictEqual(
+            { ...prior, value: undefined },
+            { ...expectedPrior, value: undefined },
+          ) &&
+          cutoverOpaqueSensitiveLeafMatches(prior.value, expectedPrior.value)
+        : isDeepStrictEqual(prior, expectedPrior));
+    if (
+      !outputChangeMatches ||
+      !plannedMatches ||
+      !priorMatches ||
+      typeof change.before_sensitive !== "boolean" ||
+      typeof change.after_sensitive !== "boolean" ||
+      typeof planned.sensitive !== "boolean" ||
+      typeof prior.sensitive !== "boolean" ||
+      planned.sensitive !== change.after_sensitive ||
+      prior.sensitive !== change.before_sensitive
+    ) return false;
+    if (
+      sensitiveOutput &&
+      (!isDeepStrictEqual(change.before, prior.value) ||
+        !isDeepStrictEqual(change.after, planned.value) ||
+        !isDeepStrictEqual(change.before, change.after) ||
+        !isDeepStrictEqual(prior.value, planned.value))
+    ) {
+      return false;
+    }
+  }
+  const models = plan.output_changes.foundry_deployment_names.after;
+  return isDeepStrictEqual(models, [PINNED_DEPLOYMENT_NAME, LUNA_DEPLOYMENT_NAME]);
+}
+
+function acceptsAzureGenerationCutover(plan, changes) {
+  if (
+    !cutoverStateSections(plan, true, true) ||
+    !cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY)
+  ) return false;
+  const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
+  const planned = cutoverCollectValueResources(plan.planned_values.root_module);
+  const prior = cutoverCollectValueResources(plan.prior_state.values.root_module);
+  const context = cutoverIdentityContext(
+    byAddress,
+    prior,
+    plan.variables.operator_principal_id?.value,
+    plan.variables.tenant_id?.value,
+  );
+  const relayImage = plan.variables.relay_image_digest?.value;
+  if (!planned || !prior || !context || !isImmutableAcrImage(relayImage)) return false;
+  if (!cutoverHasExactStateInventories(
+    plan,
+    changes,
+    AZURE_GENERATION_CUTOVER_MODE,
+    planned,
+    prior,
+  )) return false;
+  const bindings = cutoverBindings(plan, byAddress);
+  if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
+  for (const entry of changes) {
+    if (
+      !cutoverExactResourceEntry(entry, entry.address === CUTOVER_RUNTIME_SECRETS_USER) ||
+      !isDeepStrictEqual(
+        entry.change.actions,
+        [entry.address === CUTOVER_CONTAINER_APP ? "update" : "no-op"],
+      ) ||
+      !cutoverHasExactChangeEnvelope(entry, bindings)
+    ) return false;
+    if (!cutoverExactEntryMetadata(entry)) return false;
+    if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
+    if (entry.address === CUTOVER_CONTAINER_APP) {
+      const predecessor = cutoverExactPredecessorApp(
+        entry.change.before,
+        context,
+        CUTOVER_RELAY_PRIOR_IMAGE,
+      );
+      const direct = cutoverExactDirectApp(entry.change.after, relayImage, context);
+      if (!isUpdate(entry.change.actions) || !predecessor || !direct) {
+        return false;
+      }
+    } else if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (entry.address === CUTOVER_LUNA_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (CUTOVER_IDENTITY_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactIdentityChange(entry, context)) return false;
+    } else if (CUTOVER_RBAC_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === EXPIRY_CLEANUP_JOB) {
+      if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === EXPIRY_CLEANUP_JOB), bindings) || !cutoverExactCleanupImage(entry.change.after, plan.variables.expiry_cleanup_image_digest?.value, context.acrLoginServer)) return false;
+    } else if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === entry.address), bindings)) return false;
+  }
+  const models = cutoverExactFoundryModels(byAddress, bindings);
+  const outputs = cutoverExactOutputs(plan, false, bindings);
+  return models && outputs;
+}
+
+function acceptsAzureCredentialCleanup(plan, changes) {
+  if (
+    !cutoverStateSections(plan, false, true) ||
+    !cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY)
+  ) return false;
+  const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
+  const planned = cutoverCollectValueResources(plan.planned_values.root_module);
+  const prior = cutoverCollectValueResources(plan.prior_state.values.root_module);
+  const context = cutoverIdentityContext(
+    byAddress,
+    prior,
+    plan.variables.operator_principal_id?.value,
+    plan.variables.tenant_id?.value,
+  );
+  const relayImage = plan.variables.relay_image_digest?.value;
+  if (!planned || !prior || !context || !isImmutableAcrImage(relayImage)) return false;
+  if (!cutoverHasExactStateInventories(
+    plan,
+    changes,
+    AZURE_CREDENTIAL_CLEANUP_MODE,
+    planned,
+    prior,
+  )) return false;
+  const bindings = cutoverBindings(plan, byAddress);
+  if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
+  for (const entry of changes) {
+    if (
+      !cutoverExactResourceEntry(entry) ||
+      !isDeepStrictEqual(
+        entry.change.actions,
+        [entry.address === CUTOVER_RUNTIME_SECRETS_USER ? "delete" : "no-op"],
+      ) ||
+      !cutoverHasExactChangeEnvelope(entry, bindings)
+    ) return false;
+    if (!cutoverExactEntryMetadata(entry)) return false;
+    if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
+    if (entry.address === CUTOVER_CONTAINER_APP) {
+      if (!cutoverExactNoOp(entry.change) || !cutoverExactDirectApp(entry.change.after, relayImage, context)) return false;
+    } else if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
+      if (!cutoverExactRoleChange(entry, context, "delete")) return false;
+    } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (entry.address === CUTOVER_LUNA_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings)) return false;
+    } else if (CUTOVER_IDENTITY_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactIdentityChange(entry, context)) return false;
+    } else if (CUTOVER_RBAC_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === EXPIRY_CLEANUP_JOB) {
+      if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === EXPIRY_CLEANUP_JOB), bindings) || !cutoverExactCleanupImage(entry.change.after, plan.variables.expiry_cleanup_image_digest?.value, context.acrLoginServer)) return false;
+    } else if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === entry.address), bindings)) return false;
+  }
+  const models = cutoverExactFoundryModels(byAddress, bindings);
+  const outputs = cutoverExactOutputs(plan, false, bindings);
+  return models && outputs;
+}
+
+function acceptsFinalRolloutComplete(plan, changes) {
+  return (
+    cutoverStateSections(plan, false, false) &&
+    plan.applyable === false &&
+    cutoverTerminalNoOp(plan, changes)
+  );
+}
+
 export function acceptsPlan(plan, mode) {
   if (
     !isObject(plan) ||
@@ -6045,20 +8881,25 @@ export function acceptsPlan(plan, mode) {
       RUNTIME_ROLLOUT_MODE,
       FINAL_ROLLOUT_MODE,
       LUNA_MODEL_BOOTSTRAP_MODE,
+      AZURE_GENERATION_CUTOVER_MODE,
+      AZURE_CREDENTIAL_CLEANUP_MODE,
+      FINAL_ROLLOUT_COMPLETE_MODE,
     ].includes(mode)
   ) {
     return false;
   }
 
   const hasInvalidChecks =
-    mode === FINAL_ROLLOUT_MODE
+    mode === FINAL_ROLLOUT_MODE || mode === FINAL_ROLLOUT_COMPLETE_MODE
       ? false
       : mode === MODEL_SPIKE_MODE
         ? hasNonPassingModelSpikeCheck(plan)
         : hasNonPassingCheck(plan);
   if (
     hasInvalidChecks ||
-    (mode !== FINAL_ROLLOUT_MODE && hasResourceDrift(plan))
+    (mode !== FINAL_ROLLOUT_MODE &&
+      mode !== FINAL_ROLLOUT_COMPLETE_MODE &&
+      hasResourceDrift(plan))
   ) {
     return false;
   }
@@ -6082,6 +8923,18 @@ export function acceptsPlan(plan, mode) {
 
   if (mode === LUNA_MODEL_BOOTSTRAP_MODE) {
     return acceptsLunaModelBootstrap(plan, changes);
+  }
+
+  if (mode === AZURE_GENERATION_CUTOVER_MODE) {
+    return acceptsAzureGenerationCutover(plan, changes);
+  }
+
+  if (mode === AZURE_CREDENTIAL_CLEANUP_MODE) {
+    return acceptsAzureCredentialCleanup(plan, changes);
+  }
+
+  if (mode === FINAL_ROLLOUT_COMPLETE_MODE) {
+    return acceptsFinalRolloutComplete(plan, changes);
   }
 
   const requiredNoOpAddresses = new Set(FOUNDATION_NO_OP_ADDRESSES);
@@ -6139,6 +8992,9 @@ function getMode(argv) {
     RUNTIME_ROLLOUT_MODE,
     FINAL_ROLLOUT_MODE,
     LUNA_MODEL_BOOTSTRAP_MODE,
+    AZURE_GENERATION_CUTOVER_MODE,
+    AZURE_CREDENTIAL_CLEANUP_MODE,
+    FINAL_ROLLOUT_COMPLETE_MODE,
   ].includes(mode)
     ? mode
     : undefined;

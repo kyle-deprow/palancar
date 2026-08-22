@@ -1,13 +1,25 @@
 # Azure Foundry Entra cutover plan
 
+## Current status and target state
+
+The implementation target is direct Azure Foundry inference only. Terraform
+manages the Foundry account and exactly the pinned
+`gpt-4o-mini-transcribe` and `gpt-5.6-luna` deployments. The relay uses its
+user-assigned managed identity and Entra tokens for both transcription and
+generation; Foundry local authentication is disabled. The workload has one
+relay container, an empty secrets collection, and no proxy, API-key, or
+provider-fallback runtime source.
+
+The live rollout and final evidence are not claimed complete. The remainder of
+this document preserves the implementation plan and decision history; use the
+current lifecycle flow below as the operator source of truth.
+
 ## Objective
 
-Replace the deployed OpenRouter/LiteLLM generation path with direct Azure
-Foundry chat completion calls from the relay. Recreate the manually validated
-`gpt-5.6-luna` deployment through Terraform and authenticate every deployed
-inference call with the existing runtime user-assigned managed identity. The
-deployed workload must contain no API key, LiteLLM master key, proxy sidecar,
-or provider fallback.
+Replace the retired generation path with direct Azure Foundry chat completion
+calls from the relay. Recreate the `gpt-5.6-luna` deployment through
+Terraform, authenticate every deployed inference call with Entra, and retain
+the Azure Realtime transcription path.
 
 The user previously explicitly selected Terraform for Palancar, this repository
 contains 55 Terraform files and zero Bicep files, and “wire it into the biceps”
@@ -15,10 +27,11 @@ is therefore interpreted as “wire it into the existing IaC.” This plan does
 not introduce a second Bicep state/deployment system.
 
 The existing `gpt-4o-mini-transcribe` deployment and realtime transcription
-path remain intact. The live relay predecessor for this migration is
-`sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`.
+path remain intact. Live image digests, resource IDs, endpoints, subscription,
+tenant, secrets, and tfvars values are protected rollout inputs and are not
+recorded here.
 
-## Completed destructive preflight
+## Historical destructive preflight record
 
 Before this plan was written, the exact manual deployment was inventoried as
 `gpt-5.6-luna`, model version `2026-07-09`, format `OpenAI`, SKU
@@ -37,8 +50,8 @@ read model content, keys, or deployment credentials during this check.
 
 - Preserve the `GenerationProvider` interface and mock provider for local
   tests. The only deployed generation provider is `azure-openai`.
-- Call `POST <foundry-endpoint>/openai/v1/chat/completions` directly from the
-  relay with deployment name `gpt-5.6-luna`.
+- Call the fixed Azure chat-completions route directly from the relay with
+  deployment name `gpt-5.6-luna`.
 - Pin the Entra scope in code to `https://ai.azure.com/.default`. The scope and
   API path/version are not runtime-configurable.
 - Extract the capable managed-identity source already implemented in
@@ -100,11 +113,10 @@ exact `.openai.azure.com` DNS suffix and no userinfo, explicit port, path,
 query, fragment, whitespace, or trailing slash. Code appends exactly
 `/openai/v1/chat/completions`.
 
-Deployed mode rejects `PALANCAR_LITELLM_*`, `OPENAI_API_KEY`,
-`AZURE_OPENAI_API_KEY`, `AZURE_API_KEY`, configurable inference scopes, and
-configurable generation API versions. It also rejects `LITELLM_MASTER_KEY` and
-all `OPENROUTER_*` variables. The Container App has one relay
-container at 0.25 CPU/0.5 GiB and an empty secrets collection.
+Deployed mode rejects all retired provider/proxy variables, API-key settings,
+configurable inference scopes, and configurable generation API versions. The
+Container App has one relay container at 0.25 CPU/0.5 GiB and an empty secrets
+collection.
 
 ## Failure contract
 
@@ -140,7 +152,7 @@ They must never be reset, overwritten wholesale, or accidentally staged with a
 plan/guard commit.
 
 The captured binary worktree diff SHA-256 for these seven paths is
-`180bd86ed88774121cd531a98b9b0dd0d5aa0b01c39af7c11ea64c62ad5a324f`.
+`<protected-hash>`.
 Recompute `git diff --binary` over the exact ordered path list before and after
 slices 1 and 2 and require that hash unchanged. A mismatch stops the slice;
 never restore or rewrite the files to force a match.
@@ -162,7 +174,7 @@ never restore or rewrite the files to force a match.
   `git diff --cached --name-only` to equal the reviewed allowlist exactly and
   fail if any of the seven paths appears.
 
-## Sequential implementation slices and ownership
+## Historical sequential implementation slices and ownership
 
 No two workers may be active on overlapping paths. Where a later slice lists a
 path owned by an earlier slice, ownership transfers only after the earlier
@@ -208,15 +220,15 @@ read-only to every worker.
      `infra/README.md`, `docs/final-rollout-guard-plan.md`, and
      `docs/generation-output-rollout-guard-plan.md`.
    - Repin the live image to
-     `e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`;
+     `<protected-hash>`;
      preserve stale history. Add a new
      mode that permits exactly one Luna create plus the deployment-name output
      update while requiring transcription, Container App, all RBAC, and every
      other resource/output to be no-op with no drift.
    - Add a saved-plan lifecycle utility with exact phases `model-bootstrap`,
      `runtime-cutover`, `credential-cleanup`, and `terminal`; exact operations
-     `init`, `create`, `guard`, `preflight`, `apply`, `reconcile`, `supersede`,
-     and `finalize`; and guard mappings
+     `init`, `create`, `guard`, `diagnostic`, `preflight`, `apply`, `reconcile`,
+     `supersede`, `finalize`, and `close`; and guard mappings
      `luna-model-bootstrap`, `azure-generation-cutover`,
      `azure-credential-cleanup`, and `final-rollout-complete`, respectively.
      It owns a mode-0600 durable rollout state whose only legal advancement is
@@ -259,7 +271,7 @@ read-only to every worker.
      identity. The backend identity is sorted canonical JSON of exactly backend
      type, resource group, storage account, container, state key, subscription,
      tenant, `use_azuread_auth`, and `use_cli`; its required SHA-256 is
-     `171c599d84b399299b6bed79a730396ff9500df2f43c906f193db647d194fb22`.
+     `<protected-hash>`.
      Identifiers/configuration remain only in protected memory/artifacts; normal
      receipts retain hashes. Every operation revalidates all context and state
      serial/lineage before acting.
@@ -277,14 +289,14 @@ read-only to every worker.
      cache mode at most 0600, backend type/hash above, workspace exactly
      `default`, and active CLI context equal to backend context.
    - Pin the reviewed Terraform executable SHA-256 to
-     `00f55981f5215594c418cd6b20f44fa4c99f9126650602e65d533d131005ea81`.
+     `<protected-hash>`.
      Guard/lifecycle scripts, fixtures, and every transitive imported guard
      dependency must be byte-identical to their Git blobs at the reviewed `HEAD`;
      record blob IDs and SHA-256 values. Before every lifecycle operation require
      no staged/untracked paths and every non-generation tracked path clean. For
      model-bootstrap only, permit exactly the seven documented generation paths
      with binary diff hash
-     `180bd86ed88774121cd531a98b9b0dd0d5aa0b01c39af7c11ea64c62ad5a324f`;
+     `<protected-hash>`;
      later phases require a fully clean
      worktree. This prevents dirty fixtures/imports from entering the guard.
    - Caller identity supports only Azure CLI `user` accounts. Resolve the
@@ -594,11 +606,13 @@ uses the lifecycle utility from the repository root:
 node infra/scripts/dev-plan-lifecycle.mjs init
 node infra/scripts/dev-plan-lifecycle.mjs create model-bootstrap|runtime-cutover|credential-cleanup|terminal
 node infra/scripts/dev-plan-lifecycle.mjs guard model-bootstrap|runtime-cutover|credential-cleanup|terminal <run-id>
+node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover <run-id>
 node infra/scripts/dev-plan-lifecycle.mjs preflight model-bootstrap|runtime-cutover|credential-cleanup <run-id>
 node infra/scripts/dev-plan-lifecycle.mjs apply model-bootstrap|runtime-cutover|credential-cleanup <run-id>
 node infra/scripts/dev-plan-lifecycle.mjs reconcile model-bootstrap|runtime-cutover|credential-cleanup <run-id>
 node infra/scripts/dev-plan-lifecycle.mjs supersede credential-cleanup <expired-run-id>
 node infra/scripts/dev-plan-lifecycle.mjs finalize terminal <run-id>
+node infra/scripts/dev-plan-lifecycle.mjs close terminal <run-id>
 ```
 
 Create chooses an opaque run ID and a new canonical directory only beneath
@@ -654,7 +668,119 @@ permanent no-reopen marker. The final Sol audit occurs after that commit and abs
 show JSON, command output, tokens, and provider responses are never retained in
 Git.
 
-## Rollout phases
+## Current operator flow
+
+Use the lifecycle utility from the repository root. Initialize once, then run
+the non-terminal phases in order. Model bootstrap uses the normal
+create/guard/preflight/apply sequence. Runtime cutover inserts the lifecycle
+diagnostic between guard and preflight. Credential cleanup uses the normal
+sequence after its role and cleanup prerequisites:
+
+```sh
+node infra/scripts/dev-plan-lifecycle.mjs init
+
+model_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create model-bootstrap)"
+node infra/scripts/dev-plan-lifecycle.mjs guard model-bootstrap "$model_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs preflight model-bootstrap "$model_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs apply model-bootstrap "$model_run_id"
+
+runtime_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create runtime-cutover)"
+node infra/scripts/dev-plan-lifecycle.mjs guard runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs preflight runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs apply runtime-cutover "$runtime_run_id"
+
+credential_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create credential-cleanup)"
+node infra/scripts/dev-plan-lifecycle.mjs guard credential-cleanup "$credential_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs preflight credential-cleanup "$credential_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs apply credential-cleanup "$credential_run_id"
+```
+
+Use `<phase>` as `model-bootstrap`, then `runtime-cutover`, then
+`credential-cleanup`. The guard mappings are respectively
+`luna-model-bootstrap`, `azure-generation-cutover`, and
+`azure-credential-cleanup`. If apply is ambiguous, use only
+   `reconcile <phase> <run-id>`; never replay the old saved plan. For an
+   ambiguous runtime apply, use the exact runtime command with the same run ID:
+
+   ```text
+   node infra/scripts/dev-plan-lifecycle.mjs reconcile runtime-cutover "$runtime_run_id"
+   ```
+
+   The terminal guard is verification-only:
+
+```sh
+terminal_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create terminal)"
+node infra/scripts/dev-plan-lifecycle.mjs guard terminal "$terminal_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs finalize terminal "$terminal_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs close terminal "$terminal_run_id"
+```
+
+For runtime cutover, run the lifecycle diagnostic after guard and before
+preflight:
+
+```sh
+node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover "$runtime_run_id"
+```
+
+The lifecycle operation validates the existing Container Apps Job and uses the
+guarded immutable relay image, Entra runtime identity, exact no-argument inner
+command, and no secrets. It reserves durable intent before the one allowed Job
+start POST, records resumable submission/execution/receipt evidence, and never
+resubmits after an ambiguous start. The Job's inner command is:
+
+```sh
+node apps/relay/dist/azure-generation-diagnostic.js
+```
+
+The executable uses Entra, sends one bounded request, prints only a fixed
+pass/failure line, and exits `0` or `20`. Runtime-role commands are exactly:
+
+```sh
+node infra/scripts/set-dev-runtime-secrets-role.mjs assert-enabled
+node infra/scripts/set-dev-runtime-secrets-role.mjs disable
+node infra/scripts/set-dev-runtime-secrets-role.mjs assert-disabled
+```
+
+Credential preflight creates the protected Key Vault cleanup descriptor and
+starts/resumes the operation as needed. The cleanup utility's exact CLI is:
+
+```sh
+node infra/scripts/cleanup-key-vault-credentials.mjs start <run-id>
+node infra/scripts/cleanup-key-vault-credentials.mjs resume <run-id>
+node infra/scripts/cleanup-key-vault-credentials.mjs assert-absent <run-id>
+```
+
+The runtime role must be enabled before runtime cutover. After that runtime is
+proven, disable the role and assert-disabled before credential-cleanup
+creation; its preflight validates the disabled state, and its apply resumes the
+cleanup and requires absence evidence.
+
+The fixed retired cleanup targets are `openrouter-api-key` and
+`litellm-master-key`; they appear here only as historical cleanup context.
+After the Azure-only revision is proven, the fixed local cleanup command is:
+
+```sh
+node infra/scripts/remove-env-entry.mjs remove /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
+node infra/scripts/remove-env-entry.mjs assert-absent /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
+```
+
+The retained historical provider-revocation utility must be run before that
+local removal and before terminal finalization:
+
+```sh
+node infra/scripts/openrouter-revocation-state.mjs prepare
+node infra/scripts/openrouter-revocation-state.mjs resume
+node infra/scripts/openrouter-revocation-state.mjs mark-local-removed
+node infra/scripts/openrouter-revocation-state.mjs assert-complete
+```
+
+Its durable state captures preflight evidence, waits for user/provider
+revocation, requires HTTP 401 proof before `revoked`, and only then accepts
+the local removal proof. These provider/key names are historical cleanup
+context only.
+
+## Historical implementation and decision record
 
 1. The exact manual Luna deployment deletion is complete. Review and commit
    this plan alone with an explicit path list; do not stage interrupted files.
@@ -744,27 +870,25 @@ Git.
    that fact before cleanup so deleting the unmanaged secrets cannot create
    Terraform drift.
 
-   OpenRouter key deletion requires a separate Management API key, and none is
-   present locally. Provider-side revocation is therefore a deterministic
-   dashboard-only blocking gate managed by the revocation state utility. Its
-   exact `node infra/scripts/openrouter-revocation-state.mjs prepare` operation
-   queries `GET /api/v1/key`, durably enters awaiting-user,
-   and displays only provider-masked label plus non-secret expiry/limit. The
-   user deletes only the unique dashboard credential matching all three; an
-   ambiguous match stops without deletion. Exact
-   `node infra/scripts/openrouter-revocation-state.mjs resume` is interruption-safe: a 200
-   remains awaiting-user, while 401 proves revocation without inference,
-   durably enters revoked, and removes the protected raw response. Never request
-   a management key or print bearer/hash, IDs, usage, or raw content.
+   The retained provider-revocation utility is part of the current terminal
+   evidence contract. Run its exact sequence before local removal:
 
-   In revoked state run
-   `node infra/scripts/remove-env-entry.mjs remove /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY`.
-   If interrupted after rename, run its `assert-absent` mode instead. Then ask
-   the revocation utility to atomically enter local-removed. It requires zero
-   entries and the durable 401 receipt; invoke exact
-   `node infra/scripts/openrouter-revocation-state.mjs mark-local-removed`, then
-   `node infra/scripts/openrouter-revocation-state.mjs assert-complete`. No
-   other `.env` path/assignment changes and no content is printed.
+   ```text
+   node infra/scripts/openrouter-revocation-state.mjs prepare
+   node infra/scripts/openrouter-revocation-state.mjs resume
+   node infra/scripts/openrouter-revocation-state.mjs mark-local-removed
+   node infra/scripts/openrouter-revocation-state.mjs assert-complete
+   ```
+
+   `resume` requires HTTP 401 proof before `revoked`; local removal is then
+   performed and asserted with the fixed `remove-env-entry` commands in the
+   operator flow above. These names and commands are historical cleanup
+   context only.
+
+   The current fixed local cleanup is interruption-safe; after a successful
+   Azure-only cutover, run `remove` and then `assert-absent` with the exact
+   path/key pair documented above. No other `.env` path or assignment changes
+   are supported.
 
    Before credential mutation, run
    `node infra/scripts/set-dev-runtime-secrets-role.mjs disable`, create, guard,
@@ -857,9 +981,9 @@ Git.
 - Both Foundry deployments are Terraform-managed and Succeeded.
 - Every deployed inference request uses the runtime managed identity; local
   auth remains disabled.
-- The active live Container App revision has no LiteLLM/OpenRouter container, environment,
-  secret, key reference, or fallback.
-- The OpenRouter and LiteLLM master credentials are removed after cutover.
+- The active live Container App revision has no retired provider container,
+  environment, secret, key reference, or fallback.
+- Retired provider credentials are removed after cutover.
 - The capability diagnostic and bilingual smoke pass once on reviewed
   deployments.
 - Content-free telemetry and security-state cleanup pass.

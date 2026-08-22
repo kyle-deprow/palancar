@@ -5,17 +5,23 @@ import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { acceptsPlan, runCli } from "./assert-dev-plan.mjs";
+import {
+  acceptsPlan,
+  createLegacyFinalReferencePlan,
+  runCli,
+} from "./assert-dev-plan.mjs";
 
 const cliPath = fileURLToPath(new URL("./assert-dev-plan.mjs", import.meta.url));
-const finalFixtureText = readFileSync(
+const terminalFixtureText = readFileSync(
   new URL(
     "./fixtures/final-rollout-transition.plan-fixture.json",
     import.meta.url,
   ),
   "utf8",
 );
-const finalTransitionFixture = JSON.parse(finalFixtureText);
+const terminalFixture = JSON.parse(terminalFixtureText);
+const finalTransitionFixture = createLegacyFinalReferencePlan(terminalFixture);
+const finalFixtureText = JSON.stringify(finalTransitionFixture);
 const lunaFixtureText = readFileSync(
   new URL(
     "./fixtures/luna-model-bootstrap.plan-fixture.json",
@@ -24,6 +30,24 @@ const lunaFixtureText = readFileSync(
   "utf8",
 );
 const lunaModelBootstrapFixture = JSON.parse(lunaFixtureText);
+const runtimeCutoverFixture = JSON.parse(
+  readFileSync(
+    new URL(
+      "./fixtures/azure-generation-cutover.plan-fixture.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
+const credentialCleanupFixture = JSON.parse(
+  readFileSync(
+    new URL(
+      "./fixtures/azure-credential-cleanup.plan-fixture.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
 const lunaDeploymentAddress =
   'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]';
 const lunaTranscriptionAddress =
@@ -748,35 +772,12 @@ const finalSubscriptionId = "a7255fdc-572a-4ea3-9d7e-ecb7ee5a87f1";
 const finalResourceGroupId =
   `/subscriptions/${finalSubscriptionId}/resourceGroups/rg-palancar-dev-aeeacd8c`;
 const finalAcrLoginServer = "palancardevacraeeacd8c.azurecr.io";
-const finalTableEndpoint =
-  "https://palancardevstateaeeacd8c.table.core.windows.net";
-const finalTableServiceId =
-  `${finalResourceGroupId}/providers/Microsoft.Storage/storageAccounts/palancardevstateaeeacd8c/tableServices/default`;
-const finalEnvironmentId =
-  `${finalResourceGroupId}/providers/Microsoft.App/managedEnvironments/cae-palancar-dev-aeeacd8c`;
-const finalImagePullIdentity =
-  `${finalResourceGroupId}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-image-pull`;
-const finalRuntimeIdentity =
-  `${finalResourceGroupId}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-palancar-dev-runtime`;
-const finalRuntimeClientId = "00000000-0000-0000-0000-000000000001";
-const finalRuntimePrincipalId = "11111111-1111-4111-8111-111111111111";
-const finalKeyVaultHost = "kvpalancardevaeeacd8c.vault.azure.net";
-const finalRelayOrigin =
-  "wss://ca-palancar-dev-relay-aeeacd8c.eastus2.azurecontainerapps.io";
 const finalCleanupJobAddress =
   "module.expiry_cleanup_job[0].azapi_resource.this";
 const finalFoundryRealtimeEndpoint =
   "wss://palancardevopenaiaeeacd8c.openai.azure.com/openai/v1/realtime?intent=transcription";
 const finalRelayImage =
   `${finalAcrLoginServer}/palancar-relay@sha256:${"1".repeat(64)}`;
-const finalLitellmImage =
-  `${finalAcrLoginServer}/palancar-litellm-proxy@sha256:${"2".repeat(64)}`;
-const finalCleanupImage =
-  `${finalAcrLoginServer}/palancar-expiry-cleanup@sha256:${"3".repeat(64)}`;
-const finalMonitoringRoleDefinitionId =
-  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/3913510d-42f4-4e42-8a64-420c390055eb`;
-const finalApplicationInsightsId =
-  `${finalResourceGroupId}/providers/Microsoft.Insights/components/appi-palancar-dev-aeeacd8c`;
 const finalActionGroupAddress = "azurerm_monitor_action_group.relay";
 const finalActionGroupId =
   `${finalResourceGroupId}/providers/Microsoft.Insights/actionGroups/ag-palancar-dev-relay-aeeacd8c`;
@@ -786,383 +787,6 @@ const finalAlertAddresses = finalTransitionFixture.resource_changes
       entry.type === "azurerm_monitor_scheduled_query_rules_alert_v2",
   )
   .map((entry) => entry.address);
-
-function finalRoleAfter(
-  scope,
-  roleDefinitionId,
-  principalId,
-  principalType = "ServicePrincipal",
-  name = fixtureUuidV5Url(`${scope}/${principalId}/${roleDefinitionId}`),
-) {
-  return {
-    name,
-    scope,
-    role_definition_id: roleDefinitionId,
-    principal_id: principalId,
-    principal_type: principalType,
-  };
-}
-
-function finalOperatorRole(address, tableName, actions = ["create"]) {
-  const scope = `${finalTableServiceId}/tables/${tableName}`;
-  const roleDefinitionId =
-    `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
-  return change(
-    address,
-    actions,
-    finalRoleAfter(
-      scope,
-      roleDefinitionId,
-      operatorPrincipalId,
-      "User",
-      fixtureUuidV5Url(
-        `${scope}/operator/${operatorPrincipalId}/${roleDefinitionId}`,
-      ),
-    ),
-  );
-}
-
-function finalMonitoringRole(actions = ["create"]) {
-  return change(
-    "module.identities_rbac.azurerm_role_assignment.runtime_application_insights",
-    actions,
-    finalRoleAfter(
-      finalApplicationInsightsId,
-      finalMonitoringRoleDefinitionId,
-      finalRuntimePrincipalId,
-      "ServicePrincipal",
-      fixtureUuidV5Url(
-        `scope=${finalApplicationInsightsId}|principal_id=${finalRuntimePrincipalId}|role_definition_id=${finalMonitoringRoleDefinitionId}`,
-      ),
-    ),
-  );
-}
-
-function finalRoleNoOp(address, scope, roleDefinitionId, principalType = "ServicePrincipal") {
-  return change(
-    address,
-    ["no-op"],
-    finalRoleAfter(scope, roleDefinitionId, finalRuntimePrincipalId, principalType),
-  );
-}
-
-function finalContainerAppAfter() {
-  const tags = {
-    application: "palancar",
-    environment: "dev",
-    "managed-by": "terraform",
-    "data-classification": "operational-metadata",
-  };
-  return {
-    type: "Microsoft.App/containerApps@2026-01-01",
-    name: "ca-palancar-dev-relay-aeeacd8c",
-    location: "eastus2",
-    parent_id: finalResourceGroupId,
-    tags,
-    response_export_values: [
-      "properties.configuration.ingress.fqdn",
-      "properties.latestRevisionName",
-      "properties.runningStatus",
-    ],
-    retry: {
-      error_message_regex: ["IdentityDoesNotExist"],
-      interval_seconds: 10,
-      max_interval_seconds: 30,
-    },
-    identity: [
-      {
-        type: "UserAssigned",
-        identity_ids: [finalImagePullIdentity, finalRuntimeIdentity],
-      },
-    ],
-    body: {
-      properties: {
-        managedEnvironmentId: finalEnvironmentId,
-        configuration: {
-          activeRevisionsMode: "Single",
-          ingress: {
-            external: true,
-            targetPort: 8787,
-            transport: "Http",
-            allowInsecure: false,
-            traffic: [{ latestRevision: true, weight: 100 }],
-          },
-          registries: [
-            { server: finalAcrLoginServer, identity: finalImagePullIdentity },
-          ],
-          identitySettings: [
-            {
-              identity: finalImagePullIdentity.replace(
-                "/resourceGroups/",
-                "/resourcegroups/",
-              ),
-              lifecycle: "None",
-            },
-            {
-              identity: finalRuntimeIdentity.replace(
-                "/resourceGroups/",
-                "/resourcegroups/",
-              ),
-              lifecycle: "Main",
-            },
-          ],
-          secrets: [
-            {
-              name: "litellm-master-key",
-              keyVaultUrl: `https://${finalKeyVaultHost}/secrets/litellm-master-key`,
-              identity: finalRuntimeIdentity,
-            },
-            {
-              name: "openrouter-api-key",
-              keyVaultUrl: `https://${finalKeyVaultHost}/secrets/openrouter-api-key`,
-              identity: finalRuntimeIdentity,
-            },
-          ],
-        },
-        template: {
-          containers: [
-            {
-              name: "relay",
-              image: finalRelayImage,
-              resources: { cpu: 0.25, memory: "0.5Gi" },
-              env: [
-                envValue("NODE_ENV", "production"),
-                envValue("PORT", "8787"),
-                envValue("PALANCAR_GENERATION_PROVIDER", "litellm"),
-                envValue("PALANCAR_RELAY_BIND_HOST", "0.0.0.0"),
-                envValue("PALANCAR_RELAY_ENVIRONMENT", "dev"),
-                envValue("PALANCAR_RELAY_ORIGIN", finalRelayOrigin),
-                envValue("PALANCAR_GATE_POLICY_VERSION", "1.0.0"),
-                envValue("AZURE_CLIENT_ID", finalRuntimeClientId),
-                envValue("PALANCAR_DEPLOYMENT_SLOT", "dev"),
-                envValue(
-                  "PALANCAR_LANGUAGE_BOUNDARY_MODE",
-                  "development-provisional",
-                ),
-                envValue(
-                  "APPLICATIONINSIGHTS_CONNECTION_STRING",
-                  "InstrumentationKey=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa;IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com",
-                ),
-                envValue("APPLICATIONINSIGHTS_STATSBEAT_DISABLED", "true"),
-                envValue("APPLICATION_INSIGHTS_NO_STATSBEAT", "true"),
-                envValue("PALANCAR_SECURITY_MODE", "azure-table"),
-                envValue("PALANCAR_WORKLOAD_TABLE_ENDPOINT", finalTableEndpoint),
-                envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
-                envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
-                envValue("PALANCAR_TRANSCRIPTION_PROVIDER", "azure-realtime"),
-                envValue(
-                  "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
-                  finalFoundryRealtimeEndpoint,
-                ),
-                envValue(
-                  "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
-                  "gpt-4o-mini-transcribe",
-                ),
-                envValue(
-                  "PALANCAR_BROWSER_ALLOWED_ORIGINS_JSON",
-                  '["https://even-webview.synthetic.invalid"]',
-                ),
-                envValue("PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"),
-                envValue("PALANCAR_LITELLM_BASE_URL", "http://127.0.0.1:4000"),
-                envValue("PALANCAR_LITELLM_MODEL", "palancar-generation"),
-                envSecret("PALANCAR_LITELLM_API_KEY", "litellm-master-key"),
-              ],
-              probes: [
-                {
-                  type: "Liveness",
-                  tcpSocket: { port: 8787 },
-                  initialDelaySeconds: 10,
-                  periodSeconds: 10,
-                  timeoutSeconds: 3,
-                  failureThreshold: 3,
-                },
-                {
-                  type: "Readiness",
-                  httpGet: { path: "/readyz", port: 8787 },
-                  initialDelaySeconds: 5,
-                  periodSeconds: 10,
-                  timeoutSeconds: 7,
-                  failureThreshold: 3,
-                },
-              ],
-            },
-            {
-              name: "litellm",
-              image: finalLitellmImage,
-              resources: { cpu: 0.25, memory: "0.5Gi" },
-              env: [
-                envValue("PALANCAR_LITELLM_BACKEND", "openrouter"),
-                envValue(
-                  "PALANCAR_LITELLM_UPSTREAM_MODEL",
-                  "openrouter/openai/gpt-4o-mini",
-                ),
-                envSecret("LITELLM_MASTER_KEY", "litellm-master-key"),
-                envSecret("OPENROUTER_API_KEY", "openrouter-api-key"),
-              ],
-              probes: [
-                {
-                  type: "Liveness",
-                  tcpSocket: { port: 4000 },
-                  initialDelaySeconds: 10,
-                  periodSeconds: 30,
-                  timeoutSeconds: 3,
-                  failureThreshold: 3,
-                },
-                {
-                  type: "Readiness",
-                  httpGet: { path: "/health/readiness", port: 4000 },
-                  periodSeconds: 10,
-                  timeoutSeconds: 7,
-                  failureThreshold: 3,
-                },
-                {
-                  type: "Startup",
-                  httpGet: { path: "/health/liveliness", port: 4000 },
-                  periodSeconds: 10,
-                  timeoutSeconds: 3,
-                  failureThreshold: 10,
-                },
-              ],
-            },
-          ],
-          scale: { minReplicas: 1, maxReplicas: 1 },
-        },
-      },
-    },
-  };
-}
-
-function finalCleanupJobAfter() {
-  return {
-    type: "Microsoft.App/jobs@2026-01-01",
-    name: "caj-palancardev-cleanup-aeeacd8c",
-    location: "eastus2",
-    parent_id: finalResourceGroupId,
-    tags: {
-      application: "palancar",
-      environment: "dev",
-      "managed-by": "terraform",
-      "data-classification": "operational-metadata",
-    },
-    identity: [
-      {
-        type: "UserAssigned",
-        identity_ids: [finalImagePullIdentity, finalRuntimeIdentity],
-      },
-    ],
-    body: {
-      properties: {
-        environmentId: finalEnvironmentId,
-        configuration: {
-          triggerType: "Schedule",
-          scheduleTriggerConfig: {
-            cronExpression: "0 3 * * *",
-            replicaCompletionCount: 1,
-            parallelism: 1,
-          },
-          replicaRetryLimit: 0,
-          replicaTimeout: 300,
-          registries: [
-            { server: finalAcrLoginServer, identity: finalImagePullIdentity },
-          ],
-          identitySettings: [
-            {
-              identity: finalImagePullIdentity.replace(
-                "/resourceGroups/",
-                "/resourcegroups/",
-              ),
-              lifecycle: "None",
-            },
-            {
-              identity: finalRuntimeIdentity.replace(
-                "/resourceGroups/",
-                "/resourcegroups/",
-              ),
-              lifecycle: "Main",
-            },
-          ],
-        },
-        template: {
-          containers: [
-            {
-              name: "expiry-cleanup",
-              image: finalCleanupImage,
-              resources: { cpu: 0.25, memory: "0.5Gi" },
-              env: [
-                envValue("AZURE_CLIENT_ID", finalRuntimeClientId),
-                envValue("PALANCAR_WORKLOAD_TABLE_ENDPOINT", finalTableEndpoint),
-                envValue("PALANCAR_SECURITY_STATE_TABLE", "SecurityState"),
-                envValue("PALANCAR_RATE_STATE_TABLE", "RateState"),
-                envValue("PALANCAR_RELAY_ENVIRONMENT", "dev"),
-                envValue("PALANCAR_RELAY_ORIGIN", finalRelayOrigin),
-                envValue("PALANCAR_EXPIRY_CLEANUP_LIMIT", "1000"),
-                envValue("PALANCAR_EXPIRY_CLEANUP_TIMEOUT_MS", "240000"),
-              ],
-            },
-          ],
-        },
-      },
-    },
-  };
-}
-
-const finalRoleDefinitionTableId =
-  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`;
-const finalRoleDefinitionAcrId =
-  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d`;
-const finalRoleDefinitionOpenAiId =
-  `/subscriptions/${finalSubscriptionId}/providers/Microsoft.Authorization/roleDefinitions/5e0bd9bd-7b93-4f28-af87-19fc36ad61bd`;
-const finalAcrId = `${finalResourceGroupId}/providers/Microsoft.ContainerRegistry/registries/palancardevacraeeacd8c`;
-const finalStorageAccountId = `${finalResourceGroupId}/providers/Microsoft.Storage/storageAccounts/palancardevstateaeeacd8c`;
-const finalFoundryAccountId = foundryCognitiveAccountId;
-const finalKeyVaultId = `${finalResourceGroupId}/providers/Microsoft.KeyVault/vaults/kvpalancardevaeeacd8c`;
-
-function finalFoundationChanges() {
-  const changes = foundationNoOps.map(clone);
-  const runtimeIndex = changes.findIndex(
-    (item) =>
-      item.address ===
-      "module.identities_rbac.azurerm_user_assigned_identity.runtime",
-  );
-  changes[runtimeIndex] = change(
-    changes[runtimeIndex].address,
-    ["no-op"],
-    { client_id: finalRuntimeClientId, principal_id: finalRuntimePrincipalId },
-  );
-  for (const [address, scope, roleDefinitionId] of [
-    [
-      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
-      finalKeyVaultId,
-      finalRoleDefinitionOpenAiId,
-    ],
-    [
-      "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer",
-      finalKeyVaultId,
-      finalRoleDefinitionOpenAiId,
-    ],
-  ]) {
-    const index = changes.findIndex((item) => item.address === address);
-    changes[index] = finalRoleNoOp(address, scope, roleDefinitionId);
-  }
-  changes.push(
-    finalRoleNoOp(
-      "module.identities_rbac.azurerm_role_assignment.image_pull_acr",
-      finalAcrId,
-      finalRoleDefinitionAcrId,
-    ),
-    finalRoleNoOp(
-      "module.identities_rbac.azurerm_role_assignment.runtime_table",
-      finalStorageAccountId,
-      finalRoleDefinitionTableId,
-    ),
-    finalRoleNoOp(
-      "module.identities_rbac.azurerm_role_assignment.runtime_openai",
-      finalFoundryAccountId,
-      finalRoleDefinitionOpenAiId,
-    ),
-  );
-  return changes;
-}
 
 function finalValueModule(root, address) {
   if (address === "") return root;
@@ -5491,4 +5115,753 @@ test("CLI rejection output is fixed and content-free", () => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, "plan guard rejected plan\n");
+});
+
+function cutoverChange(planValue, address) {
+  const entry = planValue.resource_changes.find(
+    (candidate) => candidate.address === address,
+  );
+  assert.ok(entry, `missing cutover resource ${address}`);
+  return entry;
+}
+
+function mutateCutoverNoOpPriorCopy(planValue, address, mutate) {
+  const entry = cutoverChange(planValue, address);
+  assert.deepEqual(entry.change.actions, ["no-op"]);
+  mutate(entry.change.before);
+  const prior = finalValueResource(planValue.prior_state.values.root_module, address);
+  assert.ok(prior, `missing prior resource ${address}`);
+  mutate(prior.values);
+}
+
+function rejectsCutoverNoOpSensitiveDivergence(source, mode) {
+  const logAnalyticsAddress =
+    "module.observability.azurerm_log_analytics_workspace.this";
+  const storageAddress =
+    "module.workload_state.azurerm_storage_account.this";
+  const logPrimaryKey = Buffer.alloc(64, 0x55).toString("base64");
+  const logSecondaryKey = Buffer.alloc(64, 0x66).toString("base64");
+  const storagePrimaryKey = Buffer.alloc(64, 0x77).toString("base64");
+  const storageSecondaryKey = Buffer.alloc(64, 0x88).toString("base64");
+  const storageConnection = (name, key, blob) =>
+    blob
+      ? `DefaultEndpointsProtocol=https;BlobEndpoint=https://${name}.blob.core.windows.net/;AccountName=${name};AccountKey=${key}`
+      : `DefaultEndpointsProtocol=https;AccountName=${name};AccountKey=${key};EndpointSuffix=core.windows.net`;
+
+  for (const [address, mutate] of [
+    [logAnalyticsAddress, (value) => {
+      value.primary_shared_key = logPrimaryKey;
+      value.secondary_shared_key = logSecondaryKey;
+    }],
+    [storageAddress, (value) => {
+      value.primary_access_key = storagePrimaryKey;
+      value.secondary_access_key = storageSecondaryKey;
+      value.primary_connection_string = storageConnection(
+        value.name,
+        storagePrimaryKey,
+        false,
+      );
+      value.secondary_connection_string = storageConnection(
+        value.name,
+        storageSecondaryKey,
+        false,
+      );
+      value.primary_blob_connection_string = storageConnection(
+        value.name,
+        storagePrimaryKey,
+        true,
+      );
+      value.secondary_blob_connection_string = storageConnection(
+        value.name,
+        storageSecondaryKey,
+        true,
+      );
+    }],
+  ]) {
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateCutoverNoOpPriorCopy(candidate, address, mutate);
+    });
+  }
+}
+
+function rejectsCutoverMutation(source, mode, mutate) {
+  const candidate = clone(source);
+  mutate(candidate);
+  assert.equal(acceptsPlan(candidate, mode), false);
+}
+
+function rebindTerminalSensitiveLeaves(candidate) {
+  const mutateResourceCopies = (address, mutate) => {
+    const entry = cutoverChange(candidate, address);
+    mutate(entry.change.before);
+    mutate(entry.change.after);
+    mutate(finalValueResource(candidate.planned_values.root_module, address).values);
+    mutate(finalValueResource(candidate.prior_state.values.root_module, address).values);
+  };
+  const logPrimary = Buffer.alloc(64, 0x55).toString("base64");
+  const logSecondary = Buffer.alloc(64, 0x66).toString("base64");
+  mutateResourceCopies(
+    "module.observability.azurerm_log_analytics_workspace.this",
+    (value) => {
+      value.primary_shared_key = logPrimary;
+      value.secondary_shared_key = logSecondary;
+    },
+  );
+
+  const storageName = "palancardevstateaeeacd8c";
+  const storagePrimary = Buffer.alloc(64, 0x77).toString("base64");
+  const storageSecondary = Buffer.alloc(64, 0x88).toString("base64");
+  const storageConnection = (key, blob) =>
+    blob
+      ? `DefaultEndpointsProtocol=https;BlobEndpoint=https://${storageName}.blob.core.windows.net/;AccountName=${storageName};AccountKey=${key}`
+      : `DefaultEndpointsProtocol=https;AccountName=${storageName};AccountKey=${key};EndpointSuffix=core.windows.net`;
+  mutateResourceCopies(
+    "module.workload_state.azurerm_storage_account.this",
+    (value) => {
+      value.primary_access_key = storagePrimary;
+      value.secondary_access_key = storageSecondary;
+      value.primary_connection_string = storageConnection(storagePrimary, false);
+      value.secondary_connection_string = storageConnection(storageSecondary, false);
+      value.primary_blob_connection_string = storageConnection(storagePrimary, true);
+      value.secondary_blob_connection_string = storageConnection(storageSecondary, true);
+    },
+  );
+
+  const applicationInsightsConnection =
+    "InstrumentationKey=00000000-0000-4000-8000-000000000111;" +
+    "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com/;" +
+    "LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;" +
+    "ApplicationId=00000000-0000-4000-8000-000000000098";
+  const relayConnection =
+    "InstrumentationKey=00000000-0000-4000-8000-000000000111;" +
+    "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com";
+  mutateResourceCopies(
+    "module.observability.azurerm_application_insights.this",
+    (value) => {
+      value.connection_string = applicationInsightsConnection;
+      value.instrumentation_key =
+        "00000000-0000-4000-8000-000000000111";
+    },
+  );
+  mutateResourceCopies(
+    containerAppAddress,
+    (value) => {
+      for (const environment of value.body.properties.template.containers[0].env) {
+        if (environment.name === "APPLICATIONINSIGHTS_CONNECTION_STRING") {
+          environment.value = relayConnection;
+        }
+      }
+    },
+  );
+  for (const output of [
+    candidate.output_changes.application_insights_connection_string,
+    candidate.planned_values.outputs.application_insights_connection_string,
+    candidate.prior_state.values.outputs.application_insights_connection_string,
+  ]) {
+    if (Object.hasOwn(output, "before")) output.before = applicationInsightsConnection;
+    if (Object.hasOwn(output, "after")) output.after = applicationInsightsConnection;
+    if (Object.hasOwn(output, "value")) output.value = applicationInsightsConnection;
+  }
+
+  mutateResourceCopies(
+    "module.container_registry.azurerm_container_registry.this",
+    (value) => { value.admin_password = "opaque-admin-password"; },
+  );
+  mutateResourceCopies(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+    (value) => { value.dapr_application_insights_connection_string = "opaque-dapr-connection"; },
+  );
+}
+
+test("Azure generation cutover and credential cleanup fixtures pass only their closed modes", () => {
+  assert.equal(
+    acceptsPlan(runtimeCutoverFixture, "azure-generation-cutover"),
+    true,
+  );
+  assert.equal(
+    acceptsPlan(credentialCleanupFixture, "azure-credential-cleanup"),
+    true,
+  );
+  assert.equal(
+    acceptsPlan(runtimeCutoverFixture, "azure-credential-cleanup"),
+    false,
+  );
+  assert.equal(
+    acceptsPlan(credentialCleanupFixture, "azure-generation-cutover"),
+    false,
+  );
+});
+
+test("Azure generation cutover requires the indexed no-action Secrets User move", () => {
+  const target =
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
+  rejectsCutoverMutation(runtimeCutoverFixture, "azure-generation-cutover", (candidate) => {
+    delete cutoverChange(candidate, target).previous_address;
+  });
+  rejectsCutoverMutation(runtimeCutoverFixture, "azure-generation-cutover", (candidate) => {
+    cutoverChange(candidate, target).previous_address =
+      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[1]";
+  });
+  rejectsCutoverMutation(runtimeCutoverFixture, "azure-generation-cutover", (candidate) => {
+    cutoverChange(candidate, target).change.actions = ["update"];
+  });
+  rejectsCutoverMutation(runtimeCutoverFixture, "azure-generation-cutover", (candidate) => {
+    candidate.resource_changes = candidate.resource_changes.filter(
+      (entry) => entry.address !== target,
+    );
+  });
+});
+
+test("Azure generation cutover is direct-Entra, one-container, immutable, and secret-free", () => {
+  const appAddress = "module.container_app_workload[0].azapi_resource.this";
+  const modelAddress =
+    'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]';
+  const mutations = [
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8.azurecr.io/palancar-relay:latest";
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.configuration.maxInactiveRevisions =
+        2;
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.configuration.secrets.push(
+        { name: "unexpected" },
+      );
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.template.containers.push(
+        { name: "sidecar" },
+      );
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.template.containers[0].env.push(
+        { name: "AZURE_API_KEY", value: "fixture-secret" },
+      );
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.identity[0].identity_ids.reverse();
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after.body.properties.template.containers[0].resources.cpu =
+        0.5;
+    },
+    (candidate) => {
+      cutoverChange(candidate, modelAddress).change.after.model[0].version =
+        "2026-01-01";
+    },
+    (candidate) => {
+      cutoverChange(candidate, modelAddress).change.actions = ["update"];
+    },
+    (candidate) => {
+      cutoverChange(candidate, appAddress).change.after_unknown = {
+        body: true,
+      };
+    },
+  ];
+  for (const mutate of mutations) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      mutate,
+    );
+  }
+  rejectsCutoverNoOpSensitiveDivergence(
+    runtimeCutoverFixture,
+    "azure-generation-cutover",
+  );
+});
+
+test("Credential cleanup permits exactly one indexed RBAC delete and no previous address", () => {
+  const target =
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
+  const appAddress = "module.container_app_workload[0].azapi_resource.this";
+  rejectsCutoverMutation(credentialCleanupFixture, "azure-credential-cleanup", (candidate) => {
+    cutoverChange(candidate, target).previous_address =
+      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+  });
+  rejectsCutoverMutation(credentialCleanupFixture, "azure-credential-cleanup", (candidate) => {
+    cutoverChange(candidate, target).change.actions = ["no-op"];
+  });
+  rejectsCutoverMutation(credentialCleanupFixture, "azure-credential-cleanup", (candidate) => {
+    cutoverChange(candidate, target).change.after = {};
+  });
+  rejectsCutoverMutation(credentialCleanupFixture, "azure-credential-cleanup", (candidate) => {
+    cutoverChange(candidate, appAddress).change.actions = ["update"];
+  });
+  rejectsCutoverMutation(credentialCleanupFixture, "azure-credential-cleanup", (candidate) => {
+    candidate.resource_changes.push({
+      address: "module.identities_rbac.azurerm_role_assignment.extra",
+      change: clone(candidate.resource_changes[0].change),
+    });
+  });
+  rejectsCutoverNoOpSensitiveDivergence(
+    credentialCleanupFixture,
+    "azure-credential-cleanup",
+  );
+});
+
+test("Final rollout complete is a terminal exact no-op contract", () => {
+  const terminal = clone(terminalFixture);
+  assert.equal(acceptsPlan(terminal, "final-rollout-complete"), true);
+  for (const mutate of [
+    (candidate) => {
+      candidate.applyable = true;
+    },
+    (candidate) => {
+      finalChange(candidate, containerAppAddress).change.actions = ["update"];
+    },
+    (candidate) => {
+      candidate.resource_drift = [{ address: "fixture" }];
+    },
+    (candidate) => {
+      candidate.resource_changes.push(clone(candidate.resource_changes[0]));
+    },
+    (candidate) => {
+      finalChange(candidate, containerAppAddress).change.after_unknown = {
+        body: true,
+      };
+    },
+  ]) {
+    rejectsCutoverMutation(terminal, "final-rollout-complete", mutate);
+  }
+});
+
+test("new guard modes have closed content-free CLI entry points", () => {
+  assert.equal(
+    runCli(
+      ["--mode=azure-generation-cutover"],
+      JSON.stringify(runtimeCutoverFixture),
+    ),
+    0,
+  );
+  assert.equal(
+    runCli(
+      ["--mode=azure-credential-cleanup"],
+      JSON.stringify(credentialCleanupFixture),
+    ),
+    0,
+  );
+  assert.equal(
+    runCli(
+      ["--mode=final-rollout-complete"],
+      JSON.stringify(terminalFixture),
+    ),
+    0,
+  );
+  assert.equal(
+    runCli(["--mode=azure-generation-cutover", "extra"], "{}"),
+    2,
+  );
+  assert.equal(runCli(["--mode=final-rollout-complete"], "{"), 1);
+});
+
+test("new guard modes enforce the exact resource address set", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.resource_changes[0].address =
+        "module.inventory_substitution.azurerm_resource.this";
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.resource_changes.pop();
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.resource_changes.push(clone(candidate.resource_changes[0]));
+    });
+  }
+});
+
+test("new guard modes require exact boolean applyability", () => {
+  for (const [source, mode, expected] of [
+    [runtimeCutoverFixture, "azure-generation-cutover", true],
+    [credentialCleanupFixture, "azure-credential-cleanup", true],
+    [terminalFixture, "final-rollout-complete", false],
+  ]) {
+    assert.equal(source.applyable, expected);
+    assert.equal(acceptsPlan(source, mode), true);
+    for (const invalid of [undefined, null, "true", 0, 1, {}, []]) {
+      const candidate = clone(source);
+      if (invalid === undefined) {
+        delete candidate.applyable;
+      } else {
+        candidate.applyable = invalid;
+      }
+      assert.equal(
+        acceptsPlan(candidate, mode),
+        false,
+        `${mode} accepted applyable=${String(invalid)}`,
+      );
+    }
+  }
+});
+
+test("new guard modes require exact state envelopes and module placement", () => {
+  const cases = [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ];
+  const mutations = [
+    (candidate) => {
+      candidate.planned_values.extra = {};
+    },
+    (candidate) => {
+      candidate.prior_state.format_version = "1.2";
+    },
+    (candidate) => {
+      candidate.prior_state.terraform_version = "1.14.0";
+    },
+    (candidate) => {
+      candidate.prior_state.values.extra = {};
+    },
+    (candidate) => {
+      candidate.planned_values.root_module.child_modules[0].address =
+        "module.moved";
+    },
+    (candidate) => {
+      const modules = candidate.planned_values.root_module.child_modules;
+      const foundry = modules.find((module) => module.address === "module.foundry");
+      const observability = modules.find(
+        (module) => module.address === "module.observability",
+      );
+      const index = foundry.resources.findIndex(
+        (resource) => resource.address === lunaTranscriptionAddress,
+      );
+      observability.resources.push(foundry.resources.splice(index, 1)[0]);
+    },
+    (candidate) => {
+      candidate.planned_values.root_module.resources[0].unexpected = true;
+    },
+  ];
+  for (const [source, mode] of cases) {
+    for (const mutate of mutations) {
+      rejectsCutoverMutation(source, mode, mutate);
+    }
+  }
+});
+
+test("new guard modes require exact output schemas, types, and sensitivity references", () => {
+  const cases = [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ];
+  const mutations = [
+    (candidate) => {
+      delete candidate.planned_values.outputs.foundry_deployment_names.type;
+    },
+    (candidate) => {
+      candidate.prior_state.values.outputs.foundry_deployment_names.type = [
+        "set",
+        "string",
+      ];
+    },
+    (candidate) => {
+      candidate.output_changes.foundry_deployment_names.extra = true;
+    },
+  ];
+  for (const [source, mode] of cases) {
+    for (const mutate of mutations) {
+      rejectsCutoverMutation(source, mode, mutate);
+    }
+    for (const field of [
+      "before_sensitive",
+      "after_sensitive",
+    ]) {
+      for (const invalid of [null, 0, "false", {}, []]) {
+        rejectsCutoverMutation(source, mode, (candidate) => {
+          candidate.output_changes.application_insights_connection_string[field] =
+            invalid;
+        });
+      }
+    }
+    for (const section of [
+      candidate => candidate.planned_values.outputs,
+      candidate => candidate.prior_state.values.outputs,
+    ]) {
+      for (const invalid of [null, 0, "false", {}, []]) {
+        rejectsCutoverMutation(source, mode, (candidate) => {
+          section(candidate).application_insights_connection_string.sensitive =
+            invalid;
+        });
+      }
+    }
+  }
+});
+
+test("new guard modes tolerate legitimate Terraform show-json metadata", () => {
+  const candidate = clone(terminalFixture);
+  candidate.provider_schemas = {
+    "registry.terraform.io/hashicorp/azurerm": { version: 1 },
+  };
+  const app = cutoverChange(candidate, lunaContainerAppAddress);
+  app.change.before_identity = { id: app.change.before.id, type: null };
+  app.change.after_identity = { id: app.change.after.id, type: null };
+  assert.equal(acceptsPlan(candidate, "final-rollout-complete"), true);
+});
+
+test("Azure generation cutover binds the immutable predecessor and replacement image", () => {
+  const appAddress = "module.container_app_workload[0].azapi_resource.this";
+  rejectsCutoverMutation(
+    runtimeCutoverFixture,
+    "azure-generation-cutover",
+    (candidate) => {
+      const app = cutoverChange(candidate, appAddress);
+      app.change.before.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8.azurecr.io/palancar-relay@sha256:" + "d".repeat(64);
+    },
+  );
+  rejectsCutoverMutation(
+    runtimeCutoverFixture,
+    "azure-generation-cutover",
+    (candidate) => {
+      const app = cutoverChange(candidate, appAddress);
+      app.change.after.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8.azurecr.io/palancar-relay:latest";
+    },
+  );
+  rejectsCutoverMutation(
+    runtimeCutoverFixture,
+    "azure-generation-cutover",
+    (candidate) => {
+      candidate.variables.relay_image_digest.value =
+        "palancardevacraeeacd8.azurecr.io/palancar-relay@sha256:" + "e".repeat(64);
+    },
+  );
+  const rebound = clone(runtimeCutoverFixture);
+  const reboundImage =
+    "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:" + "f".repeat(64);
+  rebound.variables.relay_image_digest.value = reboundImage;
+  cutoverChange(rebound, appAddress).change.after.body.properties.template.containers[0].image =
+    reboundImage;
+  lunaBootstrapValueResource(
+    rebound.planned_values.root_module,
+    appAddress,
+  ).values.body.properties.template.containers[0].image = reboundImage;
+  assert.equal(acceptsPlan(rebound, "azure-generation-cutover"), true);
+});
+
+test("Azure generation cutover rejects CPU, memory, and replica drift", () => {
+  for (const mutate of [
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].resources.cpu = 0.5;
+    },
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].resources.memory = "1Gi";
+    },
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.scale.minReplicas = 2;
+    },
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.scale.maxReplicas = 2;
+    },
+  ]) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      mutate,
+    );
+  }
+});
+
+test("Azure generation cutover binds both managed identities and every role field", () => {
+  const roleAddress =
+    "module.identities_rbac.azurerm_role_assignment.runtime_openai";
+  for (const mutate of [
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.identity[0].identity_ids.reverse();
+    },
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.identity[0].identity_ids[1] += "/unexpected";
+    },
+    (candidate) => {
+      cutoverChange(candidate, "module.identities_rbac.azurerm_user_assigned_identity.runtime").change.after.principal_id =
+        "44444444-4444-4444-8444-444444444444";
+    },
+    (candidate) => {
+      cutoverChange(candidate, roleAddress).change.after.principal_id =
+        "44444444-4444-4444-8444-444444444444";
+    },
+    (candidate) => {
+      cutoverChange(candidate, roleAddress).change.after.scope += "/unexpected";
+    },
+    (candidate) => {
+      cutoverChange(candidate, roleAddress).change.after.role_definition_id += "/unexpected";
+    },
+    (candidate) => {
+      cutoverChange(candidate, roleAddress).change.after.name = "44444444-4444-4444-8444-444444444444";
+    },
+  ]) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      mutate,
+    );
+  }
+});
+
+test("Azure generation cutover rejects drift in either exact model", () => {
+  for (const address of [
+    lunaTranscriptionAddress,
+    lunaDeploymentAddress,
+  ]) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      (candidate) => {
+        cutoverChange(candidate, address).change.after.model[0].version =
+          "2099-01-01";
+      },
+    );
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      (candidate) => {
+        cutoverChange(candidate, address).change.actions = ["update"];
+      },
+    );
+  }
+});
+
+test("new guard modes reject unknowns in every security-relevant envelope", () => {
+  const mutations = [
+    (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after_unknown = {
+        body: true,
+      };
+    },
+    (candidate) => {
+      cutoverChange(candidate, lunaDeploymentAddress).change.after_unknown = {
+        model: [{ version: true }],
+      };
+    },
+    (candidate) => {
+      cutoverChange(candidate, operatorRateRoleAddress).change.after_unknown = {
+        principal_id: true,
+      };
+    },
+    (candidate) => {
+      candidate.output_changes.foundry_deployment_names.after_unknown = true;
+    },
+    (candidate) => {
+      candidate.resource_changes[0].change.unknown = true;
+    },
+  ];
+  for (const mutate of mutations) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      mutate,
+    );
+  }
+  rejectsCutoverMutation(
+    credentialCleanupFixture,
+    "azure-credential-cleanup",
+    mutations[3],
+  );
+  rejectsCutoverMutation(
+    terminalFixture,
+    "final-rollout-complete",
+    mutations[0],
+  );
+});
+
+test("new guard modes reject action reasons, imports, deposed state, and drift metadata", () => {
+  const mutations = [
+    (candidate) => {
+      candidate.resource_changes[0].change.action_reason = "fixture";
+    },
+    (candidate) => {
+      candidate.resource_changes[0].import = { id: "fixture" };
+    },
+    (candidate) => {
+      candidate.resource_changes[0].deposed = "fixture";
+    },
+    (candidate) => {
+      candidate.resource_drift = [];
+    },
+    (candidate) => {
+      candidate.deferred_changes = [];
+    },
+    (candidate) => {
+      candidate.configuration.target = "module.container_app_workload";
+    },
+  ];
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    for (const mutate of mutations) {
+      rejectsCutoverMutation(source, mode, mutate);
+    }
+  }
+});
+
+test("final-rollout-complete is the post-cleanup direct-Entra terminal state", () => {
+  const app = cutoverChange(terminalFixture, lunaContainerAppAddress).change.after;
+  const models = terminalFixture.resource_changes.filter((entry) =>
+    entry.address.startsWith("module.foundry.azurerm_cognitive_deployment.this["),
+  );
+  assert.equal(terminalFixture.applyable, false);
+  assert.equal(terminalFixture.resource_changes.every((entry) =>
+    entry.change.actions.length === 1 && entry.change.actions[0] === "no-op",
+  ), true);
+  assert.equal(app.body.properties.configuration.secrets.length, 0);
+  assert.equal(app.body.properties.template.containers.length, 1);
+  assert.deepEqual(
+    models.map((entry) => entry.change.after.name),
+    ["gpt-4o-mini-transcribe", "gpt-5.6-luna"],
+  );
+  assert.equal(
+    terminalFixture.resource_changes.some((entry) =>
+      entry.address.includes("runtime_secrets_user"),
+    ),
+    false,
+  );
+  assert.equal(acceptsPlan(terminalFixture, "final-rollout-complete"), true);
+
+  const rebound = clone(terminalFixture);
+  rebindTerminalSensitiveLeaves(rebound);
+  assert.equal(acceptsPlan(rebound, "final-rollout-complete"), true);
+
+  const inconsistent = clone(rebound);
+  finalValueResource(
+    inconsistent.planned_values.root_module,
+    "module.workload_state.azurerm_storage_account.this",
+  ).values.primary_connection_string = "inconsistent-derived-connection";
+  assert.equal(acceptsPlan(inconsistent, "final-rollout-complete"), false);
+
+  const unmasked = clone(rebound);
+  cutoverChange(
+    unmasked,
+    "module.observability.azurerm_log_analytics_workspace.this",
+  ).change.after_sensitive.primary_shared_key = false;
+  assert.equal(acceptsPlan(unmasked, "final-rollout-complete"), false);
+
+  const invalidType = clone(rebound);
+  const storageChange = cutoverChange(
+    invalidType,
+    "module.workload_state.azurerm_storage_account.this",
+  );
+  for (const value of [
+    storageChange.change.before,
+    storageChange.change.after,
+    finalValueResource(
+      invalidType.planned_values.root_module,
+      "module.workload_state.azurerm_storage_account.this",
+    ).values,
+    finalValueResource(
+      invalidType.prior_state.values.root_module,
+      "module.workload_state.azurerm_storage_account.this",
+    ).values,
+  ]) {
+    value.primary_access_key = 123;
+  }
+  assert.equal(acceptsPlan(invalidType, "final-rollout-complete"), false);
 });

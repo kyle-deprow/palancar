@@ -36,6 +36,10 @@ export const EVIDENCE_ROOT =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover";
 export const CLOSURE_PATH =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-closure";
+const CLEANUP_UTILITY_PATH = path.join(
+  path.dirname(SCRIPT_PATH),
+  "cleanup-key-vault-credentials.mjs",
+);
 const LIFECYCLE_CACHE_ROOT =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache";
 export const TERRAFORM_PATH = "/home/dev/.local/bin/terraform-1.15.8";
@@ -45,15 +49,8 @@ export const AZ_PATH = "/usr/bin/az";
 export const BACKEND_SHA256 =
   "171c599d84b399299b6bed79a730396ff9500df2f43c906f193db647d194fb22";
 export const GENERATION_DIFF_SHA256 =
-  "180bd86ed88774121cd531a98b9b0dd0d5aa0b01c39af7c11ea64c62ad5a324f";
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-const RUNTIME_RELAY_IMAGE =
-  "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd";
-const RUNTIME_LITELLM_IMAGE =
-  "palancardevacraeeacd8c.azurecr.io/palancar-litellm-proxy@sha256:d065e5e847b543fd22b43ea3b62a6680619d8c76b67c2a7ef6a135b10e3978b3";
-const RUNTIME_LITELLM_MODEL = "palancar-generation";
-const RUNTIME_LITELLM_BASE_URL = "http://127.0.0.1:4000";
-const RUNTIME_OPENROUTER_MODEL = "openrouter/openai/gpt-5.6-luna";
 const RETIRED_SECRET_NAMES = Object.freeze([
   "openrouter-api-key",
   "litellm-master-key",
@@ -80,11 +77,13 @@ export const OPERATIONS = Object.freeze([
   "init",
   "create",
   "guard",
+  "diagnostic",
   "preflight",
   "apply",
   "reconcile",
   "supersede",
   "finalize",
+  "close",
 ]);
 export const GUARD_MAPPINGS = Object.freeze({
   "model-bootstrap": "luna-model-bootstrap",
@@ -128,6 +127,8 @@ const PREFLIGHT_MAX_AGE_MS = 2 * 60 * 1000;
 const RECEIPT_MAX_BYTES = 1024;
 const JSON_MAX_BYTES = 8 * 1024 * 1024;
 const PLAN_MAX_BYTES = 64 * 1024 * 1024;
+const REVOCATION_RAW_MAX_BYTES = 1024 * 1024;
+const REVOCATION_LOCK_MAX_BYTES = 128;
 const EXECUTABLE_MAX_BYTES = 256 * 1024 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES = JSON_MAX_BYTES;
 const COMMAND_TIMEOUT_MS = 120 * 1000;
@@ -139,6 +140,7 @@ const APPLY_KILL_GRACE_MS = 500;
 const PRODUCTION_CLI_TIMEOUT_MS = APPLY_TIMEOUT_MS + COMMAND_TIMEOUT_MS + APPLY_TERM_GRACE_MS + APPLY_KILL_GRACE_MS;
 const INTERNAL_LOCKED_MARKER = "--__palancar-internal-locked-b1b";
 const INTERNAL_APPLY_RUNNER_MARKER = "--__palancar-internal-apply-runner-b1b";
+const CLEANUP_INTERNAL_LOCKED_MARKER = "--__palancar-cleanup-locked-b1b";
 const TEST_FACTORY_TOKEN = Object.freeze({});
 const TEST_FACTORY_PATH = SCRIPT_PATH;
 const TEST_EXECUTION = new AsyncLocalStorage();
@@ -162,6 +164,8 @@ const CHECKPOINT_ORDER = Object.freeze([
   "manifest",
   "show-json",
   "guard-receipt",
+  "vault-descriptor",
+  "cleanup-start",
   "preflight-receipt",
   "applying",
   "receipts-consumed",
@@ -175,20 +179,23 @@ const CHECKPOINT_ORDER_INDEX = new Map(
   CHECKPOINT_ORDER.map((name, index) => [name, index]),
 );
 const UID = typeof process.getuid === "function" ? process.getuid() : undefined;
+const RUNTIME_SECRETS_ASSIGNMENT = "enable_runtime_secrets_user_assignment";
 const GENERATION_PATHS = Object.freeze([
+  "packages/generation/src/azure-openai.ts",
   "packages/generation/src/errors.ts",
   "packages/generation/src/evidence.ts",
-  "packages/generation/src/litellm.ts",
   "packages/generation/src/service.ts",
   "packages/generation/src/types.ts",
+  "packages/generation/test/azure-openai-provider.test.ts",
   "packages/generation/test/generation.test.ts",
-  "packages/generation/test/litellm-provider.test.ts",
 ]);
 const REVIEWED_DEPENDENCIES = Object.freeze({
   "model-bootstrap": Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+    "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
+    "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json",
     // assert-dev-plan.mjs imports this fixture while its module is loaded.
     "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
   ]),
@@ -196,18 +203,24 @@ const REVIEWED_DEPENDENCIES = Object.freeze({
     "infra/scripts/dev-plan-lifecycle.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+    "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
+    "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json",
     "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
   ]),
   "credential-cleanup": Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+    "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
+    "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json",
     "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
   ]),
   terminal: Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+    "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
+    "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json",
     "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
   ]),
 });
@@ -215,6 +228,7 @@ const HASH_RE = /^[a-f0-9]{64}$/;
 const COMMIT_RE = /^[a-f0-9]{40}$/;
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CLEANUP_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const ALLOWED_CHILD_ENV_KEYS = Object.freeze([
   "PATH",
@@ -285,17 +299,6 @@ const HIGH_LEVEL_PROVIDER_KEYS = Object.freeze([
   "cleanupValidator",
   "worktreeChecker",
 ]);
-const RUN_STATUSES = Object.freeze([
-  "created",
-  "guarded",
-  "preflighted",
-  "applying",
-  "unknown",
-  "applied",
-  "finalized",
-  "invalidated",
-  "superseded",
-]);
 export const CHECKPOINTS = Object.freeze([
   "run-directory",
   "plan-started",
@@ -306,6 +309,8 @@ export const CHECKPOINTS = Object.freeze([
   "manifest",
   "show-json",
   "guard-receipt",
+  "vault-descriptor",
+  "cleanup-start",
   "preflight-receipt",
   "applying",
   "receipts-consumed",
@@ -315,12 +320,31 @@ export const CHECKPOINTS = Object.freeze([
   "invalidated",
   "superseded",
 ]);
-const TERMINAL_RECEIPTS = Object.freeze([
-  ["diagnostic", "diagnostic-receipt.json"],
-  ["cleanup", "cleanup-manifest.json"],
-  ["absence", "cleanup-absence-receipt.json"],
-  ["live", "terminal-live-receipt.json"],
+const CLEANUP_TARGET_NAMES = Object.freeze([
+  "openrouter-api-key",
+  "litellm-master-key",
 ]);
+const DIAGNOSTIC_COMMAND = Object.freeze([
+  "node",
+  "apps/relay/dist/azure-generation-diagnostic.js",
+]);
+const DIAGNOSTIC_CONTAINER_NAME = "expiry-cleanup";
+const DIAGNOSTIC_MAX_POLLS = 150;
+const DIAGNOSTIC_POLL_DELAY_MS = 2000;
+const DIAGNOSTIC_JOB_TIMEOUT_MS = 300 * 1000;
+const DIAGNOSTIC_REQUEST_VERSION = 1;
+const REVOCATION_FIXED_FILES = Object.freeze([
+  "openrouter-revocation-state.json",
+  "openrouter-revocation-raw-response.json",
+  "openrouter-revocation-receipt.json",
+  "openrouter-revocation.lock",
+]);
+const REVOCATION_STATE_RE = /^openrouter-revocation-state\.json(?:\.seq-(\d{8}))?$/;
+const REVOCATION_TEMP_RE = /^(openrouter-revocation-state\.json(?:\.seq-\d{8})?|openrouter-revocation-raw-response\.json|openrouter-revocation-receipt\.json|openrouter-revocation\.lock)\.tmp-(\d+)-([a-f0-9]{24})$/;
+const REVOCATION_MANIFEST_RE = /^openrouter-revocation-owned-temp-(\d+)-([a-f0-9]{24})\.json$/;
+const CLOSURE_STATE_RE = /^closure-state-(\d{6})\.json$/;
+const CLOSURE_TOMBSTONE_FILENAME = "closure-tombstone.json";
+const CLOSURE_INVENTORY_FILENAME = "closure-inventory.json";
 
 export class LifecycleError extends Error {
   constructor(code) {
@@ -423,6 +447,24 @@ export function sha256File(filePath, maxBytes = PLAN_MAX_BYTES) {
   return sha256Bytes(readFileSync(filePath));
 }
 
+function evidenceFileMaxBytes(label) {
+  const name = path.basename(label);
+  if (name.endsWith(".tfplan")) return PLAN_MAX_BYTES;
+  if (name === "openrouter-revocation-raw-response.json" ||
+      /^openrouter-revocation-raw-response\.json\.tmp-/.test(name)) {
+    return REVOCATION_RAW_MAX_BYTES;
+  }
+  if (name === "openrouter-revocation.lock" ||
+      /^openrouter-revocation\.lock\.tmp-/.test(name)) {
+    return REVOCATION_LOCK_MAX_BYTES;
+  }
+  return JSON_MAX_BYTES;
+}
+
+function sha256EvidenceFile(filePath, label = filePath) {
+  return sha256File(filePath, evidenceFileMaxBytes(label));
+}
+
 function terraformExecutableSha256() {
   const execution = currentTestExecution();
   if (execution === undefined) {
@@ -509,6 +551,25 @@ function sameBindingsForOperation(a, b, operation) {
   return same(left, right);
 }
 
+function sameCompletePlanContext(before, after) {
+  const left = { ...before };
+  const right = { ...after };
+  delete left.planSha256;
+  delete right.planSha256;
+  return same(left, right);
+}
+
+function normalizedContextBeforePlan(raw, expected) {
+  // A plan digest does not exist at the pre-plan boundary.  Normalize the
+  // complete context with a schema-valid sentinel and remove only that
+  // digest before comparison; the published plan digest is supplied by the
+  // post-plan snapshot and is bound into the manifest.
+  return normalizeContext(raw, {
+    ...expected,
+    planSha256: "0".repeat(64),
+  });
+}
+
 function assertReconcileSerial(current, planned) {
   failIf(
     !Number.isSafeInteger(current) ||
@@ -538,10 +599,6 @@ function exactGuardArgv(phase) {
     "guard-mapping",
   );
   return [`--mode=${mapping}`];
-}
-
-function assertOperation(operation) {
-  failIf(!OPERATIONS.includes(operation), "invalid-operation");
 }
 
 function assertRunId(runId) {
@@ -907,7 +964,8 @@ function immutableManifest(runDirectory, artifacts, checkpoints, run) {
   assertCheckpointArtifact(artifacts.manifest, checkpoint, "manifestSha256", "manifest");
   const manifest = readJson(artifacts.manifest, "manifest");
   failIf(
-    manifest.runId !== run.id || manifest.phase !== run.phase || !Array.isArray(manifest.argv),
+    manifest.runId !== run.id || manifest.phase !== run.phase || !Array.isArray(manifest.argv) ||
+      !same(manifest.argv, exactCreateArgv(artifacts.plan)),
     "manifest-mismatch",
   );
   assertRegular(artifacts.plan, ARTIFACT_MODE, "plan");
@@ -1046,6 +1104,26 @@ function validateState(state) {
     }
     if (run.status === "superseded") {
       failIf(run.phase !== "credential-cleanup" || !RUN_ID_RE.test(run.supersededBy ?? ""), "invalid-supersession");
+    }
+    if (run.supersession !== undefined) {
+      assertKnownKeys(
+        run.supersession,
+        ["oldRunId", "cleanupManifestSha256", "absenceReceiptSha256", "contextSha256"],
+        "invalid-supersession",
+      );
+      assertRequiredKeys(
+        run.supersession,
+        ["oldRunId", "cleanupManifestSha256", "absenceReceiptSha256", "contextSha256"],
+        "invalid-supersession",
+      );
+      failIf(
+        run.phase !== "credential-cleanup" ||
+          !RUN_ID_RE.test(run.supersession.oldRunId) ||
+          !isSha(run.supersession.cleanupManifestSha256) ||
+          !isSha(run.supersession.absenceReceiptSha256) ||
+          !isSha(run.supersession.contextSha256),
+        "invalid-supersession",
+      );
     }
   }
   return state;
@@ -1294,6 +1372,11 @@ function normalizeContext(raw, expected) {
     stateLineage: raw.stateLineage,
     stateSerial: raw.stateSerial,
     liveRevision: raw.liveRevision,
+    runtimeIdentityId: raw.runtimeIdentityId,
+    runtimeIdentityClientId: raw.runtimeIdentityClientId,
+    runtimeIdentityPrincipalId: raw.runtimeIdentityPrincipalId,
+    accountId: raw.accountId,
+    runtimeOpenAiRoleAssignmentId: raw.runtimeOpenAiRoleAssignmentId,
     azureContextHash,
     callerHash,
     guard: GUARD_MAPPINGS[expected.phase],
@@ -1323,6 +1406,22 @@ function normalizeContext(raw, expected) {
       bindings.liveRevision !== undefined &&
       typeof bindings.liveRevision !== "string",
     "live-context",
+  );
+  failIf(
+      typeof bindings.runtimeIdentityId !== "string" ||
+      !/^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/]+$/.test(bindings.runtimeIdentityId) ||
+      !UUID_RE.test(bindings.runtimeIdentityClientId ?? "") ||
+      !UUID_RE.test(bindings.runtimeIdentityPrincipalId ?? ""),
+    "runtime-identity",
+  );
+  const accountParts = resourceIdParts(bindings.accountId, "account-context");
+  failIf(accountParts.subscription !== azure.subscription, "binding-mismatch");
+  const roleAssignmentPrefix = `${bindings.accountId}/providers/Microsoft.Authorization/roleAssignments/`;
+  failIf(
+    typeof bindings.runtimeOpenAiRoleAssignmentId !== "string" ||
+      !bindings.runtimeOpenAiRoleAssignmentId.startsWith(roleAssignmentPrefix) ||
+      !UUID_RE.test(bindings.runtimeOpenAiRoleAssignmentId.slice(roleAssignmentPrefix.length)),
+    "runtime-openai-role",
   );
   failIf(!same(bindings.argv, expected.argv), "argv-context");
   failIf(!isSha(bindings.backendConfigurationSha256), "backend-hash");
@@ -1386,6 +1485,10 @@ function checkWorktree(repoRoot, phase, processRunner) {
     failIf(lines.length !== 0, "worktree-dirty");
     return;
   }
+  // A clean worktree is the normal post-bootstrap state.  Retain support for
+  // the interrupted generation handoff below, but do not force callers to
+  // recreate that historical diff merely to initialize a compatible state.
+  if (lines.length === 0) return;
   const changed = new Set(lines.map((entry) => entry.file));
   failIf(
     [...changed].some((file) => !GENERATION_PATHS.includes(file)) ||
@@ -1693,7 +1796,7 @@ export function parseTerraformStateCache(cache, backend, account) {
 }
 
 function defaultTerraformStateCache(config, backend, account) {
-  return testSnapshot(`terraform-cache:${config.workdir}`, () => {
+  return testSnapshot(`terraform-cache:${config.workdir}:${config.contextOperation ?? "bootstrap"}`, () => {
     const cacheDirectory = path.join(config.workdir, ".terraform");
     assertCacheDirectory(cacheDirectory);
     const cachePath = path.join(cacheDirectory, "terraform.tfstate");
@@ -1712,8 +1815,32 @@ function defaultOperatorId(workdir) {
   return match[1];
 }
 
+function protectedRuntimeSecretsRoleEnabled(config, expected) {
+  const tfvarsPath = path.join(config.workdir, "terraform.tfvars");
+  const stat = assertRegular(tfvarsPath, null, "runtime-secrets-role");
+  failIf((fileMode(stat) & 0o077) !== 0 || fileMode(stat) > 0o600, "runtime-secrets-role-mode");
+  let source;
+  try {
+    source = readFileSync(tfvarsPath, "utf8");
+  } catch {
+    reject("runtime-secrets-role-read");
+  }
+  const assignmentPattern = new RegExp(
+    `(?:^|[\\r\\n])[ \\t]*${RUNTIME_SECRETS_ASSIGNMENT}[ \\t]*=[ \\t]*(true|false)[ \\t]*(?:#[^\\r\\n]*)?(?=[\\r\\n]|$)`,
+    "g",
+  );
+  const occurrences = [...source.matchAll(new RegExp(`\\b${RUNTIME_SECRETS_ASSIGNMENT}\\b[ \\t]*=`, "g"))];
+  failIf(occurrences.length > 1, "runtime-secrets-role-assignments");
+  const matches = [...source.matchAll(assignmentPattern)];
+  failIf(matches.length !== occurrences.length, "runtime-secrets-role-value");
+  const enabled = matches.length === 0 || matches[0][1] === "true";
+  if (expected === true) failIf(!enabled, "runtime-secrets-role-disabled");
+  else failIf(enabled, "runtime-secrets-role-enabled");
+  return enabled;
+}
+
 function defaultAccount(config) {
-  return testSnapshot(`azure-account:${config.workdir}`, () => {
+  return testSnapshot(`azure-account:${config.workdir}:${config.contextOperation ?? "bootstrap"}`, () => {
     const account = runCommand(config, AZ_PATH, ["account", "show", "--output", "json"]);
     const accountJson = parseCommandJson(account, "azure-account");
     const userType = accountJson?.user?.type;
@@ -1758,7 +1885,7 @@ function defaultReviewIdentity(config) {
 }
 
 function defaultRemoteState(config) {
-  return testSnapshot(`remote-state:${config.workdir}`, () => {
+  return testSnapshot(`remote-state:${config.workdir}:${config.contextOperation ?? "bootstrap"}`, () => {
     const state = runCommand(config, TERRAFORM_PATH, ["state", "pull"]);
     return parseTerraformStateJson(parseCommandJson(state, "remote-state"));
   });
@@ -1777,7 +1904,7 @@ function parseTerraformStateJson(state) {
 }
 
 function defaultContext(config, request) {
-  return testSnapshot(`context:${config.workdir}:${request.phase}`, () => {
+  return testSnapshot(`context:${config.workdir}:${request.phase}:${request.operation ?? config.contextOperation ?? "bootstrap"}`, () => {
     const backend = defaultBackendIdentity(config);
     const account = defaultAccount(config);
     defaultTerraformStateCache(config, backend.identity, account);
@@ -1811,6 +1938,11 @@ function defaultContext(config, request) {
       azure: account,
       caller: { userType: account.userType, objectId: account.objectId },
       liveRevision: outputs.relayRevision,
+      runtimeIdentityId: outputs.runtimeIdentityId,
+      runtimeIdentityClientId: outputs.runtimeIdentityClientId,
+      runtimeIdentityPrincipalId: outputs.runtimeIdentityPrincipalId,
+      accountId: outputs.accountId,
+      runtimeOpenAiRoleAssignmentId: outputs.runtimeOpenAiRoleAssignmentId,
     };
   });
 }
@@ -1842,14 +1974,73 @@ function artifactPaths(runDirectory) {
     manifest: path.join(runDirectory, "create-manifest.json"),
     show: path.join(runDirectory, "show.json"),
     guard: path.join(runDirectory, "guard-receipt.json"),
+    descriptor: path.join(runDirectory, "vault-descriptor.json"),
+    cleanupOperation: path.join(runDirectory, "cleanup-manifest.json"),
+    cleanupState: path.join(runDirectory, "cleanup-state-000000.json"),
+    cleanupStatePattern: path.join(runDirectory, "cleanup-state-*.json"),
+    cleanupStateAnchor: path.join(runDirectory, "cleanup-state-anchor.json"),
+    cleanupStateAnchorPattern: path.join(runDirectory, "cleanup-state-anchor-*.json"),
     preflight: path.join(runDirectory, "preflight-receipt.json"),
     apply: path.join(runDirectory, "apply-receipt.json"),
-    reconcile: path.join(runDirectory, "reconcile-receipt.json"),
+    reconcile: path.join(runDirectory, "reconcile-receipt-000001.json"),
+    reconcilePattern: path.join(runDirectory, "reconcile-receipt-*.json"),
     terminal: path.join(runDirectory, "terminal-receipts.json"),
+    diagnosticIntent: path.join(runDirectory, "diagnostic-intent.json"),
+    diagnosticInvoking: path.join(runDirectory, "diagnostic-invoking.json"),
+    diagnosticSubmission: path.join(runDirectory, "diagnostic-submission.json"),
     diagnostic: path.join(runDirectory, "diagnostic-receipt.json"),
-    cleanup: path.join(runDirectory, "cleanup-manifest.json"),
     absence: path.join(runDirectory, "cleanup-absence-receipt.json"),
   };
+}
+
+function reconcileReceiptPath(runDirectory, sequence) {
+  failIf(!Number.isSafeInteger(sequence) || sequence < 1, "reconcile-sequence");
+  return path.join(runDirectory, `reconcile-receipt-${String(sequence).padStart(6, "0")}.json`);
+}
+
+function readReconcileReceiptPaths(runDirectory) {
+  const paths = [];
+  for (const entry of readdirSync(runDirectory, { withFileTypes: true })) {
+    const match = /^reconcile-receipt-(\d{6})\.json$/.exec(entry.name);
+    if (!match) {
+      if (entry.name === "reconcile-receipt.json" || entry.name.startsWith("reconcile-receipt-")) {
+        reject("reconcile-receipt-name");
+      }
+      continue;
+    }
+    failIf(entry.isSymbolicLink(), "reconcile-receipt-symlink");
+    paths.push({ sequence: Number(match[1]), path: path.join(runDirectory, entry.name) });
+  }
+  paths.sort((left, right) => left.sequence - right.sequence);
+  for (let index = 0; index < paths.length; index += 1) {
+    failIf(paths[index].sequence !== index + 1, "reconcile-sequence");
+  }
+  return paths;
+}
+
+function reconcilePathForCheckpoint(runDirectory, checkpoint) {
+  const sequence = checkpoint?.reconcileSequence;
+  failIf(!Number.isSafeInteger(sequence) || sequence < 1, "reconcile-checkpoint");
+  const filePath = reconcileReceiptPath(runDirectory, sequence);
+  failIf(path.dirname(filePath) !== runDirectory, "reconcile-checkpoint");
+  return filePath;
+}
+
+function validateReconcileReceiptCheckpointBijection(runDirectory, checkpoints) {
+  const receiptPaths = readReconcileReceiptPaths(runDirectory);
+  const reconcileCheckpoints = checkpoints
+    .filter((checkpoint) => checkpoint.name === "reconcile")
+    .sort((left, right) => left.reconcileSequence - right.reconcileSequence);
+  failIf(receiptPaths.length !== reconcileCheckpoints.length, "reconcile-receipt-checkpoint");
+  for (let index = 0; index < reconcileCheckpoints.length; index += 1) {
+    const checkpoint = reconcileCheckpoints[index];
+    const expectedSequence = index + 1;
+    failIf(checkpoint.reconcileSequence !== expectedSequence, "reconcile-checkpoint");
+    const receipt = receiptPaths[index];
+    failIf(receipt.sequence !== expectedSequence, "reconcile-sequence");
+    failIf(!isSha(checkpoint.receiptSha256), "reconcile-checkpoint");
+    failIf(sha256EvidenceFile(receipt.path, path.basename(receipt.path)) !== checkpoint.receiptSha256, "reconcile-receipt-hash");
+  }
 }
 
 function checkpointFile(runDirectory, sequence, name) {
@@ -1880,11 +2071,14 @@ function readCheckpoints(runDirectory, expected = {}) {
   const seen = new Set();
   for (const checkpoint of checkpoints) {
     if (seen.has(checkpoint.name)) {
-      failIf(!["terraform-exit-known", "terraform-exit-ambiguous"].includes(checkpoint.name), "checkpoint-replacement");
+      failIf(!["terraform-exit-known", "terraform-exit-ambiguous", "reconcile"].includes(checkpoint.name), "checkpoint-replacement");
     }
     seen.add(checkpoint.name);
   }
-  if (expected.phase !== undefined) validateCheckpointSequence(checkpoints, expected.phase);
+  if (expected.phase !== undefined && expected.skipReconcileBijection !== true) {
+    validateCheckpointSequence(checkpoints, expected.phase);
+    validateReconcileReceiptCheckpointBijection(runDirectory, checkpoints);
+  }
   return checkpoints;
 }
 
@@ -1929,6 +2123,12 @@ function validateCheckpointSequence(checkpoints, phase) {
     } else {
       consume("show-json");
       consume("guard-receipt");
+      if (phase === "credential-cleanup") {
+        consume("vault-descriptor");
+        consume("cleanup-start");
+        failIf(index < core.length && core[index] === "preflight-receipt" &&
+          (names.indexOf("vault-descriptor") < 0 || names.indexOf("cleanup-start") < 0), "checkpoint-order");
+      }
       consume("preflight-receipt");
       consume("applying");
       if (index < core.length && core[index] === "receipts-consumed") {
@@ -1941,7 +2141,7 @@ function validateCheckpointSequence(checkpoints, phase) {
           index += 1;
         }
       }
-      consume("reconcile");
+      while (index < core.length && core[index] === "reconcile") index += 1;
       if (index < core.length && core[index] === "global-state-advancement") {
         index += 1;
       }
@@ -1963,10 +2163,14 @@ function checkpointFault(config, name, record) {
 
 function writeCheckpoint(config, runDirectory, runId, phase, name, details = {}) {
   assertDirectory(runDirectory, "run-directory");
-  const existing = readCheckpoints(runDirectory, { runId, phase });
+  const existing = readCheckpoints(runDirectory, {
+    runId,
+    phase,
+    ...(name === "reconcile" ? { skipReconcileBijection: true } : {}),
+  });
   failIf(
     existing.some((checkpoint) => checkpoint.name === name) &&
-      !["terraform-exit-known", "terraform-exit-ambiguous"].includes(name),
+      !["terraform-exit-known", "terraform-exit-ambiguous", "reconcile"].includes(name),
     "checkpoint-replacement",
   );
   const sequence = existing.length + 1;
@@ -2210,8 +2414,154 @@ function runErrorInvalidates(code) {
   return /(?:mismatch|hash|integrity|symlink|mode|owner|noncanonical|replacement|context|receipt|artifact|checkpoint|state-history)/.test(code);
 }
 
-function assertStateForCreate(state, phase) {
+function assertAppliedPhaseProof(config, state, phase) {
+  const completed = state.runs.find(
+    (run) => run.phase === phase && run.status === "applied",
+  );
+  failIf(!completed || completed.lastCheckpoint !== "global-state-advancement", "phase-apply-proof");
+  const directory = runPath(config, completed.id);
+  const artifacts = artifactPaths(directory);
+  const checkpoints = readCheckpoints(directory, {
+    runId: completed.id,
+    phase,
+  });
+  const manifest = immutableManifest(
+    directory,
+    artifacts,
+    checkpoints,
+    { id: completed.id, phase },
+  );
+  const apply = readReceiptAtCheckpoint(
+    artifacts.apply,
+    checkpointNamed(checkpoints, "apply-receipt"),
+    manifest,
+    "apply",
+    ["applied"],
+  );
+  const advancement = checkpointNamed(checkpoints, "global-state-advancement");
+  failIf(
+    advancement.from !== STATE_FOR_PHASE[phase] ||
+      advancement.to !== ADVANCED_STATE[phase] ||
+      advancement.applyReceiptSha256 !== sha256File(artifacts.apply),
+    "phase-apply-proof",
+  );
+  return apply;
+}
+
+function appliedPhasePredecessorEvidence(config, state, phase, codePrefix, inventory = []) {
+  const candidates = state.runs.filter(
+    (run) => run.phase === phase && run.status === "applied",
+  );
+  failIf(candidates.length !== 1, `${codePrefix}-run`);
+  const entry = candidates[0];
+  failIf(entry.lastCheckpoint !== "global-state-advancement", `${codePrefix}-run`);
+  const runDirectory = runPath(config, entry.id);
+  const artifacts = artifactPaths(runDirectory);
+  const checkpoints = readCheckpoints(runDirectory, {
+    runId: entry.id,
+    phase,
+  });
+  const manifest = immutableManifest(runDirectory, artifacts, checkpoints, entry);
+  const showCheckpoint = checkpointNamed(checkpoints, "show-json");
+  assertCheckpointArtifact(artifacts.show, showCheckpoint, "showSha256", `${codePrefix}-show`);
+  const consumed = checkpointNamed(checkpoints, "receipts-consumed");
+  const consumedGuard = `${artifacts.guard}.consumed`;
+  const consumedPreflight = `${artifacts.preflight}.consumed`;
+  assertCheckpointArtifact(
+    consumedGuard,
+    consumed,
+    "guardReceiptSha256",
+    `${codePrefix}-guard`,
+  );
+  assertCheckpointArtifact(
+    consumedPreflight,
+    consumed,
+    "preflightReceiptSha256",
+    `${codePrefix}-preflight`,
+  );
+  const guard = assertReceiptSchema(
+    readJson(consumedGuard, `${codePrefix}-guard`),
+    manifest,
+    "guard",
+  );
+  failIf(guard.showSha256 !== showCheckpoint.showSha256, `${codePrefix}-show`);
+  assertReceiptSchema(
+    readJson(consumedPreflight, `${codePrefix}-preflight`),
+    manifest,
+    "preflight",
+  );
+  const applyCheckpoint = checkpointNamed(checkpoints, "apply-receipt");
+  readReceiptAtCheckpoint(
+    artifacts.apply,
+    applyCheckpoint,
+    manifest,
+    "apply",
+    ["applied"],
+  );
+  const reconcileCheckpoints = checkpoints.filter((checkpoint) => checkpoint.name === "reconcile");
+  for (const checkpoint of reconcileCheckpoints) {
+    readReceiptAtCheckpoint(
+      reconcilePathForCheckpoint(runDirectory, checkpoint),
+      checkpoint,
+      manifest,
+      "reconcile",
+      ["applied", "invalidated", "unknown"],
+    );
+  }
+  if (reconcileCheckpoints.length > 0) {
+    const last = reconcileCheckpoints.at(-1);
+    const lastReceipt = readReceiptAtCheckpoint(
+      reconcilePathForCheckpoint(runDirectory, last),
+      last,
+      manifest,
+      "reconcile",
+      ["applied"],
+    );
+    void lastReceipt;
+  }
+  const advancement = checkpointNamed(checkpoints, "global-state-advancement");
+  failIf(
+    advancement.from !== STATE_FOR_PHASE[phase] ||
+      advancement.to !== ADVANCED_STATE[phase] ||
+      !isSha(advancement.applyReceiptSha256) ||
+      advancement.applyReceiptSha256 !== sha256File(artifacts.apply, JSON_MAX_BYTES),
+    `${codePrefix}-global-state`,
+  );
+  validatedRunEvidence(config, inventory, entry, artifacts, checkpoints);
+  return { entry, runDirectory, artifacts, checkpoints, manifest };
+}
+
+function runtimeCutoverPredecessorEvidence(config, state) {
+  const runtime = appliedPhasePredecessorEvidence(
+    config,
+    state,
+    "runtime-cutover",
+    "credential-runtime-predecessor",
+  );
+  requiredDiagnostic(runtime);
+  const reviewed = reviewedRuntimeShapes(runtime.artifacts, "runtime-cutover");
+  failIf(
+    reviewed.before.containers.length !== 2 ||
+      reviewed.before.containers.filter((container) => container.name === "relay").length !== 1,
+    "credential-runtime-predecessor-topology",
+  );
+  const predecessorRevision = runtime.manifest.bindings.liveRevision;
+  failIf(
+    typeof predecessorRevision !== "string" || predecessorRevision.length === 0,
+    "credential-runtime-predecessor-revision",
+  );
+  return {
+    ...runtime,
+    reviewed,
+    revisionName: predecessorRevision,
+  };
+}
+
+function assertStateForCreate(state, phase, config = undefined) {
   failIf(state.state !== STATE_FOR_PHASE[phase], "out-of-order-phase");
+  if (phase === "credential-cleanup" && config !== undefined) {
+    assertAppliedPhaseProof(config, state, "runtime-cutover");
+  }
   failIf(
     state.runs.some((run) => run.phase === phase && activeStatus(run.status)),
     "phase-already-active",
@@ -2399,8 +2749,9 @@ function inProcessLock(config, callback) {
   }
 }
 
-function withLock(config, callback) {
-  ensureRoot(config);
+function withLock(config, callback, allowClosure = false) {
+  if (allowClosure) ensureClosureRoot(config);
+  else ensureRoot(config);
   if (config.lockMode === "inherited") {
     return TEST_EXECUTION.run(undefined, callback);
   }
@@ -2434,6 +2785,434 @@ function withLock(config, callback) {
       config.testExecution.operation = previousOperation;
     }
   });
+}
+
+function auxiliaryEvidenceName(name) {
+  return REVOCATION_FIXED_FILES.includes(name) || REVOCATION_STATE_RE.test(name) ||
+    REVOCATION_TEMP_RE.test(name) || REVOCATION_MANIFEST_RE.test(name);
+}
+
+function validateRevocationFile(filePath, code) {
+  const stat = assertRegular(filePath, ARTIFACT_MODE, code);
+  failIf(stat.size > JSON_MAX_BYTES, `${code}-too-large`);
+  return readJson(filePath, code);
+}
+
+function validRevocationString(value, maxLength = 256) {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength &&
+    !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function revocationIdentityDigest(identity) {
+  return sha256Bytes(`${canonicalJson(identity)}\n`);
+}
+
+function validateRevocationFileBinding(value, allowNull, code) {
+  if (value === null && allowNull) return;
+  failIf(!isObject(value), code);
+  assertKnownKeys(value, ["sha256", "size", "uid", "gid", "mode", "dev", "ino"], code);
+  assertRequiredKeys(value, ["sha256", "size", "uid", "gid", "mode", "dev", "ino"], code);
+  failIf(!isSha(value.sha256) || !Number.isSafeInteger(value.size) || value.size < 0 ||
+    !Number.isSafeInteger(value.uid) || value.uid < 0 || !Number.isSafeInteger(value.gid) || value.gid < 0 ||
+    !Number.isSafeInteger(value.dev) || value.dev < 0 || !Number.isSafeInteger(value.ino) || value.ino < 0 ||
+    value.mode !== 0o600, code);
+}
+
+function validateRevocationState(value, code) {
+  failIf(!isObject(value) || value.schema !== 1 || value.kind !== "openrouter-revocation" ||
+    !["preflight-captured", "awaiting-user", "revoked", "local-removed"].includes(value.state) ||
+    !isSha(value.response_sha256) || !isSha(value.key_sha256) || typeof value.captured_at !== "string" ||
+    !isObject(value.security_identity) || !isObject(value.masked) || !isObject(value.env) ||
+    !same(Object.keys(value.security_identity).sort(), ["key_fingerprint", "provider_key_fingerprint", "key_id", "local_mask", "endpoint", "endpoint_id", "account_id", "account_name", "provider_stable_sha256"].sort()) ||
+    !same(Object.keys(value.masked).sort(), ["expires_at", "label", "limit"]) ||
+    !same(Object.keys(value.env).sort(), ["assignment_count", "dev", "gid", "ino", "mode", "path", "removed_sha256", "removed_size", "sha256", "size", "uid"].sort()),
+    code,
+  );
+  failIf(!validRevocationString(value.captured_at, 64) || !Number.isFinite(Date.parse(value.captured_at)) || value.masked.label !== "****" ||
+    (value.masked.expires_at !== null && (!validRevocationString(value.masked.expires_at, 128) || !Number.isFinite(Date.parse(value.masked.expires_at)))) ||
+    (value.masked.limit !== null && (typeof value.masked.limit !== "number" || value.masked.limit < 0)) ||
+    value.security_identity.key_fingerprint !== value.key_sha256 || value.security_identity.local_mask !== "****" ||
+    value.security_identity.endpoint !== "https://openrouter.ai/api/v1/key" ||
+    !isSha(value.security_identity.provider_stable_sha256) ||
+    (value.security_identity.provider_key_fingerprint !== null && !isSha(value.security_identity.provider_key_fingerprint)) ||
+    ["key_id", "endpoint_id", "account_id", "account_name"].some((key) =>
+      value.security_identity[key] !== null && !validRevocationString(value.security_identity[key], 4096)) ||
+    value.response_sha256 !== revocationIdentityDigest(value.security_identity) ||
+    value.env.assignment_count !== 1 || !path.isAbsolute(value.env.path) || !validRevocationString(value.env.path, 4096) ||
+    !isSha(value.env.sha256) || !isSha(value.env.removed_sha256) ||
+    !Number.isSafeInteger(value.env.size) || value.env.size < 0 || !Number.isSafeInteger(value.env.removed_size) || value.env.removed_size < 0 ||
+    !Number.isSafeInteger(value.env.uid) || value.env.uid < 0 || !Number.isSafeInteger(value.env.gid) || value.env.gid < 0 ||
+    !Number.isSafeInteger(value.env.dev) || value.env.dev < 0 || !Number.isSafeInteger(value.env.ino) || value.env.ino < 0 ||
+    !Number.isSafeInteger(value.env.mode) || value.env.mode < 0 || (value.env.mode & ~0o600) !== 0, code);
+  const expected = ["schema", "kind", "state", "response_sha256", "key_sha256", "security_identity", "masked", "captured_at", "env", "raw"];
+  if (value.state === "revoked") expected.push("revoked_at", "removal_intent");
+  if (value.state === "local-removed") expected.push("revoked_at", "removal_intent", "local_removed_at");
+  failIf(!same(Object.keys(value).sort(), expected.sort()), code);
+  validateRevocationFileBinding(value.raw, true, code);
+  if (value.raw !== null) failIf(value.raw.sha256 !== value.response_sha256, code);
+  if (value.state === "revoked" || value.state === "local-removed") {
+    failIf(!validRevocationString(value.revoked_at, 64) || !Number.isFinite(Date.parse(value.revoked_at)) || !isObject(value.removal_intent), code);
+    assertKnownKeys(value.removal_intent, ["path", "original_sha256", "original_size", "uid", "gid", "mode", "dev", "ino", "removed_sha256", "removed_size", "assignment_count"], code);
+    assertRequiredKeys(value.removal_intent, ["path", "original_sha256", "original_size", "uid", "gid", "mode", "dev", "ino", "removed_sha256", "removed_size", "assignment_count"], code);
+    failIf(!path.isAbsolute(value.removal_intent.path) || !validRevocationString(value.removal_intent.path, 4096) ||
+      !isSha(value.removal_intent.original_sha256) || !isSha(value.removal_intent.removed_sha256) ||
+      !Number.isSafeInteger(value.removal_intent.original_size) || value.removal_intent.original_size < 0 ||
+      !Number.isSafeInteger(value.removal_intent.removed_size) || value.removal_intent.removed_size < 0 ||
+      !Number.isSafeInteger(value.removal_intent.uid) || value.removal_intent.uid < 0 ||
+      !Number.isSafeInteger(value.removal_intent.gid) || value.removal_intent.gid < 0 ||
+      !Number.isSafeInteger(value.removal_intent.dev) || value.removal_intent.dev < 0 ||
+      !Number.isSafeInteger(value.removal_intent.ino) || value.removal_intent.ino < 0 ||
+      !Number.isSafeInteger(value.removal_intent.mode) || value.removal_intent.mode < 0 ||
+      (value.removal_intent.mode & ~0o600) !== 0 || value.removal_intent.assignment_count !== 1 ||
+      value.removal_intent.path !== value.env.path || value.removal_intent.original_sha256 !== value.env.sha256 ||
+      value.removal_intent.original_size !== value.env.size || value.removal_intent.removed_sha256 !== value.env.removed_sha256 ||
+      value.removal_intent.removed_size !== value.env.removed_size || value.removal_intent.uid !== value.env.uid ||
+      value.removal_intent.gid !== value.env.gid || value.removal_intent.mode !== value.env.mode ||
+      value.removal_intent.dev !== value.env.dev || value.removal_intent.ino !== value.env.ino, code);
+  }
+  if (value.state === "local-removed") {
+    failIf(!validRevocationString(value.local_removed_at, 64) || !Number.isFinite(Date.parse(value.local_removed_at)), code);
+  }
+  return value;
+}
+
+function validateRevocationEvidence(config, { requireComplete = false } = {}) {
+  const entries = [];
+  const names = readdirSync(config.root, { withFileTypes: true });
+  for (const entry of names) {
+    if (!entry.name.startsWith("openrouter-revocation")) continue;
+    failIf(
+      !REVOCATION_FIXED_FILES.includes(entry.name) &&
+        !REVOCATION_STATE_RE.test(entry.name) &&
+        !REVOCATION_TEMP_RE.test(entry.name) &&
+        !REVOCATION_MANIFEST_RE.test(entry.name),
+      "revocation-name",
+    );
+  }
+  const stateEntries = names
+    .filter((entry) => REVOCATION_STATE_RE.test(entry.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const states = [];
+  for (const entry of stateEntries) {
+    const value = validateRevocationFile(path.join(config.root, entry.name), "revocation-state");
+    validateRevocationState(value, "revocation-state");
+    const sequence = entry.name === "openrouter-revocation-state.json"
+      ? 0
+      : Number(REVOCATION_STATE_RE.exec(entry.name)?.[1]);
+    states.push({ sequence, value, name: entry.name });
+  }
+  for (let index = 0; index < states.length; index += 1) failIf(states[index].sequence !== index, "revocation-state-sequence");
+  if (states.length > 0) {
+    failIf(states[0].value.state !== "preflight-captured", "revocation-state-transition");
+    for (let index = 1; index < states.length; index += 1) {
+      const previous = states[index - 1].value;
+      const current = states[index].value;
+      for (const field of ["response_sha256", "key_sha256", "security_identity", "captured_at", "env", "masked"]) {
+        failIf(!same(previous[field], current[field]), "revocation-state-context");
+      }
+      if (previous.raw !== null && current.raw !== null) failIf(!same(previous.raw, current.raw), "revocation-state-context");
+      failIf(previous.raw !== null && current.raw === null, "revocation-state-context");
+      const allowed = (previous.state === "preflight-captured" &&
+        ["preflight-captured", "awaiting-user"].includes(current.state)) ||
+        (previous.state === "awaiting-user" && current.state === "revoked") ||
+        (previous.state === "revoked" && current.state === "local-removed");
+      failIf(!allowed || (["awaiting-user", "revoked", "local-removed"].includes(current.state) && current.raw === null), "revocation-state-transition");
+    }
+  }
+  const receiptPath = path.join(config.root, "openrouter-revocation-receipt.json");
+  if (existsSync(receiptPath)) {
+    const receipt = validateRevocationFile(receiptPath, "revocation-receipt");
+    assertKnownKeys(receipt, ["schema", "kind", "state", "http_status", "response_sha256", "recorded_at"], "revocation-receipt");
+    failIf(receipt.schema !== 1 || receipt.kind !== "openrouter-revocation" || receipt.state !== "revoked" ||
+      receipt.http_status !== 401 || !isSha(receipt.response_sha256) || !Number.isFinite(Date.parse(receipt.recorded_at)), "revocation-receipt");
+    failIf(states.length === 0 || !["revoked", "local-removed"].includes(states.at(-1).value.state) ||
+      receipt.response_sha256 !== states.at(-1).value.response_sha256, "revocation-receipt");
+  }
+  for (const fixed of REVOCATION_FIXED_FILES) {
+    const filePath = path.join(config.root, fixed);
+    if (existsSync(filePath) && fixed !== "openrouter-revocation-receipt.json" && !REVOCATION_STATE_RE.test(fixed)) {
+      const stat = assertRegular(filePath, ARTIFACT_MODE, "revocation-auxiliary");
+      if (fixed === "openrouter-revocation.lock") {
+        failIf(stat.size > 128, "revocation-lock");
+        const text = readFileSync(filePath, "utf8");
+        const normalized = text.trim();
+        failIf(normalized !== "" &&
+          !/^\d+ [a-f0-9]{24}$/u.test(normalized) &&
+          !/^\d+(?: [a-f0-9]{0,23})?$/u.test(normalized), "revocation-lock");
+      }
+    }
+  }
+  const rawPath = path.join(config.root, "openrouter-revocation-raw-response.json");
+  if (existsSync(rawPath) && states.at(-1)?.value.raw !== null && states.at(-1)?.value.raw !== undefined) {
+    const raw = states.at(-1).value.raw;
+    const rawStat = assertRegular(rawPath, ARTIFACT_MODE, "revocation-raw");
+    failIf(rawStat.size !== raw.size || sha256EvidenceFile(rawPath, "openrouter-revocation-raw-response.json") !== raw.sha256, "revocation-raw");
+  } else if (existsSync(rawPath)) {
+    reject("revocation-raw-binding");
+  }
+  if (requireComplete) failIf(existsSync(rawPath), "revocation-raw-present");
+  const ownedTemporaryNames = new Set();
+  for (const entry of names) {
+    if (REVOCATION_MANIFEST_RE.test(entry.name)) {
+      const manifestPath = path.join(config.root, entry.name);
+      const manifestStat = assertRegular(manifestPath, ARTIFACT_MODE, "revocation-temp-manifest");
+      failIf(manifestStat.size > JSON_MAX_BYTES, "revocation-temp-manifest-too-large");
+      const manifestMatch = REVOCATION_MANIFEST_RE.exec(entry.name);
+      const manifestText = readFileSync(manifestPath, "utf8");
+      // The producer creates the exact owned-manifest name before writing its
+      // JSON. A crash at that boundary leaves an empty, but still legitimate,
+      // ownership marker; register it without ever treating an unowned temp
+      // name as evidence.
+      if (manifestText.length === 0) {
+        failIf(Number(manifestMatch?.[1]) <= 0, "revocation-temp-manifest");
+        ownedTemporaryNames.add(`__empty-owned-manifest-${entry.name}`);
+        continue;
+      }
+      let value;
+      try {
+        value = JSON.parse(manifestText);
+      } catch {
+        reject("revocation-temp-manifest");
+      }
+      assertKnownKeys(value, ["schema", "kind", "operation_kind", "target", "temporary", "sha256", "size", "pid"], "revocation-temp-manifest");
+      failIf(value.schema !== 1 || value.kind !== "openrouter-revocation-temp-manifest" ||
+        !["state", "raw", "receipt", "lock"].includes(value.operation_kind) || !isSha(value.sha256) ||
+        !Number.isSafeInteger(value.size) || !Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+        !REVOCATION_TEMP_RE.test(value.temporary) || Number(manifestMatch?.[1]) !== value.pid ||
+        manifestMatch?.[2] !== REVOCATION_TEMP_RE.exec(value.temporary)?.[3], "revocation-temp-manifest");
+      const expectedTarget = value.operation_kind === "state"
+        ? (REVOCATION_STATE_RE.test(value.target) ? value.target : undefined)
+        : value.operation_kind === "raw" ? "openrouter-revocation-raw-response.json"
+          : value.operation_kind === "receipt" ? "openrouter-revocation-receipt.json"
+            : "openrouter-revocation.lock";
+      failIf(expectedTarget === undefined || value.target !== expectedTarget || !value.temporary.startsWith(`${value.target}.tmp-`), "revocation-temp-manifest");
+      ownedTemporaryNames.add(value.temporary);
+      const temporaryPath = path.join(config.root, value.temporary);
+      if (existsSync(temporaryPath)) {
+        const temporaryStat = assertRegular(temporaryPath, ARTIFACT_MODE, "revocation-temporary");
+        const temporaryLimit = value.operation_kind === "raw" ? REVOCATION_RAW_MAX_BYTES
+          : value.operation_kind === "lock" ? REVOCATION_LOCK_MAX_BYTES : JSON_MAX_BYTES;
+        failIf(value.size > temporaryLimit || temporaryStat.size !== value.size ||
+          sha256EvidenceFile(temporaryPath, value.temporary) !== value.sha256, "revocation-temporary");
+      }
+    } else if (REVOCATION_TEMP_RE.test(entry.name)) {
+      assertRegular(path.join(config.root, entry.name), ARTIFACT_MODE, "revocation-temporary");
+      const temporaryMatch = REVOCATION_TEMP_RE.exec(entry.name);
+      const ownedTarget = temporaryMatch?.[1];
+      const temporaryPath = path.join(config.root, entry.name);
+      const temporaryLimit = ownedTarget === "openrouter-revocation-raw-response.json" ? REVOCATION_RAW_MAX_BYTES
+        : ownedTarget === "openrouter-revocation.lock" ? REVOCATION_LOCK_MAX_BYTES : JSON_MAX_BYTES;
+      const temporaryStat = lstatSync(temporaryPath);
+      failIf(temporaryStat.size > temporaryLimit, "revocation-temporary-too-large");
+    }
+  }
+  for (const entry of names) {
+    if (REVOCATION_TEMP_RE.test(entry.name)) failIf(!ownedTemporaryNames.has(entry.name), "revocation-temporary-manifest");
+  }
+  if (requireComplete) failIf(states.at(-1)?.value.state !== "local-removed" || !existsSync(receiptPath), "revocation-incomplete");
+  for (const entry of names) {
+    if (auxiliaryEvidenceName(entry.name)) entries.push({
+      label: entry.name,
+      sha256: sha256EvidenceFile(path.join(config.root, entry.name), entry.name),
+    });
+  }
+  return entries.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function ensureClosureRoot(config) {
+  failIf(path.resolve(config.closure) === path.resolve(config.root), "closure-path");
+  failIf(path.dirname(path.resolve(config.closure)) !== path.dirname(path.resolve(config.root)), "closure-path");
+  let parent;
+  try {
+    parent = lstatSync(path.dirname(config.root));
+  } catch {
+    reject("closure-parent");
+  }
+  failIf(parent.isSymbolicLink() || !parent.isDirectory(), "closure-parent");
+  try {
+    failIf(realpathSync(path.dirname(config.root)) !== path.resolve(path.dirname(config.root)), "closure-parent-noncanonical");
+  } catch {
+    reject("closure-parent-realpath");
+  }
+  if (existsSync(config.root)) assertCanonicalDirectory(config.root, "evidence-root");
+  else failIf(!existsSync(config.closure), "evidence-root");
+  if (existsSync(config.closure)) assertCanonicalDirectory(config.closure, "closure");
+}
+
+function closureFilePath(config, filename) {
+  const filePath = path.join(config.closure, filename);
+  failIf(path.dirname(filePath) !== config.closure, "closure-path");
+  return filePath;
+}
+
+function closureStatePath(config, sequence) {
+  failIf(!Number.isSafeInteger(sequence) || sequence < 0, "closure-sequence");
+  return closureFilePath(config, `closure-state-${String(sequence).padStart(6, "0")}.json`);
+}
+
+function closureInventoryEntries(root) {
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const filePath = path.join(directory, entry.name);
+      failIf(entry.isSymbolicLink(), "closure-symlink");
+      if (entry.isDirectory()) {
+        visit(filePath);
+      } else {
+        failIf(!entry.isFile(), "closure-entry");
+        const relative = path.relative(root, filePath);
+        failIf(relative === "" || relative.startsWith("..") || path.isAbsolute(relative), "closure-entry");
+        entries.push({ label: relative, sha256: sha256EvidenceFile(filePath, relative) });
+      }
+    }
+  };
+  visit(root);
+  entries.sort((left, right) => left.label.localeCompare(right.label));
+  return entries;
+}
+
+function validateClosureBundle(config) {
+  ensureClosureRoot(config);
+  assertDirectory(config.closure, "closure");
+  const tombstonePath = closureFilePath(config, CLOSURE_TOMBSTONE_FILENAME);
+  const inventoryPath = closureFilePath(config, CLOSURE_INVENTORY_FILENAME);
+  const tombstone = readJson(tombstonePath, "closure-tombstone");
+  const inventory = readJson(inventoryPath, "closure-inventory");
+  assertKnownKeys(tombstone, ["version", "type", "root", "inventorySha256", "status", "createdAt"], "closure-tombstone");
+  assertRequiredKeys(tombstone, ["version", "type", "root", "inventorySha256", "status", "createdAt"], "closure-tombstone");
+  failIf(tombstone.version !== 1 || tombstone.type !== "lifecycle-closure-tombstone" ||
+    tombstone.root !== config.root || tombstone.status !== "prepared" || !isSha(tombstone.inventorySha256), "closure-tombstone");
+  failIf(!Number.isFinite(jsonDate(tombstone.createdAt)), "closure-tombstone");
+  assertKnownKeys(inventory, ["version", "type", "root", "runCount", "entries", "entriesSha256"], "closure-inventory");
+  assertRequiredKeys(inventory, ["version", "type", "root", "runCount", "entries", "entriesSha256"], "closure-inventory");
+  failIf(inventory.version !== 1 || inventory.type !== "lifecycle-closure-inventory" || inventory.root !== config.root ||
+    !Number.isSafeInteger(inventory.runCount) || inventory.runCount < 1 || !Array.isArray(inventory.entries) ||
+    !isSha(inventory.entriesSha256) || inventory.entriesSha256 !== hashJson(inventory.entries) ||
+    tombstone.inventorySha256 !== sha256File(inventoryPath, JSON_MAX_BYTES), "closure-inventory");
+  let previous;
+  for (const entry of inventory.entries) {
+    assertKnownKeys(entry, ["label", "sha256"], "closure-inventory-entry");
+    assertRequiredKeys(entry, ["label", "sha256"], "closure-inventory-entry");
+    failIf(typeof entry.label !== "string" || entry.label === "" || entry.label.startsWith("..") || path.isAbsolute(entry.label) ||
+      !isSha(entry.sha256) || (previous !== undefined && previous >= entry.label), "closure-inventory-entry");
+    previous = entry.label;
+  }
+  const states = readdirSync(config.closure, { withFileTypes: true })
+    .filter((entry) => CLOSURE_STATE_RE.test(entry.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of readdirSync(config.closure, { withFileTypes: true })) {
+    failIf(entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory()), "closure-entry");
+    failIf(entry.name !== CLOSURE_TOMBSTONE_FILENAME && entry.name !== CLOSURE_INVENTORY_FILENAME && !CLOSURE_STATE_RE.test(entry.name), "closure-entry");
+  }
+  failIf(states.length === 0, "closure-state");
+  const values = states.map((entry, index) => {
+    failIf(entry.isSymbolicLink(), "closure-state-symlink");
+    const sequence = Number(CLOSURE_STATE_RE.exec(entry.name)[1]);
+    failIf(sequence !== index, "closure-state-sequence");
+    const value = readJson(path.join(config.closure, entry.name), "closure-state");
+    assertKnownKeys(value, ["version", "type", "sequence", "status", "createdAt", "tombstoneSha256", "inventorySha256"], "closure-state");
+    assertRequiredKeys(value, ["version", "type", "sequence", "status", "createdAt", "tombstoneSha256", "inventorySha256"], "closure-state");
+    failIf(value.version !== 1 || value.type !== "lifecycle-closure-state" || value.sequence !== sequence ||
+      !["prepared", "deleted"].includes(value.status) || !isSha(value.tombstoneSha256) ||
+      !isSha(value.inventorySha256) || value.tombstoneSha256 !== sha256File(tombstonePath, JSON_MAX_BYTES) ||
+      value.inventorySha256 !== sha256File(inventoryPath, JSON_MAX_BYTES), "closure-state");
+    failIf(!Number.isFinite(jsonDate(value.createdAt)), "closure-state");
+    return value;
+  });
+  failIf(values[0].status !== "prepared" || values.slice(1).some((value) => value.status !== "deleted") || values.filter((value) => value.status === "deleted").length > 1, "closure-state");
+  if (values.at(-1).status === "deleted") failIf(existsSync(config.root), "closure-deleted-root");
+  return { tombstone, inventory, states: values, tombstonePath, inventoryPath };
+}
+
+function writeClosurePrepared(config, state, terminalRun) {
+  ensureClosureRoot(config);
+  try {
+    mkdirSync(config.closure, { mode: DIRECTORY_MODE });
+    chmodSync(config.closure, DIRECTORY_MODE);
+  } catch {
+    reject("closure-create");
+  }
+  assertDirectory(config.closure, "closure");
+  terminalPredecessorEvidence(config, state, terminalRun);
+  const entries = closureInventoryEntries(config.root);
+  const inventory = {
+    version: 1,
+    type: "lifecycle-closure-inventory",
+    root: config.root,
+    runCount: state.runs.length,
+    entries,
+    entriesSha256: hashJson(entries),
+  };
+  exclusiveJson(closureFilePath(config, CLOSURE_INVENTORY_FILENAME), inventory, "closure-inventory");
+  const inventorySha256 = sha256File(closureFilePath(config, CLOSURE_INVENTORY_FILENAME), JSON_MAX_BYTES);
+  const tombstone = {
+    version: 1,
+    type: "lifecycle-closure-tombstone",
+    root: config.root,
+    inventorySha256,
+    status: "prepared",
+    createdAt: nowIso(config.now),
+  };
+  exclusiveJson(closureFilePath(config, CLOSURE_TOMBSTONE_FILENAME), tombstone, "closure-tombstone");
+  const tombstoneSha256 = sha256File(closureFilePath(config, CLOSURE_TOMBSTONE_FILENAME), JSON_MAX_BYTES);
+  exclusiveJson(closureStatePath(config, 0), {
+    version: 1,
+    type: "lifecycle-closure-state",
+    sequence: 0,
+    status: "prepared",
+    createdAt: nowIso(config.now),
+    tombstoneSha256,
+    inventorySha256,
+  }, "closure-state");
+  fsyncDirectory(config.closure);
+  return validateClosureBundle(config);
+}
+
+function validateDeletionAgainstInventory(config, inventory) {
+  if (!existsSync(config.root)) return;
+  assertCanonicalDirectory(config.root, "evidence-root");
+  const actual = closureInventoryEntries(config.root);
+  const expected = new Map(inventory.entries.map((entry) => [entry.label, entry.sha256]));
+  for (const entry of actual) failIf(expected.get(entry.label) !== entry.sha256, "closure-inventory-mismatch");
+}
+
+function closeEvidenceRoot(config, state) {
+  let bundle;
+  if (existsSync(config.closure)) {
+    bundle = validateClosureBundle(config);
+  } else {
+    const terminal = state?.runs.find((run) => run.phase === "terminal" && run.status === "finalized");
+    failIf(!terminal || state.state !== "terminal-verified", "closure-not-ready");
+    bundle = writeClosurePrepared(config, state, {
+      runId: terminal.id,
+      runDirectory: runPath(config, terminal.id),
+      artifacts: artifactPaths(runPath(config, terminal.id)),
+      manifest: immutableManifest(
+        runPath(config, terminal.id),
+        artifactPaths(runPath(config, terminal.id)),
+        readCheckpoints(runPath(config, terminal.id), { runId: terminal.id, phase: "terminal" }),
+        terminal,
+      ),
+    });
+  }
+  if (bundle.states.at(-1).status === "deleted") return { status: "deleted" };
+  validateDeletionAgainstInventory(config, bundle.inventory);
+  if (existsSync(config.root)) {
+    rmSync(config.root, { recursive: true, force: true });
+    fsyncDirectory(path.dirname(config.root));
+  }
+  failIf(existsSync(config.root), "closure-root-present");
+  exclusiveJson(closureStatePath(config, 1), {
+    version: 1,
+    type: "lifecycle-closure-state",
+    sequence: 1,
+    status: "deleted",
+    createdAt: nowIso(config.now),
+    tombstoneSha256: sha256File(bundle.tombstonePath, JSON_MAX_BYTES),
+    inventorySha256: sha256File(bundle.inventoryPath, JSON_MAX_BYTES),
+  }, "closure-state");
+  fsyncDirectory(config.closure);
+  return { status: "deleted" };
 }
 
 function ensureRoot(config) {
@@ -2510,7 +3289,14 @@ function loadState(config) {
     else throw error;
   }
   const latest = snapshots.at(-1);
-  if (current === null && latest === undefined) return null;
+  if (current === null && latest === undefined) {
+    validateRevocationEvidence(config);
+    for (const entry of readdirSync(config.root, { withFileTypes: true })) {
+      if (auxiliaryEvidenceName(entry.name) || entry.name === "state.json" || STATE_FILE_RE.test(entry.name)) continue;
+      failIf(true, "unregistered-run");
+    }
+    return null;
+  }
   failIf(latest === undefined || current === null, "state-history");
   assertStateSnapshotIntegrity(
     current,
@@ -2536,8 +3322,10 @@ function loadState(config) {
   recoverStateFromCheckpoints(config, state);
   assertClosedGlobalState(state);
   const registered = new Set(state.runs.map((run) => run.id));
+  validateRevocationEvidence(config);
   for (const entry of readdirSync(config.root, { withFileTypes: true })) {
     if (entry.name === "state.json" || STATE_FILE_RE.test(entry.name)) continue;
+    if (auxiliaryEvidenceName(entry.name)) continue;
     failIf(entry.isSymbolicLink(), "unregistered-symlink");
     failIf(!entry.isDirectory() || !registered.has(entry.name), "unregistered-run");
   }
@@ -2549,6 +3337,7 @@ function recoverUnregisteredRunDirectories(config, state) {
   const registered = new Set(state.runs.map((run) => run.id));
   for (const entry of readdirSync(config.root, { withFileTypes: true })) {
     if (entry.name === "state.json" || STATE_FILE_RE.test(entry.name) || registered.has(entry.name)) continue;
+    if (auxiliaryEvidenceName(entry.name)) continue;
     failIf(entry.isSymbolicLink() || !entry.isDirectory() || !RUN_ID_RE.test(entry.name), "unregistered-run");
     const directory = path.join(config.root, entry.name);
     assertDirectory(directory, "unregistered-run");
@@ -2608,6 +3397,20 @@ function recoverStateFromCheckpoints(config, state) {
     }
     if (!closedRun && names.has("guard-receipt") && !existsSync(artifacts.guard) && !names.has("receipts-consumed")) {
       reject("guard-receipt-missing");
+    }
+    if (!closedRun && run.phase === "credential-cleanup" && names.has("vault-descriptor")) {
+      const descriptorCheckpoint = checkpointNamed(checkpoints, "vault-descriptor");
+      assertCheckpointArtifact(artifacts.descriptor, descriptorCheckpoint, "descriptorSha256", "vault-descriptor");
+      validateCleanupDescriptor(artifacts.descriptor, manifest);
+    }
+    if (!closedRun && run.phase === "credential-cleanup" && names.has("cleanup-start")) {
+      const startCheckpoint = checkpointNamed(checkpoints, "cleanup-start");
+      assertCheckpointArtifact(artifacts.cleanupOperation, startCheckpoint, "cleanupOperationManifestSha256", "cleanup-operation");
+      requiredCleanup({
+        manifest,
+        artifacts,
+        guardReceiptSha256: startCheckpoint.guardReceiptSha256,
+      }, { requireAbsence: false });
     }
     if (!closedRun && names.has("preflight-receipt") && existsSync(artifacts.preflight)) {
       const checkpoint = checkpointNamed(checkpoints, "preflight-receipt");
@@ -2699,10 +3502,20 @@ function recoverStateFromCheckpoints(config, state) {
       }
     }
     if (!closedRun && names.has("reconcile")) {
-      const reconcileCheckpoint = checkpointNamed(checkpoints, "reconcile");
+      const reconcileCheckpoints = checkpoints.filter((checkpoint) => checkpoint.name === "reconcile");
+      for (const reconcileCheckpoint of reconcileCheckpoints) {
+        const reconcilePath = reconcilePathForCheckpoint(directory, reconcileCheckpoint);
+        readReceiptAtCheckpoint(
+          reconcilePath,
+          reconcileCheckpoint,
+          manifest,
+          "reconcile",
+          ["applied", "invalidated", "unknown"],
+        );
+      }
       const reconcile = readReceiptAtCheckpoint(
-        artifacts.reconcile,
-        reconcileCheckpoint,
+        reconcilePathForCheckpoint(directory, reconcileCheckpoints.at(-1)),
+        reconcileCheckpoints.at(-1),
         manifest,
         "reconcile",
         ["applied", "invalidated", "unknown"],
@@ -2719,7 +3532,7 @@ function recoverStateFromCheckpoints(config, state) {
     const sourceState = STATE_FOR_PHASE[run.phase];
     const targetState = run.phase === "terminal" ? "terminal-verified" : ADVANCED_STATE[run.phase];
     if (advancement !== undefined) {
-      if (run.phase === "terminal") validateFinalTerminalEvidence(directory, advancement);
+      if (run.phase === "terminal") validateFinalTerminalEvidence(config, directory, advancement, state);
       failIf(
         advancement.from !== sourceState || advancement.to !== targetState,
         "global-state-history",
@@ -2795,7 +3608,105 @@ function requireState(config) {
   return state;
 }
 
-function validateFinalTerminalEvidence(runDirectory, advancement) {
+function addTerminalInventoryEntry(inventory, root, filePath, label = undefined) {
+  const relative = label ?? path.relative(root, filePath);
+  failIf(relative === "" || relative.startsWith("..") || path.isAbsolute(relative), "terminal-receipt-path");
+  failIf(inventory.some((entry) => entry.label === relative), "terminal-receipt-inventory");
+  inventory.push({ label: relative, sha256: sha256EvidenceFile(filePath, relative) });
+}
+
+function validatedRunEvidence(config, inventory, entry, artifacts, checkpoints) {
+  const directory = runPath(config, entry.id);
+  const allowed = new Set([
+    "plan.tfplan",
+    "tf-cli.tfrc",
+    "create-manifest.json",
+    "show.json",
+    "guard-receipt.json.consumed",
+    "preflight-receipt.json.consumed",
+    "apply-receipt.json",
+  ]);
+  if (entry.phase === "runtime-cutover") allowed.add("diagnostic-receipt.json");
+  if (entry.phase === "runtime-cutover") {
+    allowed.add("diagnostic-intent.json");
+    allowed.add("diagnostic-invoking.json");
+    allowed.add("diagnostic-submission.json");
+  }
+  if (entry.phase === "credential-cleanup") {
+    for (const name of [
+      "vault-descriptor.json",
+      "cleanup-manifest.json",
+      "cleanup-absence-receipt.json",
+    ]) allowed.add(name);
+  }
+  const permitted = (name) => CHECKPOINT_FILE_RE.test(name) ||
+    allowed.has(name) ||
+    /^reconcile-receipt-\d{6}\.json$/.test(name) ||
+    /^cleanup-state-\d{6}\.json$/.test(name) ||
+    /^cleanup-state-anchor(?:-\d{6})?\.json$/.test(name);
+  for (const item of readdirSync(directory, { withFileTypes: true })) {
+    failIf(item.isSymbolicLink() || !item.isFile() || !permitted(item.name), "terminal-receipt-inventory");
+  }
+  for (const checkpoint of checkpoints) {
+    addTerminalInventoryEntry(inventory, config.root, path.join(directory, `${String(checkpoint.sequence).padStart(6, "0")}-${checkpoint.name}.json`), `${entry.id}/${String(checkpoint.sequence).padStart(6, "0")}-${checkpoint.name}.json`);
+  }
+  for (const item of readdirSync(directory, { withFileTypes: true })) {
+    if (!item.isFile() || CHECKPOINT_FILE_RE.test(item.name)) continue;
+    addTerminalInventoryEntry(inventory, config.root, path.join(directory, item.name), `${entry.id}/${item.name}`);
+  }
+}
+
+function terminalPredecessorEvidence(config, state, terminalRequest) {
+  const inventory = [];
+  const root = config.root;
+  const add = (filePath, label) => addTerminalInventoryEntry(inventory, root, filePath, label);
+  const terminalCheckpoints = readCheckpoints(terminalRequest.runDirectory, {
+    runId: terminalRequest.runId,
+    phase: "terminal",
+  });
+  add(terminalRequest.artifacts.manifest);
+  const terminalGuard = checkpointNamed(terminalCheckpoints, "guard-receipt");
+  readReceiptAtCheckpoint(terminalRequest.artifacts.guard, terminalGuard, terminalRequest.manifest, "guard");
+  add(terminalRequest.artifacts.guard);
+  const applied = (phase) => appliedPhasePredecessorEvidence(
+    config,
+    state,
+    phase,
+    "terminal-predecessor",
+    inventory,
+  );
+
+  applied("model-bootstrap");
+  const runtime = applied("runtime-cutover");
+  requiredDiagnostic({ manifest: runtime.manifest, artifacts: runtime.artifacts });
+
+  const credential = applied("credential-cleanup");
+  const consumed = checkpointNamed(credential.checkpoints, "receipts-consumed");
+  const cleanup = requiredCleanup({
+    manifest: credential.manifest,
+    artifacts: credential.artifacts,
+    guardReceiptSha256: consumed.guardReceiptSha256,
+  });
+
+  const revocation = validateRevocationEvidence(config, { requireComplete: true });
+  const revocationReceipt = revocation.find((entry) => entry.label === "openrouter-revocation-receipt.json");
+  failIf(revocationReceipt === undefined, "terminal-revocation");
+  for (const entry of revocation) add(path.join(root, entry.label), entry.label);
+
+  const livePath = path.join(terminalRequest.runDirectory, "terminal-live-receipt.json");
+  assertExactReceipt(
+    livePath,
+    "live-receipt",
+    terminalRequest.manifest,
+    { type: "live", status: "passed", operation: "terminal-live" },
+  );
+  add(livePath);
+  inventory.sort((left, right) => left.label.localeCompare(right.label));
+  void cleanup;
+  return inventory;
+}
+
+function validateFinalTerminalEvidence(config, runDirectory, advancement, state) {
   const artifacts = artifactPaths(runDirectory);
   const checkpoints = readCheckpoints(runDirectory, {
     runId: advancement.runId,
@@ -2811,31 +3722,13 @@ function validateFinalTerminalEvidence(runDirectory, advancement) {
   failIf(!Array.isArray(advancement.receiptInventory), "terminal-receipt-inventory");
   const checkpointInventory = advancement.receiptInventory;
   failIf(
-    checkpointInventory.length !== TERMINAL_RECEIPTS.length ||
+    checkpointInventory.length === 0 ||
       checkpointInventory.some((entry) => !isObject(entry) || !isSha(entry.sha256)),
     "terminal-receipt-inventory",
   );
   for (const entry of checkpointInventory) {
     assertKnownKeys(entry, ["label", "sha256"], "terminal-receipt-inventory");
     assertRequiredKeys(entry, ["label", "sha256"], "terminal-receipt-inventory");
-  }
-  const expectedLabels = TERMINAL_RECEIPTS.map(([, filename]) => filename).sort();
-  const checkpointLabels = checkpointInventory.map((entry) => entry.label).sort();
-  failIf(!same(expectedLabels, checkpointLabels), "terminal-receipt-inventory");
-  for (const entry of checkpointInventory) {
-    try {
-      assertCheckpointArtifact(
-        path.join(runDirectory, entry.label),
-        { receiptSha256: entry.sha256 },
-        "receiptSha256",
-        "terminal-receipt",
-      );
-    } catch (error) {
-      if (error instanceof LifecycleError && error.code.startsWith("terminal-receipt-")) {
-        reject("terminal-receipt-set");
-      }
-      throw error;
-    }
   }
   const terminal = readJson(artifacts.terminal, "terminal-receipts");
   assertReceiptMatches(terminal, manifest, "terminal");
@@ -2848,24 +3741,12 @@ function validateFinalTerminalEvidence(runDirectory, advancement) {
     "result", "receiptInventory", "receiptSetSha256",
   ], "terminal-receipt-schema");
   failIf(terminal.version !== 1 || terminal.result !== "verified", "terminal-receipt-schema");
-  requiredDiagnostic({ manifest, artifacts });
-  requiredCleanup({ manifest, artifacts });
-  const live = assertExactReceipt(
-    path.join(runDirectory, "terminal-live-receipt.json"),
-    "live-receipt",
+  const inventory = terminalPredecessorEvidence(config, state, {
+    runDirectory,
+    runId: advancement.runId,
     manifest,
-    { type: "live", status: "passed", operation: "terminal-live" },
-  );
-  assertKnownKeys(live.value, [
-    "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
-    "createdAt", "repositoryCommit", "contextSha256", "sha256",
-  ], "live-receipt-schema");
-  const inventory = TERMINAL_RECEIPTS
-    .map(([, filename]) => ({
-      label: filename,
-      sha256: sha256File(path.join(runDirectory, filename), JSON_MAX_BYTES),
-    }))
-    .sort((left, right) => left.label.localeCompare(right.label));
+    artifacts,
+  });
   failIf(!same(terminal.receiptInventory, inventory), "terminal-receipt-inventory");
   failIf(!same(advancement.receiptInventory, inventory), "terminal-receipt-inventory");
   failIf(
@@ -2907,11 +3788,109 @@ function defaultTerraformExecutor(request) {
   }, request.processRunner);
 }
 
+function cleanupUtilityResult(result, operation) {
+  if (result === true || result === 0 || result?.status === "success" || result?.status === "started" || result?.status === "absent") {
+    return { status: "success", result };
+  }
+  if (result?.status === "ambiguous") reject(`cleanup-${operation}-unknown`);
+  reject(`cleanup-${operation}`);
+}
+
+function runCleanupUtility(config, operation, runId) {
+  const runner = config.cleanupRunner;
+  if (typeof runner === "function") {
+    return cleanupUtilityResult(runner({
+      command: CLEANUP_UTILITY_PATH,
+      operation,
+      runId,
+      argv: [operation, runId],
+      root: config.root,
+    }), operation);
+  }
+  const lockFd = inheritedKernelLockDescriptor(config.kernelLockPath);
+  failIf(lockFd === undefined, "cleanup-lock-inherited");
+  let lockToken;
+  try {
+    lockToken = readFileSync(kernelPathFor(config), "utf8").trim();
+  } catch {
+    reject("cleanup-lock-token");
+  }
+  failIf(!/^[a-f0-9]{64}$/.test(lockToken), "cleanup-lock-token");
+  let child;
+  try {
+    const childStdio = ["ignore", "pipe", "pipe", lockFd];
+    child = spawnSync(process.execPath, [
+      CLEANUP_UTILITY_PATH,
+      CLEANUP_INTERNAL_LOCKED_MARKER,
+      operation,
+      runId,
+    ], {
+      cwd: REPOSITORY_ROOT,
+      env: {
+        ...PRODUCTION_ENV,
+        PALANCAR_CLEANUP_LOCK_FD: "3",
+        PALANCAR_CLEANUP_LOCK_TOKEN: lockToken,
+      },
+      encoding: "utf8",
+      timeout: 180 * 1000,
+      killSignal: "SIGKILL",
+      maxBuffer: COMMAND_OUTPUT_MAX_BYTES,
+      stdio: childStdio,
+    });
+  } catch {
+    reject(`cleanup-${operation}-unknown`);
+  }
+  if (child.error || child.status === null) reject(`cleanup-${operation}-unknown`);
+  failIf(child.status !== 0 || child.stdout !== "success\n" || child.stderr !== "", `cleanup-${operation}`);
+  return { status: "success" };
+}
+
+function createVaultDescriptor(config, run, manifest, bindings, supersession = undefined) {
+  const providerConfig = {
+    ...config,
+    childEnvironment: buildChildEnvironment(run.runDirectory, config.inheritedEnvironment),
+    account: {
+      cloud: "AzureCloud",
+      subscription: bindings.backend.subscription_id,
+      tenant: bindings.backend.tenant_id,
+    },
+  };
+  const outputs = defaultOutputs(providerConfig);
+  requireRuntimeOutputs(outputs);
+  const vaultUri = outputs.keyVaultUri.endsWith("/") ? outputs.keyVaultUri : `${outputs.keyVaultUri}/`;
+  const descriptor = {
+    version: 1,
+    type: "credential-cleanup-vault-descriptor",
+    runId: manifest.runId,
+    phase: "credential-cleanup",
+    planSha256: manifest.planSha256,
+    bindingSha256: manifest.bindingSha256,
+    contextSha256: manifest.bindingSha256,
+    vaultResourceId: outputs.keyVaultId,
+    vaultUri,
+    subscription: bindings.backend.subscription_id,
+    tenant: bindings.backend.tenant_id,
+    cloud: "AzureCloud",
+    callerIdentity: {
+      userType: "user",
+      objectId: defaultOperatorId(config.workdir),
+    },
+    targetNames: [...CLEANUP_TARGET_NAMES],
+    startState: "start",
+    ...(supersession === undefined ? {} : { supersession }),
+  };
+  failIf(!UUID_RE.test(descriptor.callerIdentity.objectId ?? ""), "cleanup-caller");
+  exclusiveJson(run.artifacts.descriptor, descriptor, "vault-descriptor");
+  validateCleanupDescriptor(run.artifacts.descriptor, manifest);
+  return descriptor;
+}
+
 function defaultShowExecutor(request) {
   failIf(terraformExecutableSha256() !== TERRAFORM_SHA256, "terraform-hash");
   return commandResult(TERRAFORM_PATH, exactShowArgv(request.planPath), {
     cwd: request.cwd,
     env: request.env,
+    phase: request.phase,
     timeoutMs: COMMAND_TIMEOUT_MS,
   }, request.processRunner);
 }
@@ -2942,7 +3921,7 @@ function resourceIdParts(resourceId, code) {
 }
 
 function defaultOutputs(config) {
-  return testSnapshot(`terraform-outputs:${config.workdir}`, () => {
+  return testSnapshot(`terraform-outputs:${config.workdir}:${config.contextOperation ?? "bootstrap"}`, () => {
     const output = runCommand(config, TERRAFORM_PATH, ["output", "-json"]);
     const values = parseCommandJson(output, "terraform-output");
     failIf(!isObject(values), "terraform-output");
@@ -2955,16 +3934,19 @@ function defaultOutputs(config) {
     failIf(accountParts.subscription !== config.account.subscription, "binding-mismatch");
     const resourceGroup = get("resource_group_name");
     failIf(resourceGroup !== accountParts.resourceGroup, "resource-context");
-    return {
+    const outputs = {
       resourceGroup,
       region: get("region"),
       accountId: get("foundry_account_id"),
       account: accountParts.account,
       foundryResourceGroup: accountParts.resourceGroup,
       foundryEndpoint: get("foundry_endpoint", false),
+      containerAppEnvironmentId: get("container_app_environment_id", false),
       relayContainerApp: get("relay_container_app_name", false),
       relayRevision: get("relay_latest_revision_name", false),
       relayContainerAppId: get("relay_container_app_id", false),
+      expiryCleanupJobName: get("expiry_cleanup_job_name", false),
+      expiryCleanupJobId: get("expiry_cleanup_job_id", false),
       keyVault: get("key_vault_name", false),
       keyVaultId: get("key_vault_id", false),
       keyVaultUri: get("key_vault_uri", false),
@@ -2977,7 +3959,36 @@ function defaultOutputs(config) {
       applicationInsightsId: get("application_insights_id", false),
       workloadStateStorageAccountId: get("workload_state_storage_account_id", false),
     };
+    outputs.runtimeIdentityPrincipalId = runtimeIdentityPrincipalFromAccountRole(config, outputs);
+    return outputs;
   });
+}
+
+function runtimeIdentityPrincipalFromAccountRole(config, outputs) {
+  failIf(typeof outputs.accountId !== "string" || typeof outputs.runtimeOpenAiRoleAssignmentId !== "string", "runtime-openai-role");
+  const assignments = azJson(config, [
+    "role", "assignment", "list",
+    "--scope", outputs.accountId,
+    "--all",
+    "--output", "json",
+  ], "runtime-openai-role");
+  failIf(!Array.isArray(assignments), "runtime-openai-role");
+  const matches = assignments.filter((assignment) => assignment?.id === outputs.runtimeOpenAiRoleAssignmentId);
+  failIf(matches.length !== 1, "runtime-openai-role");
+  const assignment = matches[0];
+  assertKnownKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], "runtime-openai-role");
+  assertRequiredKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], "runtime-openai-role");
+  const assignmentPrefix = `${outputs.accountId}/providers/Microsoft.Authorization/roleAssignments/`;
+  failIf(
+    !assignment.id.startsWith(assignmentPrefix) ||
+      !UUID_RE.test(assignment.id.slice(assignmentPrefix.length)) ||
+      !UUID_RE.test(assignment.principalId) ||
+      assignment.principalType !== "ServicePrincipal" ||
+      assignment.roleDefinitionId !== roleDefinitionResourceId(config.account.subscription, ENTRA_ROLES.openAiUser) ||
+      assignment.scope !== outputs.accountId,
+    "runtime-openai-role",
+  );
+  return assignment.principalId;
 }
 
 function azJson(config, args, code) {
@@ -3543,6 +4554,251 @@ function assertExactReceipt(filePath, code, manifest, expected) {
   return checked;
 }
 
+function reviewedRuntimeDigest(manifest, artifacts) {
+  failIf(!manifest || !artifacts, "diagnostic-plan-context");
+  return hashJson({
+    planSha256: manifest.planSha256,
+    bindingSha256: manifest.bindingSha256,
+    argv: manifest.argv,
+    showSha256: sha256File(artifacts.show, JSON_MAX_BYTES),
+  });
+}
+
+function canonicalRuntimeContainer(container, code) {
+  assertKnownKeys(container, ["name", "image", "env", "resources", "probes", "command", "args"], code);
+  assertRequiredKeys(container, ["name", "image"], code);
+  failIf(typeof container.name !== "string" || !/^[-a-z0-9]{1,63}$/i.test(container.name), code);
+  failIf(typeof container.image !== "string" || !/^.+@sha256:[a-f0-9]{64}$/i.test(container.image), code);
+  const env = container.env === undefined ? [] : container.env;
+  assertEnvironmentEntries(env, code);
+  const values = env.map((entry) => ({
+    name: entry.name,
+    ...(entry.value === undefined ? {} : { value: entry.value }),
+    ...(entry.secretRef === undefined ? {} : { secretRef: entry.secretRef }),
+  }));
+  failIf(new Set(values.map((entry) => entry.name)).size !== values.length, code);
+  const resources = container.resources === undefined ? undefined : container.resources;
+  if (resources !== undefined) {
+    assertKnownKeys(resources, ["cpu", "memory"], code);
+    assertRequiredKeys(resources, ["cpu", "memory"], code);
+  }
+  return {
+    name: container.name,
+    image: container.image,
+    env: values,
+    ...(container.command === undefined ? {} : { command: [...container.command] }),
+    ...(container.args === undefined ? {} : { args: [...container.args] }),
+    ...(container.probes === undefined ? {} : { probes: structuredClone(container.probes) }),
+    ...(resources === undefined ? {} : { resources }),
+  };
+}
+
+function canonicalRuntimeTemplate(template, code) {
+  assertContainerTemplate(template, code);
+  failIf(template.revisionSuffix !== undefined || template.volumes !== undefined, code);
+  const containers = template.containers.map((container) => canonicalRuntimeContainer(container, code));
+  failIf(new Set(containers.map((container) => container.name)).size !== containers.length, code);
+  let scale;
+  if (template.scale !== undefined) {
+    assertKnownKeys(template.scale, ["minReplicas", "maxReplicas"], code);
+    assertRequiredKeys(template.scale, ["minReplicas", "maxReplicas"], code);
+    scale = {
+      minReplicas: template.scale.minReplicas,
+      maxReplicas: template.scale.maxReplicas,
+    };
+  }
+  return {
+    containers,
+    ...(scale === undefined ? {} : { scale }),
+  };
+}
+
+function projectRuntimeTemplateEnvironment(template, compareEnvironmentValues) {
+  if (compareEnvironmentValues) return template;
+  return {
+    ...template,
+    containers: template.containers.map((container) => ({
+      ...container,
+      env: container.env.map((entry) => ({
+        name: entry.name,
+        ...(entry.secretRef === undefined ? {} : { secretRef: entry.secretRef }),
+      })),
+    })),
+  };
+}
+
+function canonicalRuntimeIdentity(value, code) {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) {
+    failIf(value.length !== 1, code);
+    return canonicalRuntimeIdentity(value[0], code);
+  }
+  if (Array.isArray(value.identity_ids)) {
+    assertKnownKeys(value, ["identity_ids", "principal_id", "tenant_id", "type"], code);
+    assertRequiredKeys(value, ["identity_ids", "type"], code);
+    failIf(value.type !== "UserAssigned" || value.identity_ids.length === 0, code);
+    const identities = value.identity_ids.map(identityKey).sort();
+    failIf(new Set(identities).size !== identities.length, code);
+    return { type: value.type, userAssignedIdentities: identities };
+  }
+  assertKnownKeys(value, ["type", "userAssignedIdentities"], code);
+  assertRequiredKeys(value, ["type", "userAssignedIdentities"], code);
+  failIf(typeof value.type !== "string" || !isObject(value.userAssignedIdentities), code);
+  const identities = Object.keys(value.userAssignedIdentities).map(identityKey).sort();
+  failIf(identities.length === 0 || new Set(identities).size !== identities.length, code);
+  return { type: value.type, userAssignedIdentities: identities };
+}
+
+function canonicalRuntimeShape(value, code) {
+  failIf(!isObject(value), code);
+  const body = isObject(value.body) ? value.body : value;
+  const properties = isObject(body.properties) ? body.properties : body;
+  const configuration = isObject(properties.configuration) ? properties.configuration : {};
+  const template = properties.template;
+  failIf(!isObject(template) || !Array.isArray(template.containers), code);
+  const containers = template.containers.map((container) => canonicalRuntimeContainer(container, code));
+  failIf(containers.length === 0 || new Set(containers.map((entry) => entry.name)).size !== containers.length, code);
+  const normalizeIdentity = (value) => typeof value === "string" ? identityKey(value) : value;
+  const registries = configuration.registries === undefined ? [] : configuration.registries.map((registry) => {
+    assertKnownKeys(registry, ["server", "identity", "username", "passwordSecretRef"], code);
+    assertRequiredKeys(registry, ["server", "identity"], code);
+    failIf(typeof registry.server !== "string" || !/^[a-z0-9-]{5,50}\.azurecr\.io$/i.test(registry.server), code);
+    return {
+      server: registry.server.toLowerCase(),
+      identity: normalizeIdentity(registry.identity),
+      ...(registry.username === undefined ? {} : { username: registry.username }),
+      ...(registry.passwordSecretRef === undefined ? {} : { passwordSecretRef: registry.passwordSecretRef }),
+    };
+  });
+  const secrets = configuration.secrets === undefined ? [] : configuration.secrets.map((secret) => {
+    assertKnownKeys(secret, ["name", "keyVaultUrl", "identity"], code);
+    assertRequiredKeys(secret, ["name", "keyVaultUrl", "identity"], code);
+    failIf(typeof secret.name !== "string" || typeof secret.keyVaultUrl !== "string", code);
+    return { name: secret.name, keyVaultUrl: secret.keyVaultUrl, identity: normalizeIdentity(secret.identity) };
+  });
+  const identitySettings = configuration.identitySettings === undefined ? [] : configuration.identitySettings.map((setting) => {
+    assertKnownKeys(setting, ["identity", "lifecycle"], code);
+    assertRequiredKeys(setting, ["identity", "lifecycle"], code);
+    return { identity: normalizeIdentity(setting.identity), lifecycle: setting.lifecycle };
+  });
+  const ingress = isObject(configuration.ingress) ? {
+    external: configuration.ingress.external,
+    targetPort: configuration.ingress.targetPort,
+    transport: configuration.ingress.transport,
+    allowInsecure: configuration.ingress.allowInsecure,
+    traffic: Array.isArray(configuration.ingress.traffic)
+      ? configuration.ingress.traffic.map((traffic) => ({
+          ...(traffic.revisionName === undefined ? {} : { revisionName: traffic.revisionName }),
+          ...(traffic.latestRevision === undefined ? {} : { latestRevision: traffic.latestRevision }),
+          weight: traffic.weight,
+        }))
+      : [],
+  } : undefined;
+  const scale = isObject(template.scale) ? {
+    minReplicas: template.scale.minReplicas,
+    maxReplicas: template.scale.maxReplicas,
+  } : undefined;
+  const identity = canonicalRuntimeIdentity(body.identity ?? value.identity, code);
+  return {
+    containers,
+    ...(scale === undefined ? {} : { scale }),
+    ...(configuration.maxInactiveRevisions === undefined ? {} : { maxInactiveRevisions: configuration.maxInactiveRevisions }),
+    ...(ingress === undefined ? {} : { ingress }),
+    registries,
+    secrets,
+    identitySettings,
+    ...(identity === undefined ? {} : { identity }),
+  };
+}
+
+function reviewedRuntimeShapes(artifacts, phase) {
+  failIf(!["runtime-cutover", "credential-cleanup", "terminal"].includes(phase), "diagnostic-plan-phase");
+  const show = parseJsonText(boundedFileText(artifacts.show, JSON_MAX_BYTES, "show-json"), "show-json");
+  const address = "module.container_app_workload[0].azapi_resource.this";
+  const moduleAddress = "module.container_app_workload[0]";
+  const stateAddress = (root, code) => {
+    failIf(!isObject(root), code);
+    const rootMatches = (root.resources ?? []).filter((resource) => resource?.address === address);
+    const moduleMatches = (root.child_modules ?? [])
+      .filter((module) => module?.address === moduleAddress)
+      .flatMap((module) => (module.resources ?? []).filter((resource) =>
+        resource?.address === address || resource?.address === "azapi_resource.this"));
+    const matches = [...rootMatches, ...moduleMatches];
+    failIf(matches.length !== 1, code);
+    return matches[0];
+  };
+  const changeEntries = Array.isArray(show.resource_changes)
+    ? show.resource_changes.filter((entry) => entry?.address === address)
+    : [];
+  failIf(changeEntries.length !== 1, "diagnostic-plan-topology");
+  const change = changeEntries[0]?.change;
+  const expectedActions = phase === "runtime-cutover" ? ["update"] : ["no-op"];
+  failIf(!isObject(change) || !same(change.actions, expectedActions) || !isObject(change.before) || !isObject(change.after), "diagnostic-plan-topology");
+  const prior = stateAddress(show.prior_state?.values?.root_module, "diagnostic-plan-topology");
+  const planned = stateAddress(show.planned_values?.root_module, "diagnostic-plan-topology");
+  failIf(prior === undefined || planned === undefined || !isObject(prior.values) || !isObject(planned.values), "diagnostic-plan-topology");
+  const before = canonicalRuntimeShape(change.before, "diagnostic-plan-topology");
+  const after = canonicalRuntimeShape(change.after, "diagnostic-plan-topology");
+  const priorShape = canonicalRuntimeShape(prior.values, "diagnostic-plan-topology");
+  const plannedShape = canonicalRuntimeShape(planned.values, "diagnostic-plan-topology");
+  if (phase === "runtime-cutover") {
+    failIf(!same(before, priorShape) || !same(after, plannedShape), "diagnostic-plan-topology");
+  } else {
+    failIf(!same(before, after) || !same(before, priorShape) || !same(before, plannedShape), "diagnostic-plan-topology");
+  }
+  const variableDigest = show.variables?.relay_image_digest?.value;
+  const relay = after.containers.find((container) => container.name === "relay");
+  failIf(relay === undefined || variableDigest !== relay.image, "diagnostic-plan-image");
+  return { before, after, image: relay.image };
+}
+
+function reviewedRuntimeImage(artifacts) {
+  return reviewedRuntimeShapes(artifacts, "runtime-cutover").image;
+}
+
+function validateDiagnosticIdentity(value, manifest, job, code) {
+  assertKnownKeys(value, ["resourceId", "principalId", "clientId", "planSha256", "job"], code);
+  assertRequiredKeys(value, ["resourceId", "principalId", "clientId", "planSha256", "job"], code);
+  assertKnownKeys(value.job, ["requestId", "executionName"], code);
+  assertRequiredKeys(value.job, ["requestId", "executionName"], code);
+  failIf(
+      value.resourceId !== manifest.bindings.runtimeIdentityId ||
+      value.principalId !== manifest.bindings.runtimeIdentityPrincipalId ||
+      !UUID_RE.test(value.principalId) ||
+      value.clientId !== manifest.bindings.runtimeIdentityClientId ||
+      !UUID_RE.test(value.clientId) ||
+      value.planSha256 !== manifest.planSha256 ||
+      value.job.requestId !== job.requestId ||
+      value.job.executionName !== job.executionName,
+    code,
+  );
+  return value;
+}
+
+function validateDiagnosticOpenAiRole(value, manifest, principalId, code) {
+  assertKnownKeys(value, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], code);
+  assertRequiredKeys(value, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], code);
+  const expectedScope = manifest.bindings.accountId;
+  const expectedPrincipalId = manifest.bindings.runtimeIdentityPrincipalId;
+  const expectedRole = roleDefinitionResourceId(
+    manifest.bindings.backend.subscription_id,
+    ENTRA_ROLES.openAiUser,
+  );
+  const assignmentPrefix = `${expectedScope}/providers/Microsoft.Authorization/roleAssignments/`;
+  failIf(
+    principalId !== expectedPrincipalId ||
+      value.principalId !== expectedPrincipalId ||
+      value.principalType !== "ServicePrincipal" ||
+      value.roleDefinitionId !== expectedRole ||
+      value.scope !== expectedScope ||
+      typeof value.id !== "string" || !value.id.startsWith(assignmentPrefix) ||
+      !UUID_RE.test(value.id.slice(assignmentPrefix.length)) ||
+      value.id !== manifest.bindings.runtimeOpenAiRoleAssignmentId,
+    code,
+  );
+  return value;
+}
+
 function requiredDiagnostic(request) {
   const manifest = request.manifest;
   failIf(!manifest, "diagnostic-receipt-context");
@@ -3550,21 +4806,61 @@ function requiredDiagnostic(request) {
     type: "diagnostic",
     status: "passed",
     operation: "runtime-cutover-diagnostic",
-    imageDigest: RUNTIME_RELAY_IMAGE,
+    imageDigest: reviewedRuntimeImage(request.artifacts),
     digestCount: 1,
   });
   const value = checked.value;
   assertKnownKeys(value, [
     "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
-    "createdAt", "repositoryCommit", "contextSha256", "imageDigest", "digestCount", "execution",
-    "runtimeSecretReferences", "sha256",
+    "createdAt", "repositoryCommit", "contextSha256", "reviewedDigest", "imageDigest", "digestCount",
+    "submission", "request", "activity", "execution", "identity", "openAiRole", "runtimeSecretReferences", "sha256",
   ], "diagnostic-receipt-schema");
-  assertKnownKeys(value.execution, ["baseline", "result", "retryCount"], "diagnostic-receipt-schema");
-  assertRequiredKeys(value.execution, ["baseline", "result", "retryCount"], "diagnostic-receipt-schema");
+  assertRequiredKeys(value, ["reviewedDigest", "submission", "request", "activity", "execution", "identity", "openAiRole"], "diagnostic-receipt-schema");
+  failIf(value.reviewedDigest !== reviewedRuntimeDigest(manifest, request.artifacts), "diagnostic-plan-context");
+  assertKnownKeys(value.submission, ["requestId", "executionName", "artifactSha256"], "diagnostic-submission");
+  assertRequiredKeys(value.submission, ["requestId", "executionName", "artifactSha256"], "diagnostic-submission");
+  assertKnownKeys(value.request, ["requestId", "operation", "argv"], "diagnostic-request");
+  assertRequiredKeys(value.request, ["requestId", "operation", "argv"], "diagnostic-request");
+  assertKnownKeys(value.activity, ["requestId", "status", "terminal"], "diagnostic-activity");
+  assertRequiredKeys(value.activity, ["requestId", "status", "terminal"], "diagnostic-activity");
+  assertKnownKeys(value.execution, ["baseline", "result", "retryCount", "exitCode", "terminalResult"], "diagnostic-execution");
+  assertRequiredKeys(value.execution, ["baseline", "result", "retryCount", "exitCode", "terminalResult"], "diagnostic-execution");
+  assertKnownKeys(value.identity, ["before", "after"], "diagnostic-identity");
+  assertRequiredKeys(value.identity, ["before", "after"], "diagnostic-identity");
+  assertKnownKeys(value.openAiRole, ["before", "after"], "diagnostic-openai-role");
+  assertRequiredKeys(value.openAiRole, ["before", "after"], "diagnostic-openai-role");
+  const identityBefore = value.identity.before;
+  const identityAfter = value.identity.after;
+  const roleBefore = value.openAiRole.before;
+  const roleAfter = value.openAiRole.after;
+  const job = {
+    requestId: value.submission.requestId,
+    executionName: value.submission.executionName,
+  };
+  validateDiagnosticIdentity(identityBefore, manifest, job, "diagnostic-identity");
+  validateDiagnosticIdentity(identityAfter, manifest, job, "diagnostic-identity");
+  failIf(!same(identityBefore, identityAfter), "diagnostic-identity-transition");
+  validateDiagnosticOpenAiRole(roleBefore, manifest, identityBefore.principalId, "diagnostic-openai-role");
+  validateDiagnosticOpenAiRole(roleAfter, manifest, identityAfter.principalId, "diagnostic-openai-role");
+  failIf(!same(roleBefore, roleAfter), "diagnostic-openai-role-transition");
   failIf(
-    value.execution.baseline !== "pre-cutover" ||
+    value.imageDigest !== reviewedRuntimeImage(request.artifacts) ||
+      !/^.+@sha256:[a-f0-9]{64}$/i.test(value.imageDigest) ||
+      !isSha(value.reviewedDigest) ||
+      !UUID_RE.test(value.submission.requestId) ||
+      value.request.requestId !== value.submission.requestId ||
+      value.request.operation !== "start" ||
+      !same(value.request.argv, DIAGNOSTIC_COMMAND) ||
+      value.activity.requestId !== value.submission.requestId ||
+      value.activity.status !== "Succeeded" || value.activity.terminal !== true ||
+      value.submission.artifactSha256 !== value.reviewedDigest ||
+      typeof value.submission.executionName !== "string" || value.submission.executionName.length === 0 ||
+      value.execution.baseline !== "pre-cutover" ||
       value.execution.result !== "passed" ||
-      value.execution.retryCount !== 0,
+      value.execution.retryCount !== 0 || value.execution.exitCode !== 0 ||
+      value.execution.terminalResult !== "succeeded" ||
+      !isObject(value.identity.before) || !isObject(value.identity.after) ||
+      !isObject(value.openAiRole.before) || !isObject(value.openAiRole.after),
     "diagnostic-receipt-execution",
   );
   failIf(!Array.isArray(value.runtimeSecretReferences) || value.runtimeSecretReferences.length !== 0, "diagnostic-receipt-secret");
@@ -3575,36 +4871,491 @@ function requiredDiagnostic(request) {
   return checked;
 }
 
-function requiredCleanup(request) {
+function diagnosticJobIdentity(outputs, config, code = "diagnostic-job") {
+  failIf(typeof outputs.expiryCleanupJobName !== "string" ||
+    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(outputs.expiryCleanupJobName), code);
+  const match = /^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)\/providers\/Microsoft\.App\/jobs\/([^/]+)$/.exec(
+    outputs.expiryCleanupJobId ?? "",
+  );
+  failIf(match === null || match[1] !== config.account.subscription ||
+    match[2] !== outputs.resourceGroup || match[3] !== outputs.expiryCleanupJobName, code);
+  return { name: outputs.expiryCleanupJobName, id: outputs.expiryCleanupJobId };
+}
+
+function diagnosticIdentity(config, outputs, manifest, job) {
+  const value = azJson(config, [
+    "identity", "show", "--ids", outputs.runtimeIdentityId,
+    "--subscription", config.account.subscription, "--output", "json",
+  ], "diagnostic-identity");
+  failIf(!isObject(value), "diagnostic-identity");
+  const identity = {
+    resourceId: value.id ?? value.resourceId,
+    principalId: value.principalId,
+    clientId: value.clientId,
+    planSha256: manifest.planSha256,
+    job,
+  };
+  failIf(identity.resourceId !== outputs.runtimeIdentityId ||
+    !UUID_RE.test(identity.principalId ?? "") || identity.principalId !== manifest.bindings.runtimeIdentityPrincipalId ||
+    !UUID_RE.test(identity.clientId ?? "") || identity.clientId !== manifest.bindings.runtimeIdentityClientId,
+    "diagnostic-identity",
+  );
+  return identity;
+}
+
+function diagnosticOpenAiRole(config, manifest) {
+  const assignments = azJson(config, [
+    "role", "assignment", "list", "--scope", manifest.bindings.accountId,
+    "--assignee-object-id", manifest.bindings.runtimeIdentityPrincipalId,
+    "--all", "--output", "json",
+  ], "diagnostic-openai-role");
+  failIf(!Array.isArray(assignments), "diagnostic-openai-role");
+  const projected = assignments.filter((assignment) => isObject(assignment)).map((assignment) => ({
+    id: assignment.id,
+    principalId: assignment.principalId,
+    principalType: assignment.principalType,
+    roleDefinitionId: assignment.roleDefinitionId,
+    scope: assignment.scope,
+  }));
+  const expectedId = manifest.bindings.runtimeOpenAiRoleAssignmentId;
+  const match = projected.find((assignment) => assignment.id === expectedId);
+  failIf(match === undefined, "diagnostic-openai-role");
+  return validateDiagnosticOpenAiRole(match, manifest, manifest.bindings.runtimeIdentityPrincipalId, "diagnostic-openai-role");
+}
+
+function diagnosticEnvironment(outputs, manifest, requestId) {
+  return [
+    { name: "AZURE_CLIENT_ID", value: outputs.runtimeIdentityClientId },
+    { name: "PALANCAR_AZURE_GENERATION_ENDPOINT", value: assertHttpsEndpoint(outputs.foundryEndpoint, "diagnostic-job") },
+    { name: "PALANCAR_AZURE_GENERATION_DEPLOYMENT", value: MODEL_BOOTSTRAP_CONTRACT.lunaDeployment },
+    { name: "PALANCAR_DIAGNOSTIC_REQUEST_ID", value: requestId },
+    { name: "PALANCAR_DIAGNOSTIC_RUN_ID", value: manifest.runId },
+    { name: "PALANCAR_DIAGNOSTIC_PLAN_SHA256", value: manifest.planSha256 },
+  ];
+}
+
+function diagnosticJobContract(value, outputs, reviewed, config) {
+  assertKnownKeys(value, ["id", "name", "location", "type", "identity", "properties", "tags", "systemData"], "diagnostic-job");
+  assertRequiredKeys(value, ["id", "name", "identity", "properties"], "diagnostic-job");
+  const job = diagnosticJobIdentity(outputs, config);
+  failIf(value.id !== job.id || value.name !== job.name || value.type !== "Microsoft.App/jobs", "diagnostic-job");
+  const properties = value.properties;
+  assertKnownKeys(properties, ["environmentId", "configuration", "template", "provisioningState", "runningStatus", "eventStreamEndpoint"], "diagnostic-job");
+  assertRequiredKeys(properties, ["environmentId", "configuration", "template", "provisioningState"], "diagnostic-job");
+  failIf(properties.environmentId !== outputs.containerAppEnvironmentId || properties.provisioningState !== "Succeeded", "diagnostic-job");
+  const identity = value.identity;
+  assertKnownKeys(identity, ["type", "userAssignedIdentities"], "diagnostic-job");
+  assertRequiredKeys(identity, ["type", "userAssignedIdentities"], "diagnostic-job");
+  failIf(identity.type !== "UserAssigned" || !isObject(identity.userAssignedIdentities), "diagnostic-job");
+  const identityIds = Object.keys(identity.userAssignedIdentities).map(identityKey).sort();
+  failIf(!same(identityIds, [identityKey(outputs.imagePullIdentityId), identityKey(outputs.runtimeIdentityId)].sort()), "diagnostic-job");
+  const configuration = properties.configuration;
+  assertKnownKeys(configuration, ["triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings"], "diagnostic-job");
+  assertRequiredKeys(configuration, ["triggerType", "scheduleTriggerConfig", "replicaRetryLimit", "replicaTimeout", "registries", "identitySettings"], "diagnostic-job");
+  failIf(configuration.triggerType !== "Schedule" || configuration.replicaRetryLimit !== 0 || configuration.replicaTimeout !== 300, "diagnostic-job");
+  failIf(!Array.isArray(configuration.registries) || configuration.registries.length !== 1, "diagnostic-job");
+  const registry = configuration.registries[0];
+  assertKnownKeys(registry, ["server", "identity", "username", "passwordSecretRef"], "diagnostic-job");
+  assertRequiredKeys(registry, ["server", "identity"], "diagnostic-job");
+  failIf(Object.hasOwn(registry, "username") || Object.hasOwn(registry, "passwordSecretRef") ||
+    registry.server !== reviewed.after.registries[0]?.server || identityKey(registry.identity) !== identityKey(outputs.imagePullIdentityId), "diagnostic-job");
+  failIf(configuration.identitySettings.length !== 2 ||
+    !same(configuration.identitySettings.map((setting) => ({ identity: identityKey(setting.identity), lifecycle: setting.lifecycle })), [
+      { identity: identityKey(outputs.imagePullIdentityId), lifecycle: "None" },
+      { identity: identityKey(outputs.runtimeIdentityId), lifecycle: "Main" },
+    ]), "diagnostic-job");
+  assertContainerTemplate(properties.template, "diagnostic-job");
+  failIf(properties.template.containers.length !== 1, "diagnostic-job");
+  const container = properties.template.containers[0];
+  assertKnownKeys(container, ["name", "image", "env", "resources", "probes", "command", "args"], "diagnostic-job");
+  assertRequiredKeys(container, ["name", "image", "env", "resources"], "diagnostic-job");
+  failIf(container.name !== "expiry-cleanup" || !/^.+@sha256:[a-f0-9]{64}$/i.test(container.image), "diagnostic-job");
+  failIf((container.env ?? []).some((entry) => entry.secretRef !== undefined), "diagnostic-job");
+  failIf(container.resources.cpu !== 0.25 || container.resources.memory !== "0.5Gi", "diagnostic-job");
+  return { value, job };
+}
+
+function immutableDiagnosticArtifact(value, type, manifest, outputs, reviewed, job, requestId, executionName = null) {
+  assertKnownKeys(value, [
+    "version", "type", "status", "runId", "phase", "planSha256", "bindingSha256",
+    "repositoryCommit", "contextSha256", "requestId", "executionName", "job", "imageDigest",
+    "argv", "containerName", "env", "identity", "openAiRole", "sha256",
+  ], `diagnostic-${type}`);
+  assertRequiredKeys(value, [
+    "version", "type", "status", "runId", "phase", "planSha256", "bindingSha256",
+    "repositoryCommit", "contextSha256", "requestId", "executionName", "job", "imageDigest",
+    "argv", "containerName", "env", "identity", "openAiRole", "sha256",
+  ], `diagnostic-${type}`);
+  const unsigned = { ...value };
+  delete unsigned.sha256;
+  const code = `diagnostic-${type}`;
+  failIf(value.version !== DIAGNOSTIC_REQUEST_VERSION || value.type !== `diagnostic-${type}` ||
+    value.status !== (type === "intent" ? "reserved" : type === "invoking" ? "invoking" : "submitted") || value.runId !== manifest.runId ||
+    value.phase !== "runtime-cutover" || value.planSha256 !== manifest.planSha256 ||
+    value.bindingSha256 !== manifest.bindingSha256 || value.repositoryCommit !== manifest.bindings.repositoryCommit ||
+    value.contextSha256 !== manifest.bindingSha256 || !UUID_RE.test(value.requestId) ||
+    value.requestId !== requestId || value.executionName !== executionName ||
+    !same(value.job, job) || value.imageDigest !== reviewed.image || !same(value.argv, DIAGNOSTIC_COMMAND) ||
+    value.containerName !== DIAGNOSTIC_CONTAINER_NAME || !isSha(value.sha256) ||
+    !same(value.env, diagnosticEnvironment(outputs, manifest, requestId)) || value.sha256 !== hashJson(unsigned), `${code}-context`);
+  validateDiagnosticIdentity(value.identity, manifest, {
+    requestId: value.requestId,
+    executionName,
+  }, `${code}-identity`);
+  validateDiagnosticOpenAiRole(value.openAiRole, manifest, manifest.bindings.runtimeIdentityPrincipalId, `${code}-openai-role`);
+  return value;
+}
+
+function diagnosticExecutionName(value, job, code) {
+  failIf(!isObject(value), code);
+  const name = value.name;
+  const id = value.id;
+  failIf(typeof name !== "string" || name.length === 0 ||
+    typeof id !== "string" || !id.endsWith(`/jobs/${job.name}/executions/${name}`), code);
+  return name;
+}
+
+function diagnosticExecutionState(value, job, code) {
+  failIf(!isObject(value), code);
+  const name = diagnosticExecutionName(value, job, code);
+  const properties = isObject(value.properties) ? value.properties : {};
+  const status = properties.status;
+  const terminal = ["Succeeded", "Failed", "Canceled", "Stopped"].includes(status);
+  return {
+    name,
+    status,
+    terminal,
+    passed: status === "Succeeded" &&
+      (properties.result === undefined || properties.result === "passed") &&
+      (properties.exitCode === undefined || properties.exitCode === 0),
+    exitCode: properties.exitCode === undefined ? (status === "Succeeded" ? 0 : null) : properties.exitCode,
+    result: properties.result === undefined ? (status === "Succeeded" ? "passed" : null) : properties.result,
+  };
+}
+
+function diagnosticExecutionTemplate(value, expectedEnv, expectedImage, code) {
+  failIf(!isObject(value) || !isObject(value.properties), code);
+  const template = value.properties.template;
+  failIf(!isObject(template) || !Array.isArray(template.containers) || template.containers.length !== 1, code);
+  const container = template.containers[0];
+  assertKnownKeys(container, ["name", "image", "env", "resources", "command", "args"], code);
+  assertRequiredKeys(container, ["name", "image", "env", "resources", "command", "args"], code);
+  failIf(container.name !== DIAGNOSTIC_CONTAINER_NAME || container.image !== expectedImage ||
+    !same(container.command, [DIAGNOSTIC_COMMAND[0]]) || !same(container.args, [DIAGNOSTIC_COMMAND[1]]) ||
+    !same(container.env, expectedEnv) || !same(container.resources, { cpu: 0.25, memory: "0.5Gi" }), code);
+  return container;
+}
+
+function diagnosticRestUrl(job) {
+  return `${job.id}/executions?api-version=2025-07-01`;
+}
+
+function diagnosticNextLink(value, job, code) {
+  failIf(typeof value !== "string" || value.length === 0, code);
+  let parsed;
+  try {
+    parsed = new URL(value.startsWith("/") ? `https://management.azure.com${value}` : value);
+  } catch {
+    reject(code);
+  }
+  const expectedPath = `${new URL(job.id, "https://management.azure.com").pathname}/executions`;
+  failIf(parsed.protocol !== "https:" || parsed.hostname !== "management.azure.com" ||
+    parsed.username || parsed.password || parsed.hash || parsed.pathname !== expectedPath ||
+    parsed.searchParams.getAll("api-version").length !== 1 ||
+    parsed.searchParams.get("api-version") !== "2025-07-01", code);
+  return parsed.href;
+}
+
+function diagnosticExecutionMatches(value, job, requestId, code) {
+  const state = diagnosticExecutionState(value, job, code);
+  const containers = value.properties?.template?.containers;
+  if (!Array.isArray(containers) || containers.length !== 1) return undefined;
+  const env = containers[0].env;
+  if (!Array.isArray(env)) return undefined;
+  const requestEntry = env.find((entry) => entry?.name === "PALANCAR_DIAGNOSTIC_REQUEST_ID");
+  return requestEntry?.value === requestId ? state : undefined;
+}
+
+function reconcileDiagnosticSubmission(config, job, requestId, deadline) {
+  const baseUrl = diagnosticNextLink(diagnosticRestUrl(job), job, "diagnostic-execution-pagination");
+  let url = baseUrl;
+  const seenUrls = new Set();
+  const matches = [];
+  let observedEndOfPages = false;
+  for (let page = 0; page < 32; page += 1) {
+    if (config.now() > deadline) reject("diagnostic-execution-timeout");
+    failIf(seenUrls.has(url), "diagnostic-execution-pagination");
+    seenUrls.add(url);
+    const result = runCommand(config, AZ_PATH, [
+      "rest", "--method", "get", "--url", url, "--output", "json",
+    ], { phase: "diagnostic", timeoutMs: COMMAND_TIMEOUT_MS });
+    if (result.status === "ambiguous") reject("diagnostic-execution-unknown");
+    if (result.status !== "success") reject("diagnostic-execution-query");
+    if (config.now() > deadline) reject("diagnostic-execution-timeout");
+    const pageValue = parseCommandJson(result, "diagnostic-execution-list");
+    assertKnownKeys(pageValue, ["value", "nextLink"], "diagnostic-execution-list");
+    assertRequiredKeys(pageValue, ["value", "nextLink"], "diagnostic-execution-list");
+    failIf(!Array.isArray(pageValue.value), "diagnostic-execution-list");
+    for (const item of pageValue.value) {
+      const matched = diagnosticExecutionMatches(item, job, requestId, "diagnostic-execution-list");
+      if (matched !== undefined) matches.push({ item, state: matched });
+    }
+    if (pageValue.nextLink === null) {
+      observedEndOfPages = true;
+      break;
+    }
+    url = diagnosticNextLink(pageValue.nextLink, job, "diagnostic-execution-pagination");
+  }
+  failIf(!observedEndOfPages, "diagnostic-execution-pagination");
+  failIf(matches.length > 1, "diagnostic-execution-duplicate");
+  failIf(matches.length === 0, "diagnostic-start-unknown");
+  return matches[0];
+}
+
+const CLEANUP_DESCRIPTOR_KEYS = Object.freeze([
+  "version", "type", "runId", "phase", "planSha256", "bindingSha256", "contextSha256",
+  "vaultResourceId", "vaultUri", "subscription", "tenant", "cloud", "callerIdentity",
+  "targetNames", "startState", "supersession",
+]);
+const CLEANUP_OPERATION_KEYS = Object.freeze([
+  "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
+  "createdAt", "repositoryCommit", "contextSha256", "runtimeSecretReferences", "supersession", "sha256",
+]);
+const CLEANUP_ABSENCE_KEYS = Object.freeze([
+  "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
+  "createdAt", "repositoryCommit", "contextSha256", "inventory", "supersession", "sha256",
+]);
+
+function validateCleanupDescriptor(filePath, manifest, code = "vault-descriptor") {
+  const descriptor = readJson(filePath, code);
+  assertKnownKeys(descriptor, CLEANUP_DESCRIPTOR_KEYS, code);
+  assertRequiredKeys(descriptor, CLEANUP_DESCRIPTOR_KEYS.filter((key) => key !== "supersession"), code);
+  failIf(
+    descriptor.version !== 1 || descriptor.type !== "credential-cleanup-vault-descriptor" ||
+      descriptor.runId !== manifest.runId || descriptor.phase !== "credential-cleanup" ||
+      descriptor.planSha256 !== manifest.planSha256 || descriptor.bindingSha256 !== manifest.bindingSha256 ||
+      descriptor.contextSha256 !== manifest.bindingSha256 || descriptor.cloud !== "AzureCloud" ||
+      descriptor.startState !== "start" || !same(descriptor.targetNames, CLEANUP_TARGET_NAMES),
+    `${code}-context`,
+  );
+  failIf(!isSha(descriptor.planSha256) || !isSha(descriptor.bindingSha256), `${code}-hash`);
+  failIf(!isObject(descriptor.callerIdentity) || descriptor.callerIdentity.userType !== "user" ||
+    !CLEANUP_GUID_RE.test(descriptor.callerIdentity.objectId), `${code}-caller`);
+  failIf(!CLEANUP_GUID_RE.test(descriptor.subscription) || !CLEANUP_GUID_RE.test(descriptor.tenant), `${code}-identity`);
+  const resourceMatch = /^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)\/providers\/Microsoft\.KeyVault\/vaults\/([^/]+)$/.exec(
+    descriptor.vaultResourceId ?? "",
+  );
+  failIf(resourceMatch === null || resourceMatch[1] !== descriptor.subscription ||
+    !/^[A-Za-z0-9-]{1,127}$/.test(resourceMatch[3]), `${code}-vault`);
+  let vaultUri;
+  try { vaultUri = new URL(descriptor.vaultUri); } catch { reject(`${code}-vault`); }
+  const vaultMatch = /\/providers\/Microsoft\.KeyVault\/vaults\/([^/]+)$/.exec(descriptor.vaultResourceId);
+  failIf(vaultUri.protocol !== "https:" || vaultUri.pathname !== "/" || vaultUri.search || vaultUri.hash ||
+    vaultUri.username || vaultUri.password || vaultMatch === null ||
+    vaultUri.hostname !== `${vaultMatch[1].toLowerCase()}.vault.azure.net`, `${code}-vault`);
+  if (descriptor.supersession !== undefined) validateSupersessionShape(descriptor.supersession, `${code}-supersession`);
+  return { value: descriptor, fileSha256: sha256File(filePath, JSON_MAX_BYTES) };
+}
+
+function validateSupersessionShape(value, code) {
+  assertKnownKeys(value, ["oldRunId", "cleanupManifestSha256", "absenceReceiptSha256", "contextSha256"], code);
+  assertRequiredKeys(value, ["oldRunId", "cleanupManifestSha256", "absenceReceiptSha256", "contextSha256"], code);
+  failIf(!RUN_ID_RE.test(value.oldRunId) || !isSha(value.cleanupManifestSha256) ||
+    !isSha(value.absenceReceiptSha256) || !isSha(value.contextSha256), `${code}-hash`);
+  return value;
+}
+
+function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanup-operation") {
+  const operation = readJson(filePath, code);
+  assertKnownKeys(operation, CLEANUP_OPERATION_KEYS, code);
+  assertRequiredKeys(operation, CLEANUP_OPERATION_KEYS, code);
+  failIf(
+    operation.version !== 2 || operation.type !== "cleanup" ||
+      !["prepared", "completed"].includes(operation.status) ||
+      operation.operation !== "credential-cleanup" ||
+      operation.runId !== manifest.runId || operation.phase !== "credential-cleanup" ||
+      operation.planSha256 !== manifest.planSha256 || operation.bindingSha256 !== manifest.bindingSha256 ||
+      operation.contextSha256 !== manifest.bindingSha256 || operation.createdAt !== manifest.createdAt ||
+      operation.repositoryCommit !== manifest.bindings.repositoryCommit ||
+      !Array.isArray(operation.runtimeSecretReferences) || operation.runtimeSecretReferences.length !== 0 ||
+      !isSha(operation.sha256) || operation.sha256 !== hashJson(Object.fromEntries(Object.entries(operation).filter(([key]) => key !== "sha256"))),
+    `${code}-context`,
+  );
+  if (operation.supersession !== null) validateSupersessionShape(operation.supersession, `${code}-supersession`);
+  failIf(canonicalJson(operation.supersession) !== canonicalJson(descriptor.supersession ?? null), `${code}-supersession`);
+  return { value: operation, fileSha256: sha256File(filePath, JSON_MAX_BYTES) };
+}
+
+function validateCleanupAbsence(filePath, manifest, operation, code = "cleanup-absence") {
+  const absence = readJson(filePath, code);
+  assertKnownKeys(absence, CLEANUP_ABSENCE_KEYS, code);
+  assertRequiredKeys(absence, CLEANUP_ABSENCE_KEYS.filter((key) => key !== "supersession"), code);
+  failIf(
+      absence.version !== 2 || absence.type !== "absence" || absence.status !== "absent" ||
+      absence.operation !== "credential-cleanup" || absence.runId !== manifest.runId || absence.phase !== "credential-cleanup" ||
+      absence.planSha256 !== manifest.planSha256 ||
+      absence.bindingSha256 !== manifest.bindingSha256 || absence.contextSha256 !== manifest.bindingSha256 ||
+      absence.createdAt !== operation.value.createdAt ||
+      absence.repositoryCommit !== manifest.bindings.repositoryCommit ||
+      !isSha(absence.sha256) || absence.sha256 !== hashJson(Object.fromEntries(Object.entries(absence).filter(([key]) => key !== "sha256"))),
+    `${code}-context`,
+  );
+  assertKnownKeys(absence.inventory, ["keyVault", "runtimeSecretReferences"], `${code}-inventory`);
+  assertRequiredKeys(absence.inventory, ["keyVault", "runtimeSecretReferences"], `${code}-inventory`);
+  failIf(absence.inventory.keyVault !== "absent" || absence.inventory.runtimeSecretReferences !== 0, `${code}-inventory`);
+  if (absence.supersession !== null) validateSupersessionShape(absence.supersession, `${code}-supersession`);
+  failIf(canonicalJson(absence.supersession) !== canonicalJson(operation.value.supersession ?? null), `${code}-supersession`);
+  return { value: absence, fileSha256: sha256File(filePath, JSON_MAX_BYTES) };
+}
+
+function validateCleanupStateEvidence(request, operation, { requireComplete = false } = {}) {
+  const directory = path.dirname(request.artifacts.cleanupOperation);
+  const stateFiles = [];
+  const anchorFiles = new Map();
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) reject("cleanup-state-symlink");
+    const stateMatch = /^cleanup-state-(\d{6})\.json$/.exec(entry.name);
+    const anchorMatch = /^cleanup-state-anchor(?:-(\d{6}))?\.json$/.exec(entry.name);
+    if (stateMatch) stateFiles.push({ sequence: Number(stateMatch[1]), path: path.join(directory, entry.name) });
+    else if (anchorMatch) anchorFiles.set(anchorMatch[1] === undefined ? 0 : Number(anchorMatch[1]), path.join(directory, entry.name));
+    else if (entry.name.startsWith("cleanup-state-")) reject("cleanup-state-name");
+  }
+  stateFiles.sort((left, right) => left.sequence - right.sequence);
+  for (let index = 0; index < stateFiles.length; index += 1) {
+    failIf(stateFiles[index].sequence !== index, "cleanup-state-sequence");
+    failIf(!existsSync(stateFiles[index].path), "cleanup-state-missing");
+    const value = readJson(stateFiles[index].path, "cleanup-state");
+    assertKnownKeys(value, [
+      "version", "type", "runId", "phase", "sequence", "status", "attempts", "cumulativeElapsedMs",
+      "attemptStartedAt", "operationStartedAt", "accountingCursor", "retryNotBefore", "absenceReceiptSha256",
+      "manifestSha256", "inventory", "inventorySha256", "previousStateSha256", "stateSha256",
+    ], "cleanup-state");
+    assertRequiredKeys(value, [
+      "version", "type", "runId", "phase", "sequence", "status", "attempts", "cumulativeElapsedMs",
+      "attemptStartedAt", "operationStartedAt", "accountingCursor", "retryNotBefore", "absenceReceiptSha256",
+      "manifestSha256", "inventory", "inventorySha256", "previousStateSha256", "stateSha256",
+    ], "cleanup-state");
+    failIf(value.version !== 1 || value.type !== "key-vault-cleanup-state" || value.runId !== request.manifest.runId ||
+      value.phase !== "credential-cleanup" || value.sequence !== index ||
+      !["start-inventory-validated", "attempting", "unknown", "complete"].includes(value.status) ||
+      !Number.isSafeInteger(value.attempts) || value.attempts < 0 || value.attempts > 3 ||
+      !Number.isSafeInteger(value.cumulativeElapsedMs) || value.cumulativeElapsedMs < 0 ||
+      !Number.isFinite(value.operationStartedAt) || !Number.isFinite(value.accountingCursor) ||
+      (value.attemptStartedAt !== null && !Number.isFinite(value.attemptStartedAt)) ||
+      (value.retryNotBefore !== null && !Number.isFinite(value.retryNotBefore)) ||
+      (value.absenceReceiptSha256 !== null && !isSha(value.absenceReceiptSha256)) ||
+      value.manifestSha256 !== operation.fileSha256 || !isObject(value.inventory) ||
+      value.inventorySha256 !== hashJson(value.inventory) || !isSha(value.stateSha256) ||
+      value.stateSha256 !== hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "stateSha256"))),
+      "cleanup-state-context");
+    assertKnownKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
+    assertRequiredKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
+    assertKnownKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
+    assertRequiredKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
+    failIf(!Array.isArray(value.inventory.activeNames) || !Array.isArray(value.inventory.deletedNames) ||
+      value.inventory.activeNames.some((name) => !CLEANUP_TARGET_NAMES.includes(name)) ||
+      value.inventory.deletedNames.some((name) => !CLEANUP_TARGET_NAMES.includes(name)) ||
+      new Set(value.inventory.activeNames).size !== value.inventory.activeNames.length ||
+      new Set(value.inventory.deletedNames).size !== value.inventory.deletedNames.length ||
+      !same(value.inventory.targetStates.map((item) => item.name), CLEANUP_TARGET_NAMES), "cleanup-state-targets");
+    for (const target of value.inventory.targetStates) {
+      assertKnownKeys(target, ["name", "activeCount", "deletedCount", "state"], "cleanup-state-target");
+      assertRequiredKeys(target, ["name", "activeCount", "deletedCount", "state"], "cleanup-state-target");
+      failIf(!CLEANUP_TARGET_NAMES.includes(target.name) || !["active", "deleted", "absent"].includes(target.state) ||
+        ![0, 1].includes(target.activeCount) || ![0, 1].includes(target.deletedCount) ||
+        target.activeCount + target.deletedCount > 1 ||
+        (target.state === "active" && target.activeCount !== 1) ||
+        (target.state === "deleted" && target.deletedCount !== 1) ||
+        (target.state === "absent" && (target.activeCount !== 0 || target.deletedCount !== 0)), "cleanup-state-target");
+    }
+    failIf(
+      !same(value.inventory.activeNames, value.inventory.targetStates.filter((item) => item.activeCount === 1).map((item) => item.name)) ||
+      !same(value.inventory.deletedNames, value.inventory.targetStates.filter((item) => item.deletedCount === 1).map((item) => item.name)),
+      "cleanup-state-targets",
+    );
+    if (index === 0) {
+      failIf(value.status !== "start-inventory-validated" || value.attempts !== 0 ||
+        value.attemptStartedAt !== null || value.retryNotBefore !== null || value.absenceReceiptSha256 !== null ||
+        value.previousStateSha256 !== null || value.inventory.targetStates.some((item) => item.state !== "active"),
+        "cleanup-state-transition");
+    } else {
+      const previous = readJson(stateFiles[index - 1].path, "cleanup-state");
+      failIf(previous.status === "complete", "cleanup-state-terminal");
+      if (value.status === "attempting") {
+        failIf(!["start-inventory-validated", "attempting", "unknown"].includes(previous.status) ||
+          value.attempts !== previous.attempts + 1 || value.attemptStartedAt === null ||
+          value.retryNotBefore !== null || value.absenceReceiptSha256 !== null, "cleanup-state-transition");
+      } else if (value.status === "unknown") {
+        failIf(previous.status !== "attempting" || value.attempts !== previous.attempts ||
+          value.attemptStartedAt !== null || value.retryNotBefore === null || value.absenceReceiptSha256 !== null ||
+          value.retryNotBefore < value.accountingCursor + 5000, "cleanup-state-transition");
+      } else if (value.status === "complete") {
+        failIf(!["start-inventory-validated", "attempting", "unknown"].includes(previous.status) ||
+          value.attempts !== previous.attempts || value.attemptStartedAt !== null ||
+          value.retryNotBefore !== null || !isSha(value.absenceReceiptSha256), "cleanup-state-transition");
+      } else {
+        reject("cleanup-state-transition");
+      }
+      failIf(value.cumulativeElapsedMs < previous.cumulativeElapsedMs, "cleanup-state-transition");
+    }
+    failIf(index === 0 ? value.previousStateSha256 !== null : value.previousStateSha256 !== sha256File(stateFiles[index - 1].path, JSON_MAX_BYTES), "cleanup-state-chain");
+    const anchorPath = anchorFiles.get(index);
+    failIf(anchorPath === undefined, "cleanup-state-anchor");
+    const anchor = readJson(anchorPath, "cleanup-state-anchor");
+    assertKnownKeys(anchor, ["version", "type", "runId", "phase", "stateSequence", "stateSha256", "stateFileSha256", "manifestSha256", "anchorSha256"], "cleanup-state-anchor");
+    assertRequiredKeys(anchor, ["version", "type", "runId", "phase", "stateSequence", "stateSha256", "stateFileSha256", "manifestSha256", "anchorSha256"], "cleanup-state-anchor");
+    failIf(anchor.version !== 1 || anchor.type !== "key-vault-cleanup-state-anchor" || anchor.runId !== request.manifest.runId ||
+      anchor.phase !== "credential-cleanup" || anchor.stateSequence !== index || anchor.stateSha256 !== value.stateSha256 ||
+      anchor.stateFileSha256 !== sha256File(stateFiles[index].path, JSON_MAX_BYTES) || anchor.manifestSha256 !== operation.fileSha256 ||
+      !isSha(anchor.anchorSha256) || anchor.anchorSha256 !== hashJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256"))), "cleanup-state-anchor");
+  }
+  failIf(anchorFiles.size !== stateFiles.length, "cleanup-state-history");
+  if (stateFiles.length > 0) {
+    const last = readJson(stateFiles.at(-1).path, "cleanup-state");
+    failIf(last.status === "complete" && stateFiles.some(({ path: statePath }, index) => {
+      if (index === stateFiles.length - 1) return false;
+      return readJson(statePath, "cleanup-state").status === "complete";
+    }), "cleanup-state-terminal");
+  }
+  if (requireComplete) {
+    failIf(stateFiles.length === 0, "cleanup-state-missing");
+    const last = readJson(stateFiles.at(-1).path, "cleanup-state");
+    failIf(last.status !== "complete" || !last.absenceReceiptSha256, "cleanup-state-incomplete");
+  }
+  return stateFiles;
+}
+
+function requiredCleanup(request, { requireAbsence = true } = {}) {
   const manifest = request.manifest;
   failIf(!manifest, "cleanup-context");
-  const cleanup = assertExactReceipt(request.artifacts.cleanup, "cleanup-manifest", manifest, {
-    type: "cleanup",
-    status: "completed",
-    operation: "credential-cleanup",
-  });
-  const absence = assertExactReceipt(request.artifacts.absence, "cleanup-absence", manifest, {
-    type: "absence",
-    status: "absent",
-    operation: "credential-cleanup",
-  });
-  assertKnownKeys(cleanup.value, [
-    "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
-    "createdAt", "repositoryCommit", "contextSha256", "runtimeSecretReferences", "sha256",
-  ], "cleanup-manifest-schema");
-  assertKnownKeys(absence.value, [
-    "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
-    "createdAt", "repositoryCommit", "contextSha256", "inventory", "sha256",
-  ], "cleanup-absence-schema");
-  failIf(!Array.isArray(cleanup.value.runtimeSecretReferences) || cleanup.value.runtimeSecretReferences.length !== 0, "cleanup-context");
-  assertKnownKeys(absence.value.inventory, ["keyVault", "runtimeSecretReferences"], "cleanup-absence-schema");
-  assertRequiredKeys(absence.value.inventory, ["keyVault", "runtimeSecretReferences"], "cleanup-absence-schema");
-  failIf(
-    absence.value.inventory.keyVault !== "absent" ||
-      absence.value.inventory.runtimeSecretReferences !== 0,
-    "cleanup-absence-context",
+  const descriptor = validateCleanupDescriptor(request.artifacts.descriptor, manifest);
+  const operationPath = request.artifacts.cleanupOperation;
+  const operation = validateCleanupOperation(
+    operationPath,
+    manifest,
+    descriptor.value,
   );
-  return { cleanup, absence };
+  let stateFiles = [];
+  if (!existsSync(request.artifacts.absence)) {
+    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: false });
+  } else {
+    failIf(operation.value.status !== "completed", "cleanup-operation-incomplete");
+    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: operation.value.supersession === null });
+  }
+  if (request.guardReceiptSha256 !== undefined) {
+    const guardPath = existsSync(`${request.artifacts.guard}.consumed`)
+      ? `${request.artifacts.guard}.consumed`
+      : request.artifacts.guard;
+    failIf(sha256File(guardPath, JSON_MAX_BYTES) !== request.guardReceiptSha256, "cleanup-guard-context");
+  }
+  let absence;
+  if (requireAbsence) {
+    absence = validateCleanupAbsence(request.artifacts.absence, manifest, { ...operation, path: operationPath });
+  }
+  if (operation.value.supersession !== null && stateFiles.length !== 0) {
+    failIf(true, "cleanup-supersession-state");
+  }
+  return { descriptor, operation, absence };
 }
 
 function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifest) {
@@ -3618,23 +5369,23 @@ function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifes
     );
     requiredDiagnostic({ manifest, artifacts });
   } else if (phase === "credential-cleanup") {
-    failIf(
-      !isSha(checkpoint.cleanupManifestSha256) || !isSha(checkpoint.absenceReceiptSha256),
-      "cleanup-receipt-checkpoint",
-    );
+    failIf(!isSha(checkpoint.cleanupOperationManifestSha256), "cleanup-operation-checkpoint");
     assertCheckpointArtifact(
-      artifacts.cleanup,
+      artifacts.cleanupOperation,
       checkpoint,
-      "cleanupManifestSha256",
-      "cleanup-manifest",
+      "cleanupOperationManifestSha256",
+      "cleanup-operation",
     );
-    assertCheckpointArtifact(
-      artifacts.absence,
-      checkpoint,
-      "absenceReceiptSha256",
-      "cleanup-absence",
-    );
-    requiredCleanup({ manifest, artifacts });
+    const cleanup = requiredCleanup({
+      manifest,
+      artifacts,
+      guardReceiptSha256: checkpoint.guardReceiptSha256,
+    }, { requireAbsence: false });
+    if (checkpoint.absenceReceiptSha256 !== undefined) {
+      failIf(!isSha(checkpoint.absenceReceiptSha256), "cleanup-absence-checkpoint");
+      assertCheckpointArtifact(artifacts.absence, checkpoint, "absenceReceiptSha256", "cleanup-absence");
+      validateCleanupAbsence(artifacts.absence, manifest, { ...cleanup.operation, path: artifacts.cleanupOperation });
+    }
   }
 }
 
@@ -3690,7 +5441,7 @@ function assertContainerTemplate(template, code) {
   return template;
 }
 
-function assertContainerAppResponse(value, outputs, code) {
+function assertContainerAppResponse(value, outputs, reviewed, code) {
   assertKnownKeys(value, ["id", "name", "location", "type", "identity", "properties", "tags", "systemData", "kind", "managedBy", "sku"], code);
   assertRequiredKeys(value, ["id", "name", "location", "type", "identity", "properties"], code);
   failIf(value.name !== outputs.relayContainerApp || value.location !== outputs.region, code);
@@ -3711,9 +5462,9 @@ function assertContainerAppResponse(value, outputs, code) {
   assertRequiredKeys(properties, ["configuration", "template", "provisioningState", "runningStatus"], code);
   failIf(properties.provisioningState !== "Succeeded" || properties.runningStatus !== "Running", code);
   const configuration = properties.configuration;
-  assertKnownKeys(configuration, ["activeRevisionsMode", "ingress", "registries", "identitySettings", "secrets"], code);
-  assertRequiredKeys(configuration, ["activeRevisionsMode", "ingress", "registries", "identitySettings", "secrets"], code);
-  failIf(configuration.activeRevisionsMode !== "Single", code);
+  assertKnownKeys(configuration, ["activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets"], code);
+  assertRequiredKeys(configuration, ["activeRevisionsMode", "ingress", "maxInactiveRevisions", "registries", "identitySettings", "secrets"], code);
+  failIf(configuration.activeRevisionsMode !== "Single" || configuration.maxInactiveRevisions !== 1, code);
   const ingress = configuration.ingress;
   assertKnownKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], code);
   assertRequiredKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], code);
@@ -3728,7 +5479,10 @@ function assertContainerAppResponse(value, outputs, code) {
   const registry = configuration.registries[0];
   assertKnownKeys(registry, ["server", "identity", "username", "passwordSecretRef"], code);
   assertRequiredKeys(registry, ["server", "identity"], code);
-  failIf(registry.server !== RUNTIME_RELAY_IMAGE.split("/")[0] || identityKey(registry.identity) !== identityKey(outputs.imagePullIdentityId), code);
+  const reviewedRegistry = reviewed.after.registries[0];
+  failIf(reviewedRegistry === undefined || registry.server !== reviewedRegistry.server ||
+    identityKey(registry.identity) !== reviewedRegistry.identity ||
+    identityKey(registry.identity) !== identityKey(outputs.imagePullIdentityId), code);
   failIf(!Array.isArray(configuration.identitySettings) || configuration.identitySettings.length !== 2, code);
   const settings = configuration.identitySettings.map((setting) => {
     assertKnownKeys(setting, ["identity", "lifecycle"], code);
@@ -3766,26 +5520,21 @@ function assertContainerAppResponse(value, outputs, code) {
 function assertSecretConfiguration(configuration, outputs, mode, code) {
   failIf(!Array.isArray(configuration.secrets), code);
   if (mode === "pre") {
-    failIf(configuration.secrets.length !== 2, code);
-    const expected = new Map([
-      ["openrouter-api-key", "openrouter-api-key"],
-      ["litellm-master-key", "litellm-master-key"],
-    ]);
+    failIf(configuration.secrets.length !== RETIRED_SECRET_NAMES.length, code);
     const names = new Set();
     for (const secret of configuration.secrets) {
       assertKnownKeys(secret, ["name", "keyVaultUrl", "identity"], code);
       assertRequiredKeys(secret, ["name", "keyVaultUrl", "identity"], code);
-      failIf(!expected.has(secret.name), code);
-      failIf(names.has(secret.name), code);
+      failIf(!RETIRED_SECRET_NAMES.includes(secret.name) || names.has(secret.name), code);
       names.add(secret.name);
       const vaultUri = assertHttpsEndpoint(outputs.keyVaultUri, code);
-      failIf(secret.keyVaultUrl !== `${vaultUri}/secrets/${expected.get(secret.name)}`, code);
+      failIf(secret.keyVaultUrl !== `${vaultUri}/secrets/${secret.name}`, code);
       failIf(identityKey(secret.identity) !== identityKey(outputs.runtimeIdentityId), code);
     }
-    failIf(names.size !== expected.size, code);
-  } else {
-    failIf(configuration.secrets.length !== 0, code);
+    failIf(names.size !== RETIRED_SECRET_NAMES.length, code);
+    return;
   }
+  failIf(configuration.secrets.length !== 0, code);
 }
 
 function environmentMap(container, code) {
@@ -3810,27 +5559,99 @@ function assertNoRetiredReferences(value, code) {
   return references;
 }
 
-function assertPreCutoverTopology(app, outputs, expectedRevision) {
+function assertNoRetiredProviderText(value, code) {
+  const visit = (entry) => {
+    if (typeof entry === "string") {
+      failIf(/(?:LIT(?:ELLM)|OPEN(?:ROUTER))/i.test(entry), code);
+      return;
+    }
+    if (Array.isArray(entry)) {
+      entry.forEach(visit);
+      return;
+    }
+    if (isObject(entry)) Object.values(entry).forEach(visit);
+  };
+  visit(value);
+}
+
+function assertReviewedTopology(app, outputs, reviewed, mode, code, options = {}) {
+  const expected = mode === "pre" ? reviewed.before : reviewed.after;
+  failIf(expected === undefined, code);
+  const actual = canonicalRuntimeShape(app.value, code);
+  const canonicalIngressComparison = (ingress, sourceCode, source) => {
+    failIf(!isObject(ingress), sourceCode);
+    assertKnownKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], sourceCode);
+    assertRequiredKeys(ingress, ["external", "targetPort", "transport", "allowInsecure", "traffic"], sourceCode);
+    failIf(!Array.isArray(ingress.traffic) || ingress.traffic.length !== 1, sourceCode);
+    const traffic = ingress.traffic[0];
+    assertKnownKeys(traffic, ["revisionName", "latestRevision", "weight"], sourceCode);
+    assertRequiredKeys(traffic, ["weight"], sourceCode);
+    failIf(traffic.weight !== 100, sourceCode);
+    if (source === "reviewed") {
+      failIf(traffic.latestRevision !== true || Object.hasOwn(traffic, "revisionName"), sourceCode);
+    } else {
+      failIf(typeof traffic.revisionName !== "string" || traffic.revisionName.length === 0 ||
+        Object.hasOwn(traffic, "latestRevision"), sourceCode);
+    }
+    return {
+      external: ingress.external,
+      targetPort: ingress.targetPort,
+      transport: ingress.transport,
+      allowInsecure: ingress.allowInsecure,
+      traffic: [{ weight: traffic.weight }],
+    };
+  };
+  const expectedIngress = expected.ingress === undefined
+    ? undefined
+    : canonicalIngressComparison(expected.ingress, code, "reviewed");
+  const actualIngress = actual.ingress === undefined
+    ? undefined
+    : canonicalIngressComparison(actual.ingress, code, "live");
+  const projectContainers = (containers) => options.compareEnvironmentValues === false
+    ? containers.map((container) => ({
+        ...container,
+        env: container.env.map((entry) => ({
+          name: entry.name,
+          ...(entry.secretRef === undefined ? {} : { secretRef: entry.secretRef }),
+        })),
+      }))
+    : containers;
+  const expectedShape = {
+    containers: projectContainers(expected.containers),
+    ...(expected.scale === undefined ? {} : { scale: expected.scale }),
+    ...(expected.maxInactiveRevisions === undefined ? {} : { maxInactiveRevisions: expected.maxInactiveRevisions }),
+    ...(expectedIngress === undefined ? {} : { ingress: expectedIngress }),
+    registries: expected.registries,
+    secrets: expected.secrets,
+    identitySettings: expected.identitySettings,
+    ...(expected.identity === undefined ? {} : { identity: expected.identity }),
+  };
+  const actualShape = {
+    containers: projectContainers(actual.containers),
+    ...(actual.scale === undefined ? {} : { scale: actual.scale }),
+    ...(actual.maxInactiveRevisions === undefined ? {} : { maxInactiveRevisions: actual.maxInactiveRevisions }),
+    ...(actualIngress === undefined ? {} : { ingress: actualIngress }),
+    registries: actual.registries,
+    secrets: actual.secrets,
+    identitySettings: actual.identitySettings,
+    ...(actual.identity === undefined ? {} : { identity: actual.identity }),
+  };
+  failIf(!same(actualShape, expectedShape), code);
+  return expected;
+}
+
+function assertPreCutoverTopology(app, outputs, reviewed, expectedRevision) {
+  assertReviewedTopology(app, outputs, reviewed, "pre", "runtime-topology");
   assertSecretConfiguration(app.configuration, outputs, "pre", "runtime-topology");
-  failIf(app.template.containers.length !== 2, "runtime-topology");
+  failIf(app.template.containers.length < 2, "runtime-topology");
   const relay = app.template.containers.find((container) => container.name === "relay");
-  const litellm = app.template.containers.find((container) => container.name === "litellm");
-  failIf(!relay || !litellm || relay.image !== RUNTIME_RELAY_IMAGE || litellm.image !== RUNTIME_LITELLM_IMAGE, "runtime-topology");
+  const predecessor = app.template.containers.find((container) => container.name !== "relay");
+  failIf(!relay, "runtime-topology");
   const relayEnv = environmentMap(relay, "runtime-topology");
-  const litellmEnv = environmentMap(litellm, "runtime-topology");
-  failIf(
-    relayEnv.get("PALANCAR_GENERATION_PROVIDER")?.value !== "litellm" ||
-      relayEnv.get("PALANCAR_LITELLM_BASE_URL")?.value !== RUNTIME_LITELLM_BASE_URL ||
-      relayEnv.get("PALANCAR_LITELLM_MODEL")?.value !== RUNTIME_LITELLM_MODEL ||
-      relayEnv.get("PALANCAR_LITELLM_API_KEY")?.secretRef !== "litellm-master-key" ||
-      litellmEnv.get("PALANCAR_LITELLM_BACKEND")?.value !== "openrouter" ||
-      litellmEnv.get("PALANCAR_LITELLM_UPSTREAM_MODEL")?.value !== RUNTIME_OPENROUTER_MODEL ||
-      litellmEnv.get("LITELLM_MASTER_KEY")?.secretRef !== "litellm-master-key" ||
-      litellmEnv.get("OPENROUTER_API_KEY")?.secretRef !== "openrouter-api-key",
-    "runtime-topology",
-  );
+  void relayEnv;
+  failIf(!predecessor, "runtime-topology");
   failIf(app.ingress.traffic[0].revisionName !== expectedRevision, "runtime-revision");
-  return { relay, litellm, imageDigest: relay.image, revisionName: expectedRevision };
+  return { relay, predecessor, imageDigest: relay.image, revisionName: expectedRevision };
 }
 
 function expectedRealtimeEndpoint(outputs, code) {
@@ -3838,27 +5659,67 @@ function expectedRealtimeEndpoint(outputs, code) {
   return `wss://${new URL(endpoint).hostname}/openai/v1/realtime?intent=transcription`;
 }
 
-function assertPostCutoverTopology(app, outputs, expectedRevision) {
+function assertPostCutoverTopology(app, outputs, reviewed, expectedRevision) {
+  assertNoRetiredReferences(app, "credential-secret-reference");
+  assertReviewedTopology(app, outputs, reviewed, "post", "credential-topology", { compareEnvironmentValues: false });
   assertSecretConfiguration(app.configuration, outputs, "post", "credential-topology");
   failIf(app.template.containers.length !== 1 || app.template.containers[0].name !== "relay", "credential-topology");
   const relay = app.template.containers[0];
-  failIf(relay.image !== RUNTIME_RELAY_IMAGE, "credential-topology");
-  assertNoRetiredReferences(app, "credential-secret-reference");
+  assertNoRetiredProviderText(app, "credential-topology");
   const env = environmentMap(relay, "credential-topology");
+  const reviewedRelay = reviewed.after.containers.find((container) => container.name === "relay");
+  const reviewedEnv = environmentMap({ env: reviewedRelay?.env }, "credential-topology");
+  const directAzureNames = new Set([
+    "PALANCAR_GENERATION_PROVIDER",
+    "PALANCAR_AZURE_GENERATION_ENDPOINT",
+    "PALANCAR_AZURE_GENERATION_DEPLOYMENT",
+    "AZURE_CLIENT_ID",
+    "PALANCAR_TRANSCRIPTION_PROVIDER",
+    "PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT",
+    "PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT",
+  ]);
+  for (const [name, expectedEntry] of reviewedEnv) {
+    const actualEntry = env.get(name);
+    if (!directAzureNames.has(name)) {
+      failIf(actualEntry?.value !== expectedEntry.value || actualEntry?.secretRef !== expectedEntry.secretRef, "credential-topology");
+    }
+  }
+  const generationEndpoint = assertHttpsEndpoint(outputs.foundryEndpoint, "credential-direct-azure");
   failIf(
+    env.get("PALANCAR_GENERATION_PROVIDER")?.value !== "azure-openai" ||
+      env.get("PALANCAR_AZURE_GENERATION_ENDPOINT")?.value !== generationEndpoint ||
+      env.get("PALANCAR_AZURE_GENERATION_DEPLOYMENT")?.value !== MODEL_BOOTSTRAP_CONTRACT.lunaDeployment ||
+      env.get("AZURE_CLIENT_ID")?.value !== outputs.runtimeIdentityClientId ||
     env.get("PALANCAR_TRANSCRIPTION_PROVIDER")?.value !== "azure-realtime" ||
       env.get("PALANCAR_AZURE_TRANSCRIPTION_ENDPOINT")?.value !== expectedRealtimeEndpoint(outputs, "credential-topology") ||
       env.get("PALANCAR_AZURE_TRANSCRIPTION_DEPLOYMENT")?.value !== MODEL_BOOTSTRAP_CONTRACT.transcriptionDeployment,
     "credential-direct-azure",
   );
   for (const entry of env.values()) {
-    failIf(/(?:LITELLM|OPENROUTER)/i.test(entry.name) || /(?:LITELLM|OPENROUTER)/i.test(entry.value ?? ""), "credential-topology");
+    failIf(/(?:API[_-]?KEY|INFERENCE[_-]?SCOPE|GENERATION[_-]?API[_-]?VERSION)/i.test(entry.name), "credential-topology");
   }
+  failIf(!isObject(relay.resources) || relay.resources.cpu !== 0.25 || relay.resources.memory !== "0.5Gi", "credential-topology");
+  failIf(!isObject(app.template.scale) || app.template.scale.minReplicas !== 1 || app.template.scale.maxReplicas !== 1, "credential-topology");
   failIf(app.ingress.traffic[0].revisionName !== expectedRevision, "credential-revision");
   return { relay, imageDigest: relay.image, revisionName: expectedRevision };
 }
 
-function assertRevisionResponse(value, app, expectedRevision, mode, code) {
+function assertInactiveRevisionTemplate(template, reviewed, mode, code) {
+  assertContainerTemplate(template, code);
+  assertKnownKeys(template, ["containers", "scale"], code);
+  assertRequiredKeys(template, ["containers", "scale"], code);
+  assertKnownKeys(template.scale, ["minReplicas", "maxReplicas"], code);
+  assertRequiredKeys(template.scale, ["minReplicas", "maxReplicas"], code);
+  failIf(template.volumes !== undefined || template.revisionSuffix !== undefined, code);
+  const expected = mode === "post" ? reviewed.before : reviewed.after;
+  failIf(!same(
+    template.containers.map((container) => canonicalRuntimeContainer(container, code)),
+    expected.containers,
+  ), code);
+  failIf(!same(template.scale, expected.scale), code);
+}
+
+function assertRevisionResponse(value, app, reviewed, expectedRevision, expectedInactiveRevision, mode, code, options = {}) {
   failIf(!Array.isArray(value) || value.length === 0, code);
   const revisions = value.map((revision) => {
     assertKnownKeys(revision, ["id", "name", "type", "properties", "location", "tags", "systemData"], code);
@@ -3878,42 +5739,84 @@ function assertRevisionResponse(value, app, expectedRevision, mode, code) {
   });
   const active = revisions.filter(({ properties }) => properties.active === true);
   failIf(active.length !== 1, `${code}-active`);
+  const inactive = revisions.filter(({ properties }) => properties.active === false);
+  failIf(inactive.length > 1, `${code}-set`);
+  const retainedPredecessor = options.inactiveRevisionContract;
   const selected = active[0];
   const selectedName = selected.revision.name;
   failIf(expectedRevision !== undefined && selectedName !== expectedRevision, `${code}-traffic`);
   failIf(selected.properties.trafficWeight !== 100, `${code}-traffic`);
   failIf(app.ingress.traffic.length !== 1 || app.ingress.traffic[0].revisionName !== selectedName || app.ingress.traffic[0].weight !== 100, `${code}-traffic`);
-  const appContainers = app.template.containers.map((container) => ({
-    name: container.name,
-    image: container.image,
-    env: container.env,
-  }));
-  const revisionContainers = selected.properties.template.containers.map((container) => ({
-    name: container.name,
-    image: container.image,
-    env: container.env,
-  }));
-  failIf(!same(appContainers, revisionContainers), `${code}-template`);
+  const appTemplate = canonicalRuntimeTemplate(app.template, `${code}-template`);
+  const revisionTemplate = canonicalRuntimeTemplate(selected.properties.template, `${code}-template`);
+  failIf(!same(appTemplate, revisionTemplate), `${code}-template`);
+  if (mode === "post") {
+    assertNoRetiredReferences(selected.properties.template, "credential-secret-reference");
+    assertNoRetiredProviderText(selected.properties.template, "credential-topology");
+  }
   const topology = mode === "pre"
-    ? assertPreCutoverTopology(app, { ...app.outputs }, selectedName)
-    : assertPostCutoverTopology(app, { ...app.outputs }, selectedName);
+    ? assertPreCutoverTopology(app, { ...app.outputs }, reviewed, selectedName)
+    : assertPostCutoverTopology(app, { ...app.outputs }, reviewed, selectedName);
+  const expectedTemplate = mode === "pre" ? reviewed.before : reviewed.after;
+  failIf(
+    !same(
+      projectRuntimeTemplateEnvironment(revisionTemplate, options.compareEnvironmentValues ?? mode === "pre"),
+      projectRuntimeTemplateEnvironment({
+        containers: expectedTemplate.containers,
+        ...(expectedTemplate.scale === undefined ? {} : { scale: expectedTemplate.scale }),
+      }, options.compareEnvironmentValues ?? mode === "pre"),
+    ),
+    `${code}-template`,
+  );
+  if (retainedPredecessor !== undefined) {
+    failIf(
+      !isObject(retainedPredecessor) ||
+        typeof retainedPredecessor.revisionName !== "string" ||
+        !isObject(retainedPredecessor.reviewed),
+      `${code}-inactive`,
+    );
+    failIf(
+      inactive.length !== 1 ||
+        inactive[0].revision.name !== retainedPredecessor.revisionName,
+      `${code}-inactive`,
+    );
+  } else if (expectedInactiveRevision !== undefined) {
+    failIf(typeof expectedInactiveRevision !== "string" || expectedInactiveRevision.length === 0, `${code}-inactive`);
+    failIf(inactive.length !== 1 || inactive[0].revision.name !== expectedInactiveRevision, `${code}-inactive`);
+  }
+  for (const candidate of inactive) {
+    failIf(candidate.properties.trafficWeight !== 0, `${code}-inactive`);
+    if (candidate.properties.replicaCount !== undefined) {
+      failIf(candidate.properties.replicaCount !== 0, `${code}-inactive`);
+    }
+    const inactiveReviewed = retainedPredecessor?.reviewed ?? reviewed;
+    const inactiveMode = retainedPredecessor === undefined ? mode : "post";
+    assertInactiveRevisionTemplate(candidate.properties.template, inactiveReviewed, inactiveMode, `${code}-inactive`);
+  }
   return { revisions, selected, topology, revisionName: selectedName };
 }
 
 function parseContainerAppAndRevisions(config, outputs, request, mode) {
+  const reviewed = reviewedRuntimeShapes(request.artifacts, request.phase);
   const appResponse = azJson(config, [
     "containerapp", "show", "--name", outputs.relayContainerApp,
     "--resource-group", outputs.resourceGroup,
     "--subscription", config.account.subscription,
     "--output", "json",
   ], "containerapp-show");
-  const app = assertContainerAppResponse(appResponse, outputs, mode === "pre" ? "runtime-containerapp" : "credential-containerapp");
+  const app = assertContainerAppResponse(appResponse, outputs, reviewed, mode === "pre" ? "runtime-containerapp" : "credential-containerapp");
   app.outputs = outputs;
   const expectedRevision = request.allowRevisionChange
     ? undefined
     : request.expectedRevision ?? request.manifest.bindings.liveRevision;
   if (expectedRevision !== undefined) {
     failIf(typeof expectedRevision !== "string" || expectedRevision.length === 0, `${mode === "pre" ? "runtime" : "credential"}-revision`);
+  }
+  const expectedInactiveRevision = mode === "post" && request.phase === "runtime-cutover"
+    ? request.manifest.bindings.liveRevision
+    : undefined;
+  if (mode === "post" && request.phase === "runtime-cutover") {
+    failIf(typeof expectedInactiveRevision !== "string" || expectedInactiveRevision.length === 0, "runtime-revision");
   }
   const revisionResponse = azJson(config, [
     "containerapp", "revision", "list", "--name", outputs.relayContainerApp,
@@ -3924,9 +5827,15 @@ function parseContainerAppAndRevisions(config, outputs, request, mode) {
   const revision = assertRevisionResponse(
     revisionResponse,
     app,
+    reviewed,
     expectedRevision,
+    expectedInactiveRevision,
     mode,
     mode === "pre" ? "runtime-revisions" : "credential-revisions",
+    {
+      inactiveRevisionContract: request.inactiveRevisionContract,
+      compareEnvironmentValues: mode === "pre",
+    },
   );
   return { appResponse, revisionResponse, app, revision };
 }
@@ -4089,16 +5998,21 @@ function parseRoleAssignments(value, expected, code) {
   failIf(!Array.isArray(value), code);
   return value.map((assignment) => {
     assertKnownKeys(assignment, [
-      "id", "name", "principalId", "principalType", "roleDefinitionId", "scope",
-      "condition", "conditionVersion", "description", "createdOn", "updatedOn",
+      "id", "principalId", "principalType", "roleDefinitionId", "scope",
     ], code);
     assertRequiredKeys(assignment, ["id", "principalId", "principalType", "roleDefinitionId", "scope"], code);
+    const assignmentPrefix = typeof assignment.scope === "string"
+      ? `${assignment.scope}/providers/Microsoft.Authorization/roleAssignments/`
+      : "";
+    const assignmentId = typeof assignment.id === "string" && assignment.id.startsWith(assignmentPrefix) &&
+      UUID_RE.test(assignment.id.slice(assignmentPrefix.length));
     failIf(
-      typeof assignment.id !== "string" ||
+        !assignmentId ||
+        !UUID_RE.test(assignment.principalId) ||
         assignment.principalId !== expected.principalId ||
         assignment.principalType !== "ServicePrincipal" ||
-        assignment.roleDefinitionId.toLowerCase() !== expected.roleDefinitionId.toLowerCase() ||
-        assignment.scope.toLowerCase() !== expected.scope.toLowerCase(),
+        assignment.roleDefinitionId !== expected.roleDefinitionId ||
+        assignment.scope !== expected.scope,
       code,
     );
     return assignment;
@@ -4124,10 +6038,18 @@ function verifyRoleAssignment(config, outputs, principalId, scope, roleUuid, req
 }
 
 function runtimePrincipalId(app, outputs, code) {
-  const identityId = Object.keys(app.identity.userAssignedIdentities)
-    .find((id) => identityKey(id) === identityKey(outputs.runtimeIdentityId));
+  failIf(!isObject(app.identity) || app.identity.type !== "UserAssigned" ||
+    !isObject(app.identity.userAssignedIdentities), code);
+  const identityIds = Object.keys(app.identity.userAssignedIdentities);
+  const identityId = identityIds.find((id) => id === outputs.runtimeIdentityId);
   failIf(!identityId, code);
-  return app.identity.userAssignedIdentities[identityId].principalId;
+  const identity = app.identity.userAssignedIdentities[identityId];
+  assertKnownKeys(identity, ["clientId", "principalId"], code);
+  assertRequiredKeys(identity, ["clientId", "principalId"], code);
+  failIf(identity.clientId !== outputs.runtimeIdentityClientId ||
+    identity.principalId !== outputs.runtimeIdentityPrincipalId ||
+    !UUID_RE.test(identity.principalId), code);
+  return identity.principalId;
 }
 
 function verifyTerminalRbac(config, outputs, app) {
@@ -4188,10 +6110,13 @@ function verifyCredentialRbac(config, outputs, app, retiredRequired) {
 }
 
 function credentialLiveState(config, outputs, request) {
+  const predecessor = request.inactiveRevisionContract ??
+    runtimeCutoverPredecessorEvidence(config, request.state);
   return parseContainerAppAndRevisions(config, outputs, {
     ...request,
     allowRevisionChange: false,
     expectedRevision: request.manifest.bindings.liveRevision,
+    inactiveRevisionContract: predecessor,
   }, "post");
 }
 
@@ -4247,7 +6172,16 @@ function verifyTerminalDeployments(config, outputs) {
 
 function liveReadOnlyChecks(config, outputs, request, mode) {
   const state = defaultRemoteState(config);
-  const live = parseContainerAppAndRevisions(config, outputs, request, mode);
+  const retainedPredecessor = request.inactiveRevisionContract ??
+    (["credential-cleanup", "terminal"].includes(request.phase)
+      ? runtimeCutoverPredecessorEvidence(config, request.state)
+      : undefined);
+  const live = parseContainerAppAndRevisions(config, outputs, {
+    ...request,
+    ...(retainedPredecessor === undefined
+      ? {}
+      : { inactiveRevisionContract: retainedPredecessor }),
+  }, mode);
   return { ...state, ...live };
 }
 
@@ -4259,6 +6193,7 @@ function requireRuntimeOutputs(outputs) {
     ["keyVaultId", "cleanup-resource"],
     ["relayContainerAppId", "runtime-resource"],
     ["runtimeIdentityId", "runtime-identity"],
+    ["runtimeIdentityPrincipalId", "runtime-identity"],
     ["imagePullIdentityId", "image-pull-identity"],
     ["foundryEndpoint", "foundry-endpoint"],
   ]) {
@@ -4299,7 +6234,6 @@ function defaultPreflightVerifier(config, request) {
     requireRuntimeOutputs(outputs);
     const diagnostic = requiredDiagnostic(request);
     const live = liveReadOnlyChecks(providerConfig, outputs, request, "pre");
-    failIf(live.revision.topology.imageDigest !== diagnostic.value.imageDigest, "diagnostic-image-linkage");
     evidence = {
       diagnosticSha256: diagnostic.fileSha256,
       containerAppSha256: hashJson(live.appResponse),
@@ -4307,13 +6241,10 @@ function defaultPreflightVerifier(config, request) {
     };
   } else if (request.phase === "credential-cleanup") {
     requireRuntimeOutputs(outputs);
-    const cleanup = requiredCleanup(request);
+    const cleanup = requiredCleanup(request, { requireAbsence: false });
     const live = liveReadOnlyChecks(providerConfig, outputs, request, "post");
-    const absence = verifyKeyVaultAbsence(providerConfig, outputs);
     evidence = {
-      cleanupSha256: cleanup.cleanup.fileSha256,
-      absenceSha256: cleanup.absence.fileSha256,
-      keyVault: absence.status,
+      cleanupOperationManifestSha256: cleanup.operation.fileSha256,
       containerAppSha256: hashJson(live.appResponse),
       revisionsSha256: hashJson(live.revisionResponse),
     };
@@ -4321,6 +6252,18 @@ function defaultPreflightVerifier(config, request) {
     reject("invalid-phase");
   }
   return { status: "success", verifierSha256: hashJson(evidence) };
+}
+
+function boundedDiagnosticDelay() {
+  if (currentTestExecution() !== undefined) return;
+  spawnSync("/usr/bin/sleep", [String(DIAGNOSTIC_POLL_DELAY_MS / 1000)], {
+    cwd: REPOSITORY_ROOT,
+    env: PRODUCTION_ENV,
+    encoding: "utf8",
+    timeout: DIAGNOSTIC_POLL_DELAY_MS + 1000,
+    maxBuffer: 1024,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
 }
 
 function defaultLiveInspector(config, request) {
@@ -4432,9 +6375,7 @@ function defaultTerminalReceiptProvider(config, request) {
     },
   };
   const evidence = {};
-  const inventory = [];
-  evidence.diagnostic = requiredDiagnostic(request);
-  evidence.cleanup = requiredCleanup(request);
+  const inventory = terminalPredecessorEvidence(config, request.state, request);
   evidence.live = assertExactReceipt(
     path.join(request.runDirectory, "terminal-live-receipt.json"),
     "live-receipt",
@@ -4445,15 +6386,12 @@ function defaultTerminalReceiptProvider(config, request) {
     "version", "type", "status", "operation", "runId", "phase", "planSha256", "bindingSha256",
     "createdAt", "repositoryCommit", "contextSha256", "sha256",
   ], "live-receipt-schema");
-  for (const [, filename] of TERMINAL_RECEIPTS) {
-    const filePath = path.join(request.runDirectory, filename);
-    inventory.push({ label: filename, sha256: sha256File(filePath, JSON_MAX_BYTES) });
-  }
   const outputs = defaultOutputs(providerConfig);
   requireRuntimeOutputs(outputs);
   const live = liveReadOnlyChecks(providerConfig, outputs, {
     ...request,
     expectedRevision: outputs.relayRevision,
+    inactiveRevisionContract: runtimeCutoverPredecessorEvidence(config, request.state),
   }, "post");
   const keyVault = verifyKeyVaultAbsence(providerConfig, outputs);
   const deployments = verifyTerminalDeployments(providerConfig, outputs);
@@ -4469,7 +6407,6 @@ function defaultTerminalReceiptProvider(config, request) {
     })),
     rbac,
   };
-  inventory.sort((left, right) => left.label.localeCompare(right.label));
   return {
     status: "success",
     receiptInventory: inventory,
@@ -4495,7 +6432,7 @@ function defaultCleanupValidator(config, request) {
   return {
     status: "success",
     evidenceSha256: hashJson({
-      cleanup: evidence.cleanup.fileSha256,
+      cleanup: evidence.operation.fileSha256,
       absence: evidence.absence.fileSha256,
       keyVault: keyVault.status,
       containerApp: hashJson(live.appResponse),
@@ -4510,6 +6447,14 @@ export function parseCli(argv) {
   if (operation === "init" && argv.length === 1) return { operation };
   if (operation === "create" && argv.length === 2 && PHASES.includes(phase)) {
     return { operation, phase };
+  }
+  if (
+    operation === "diagnostic" &&
+    argv.length === 3 &&
+    phase === "runtime-cutover" &&
+    RUN_ID_RE.test(runId)
+  ) {
+    return { operation, phase, runId };
   }
   if (
     ["guard", "preflight", "apply", "reconcile"].includes(operation) &&
@@ -4538,6 +6483,14 @@ export function parseCli(argv) {
   }
   if (
     operation === "finalize" &&
+    argv.length === 3 &&
+    phase === "terminal" &&
+    RUN_ID_RE.test(runId)
+  ) {
+    return { operation, phase, runId };
+  }
+  if (
+    operation === "close" &&
     argv.length === 3 &&
     phase === "terminal" &&
     RUN_ID_RE.test(runId)
@@ -4623,6 +6576,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
     now: lowLevel.clock?.now ?? (() => Date.now()),
     inheritedEnvironment: options.inheritedEnvironment ?? process.env,
     processRunner: lowLevel.processRunner,
+    cleanupRunner: lowLevel.cleanupRunner,
     privateHttpGet:
       lowLevel.privateHttpGet ??
       lowLevel.privateHttpsGet ??
@@ -4651,7 +6605,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       argv,
     };
     const raw = defaultContext(
-      { ...config, childEnvironment: env },
+      { ...config, childEnvironment: env, contextOperation: operation },
       { phase, operation, planPath, argv, env },
     );
     return normalizeInjectedContext(raw, expected);
@@ -4669,7 +6623,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
     failIf(
       manifest.runId !== run.entry.id ||
         manifest.phase !== run.entry.phase ||
-        !Array.isArray(manifest.argv),
+        !Array.isArray(manifest.argv) || !same(manifest.argv, exactCreateArgv(run.artifacts.plan)),
       "manifest-mismatch",
     );
     assertRegular(run.artifacts.plan, ARTIFACT_MODE, "plan");
@@ -4764,9 +6718,11 @@ function createLifecycleInternal(options = {}, internal = {}) {
       return withLock(config, () => {
       const state = requireState(config);
       operationState = state;
-      assertStateForCreate(state, phase);
+      assertStateForCreate(state, phase, config);
       checkWorktreeIfInjected(phase);
       checkInheritedEnvironment(config.inheritedEnvironment);
+      if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
+      if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
       const runId = makeRunId();
       operationRunId = runId;
       const runDirectory = createRunDirectory(config, runId);
@@ -4781,16 +6737,19 @@ function createLifecycleInternal(options = {}, internal = {}) {
       writeCheckpoint(config, runDirectory, runId, phase, "run-directory");
       const env = buildChildEnvironment(runDirectory, config.inheritedEnvironment);
       const planArgv = exactCreateArgv(artifacts.plan);
-      const manifestArgv = config.processRunner === undefined ? exactCreateArgv(artifacts.planTemp) : planArgv;
+      const manifestArgv = planArgv;
       const planStartedAt = nowIso(config.now);
       writeCheckpoint(config, runDirectory, runId, phase, "plan-started", {
         argv: manifestArgv,
         createdAt: planStartedAt,
       });
       updateRun(state, runId, { lastCheckpoint: "plan-started" });
-      const beforePlan = defaultContext(
-        { ...config, childEnvironment: env },
-        { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+      const beforePlan = normalizedContextBeforePlan(
+        defaultContext(
+          { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
+          { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+        ),
+        { phase, cwd: config.workdir, argv: manifestArgv },
       );
       let result;
       try {
@@ -4850,11 +6809,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         manifestArgv,
         env,
       );
-      failIf(
-        beforePlan.stateLineage !== context.stateLineage ||
-          beforePlan.stateSerial !== context.stateSerial,
-        "binding-mismatch",
-      );
+      failIf(!sameCompletePlanContext(beforePlan, context), "binding-mismatch");
       const startedManifest = { phase, createdAt: planStartedAt };
       try {
         assertPlanAge(startedManifest, phase, config.now);
@@ -4965,7 +6920,15 @@ function createLifecycleInternal(options = {}, internal = {}) {
           showSha256: receipt.showSha256,
           guard: receipt.guard,
         });
-        updateRun(state, runId, { status: "guarded", guardedAt: nowIso(config.now), lastCheckpoint: "guard-receipt" });
+        if (phase === "credential-cleanup") {
+          const descriptor = createVaultDescriptor(config, run, manifest, manifest.bindings, manifest.supersession);
+          writeCheckpoint(config, run.runDirectory, runId, phase, "vault-descriptor", {
+            descriptorSha256: sha256File(run.artifacts.descriptor),
+            planSha256: manifest.planSha256,
+            targetNames: descriptor.targetNames,
+          });
+        }
+        updateRun(state, runId, { status: "guarded", guardedAt: nowIso(config.now), lastCheckpoint: phase === "credential-cleanup" ? "vault-descriptor" : "guard-receipt" });
         saveState(config, state);
         return { runId, phase, status: "guarded" };
       } catch (error) {
@@ -4975,6 +6938,250 @@ function createLifecycleInternal(options = {}, internal = {}) {
         handleRunFailure(state, runId, error);
         throw error;
       }
+    });
+  }
+
+  function diagnostic(phase, runId) {
+    failIf(phase !== "runtime-cutover", "diagnostic-phase");
+    assertRunId(runId);
+    return withLock(config, () => {
+      checkWorktreeIfInjected(phase);
+      const state = requireState(config);
+      const run = parseRun(config, state, phase, runId);
+      assertRunStatus(run.entry, ["guarded"]);
+      const manifest = readManifest(run);
+      const env = buildChildEnvironment(run.runDirectory, config.inheritedEnvironment);
+      protectedRuntimeSecretsRoleEnabled(config, true);
+      const bindings = revalidate(run, "diagnostic", manifest, env);
+      const checkpoints = readCheckpoints(run.runDirectory, { runId, phase });
+      const guardReceipt = readReceiptAtCheckpoint(
+        run.artifacts.guard,
+        checkpointNamed(checkpoints, "guard-receipt"),
+        manifest,
+        "guard",
+      );
+      const showCheckpoint = checkpointNamed(checkpoints, "show-json");
+      assertCheckpointArtifact(run.artifacts.show, showCheckpoint, "showSha256", "show-json");
+      failIf(guardReceipt.showSha256 !== sha256File(run.artifacts.show, JSON_MAX_BYTES), "show-hash");
+      const providerConfig = {
+        ...config,
+        childEnvironment: env,
+        account: {
+          cloud: "AzureCloud",
+          subscription: bindings.backend.subscription_id,
+          tenant: bindings.backend.tenant_id,
+        },
+      };
+      const outputs = defaultOutputs(providerConfig);
+      const job = diagnosticJobIdentity(outputs, providerConfig);
+      const reviewed = reviewedRuntimeShapes(run.artifacts, phase);
+      const reviewedDigest = reviewedRuntimeDigest(manifest, run.artifacts);
+      const jobResponse = azJson(providerConfig, [
+        "containerapp", "job", "show", "--name", job.name,
+        "--resource-group", outputs.resourceGroup,
+        "--subscription", bindings.backend.subscription_id,
+        "--output", "json",
+      ], "diagnostic-job");
+      diagnosticJobContract(jobResponse, outputs, reviewed, providerConfig);
+
+      if (existsSync(run.artifacts.diagnostic)) {
+        requiredDiagnostic({ manifest, artifacts: run.artifacts });
+        return { runId, phase, status: "diagnostic-passed", execution: "existing" };
+      }
+
+      const requestId = existsSync(run.artifacts.diagnosticIntent)
+        ? readJson(run.artifacts.diagnosticIntent, "diagnostic-intent").requestId
+        : randomUUID();
+      let intent;
+      if (existsSync(run.artifacts.diagnosticIntent)) {
+        intent = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticIntent, "diagnostic-intent"),
+          "intent", manifest, outputs, reviewed, job, requestId, null,
+        );
+      } else {
+        const identity = diagnosticIdentity(providerConfig, outputs, manifest, {
+          requestId,
+          executionName: null,
+        });
+        const openAiRole = diagnosticOpenAiRole(providerConfig, manifest);
+        const unsigned = {
+          version: DIAGNOSTIC_REQUEST_VERSION,
+          type: "diagnostic-intent",
+          status: "reserved",
+          runId,
+          phase,
+          planSha256: manifest.planSha256,
+          bindingSha256: manifest.bindingSha256,
+          repositoryCommit: manifest.bindings.repositoryCommit,
+          contextSha256: manifest.bindingSha256,
+          requestId,
+          executionName: null,
+          job,
+          imageDigest: reviewed.image,
+          argv: [...DIAGNOSTIC_COMMAND],
+          containerName: DIAGNOSTIC_CONTAINER_NAME,
+          env: diagnosticEnvironment(outputs, manifest, requestId),
+          identity,
+          openAiRole,
+        };
+        exclusiveJson(run.artifacts.diagnosticIntent, {
+          ...unsigned,
+          sha256: hashJson(unsigned),
+        }, "diagnostic-intent");
+        intent = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticIntent, "diagnostic-intent"),
+          "intent", manifest, outputs, reviewed, job, requestId, null,
+        );
+      }
+
+      let invoking;
+      let createdInvokingThisCall = false;
+      if (existsSync(run.artifacts.diagnosticInvoking)) {
+        invoking = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticInvoking, "diagnostic-invoking"),
+          "invoking", manifest, outputs, reviewed, job, requestId, null,
+        );
+      } else {
+        createdInvokingThisCall = true;
+        const unsigned = { ...intent, type: "diagnostic-invoking", status: "invoking" };
+        delete unsigned.sha256;
+        exclusiveJson(run.artifacts.diagnosticInvoking, {
+          ...unsigned,
+          sha256: hashJson(unsigned),
+        }, "diagnostic-invoking");
+        invoking = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticInvoking, "diagnostic-invoking"),
+          "invoking", manifest, outputs, reviewed, job, requestId, null,
+        );
+      }
+
+      const diagnosticDeadline = config.now() + DIAGNOSTIC_JOB_TIMEOUT_MS;
+      let submission;
+      if (existsSync(run.artifacts.diagnosticSubmission)) {
+        submission = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticSubmission, "diagnostic-submission"),
+          "submission", manifest, outputs, reviewed, job, requestId,
+          readJson(run.artifacts.diagnosticSubmission, "diagnostic-submission").executionName,
+        );
+      } else {
+        let executionName;
+        if (createdInvokingThisCall) {
+          const started = runCommand(providerConfig, AZ_PATH, [
+            "containerapp", "job", "start",
+            "--name", job.name,
+            "--resource-group", outputs.resourceGroup,
+            "--subscription", bindings.backend.subscription_id,
+            "--container-name", DIAGNOSTIC_CONTAINER_NAME,
+            "--image", reviewed.image,
+            "--command", DIAGNOSTIC_COMMAND[0],
+            "--args", DIAGNOSTIC_COMMAND[1],
+            "--env-vars", ...diagnosticEnvironment(outputs, manifest, requestId).map((entry) => `${entry.name}=${entry.value}`),
+            "--cpu", "0.25",
+            "--memory", "0.5Gi",
+            "--output", "json",
+          ], { phase: "diagnostic", timeoutMs: COMMAND_TIMEOUT_MS });
+          if (started.status === "success") {
+            const response = parseCommandJson(started, "diagnostic-start-response");
+            if (config.now() > diagnosticDeadline) reject("diagnostic-execution-timeout");
+            executionName = diagnosticExecutionName(response, job, "diagnostic-start-response");
+          } else if (started.status !== "ambiguous") {
+            reject("diagnostic-start-failed");
+          }
+        }
+        if (executionName === undefined) {
+          const matched = reconcileDiagnosticSubmission(providerConfig, job, requestId, diagnosticDeadline);
+          executionName = matched.state.name;
+        }
+        const unsigned = {
+          ...invoking,
+          type: "diagnostic-submission",
+          status: "submitted",
+          executionName,
+          identity: {
+            ...invoking.identity,
+            job: { requestId, executionName },
+          },
+        };
+        delete unsigned.sha256;
+        exclusiveJson(run.artifacts.diagnosticSubmission, {
+          ...unsigned,
+          sha256: hashJson(unsigned),
+        }, "diagnostic-submission");
+        submission = immutableDiagnosticArtifact(
+          readJson(run.artifacts.diagnosticSubmission, "diagnostic-submission"),
+          "submission", manifest, outputs, reviewed, job, requestId, executionName,
+        );
+      }
+
+      const executionName = submission.executionName;
+      let execution;
+      for (let attempt = 0; attempt < DIAGNOSTIC_MAX_POLLS && config.now() <= diagnosticDeadline; attempt += 1) {
+        const observed = runCommand(providerConfig, AZ_PATH, [
+          "containerapp", "job", "execution", "show",
+          "--name", job.name,
+          "--resource-group", outputs.resourceGroup,
+          "--subscription", bindings.backend.subscription_id,
+          "--job-execution-name", executionName,
+          "--output", "json",
+        ], { phase: "diagnostic", timeoutMs: COMMAND_TIMEOUT_MS });
+        if (observed.status === "ambiguous") reject("diagnostic-execution-unknown");
+        if (observed.status !== "success") reject("diagnostic-execution-query");
+        if (config.now() > diagnosticDeadline) reject("diagnostic-execution-timeout");
+        const parsed = parseCommandJson(observed, "diagnostic-execution-response");
+        const stateValue = diagnosticExecutionState(parsed, job, "diagnostic-execution-response");
+        diagnosticExecutionTemplate(parsed, submission.env, reviewed.image, "diagnostic-execution-template");
+        if (stateValue.name !== executionName) reject("diagnostic-execution-context");
+        if (stateValue.terminal) {
+          execution = stateValue;
+          break;
+        }
+        boundedDiagnosticDelay();
+      }
+      failIf(execution === undefined, "diagnostic-execution-timeout");
+      failIf(!execution.passed, "diagnostic-execution-failed");
+
+      const afterIdentity = diagnosticIdentity(providerConfig, outputs, manifest, {
+        requestId,
+        executionName,
+      });
+      const afterRole = diagnosticOpenAiRole(providerConfig, manifest);
+      const identityWithoutExecution = (value) => {
+        const { job, ...identity } = value;
+        void job;
+        return identity;
+      };
+      failIf(!same(identityWithoutExecution(intent.identity), identityWithoutExecution(afterIdentity)), "diagnostic-identity-transition");
+      failIf(!same(intent.openAiRole, afterRole), "diagnostic-openai-role-transition");
+      const beforeIdentity = {
+        ...intent.identity,
+        job: { requestId, executionName },
+      };
+      const unsignedReceipt = {
+        version: 2,
+        type: "diagnostic",
+        status: "passed",
+        operation: "runtime-cutover-diagnostic",
+        runId,
+        phase,
+        planSha256: manifest.planSha256,
+        bindingSha256: manifest.bindingSha256,
+        createdAt: manifest.createdAt,
+        repositoryCommit: manifest.bindings.repositoryCommit,
+        contextSha256: manifest.bindingSha256,
+        reviewedDigest,
+        imageDigest: reviewed.image,
+        digestCount: 1,
+        submission: { requestId, executionName, artifactSha256: reviewedDigest },
+        request: { requestId, operation: "start", argv: [...DIAGNOSTIC_COMMAND] },
+        activity: { requestId, status: "Succeeded", terminal: true },
+        execution: { baseline: "pre-cutover", result: "passed", retryCount: 0, exitCode: execution.exitCode, terminalResult: "succeeded" },
+        identity: { before: beforeIdentity, after: afterIdentity },
+        openAiRole: { before: intent.openAiRole, after: afterRole },
+        runtimeSecretReferences: [],
+      };
+      exclusiveJson(run.artifacts.diagnostic, { ...unsignedReceipt, sha256: hashJson(unsignedReceipt) }, "diagnostic-receipt");
+      requiredDiagnostic({ manifest, artifacts: run.artifacts });
+      return { runId, phase, status: "diagnostic-passed", execution: executionName };
     });
   }
 
@@ -4990,11 +7197,69 @@ function createLifecycleInternal(options = {}, internal = {}) {
       try {
         const manifest = readManifest(run);
         const env = buildChildEnvironment(run.runDirectory, config.inheritedEnvironment);
+        if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
+        if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
         const bindings = revalidate(run, "preflight", manifest, env);
+        let cleanupStart;
+        if (phase === "credential-cleanup") {
+          const descriptorCheckpoint = checkpointNamed(
+            readCheckpoints(run.runDirectory, { runId, phase }),
+            "vault-descriptor",
+          );
+          assertCheckpointArtifact(
+            run.artifacts.descriptor,
+            descriptorCheckpoint,
+            "descriptorSha256",
+            "vault-descriptor",
+          );
+          validateCleanupDescriptor(run.artifacts.descriptor, manifest);
+          const currentCheckpoints = readCheckpoints(run.runDirectory, { runId, phase });
+          cleanupStart = currentCheckpoints.find((checkpoint) => checkpoint.name === "cleanup-start");
+          if (cleanupStart === undefined) {
+            if (!existsSync(run.artifacts.cleanupOperation)) {
+              runCleanupUtility(config, "start", runId);
+            } else {
+              const existing = requiredCleanup({
+                manifest,
+                artifacts: run.artifacts,
+                guardReceiptSha256: sha256File(run.artifacts.guard, JSON_MAX_BYTES),
+              }, { requireAbsence: false });
+              if (existing.operation.value.status === "prepared") {
+                runCleanupUtility(config, "resume", runId);
+              } else if (existing.operation.value.supersession === null &&
+                !existsSync(run.artifacts.absence) && !existsSync(run.artifacts.cleanupState)) {
+                reject("cleanup-state-missing");
+              }
+            }
+            const cleanup = requiredCleanup({
+              manifest,
+              artifacts: run.artifacts,
+              guardReceiptSha256: sha256File(run.artifacts.guard, JSON_MAX_BYTES),
+            }, { requireAbsence: false });
+            cleanupStart = writeCheckpoint(config, run.runDirectory, runId, phase, "cleanup-start", {
+              cleanupOperationManifestSha256: cleanup.operation.fileSha256,
+              guardReceiptSha256: sha256File(run.artifacts.guard, JSON_MAX_BYTES),
+            });
+          } else {
+            failIf(!isSha(cleanupStart.cleanupOperationManifestSha256), "cleanup-operation-checkpoint");
+            assertCheckpointArtifact(
+              run.artifacts.cleanupOperation,
+              cleanupStart,
+              "cleanupOperationManifestSha256",
+              "cleanup-operation",
+            );
+            requiredCleanup({
+              manifest,
+              artifacts: run.artifacts,
+              guardReceiptSha256: cleanupStart.guardReceiptSha256,
+            }, { requireAbsence: false });
+          }
+        }
         const verified = defaultPreflightVerifier(config, {
           operation: "preflight",
           phase,
           runId,
+          state,
           env,
           cwd: config.workdir,
           bindings,
@@ -5010,10 +7275,13 @@ function createLifecycleInternal(options = {}, internal = {}) {
             diagnosticReceiptSha256: requiredDiagnostic({ manifest, artifacts: run.artifacts }).fileSha256,
           };
         } else if (phase === "credential-cleanup") {
-          const cleanup = requiredCleanup({ manifest, artifacts: run.artifacts });
+          const cleanup = requiredCleanup({
+            manifest,
+            artifacts: run.artifacts,
+            guardReceiptSha256: cleanupStart.guardReceiptSha256,
+          }, { requireAbsence: false });
           evidence = {
-            cleanupManifestSha256: cleanup.cleanup.fileSha256,
-            absenceReceiptSha256: cleanup.absence.fileSha256,
+            cleanupOperationManifestSha256: cleanup.operation.fileSha256,
           };
         }
         const receipt = receiptFor("preflight", manifest, {
@@ -5055,6 +7323,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
       try {
         const manifest = readManifest(run);
         env = buildChildEnvironment(run.runDirectory, config.inheritedEnvironment);
+        if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
+        if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
         revalidate(run, "apply", manifest, env);
         const checkpoints = readCheckpoints(run.runDirectory, { runId, phase });
         readReceiptAtCheckpoint(
@@ -5118,6 +7388,15 @@ function createLifecycleInternal(options = {}, internal = {}) {
         });
         updateRun(state, runId, { lastCheckpoint: exitCheckpoint });
         if (resultStatus === "success") {
+          if (phase === "credential-cleanup") {
+            runCleanupUtility(config, "resume", runId);
+            const cleanup = requiredCleanup({
+              manifest,
+              artifacts: run.artifacts,
+              guardReceiptSha256: sha256File(`${run.artifacts.guard}.consumed`, JSON_MAX_BYTES),
+            });
+            failIf(cleanup.absence === undefined, "cleanup-absence-missing");
+          }
           const receipt = {
             ...receiptFor("apply", manifest, { status: "applied" }),
             appliedAt: nowIso(config.now),
@@ -5321,18 +7600,24 @@ function createLifecycleInternal(options = {}, internal = {}) {
         );
       }
       if (checkpoints.some((checkpoint) => checkpoint.name === "reconcile")) {
-        readReceiptAtCheckpoint(
-          run.artifacts.reconcile,
-          checkpointNamed(checkpoints, "reconcile"),
-          manifest,
-          "reconcile",
-          ["applied", "invalidated", "unknown"],
-        );
+        for (const checkpoint of checkpoints.filter((candidate) => candidate.name === "reconcile")) {
+          readReceiptAtCheckpoint(
+            reconcilePathForCheckpoint(run.runDirectory, checkpoint),
+            checkpoint,
+            manifest,
+            "reconcile",
+            ["applied", "invalidated", "unknown"],
+          );
+        }
+      }
+      if (phase === "credential-cleanup") {
+        runCleanupUtility(config, "resume", runId);
       }
       const inspected = defaultLiveInspector(config, {
         operation: "reconcile",
         phase,
         runId,
+        state,
         manifest,
         bindings,
         env,
@@ -5348,9 +7633,12 @@ function createLifecycleInternal(options = {}, internal = {}) {
           reconciledAt: nowIso(config.now),
         };
         ensureReceiptSize(receipt);
-        exclusiveJson(run.artifacts.reconcile, receipt, "reconcile-receipt");
+        const sequence = readReconcileReceiptPaths(run.runDirectory).length + 1;
+        const reconcilePath = reconcileReceiptPath(run.runDirectory, sequence);
+        exclusiveJson(reconcilePath, receipt, "reconcile-receipt");
         writeCheckpoint(config, run.runDirectory, runId, phase, "reconcile", {
-          receiptSha256: sha256File(run.artifacts.reconcile),
+          receiptSha256: sha256File(reconcilePath),
+          reconcileSequence: sequence,
           outcome,
           status: receipt.status,
         });
@@ -5371,9 +7659,12 @@ function createLifecycleInternal(options = {}, internal = {}) {
           reconciledAt: nowIso(config.now),
         };
         ensureReceiptSize(receipt);
-        exclusiveJson(run.artifacts.reconcile, receipt, "reconcile-receipt");
+        const sequence = readReconcileReceiptPaths(run.runDirectory).length + 1;
+        const reconcilePath = reconcileReceiptPath(run.runDirectory, sequence);
+        exclusiveJson(reconcilePath, receipt, "reconcile-receipt");
         writeCheckpoint(config, run.runDirectory, runId, phase, "reconcile", {
-          receiptSha256: sha256File(run.artifacts.reconcile),
+          receiptSha256: sha256File(reconcilePath),
+          reconcileSequence: sequence,
           outcome,
           status: receipt.status,
         });
@@ -5381,22 +7672,21 @@ function createLifecycleInternal(options = {}, internal = {}) {
         saveState(config, state);
         return { runId, phase, status: "invalidated" };
       }
-      if (!existsSync(run.artifacts.reconcile)) {
-        const receipt = {
-          ...receiptFor("reconcile", manifest, { status: "unknown" }),
-          reconciledAt: nowIso(config.now),
-        };
-        ensureReceiptSize(receipt);
-        exclusiveJson(run.artifacts.reconcile, receipt, "reconcile-receipt");
-        writeCheckpoint(config, run.runDirectory, runId, phase, "reconcile", {
-          receiptSha256: sha256File(run.artifacts.reconcile),
-          outcome,
-          status: receipt.status,
-        });
-        updateRun(state, runId, { lastCheckpoint: "reconcile" });
-      } else {
-        assertRegular(run.artifacts.reconcile, ARTIFACT_MODE, "reconcile-receipt");
-      }
+      const receipt = {
+        ...receiptFor("reconcile", manifest, { status: "unknown" }),
+        reconciledAt: nowIso(config.now),
+      };
+      ensureReceiptSize(receipt);
+      const sequence = readReconcileReceiptPaths(run.runDirectory).length + 1;
+      const reconcilePath = reconcileReceiptPath(run.runDirectory, sequence);
+      exclusiveJson(reconcilePath, receipt, "reconcile-receipt");
+      writeCheckpoint(config, run.runDirectory, runId, phase, "reconcile", {
+        receiptSha256: sha256File(reconcilePath),
+        reconcileSequence: sequence,
+        outcome,
+        status: receipt.status,
+      });
+      updateRun(state, runId, { lastCheckpoint: "reconcile" });
       reject("reconcile-unknown");
       } catch (error) {
         const entry = state.runs.find((candidate) => candidate.id === runId);
@@ -5433,25 +7723,23 @@ function createLifecycleInternal(options = {}, internal = {}) {
         oldEnv,
       );
       failIf(!same(oldBindings, oldManifest.bindings), "binding-mismatch");
-      const cleanup = readJson(old.artifacts.cleanup, "cleanup-manifest");
-      const absence = readJson(old.artifacts.absence, "cleanup-absence");
-      failIf(cleanup.runId !== oldRunId || absence.runId !== oldRunId, "cleanup-context");
-      failIf(!isSha(cleanup.sha256) || !isSha(absence.sha256), "cleanup-context");
-      failIf(
-        cleanup.planSha256 !== oldManifest.planSha256 ||
-          cleanup.bindingSha256 !== oldManifest.bindingSha256 ||
-          absence.planSha256 !== oldManifest.planSha256 ||
-          absence.bindingSha256 !== oldManifest.bindingSha256,
-        "cleanup-context",
-      );
-      const cleanupArtifactSha256 = sha256File(old.artifacts.cleanup, JSON_MAX_BYTES);
-      const absenceArtifactSha256 = sha256File(old.artifacts.absence, JSON_MAX_BYTES);
+      const oldCheckpoints = readCheckpoints(old.runDirectory, { runId: oldRunId, phase });
+      const consumed = oldCheckpoints.find((checkpoint) => checkpoint.name === "receipts-consumed");
+      const cleanup = requiredCleanup({
+        manifest: oldManifest,
+        artifacts: old.artifacts,
+        guardReceiptSha256: consumed?.guardReceiptSha256 ?? sha256File(old.artifacts.guard, JSON_MAX_BYTES),
+      });
+      const cleanupArtifactSha256 = cleanup.operation.fileSha256;
+      const absenceArtifactSha256 = cleanup.absence.fileSha256;
+      runCleanupUtility(config, "assert-absent", oldRunId);
       const valid = defaultCleanupValidator(config, {
         phase,
         runId: oldRunId,
+        state,
         manifest: oldManifest,
-        cleanup,
-        absence,
+        cleanup: cleanup.operation.value,
+        absence: cleanup.absence.value,
         artifacts: old.artifacts,
         runDirectory: old.runDirectory,
         env: oldEnv,
@@ -5483,8 +7771,10 @@ function createLifecycleInternal(options = {}, internal = {}) {
   }
 
   function createUnderLockBody(phase, supersession, state, onRunId) {
-    assertStateForCreate(state, phase);
+    assertStateForCreate(state, phase, config);
     checkInheritedEnvironment(config.inheritedEnvironment);
+    if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
+    if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
     const runId = makeRunId();
     onRunId(runId);
     const runDirectory = createRunDirectory(config, runId);
@@ -5500,16 +7790,19 @@ function createLifecycleInternal(options = {}, internal = {}) {
     writeCheckpoint(config, runDirectory, runId, phase, "run-directory");
     const env = buildChildEnvironment(runDirectory, config.inheritedEnvironment);
     const planArgv = exactCreateArgv(artifacts.plan);
-    const manifestArgv = config.processRunner === undefined ? exactCreateArgv(artifacts.planTemp) : planArgv;
+    const manifestArgv = planArgv;
     const planStartedAt = nowIso(config.now);
     writeCheckpoint(config, runDirectory, runId, phase, "plan-started", {
       argv: manifestArgv,
       createdAt: planStartedAt,
       });
       updateRun(state, runId, { lastCheckpoint: "plan-started" });
-    const beforePlan = defaultContext(
-      { ...config, childEnvironment: env },
-      { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+    const beforePlan = normalizedContextBeforePlan(
+      defaultContext(
+        { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
+        { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+      ),
+      { phase, cwd: config.workdir, argv: manifestArgv },
     );
     let result;
     try {
@@ -5562,11 +7855,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       manifestArgv,
       env,
     );
-    failIf(
-      beforePlan.stateLineage !== context.stateLineage ||
-        beforePlan.stateSerial !== context.stateSerial,
-      "binding-mismatch",
-    );
+    failIf(!sameCompletePlanContext(beforePlan, context), "binding-mismatch");
     try {
       assertPlanAge({ phase, createdAt: planStartedAt }, phase, config.now);
     } catch (error) {
@@ -5620,6 +7909,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         operation: "finalize",
         phase,
         runId,
+        state,
         manifest,
         bindings,
         env,
@@ -5629,12 +7919,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       });
       failIf(parseStatus(terminal) !== "success", "terminal-receipts");
       failIf(!isObject(terminal) || !isSha(terminal.receiptSetSha256), "terminal-receipt-set");
-      const expectedInventory = TERMINAL_RECEIPTS
-        .map(([, filename]) => ({
-          label: filename,
-          sha256: sha256File(path.join(run.runDirectory, filename), JSON_MAX_BYTES),
-        }))
-        .sort((left, right) => left.label.localeCompare(right.label));
+      const expectedInventory = terminal.receiptInventory;
       failIf(!same(terminal.receiptInventory, expectedInventory), "terminal-receipt-inventory");
       failIf(hashJson(expectedInventory) !== terminal.receiptSetSha256, "terminal-receipt-set");
       const receipt = receiptFor("terminal", manifest, {
@@ -5642,7 +7927,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         receiptInventory: expectedInventory,
         receiptSetSha256: terminal.receiptSetSha256,
       });
-      ensureReceiptSize(receipt);
+      failIf(Buffer.byteLength(canonicalJson(receipt)) > JSON_MAX_BYTES, "terminal-receipt-too-large");
       exclusiveJson(run.artifacts.terminal, receipt, "terminal-receipts");
       writeCheckpoint(config, run.runDirectory, runId, phase, "global-state-advancement", {
         from: state.state,
@@ -5665,6 +7950,19 @@ function createLifecycleInternal(options = {}, internal = {}) {
     });
   }
 
+  function close(phase, runId) {
+    failIf(phase !== "terminal", "close-phase");
+    assertRunId(runId);
+    return withLock(config, () => {
+      checkWorktreeIfInjected(phase);
+      if (existsSync(config.closure)) return closeEvidenceRoot(config, undefined);
+      const state = requireState(config);
+      const run = parseRun(config, state, phase, runId);
+      failIf(run.entry.status !== "finalized" || state.state !== "terminal-verified", "closure-not-ready");
+      return closeEvidenceRoot(config, state);
+    }, true);
+  }
+
   function execute(parsed) {
     failIf(!parsed, "usage");
     switch (parsed.operation) {
@@ -5674,6 +7972,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
         return create(parsed.phase);
       case "guard":
         return guard(parsed.phase, parsed.runId);
+      case "diagnostic":
+        return diagnostic(parsed.phase, parsed.runId);
       case "preflight":
         return preflight(parsed.phase, parsed.runId);
       case "apply":
@@ -5684,6 +7984,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
         return supersede(parsed.phase, parsed.runId);
       case "finalize":
         return finalize(parsed.phase, parsed.runId);
+      case "close":
+        return close(parsed.phase, parsed.runId);
       default:
         reject("usage");
     }
@@ -5694,11 +7996,13 @@ function createLifecycleInternal(options = {}, internal = {}) {
     init,
     create,
     guard,
+    diagnostic,
     preflight,
     apply,
     reconcile,
     supersede,
     finalize,
+    close,
     execute,
     parseCli,
     paths: (runId) => artifactPaths(runPath(config, runId)),
@@ -5757,6 +8061,12 @@ function runCliForTests(argv, options = {}) {
     runCliInternal(argv, options, internal),
   );
 }
+
+// The test harness exports these helpers from an instrumented module copy.
+void createLifecycle;
+void runCli;
+void createLifecycleForTests;
+void runCliForTests;
 
 function runLockedCli(argv) {
   return runCliInternal(argv, {}, { production: true, lockMode: "inherited" });

@@ -1,28 +1,27 @@
 # Final rollout plan-guard implementation
 
-Status: Approved for bounded implementation
+Status: Guard implementation retained; live rollout and final evidence pending
 Date: 2026-08-20
 
 ## Objective
 
-Maintain the fail-closed `final-rollout` mode for the relay-image correction
-plus explicit dev-only provisional language-boundary activation after the
-telemetry-enrichment fix and completed LiteLLM OOM remediation. It
-retains the deployed Azure Realtime relay, OpenRouter LiteLLM sidecar,
-expiry-cleanup Job, action group, six scheduled-query alerts, and pinned
-transcription model.
+Document the fail-closed final guard for the implemented Azure-only relay
+target. Terraform manages Azure Foundry, the relay uses direct Azure OpenAI
+generation with the runtime managed identity and Entra auth, and the workload
+has one relay container with no runtime proxy or API-key path. The dev
+language boundary remains explicitly provisional; staging and production must
+use `deny-all`.
 
-The existing `model-spike`, `full-deploy`, `runtime-rollout`, and
-`luna-model-bootstrap` behavior must
-remain unchanged. `final-rollout` is a new mode, not an alias and not a relaxed
-version of an old mode.
+The current lifecycle maps `model-bootstrap` to `luna-model-bootstrap`,
+`runtime-cutover` to `azure-generation-cutover`, `credential-cleanup` to
+`azure-credential-cleanup`, and `terminal` to `final-rollout-complete`.
+The terminal guard is a complete no-op verification and must never be applied.
 
-The model-bootstrap guard is the separate normal-refresh guard for recreating
-the already-absent `gpt-5.6-luna` deployment. It is intentionally outside this
-final rollout contract; its exact transition and adversarial coverage live in
-`infra/scripts/assert-dev-plan.test.mjs`. The final guard's live predecessor is
-the reviewed current digest below; the historical predecessor remains only as
-a stale rejection case.
+The model-bootstrap guard is the separate normal-refresh guard for creating the
+Terraform-managed `gpt-5.6-luna` deployment. Its exact transition and
+adversarial coverage live in `infra/scripts/assert-dev-plan.test.mjs`. Live
+image digests, endpoints, resource IDs, subscription/tenant values, and tfvars
+values remain protected rollout inputs and are intentionally absent here.
 
 ### Luna bootstrap guard boundary
 
@@ -31,12 +30,11 @@ Terraform 1.15.8 plan at
 `infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json`. The fixture
 contains 40 resource changes and all 10 modules with the provider, schema, and
 identity metadata emitted by Terraform; it is sanitized and contains no empty
-resource payloads. The guard accepts canonical live Azure IDs, operator
-principals, and contact values only when their references remain coherently
-cross-bound across changes, prior/planned values, outputs, configuration, and
-checks. It preserves exact structural envelopes and resource inventory, so
-extra or missing resources, modules, metadata, or coordinated type/identity
-changes fail closed.
+resource payloads. The guard accepts protected live bindings only when their
+references remain coherently cross-bound across changes, prior/planned values,
+outputs, configuration, and checks. It preserves exact structural envelopes
+and resource inventory, so extra or missing resources, modules, metadata, or
+coordinated type/identity changes fail closed.
 
 Its sole transition is creation of
 `module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]` and the
@@ -49,15 +47,101 @@ subscription-wide `runtime_openai` scope, role/principal/name mutation, image
 cross-binding change, non-canonical timestamp, or wildcard empty payload is
 rejected. This boundary is covered by the Luna tests and does not alter the
 older guard modes or the final-rollout fixture.
-The Luna `relay_image_digest` variable is the full immutable
-`palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`
-reference, cross-bound unchanged through configuration, Container App prior
-and planned state, and resource changes; digest-only, mutable-tag, or
-registry/repository/digest substitutions fail closed.
 
-## File ownership
+## Current operator flow
 
-The implementation worker owns only:
+Run the lifecycle utility from the repository root. Initialize once, then run
+the phase-specific sequences below. Model bootstrap has the normal
+create/guard/preflight/apply sequence. Runtime cutover adds the lifecycle
+diagnostic between guard and preflight:
+
+```sh
+node infra/scripts/dev-plan-lifecycle.mjs init
+run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create <phase>)"
+node infra/scripts/dev-plan-lifecycle.mjs guard <phase> "$run_id"
+node infra/scripts/dev-plan-lifecycle.mjs preflight <phase> "$run_id"
+node infra/scripts/dev-plan-lifecycle.mjs apply <phase> "$run_id"
+
+runtime_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create runtime-cutover)"
+node infra/scripts/dev-plan-lifecycle.mjs guard runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs preflight runtime-cutover "$runtime_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs apply runtime-cutover "$runtime_run_id"
+```
+
+The `diagnostic` operation is valid only for `runtime-cutover`. It validates
+the existing Container Apps Job, then uses the guarded immutable relay image,
+the Entra runtime identity, the exact diagnostic command, and no secrets. It
+records durable intent, invoking, submission, execution, and receipt evidence;
+there is exactly one Job-start POST attempt per lifecycle run. An ambiguous
+start is reconciled from resumable evidence and is never replayed. The Job's
+inner command is `node apps/relay/dist/azure-generation-diagnostic.js` and its
+successful receipt is required by runtime preflight.
+
+If an apply is ambiguous, use only:
+
+```sh
+node infra/scripts/dev-plan-lifecycle.mjs reconcile <phase> <run-id>
+```
+
+Never replay the old saved plan. The terminal flow is guard-only until its
+receipts are ready and has no `preflight` or `apply`:
+
+```sh
+terminal_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create terminal)"
+node infra/scripts/dev-plan-lifecycle.mjs guard terminal "$terminal_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs finalize terminal "$terminal_run_id"
+node infra/scripts/dev-plan-lifecycle.mjs close terminal "$terminal_run_id"
+```
+
+The diagnostic executable is run by the lifecycle-controlled Job from the
+reviewed image. Its no-argument inner command is:
+
+```sh
+node apps/relay/dist/azure-generation-diagnostic.js
+```
+
+The runtime-role utility supports only `assert-enabled`, `disable`, and
+`assert-disabled`. Assert the role enabled before runtime cutover; after the
+Azure-only runtime is proven, run `disable` and `assert-disabled` before
+credential cleanup. Credential-cleanup preflight validates the disabled role,
+creates the protected descriptor, and invokes the Key Vault utility's `start`
+or `resume` operation as needed. Apply resumes it and requires absence
+evidence. Its exact utility commands are:
+
+```sh
+node infra/scripts/cleanup-key-vault-credentials.mjs start <run-id>
+node infra/scripts/cleanup-key-vault-credentials.mjs resume <run-id>
+node infra/scripts/cleanup-key-vault-credentials.mjs assert-absent <run-id>
+```
+
+After provider-side revocation is proved by the retained historical
+revocation utility, the fixed local cleanup command is:
+
+```sh
+node infra/scripts/remove-env-entry.mjs remove /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
+node infra/scripts/remove-env-entry.mjs assert-absent /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
+```
+
+The revocation evidence sequence is:
+
+```sh
+node infra/scripts/openrouter-revocation-state.mjs prepare
+node infra/scripts/openrouter-revocation-state.mjs resume
+node infra/scripts/openrouter-revocation-state.mjs mark-local-removed
+node infra/scripts/openrouter-revocation-state.mjs assert-complete
+```
+
+`resume` requires HTTP 401 proof before `revoked`; `mark-local-removed` and
+`assert-complete` require the local absence proof. These provider/key names and
+commands are historical cleanup context only.
+
+The names `OPENROUTER_API_KEY`, `openrouter-api-key`, and `litellm-master-key`
+appear only in this marked historical cleanup context; they are not runtime
+settings.
+This plan records the required future flow, not completed live evidence.
+
+## Historical implementation scope
 
 - `infra/scripts/assert-dev-plan.mjs`
 - `infra/scripts/assert-dev-plan.test.mjs`
@@ -89,32 +173,21 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   Its `applyable` value is exactly `true`. The mutually exclusive terminal
   idempotent form has 39 no-op actions and `applyable=false`; it is guard-only
   verification evidence and must never be applied.
-  LiteLLM remains exactly 0.75 CPU/1.5Gi, relay
-  remains exactly 0.25 CPU/0.5Gi, and the aggregate remains exactly 1 CPU/2Gi.
+  The relay remains exactly 0.25 CPU/0.5Gi and the deployed workload contains
+  one relay container with no proxy sidecar.
   The Container App before/after recursive differences are exactly
   `body.properties.template.containers[0].image` and `output`. Prior, planned,
   and terminal state each contain the same 25-entry relay environment with
   exactly one plain, nonsecret
   `PALANCAR_LANGUAGE_BOUNDARY_MODE=development-provisional` entry. Missing,
   changed, duplicated, secret-backed, or otherwise drifted environments are
-  rejected. Configuration body references retain the
-  exact Terraform v2 order around the boundary and sidecar expressions. The
-  transition has 25 ordered empty relay `after_unknown.env` descriptors and
-  exactly one passing module `language_boundary_mode` variable check. The prior relay
-  image is the hard-pinned reviewed digest
-  `sha256:e9b7e2ea937d3a15f3b3a52e50d9736b5c63c69765c3ee571ab0c06f762436bd`;
-  the historical `sha256:af41c6ad829046e4e92e548afc50a84e8e0da18ad3e3d37be08e2b877c2809df`
-  is rejected as stale.
-  the planned relay image equals `var.relay_image_digest`, is immutable in the
-  same ACR/repository, and is distinct from prior. The reviewed after digest
-  remains variable-bound and is not hard-coded in the committed guard or
-  sanitized fixture. The provider-computed
+  rejected. Configuration body references retain the exact Terraform v2 order
+  around the language boundary. The transition has ordered empty relay
+  `after_unknown.env` descriptors and a passing language-boundary check.
+  The planned relay image equals `var.relay_image_digest`, is immutable, and
+  is distinct from the protected predecessor. The provider-computed
   `relay_latest_revision_name` output becomes unknown. The already deployed
-  cleanup Job, action group, and six scheduled-query alerts remain no-op.
-  The action group is enabled/global/tagged, contains exactly one common-schema
-  email receiver per sorted synthetic fixture budget contact under non-PII
-  ordinal names, and has no other receiver type. Its deterministic plan-known
-  ARM ID is cross-bound to the root output and every alert action list. All four
+  cleanup Job, action group, and scheduled-query alerts remain no-op.
   budget notification lists, the action-group receivers, and
   `budget_contact_emails` contain the same contact set. Every alert has the
   exact committed KQL, threshold, severity, aggregation, periods, action group,
@@ -129,9 +202,9 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
 - The corresponding indexed Foundry deployment is present exactly once and is
   no-op with the exact pinned after-state. The retired Luna deployment and any
   additional cognitive deployment are rejected everywhere in the plan.
-- The current reviewed OpenRouter generation model is exactly
-  `openrouter/openai/gpt-5.6-luna`; the Container App sidecar environment and
-  root plan variable must match that value exactly.
+- The generation provider is exactly `azure-openai`, the deployment is exactly
+  `gpt-5.6-luna`, and endpoint/client-ID bindings remain protected Terraform
+  values. No retired-provider environment or proxy configuration is accepted.
 - The Monitoring Metrics Publisher assignment for the runtime identity at the
   exact Application Insights component scope is present exactly once and is
   no-op in this transition. Its deterministic UUIDv5 name, canonical role
@@ -145,14 +218,11 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   two distinct user-assigned identities with image-pull lifecycle `None` and
   runtime lifecycle `Main`; ACR registry through image-pull identity; external
   secure HTTP ingress to relay port 8787; single revision and 100% latest
-  traffic; relay and LiteLLM containers only; exact CPU/memory, probes,
-  immutable same-ACR images in repositories `palancar-relay` and
-  `palancar-litellm-proxy`; warm `minReplicas=1`, `maxReplicas=1`; exactly two
-  same-vault Key Vault references and no plaintext credentials; exact relay
-  environment including Azure Table security, Azure Realtime transcription,
-  deployment slot, managed identity, Application Insights connection string,
-  disabled statsbeat flags, browser policy, and localhost LiteLLM alias; exact
-  OpenRouter LiteLLM environment; and no helper/OTLP/provider topology.
+  traffic; one relay container with exact CPU/memory and probes; an immutable
+  relay image; warm `minReplicas=1`, `maxReplicas=1`; no plaintext credentials;
+  and the exact Azure Table, Azure Realtime, managed-identity, telemetry,
+  browser-policy, deployment-slot, and language-boundary environment. No
+  proxy, fallback, or provider sidecar is accepted.
   The reviewed update uses the reference `after_sensitive` envelope. Every
   no-op resource, including the terminal Container App, uses the corresponding
   reference `before_sensitive` envelope as its exact `after_sensitive` value.
@@ -160,11 +230,8 @@ The mode accepts a complete, non-targeted Terraform 1.15.8 JSON plan only when:
   Foundry host and ends exactly in
   `/openai/v1/realtime?intent=transcription`; deployment is exactly
   `gpt-4o-mini-transcribe`.
-- The three immutable image variables are present, canonical, from the exact
-  development ACR, and use three distinct exact repositories:
-  `palancar-relay`, `palancar-litellm-proxy`, and
-  `palancar-expiry-cleanup`. The Container App/Job images must equal those
-  variable values exactly.
+- The immutable relay and expiry-cleanup image variables are present and the
+  Container App/Job images must equal their protected variable values exactly.
 - The expiry-cleanup Job is present exactly once and is no-op in this
   remediation. Its
   complete after-state exactly matches the committed module: API type and
@@ -193,18 +260,7 @@ applyable flags, configuration and child-module trees, prior/planned values,
 nulls, computed values, unknown maps, and sensitivity maps. It must contain no
 live contact, secret, credential, instrumentation key, or personal principal
 identifier; synthetic placeholders must be cross-bound throughout. The
-telemetry-enrichment binary `/tmp/palancar-telemetry-enrichment.tfplan` had
-SHA-256
-`ad7e5c2090cce0c82d74d40ba242c30f933073c1bdf24a997e06f4d1bbb4dcf7` and is
-historical and non-applicable. The former GA item-lifecycle binary is
-`/tmp/palancar-ga-item-lifecycle-v3.tfplan`, with reviewed SHA-256
-`a4caa91081861c707e07387e4aa2979b3e1cbced0359ee53f19a35d1844b08f8`.
-It is also historical and non-applicable because it predates the explicit
-language-boundary environment contract; do not guard or apply it. A future
-activation needs a newly reviewed protected binary and hash, verified before
-guard and immediately before applying that same binary. Verify the binary
-hash, not the hash of its JSON view. Keep raw artifacts protected with mode
-`0600`, and never commit them. Build the idempotent
+Historical raw plan artifacts and their hashes are intentionally omitted here. Use only a newly created protected lifecycle run, verify the binary rather than its JSON view, keep raw artifacts mode `0600`, and never commit them. Build the idempotent
 fixture from the same genuine schema and prove acceptance
 for the initial transition and idempotent state. Add adversarial mutations covering every
 accepted resource and invariant above, especially omitted inventory entries,
