@@ -959,15 +959,123 @@ function assertCheckpointArtifact(filePath, checkpoint, hashKey, code) {
   return actual;
 }
 
+function validateManifestArgv(manifest, artifacts, checkpoints, run) {
+  if (same(manifest.argv, exactCreateArgv(artifacts.plan))) return;
+
+  failIf(
+    !same(manifest.argv, exactCreateArgv(artifacts.planTemp)) ||
+      run.phase !== "model-bootstrap" ||
+      !["applied", "invalidated"].includes(run.status),
+    "manifest-mismatch",
+  );
+
+  // The temporary output pathname is accepted only as a migration proof for
+  // a closed historical model run.  Re-check the complete create provenance
+  // so changing an argv record cannot turn an incomplete or tampered run into
+  // an acceptable predecessor or historical invalidation.
+  const legacyArgv = exactCreateArgv(artifacts.planTemp);
+  const planStarted = checkpointNamed(checkpoints, "plan-started");
+  failIf(!same(planStarted.argv, legacyArgv), "checkpoint-integrity");
+
+  const tempPlan = checkpointNamed(checkpoints, "temp-plan");
+  failIf(!isSha(tempPlan.planSha256), "checkpoint-integrity");
+
+  const published = checkpointNamed(checkpoints, "published-plan");
+  failIf(
+    published.planSha256 !== tempPlan.planSha256 ||
+      published.planPath !== artifacts.plan,
+    "checkpoint-integrity",
+  );
+
+  const createExitCheckpoints = checkpoints.filter((checkpoint) =>
+    checkpoint.name === "terraform-exit-known" && checkpoint.operation === "create",
+  );
+  failIf(createExitCheckpoints.length !== 1, "checkpoint-integrity");
+  const terraformExit = createExitCheckpoints[0];
+  failIf(
+    terraformExit.operation !== "create" ||
+      terraformExit.status !== "success" ||
+      terraformExit.exitCode !== 0,
+    "checkpoint-integrity",
+  );
+
+  const manifestCheckpoint = checkpointNamed(checkpoints, "manifest");
+  assertCheckpointArtifact(artifacts.manifest, manifestCheckpoint, "manifestSha256", "manifest");
+  failIf(
+    manifestCheckpoint.planSha256 !== manifest.planSha256 ||
+      tempPlan.planSha256 !== manifest.planSha256,
+    "checkpoint-integrity",
+  );
+  assertRegular(artifacts.plan, ARTIFACT_MODE, "plan");
+  failIf(sha256File(artifacts.plan) !== manifest.planSha256, "plan-hash");
+  failIf(
+    !isObject(manifest.bindings) ||
+      !same(manifest.bindings.argv, manifest.argv) ||
+      bindingHash(manifest.bindings) !== manifest.bindingSha256,
+    "binding-hash",
+  );
+
+  if (run.status === "invalidated") {
+    const invalidated = checkpointNamed(checkpoints, "invalidated");
+    const durable = checkpoints.at(-2);
+    const runLastCheckpoint = run.lastCheckpoint;
+    const invalidatedLastCheckpoint = invalidated.lastCheckpoint;
+    failIf(
+      checkpoints.at(-1) !== invalidated ||
+        checkpoints.some((checkpoint) =>
+          ["apply-receipt", "global-state-advancement"].includes(checkpoint.name),
+        ) ||
+        typeof run.reason !== "string" ||
+        run.reason.length === 0 ||
+        invalidated.reason !== run.reason ||
+        durable === undefined ||
+        durable.name === "invalidated" ||
+        (runLastCheckpoint !== undefined && runLastCheckpoint !== durable.name) ||
+        (invalidatedLastCheckpoint !== undefined && invalidatedLastCheckpoint !== durable.name) ||
+        (runLastCheckpoint !== undefined &&
+          invalidatedLastCheckpoint !== undefined &&
+          runLastCheckpoint !== invalidatedLastCheckpoint),
+      "invalidated-history",
+    );
+    return;
+  }
+
+  failIf(
+    run.lastCheckpoint !== "global-state-advancement",
+    "manifest-mismatch",
+  );
+
+  const applyCheckpoint = checkpointNamed(checkpoints, "apply-receipt");
+  readReceiptAtCheckpoint(
+    artifacts.apply,
+    applyCheckpoint,
+    manifest,
+    "apply",
+    ["applied"],
+  );
+  failIf(applyCheckpoint.status !== "applied", "phase-apply-proof");
+
+  const advancement = checkpointNamed(checkpoints, "global-state-advancement");
+  failIf(
+    advancement.from !== STATE_FOR_PHASE[run.phase] ||
+      advancement.to !== ADVANCED_STATE[run.phase] ||
+      !isSha(advancement.applyReceiptSha256) ||
+      advancement.applyReceiptSha256 !== sha256File(artifacts.apply, JSON_MAX_BYTES),
+    "phase-apply-proof",
+  );
+}
+
 function immutableManifest(runDirectory, artifacts, checkpoints, run) {
   const checkpoint = checkpointNamed(checkpoints, "manifest");
   assertCheckpointArtifact(artifacts.manifest, checkpoint, "manifestSha256", "manifest");
   const manifest = readJson(artifacts.manifest, "manifest");
   failIf(
     manifest.runId !== run.id || manifest.phase !== run.phase || !Array.isArray(manifest.argv) ||
-      !same(manifest.argv, exactCreateArgv(artifacts.plan)),
+      (!same(manifest.argv, exactCreateArgv(artifacts.plan)) &&
+        !same(manifest.argv, exactCreateArgv(artifacts.planTemp))),
     "manifest-mismatch",
   );
+  validateManifestArgv(manifest, artifacts, checkpoints, run);
   assertRegular(artifacts.plan, ARTIFACT_MODE, "plan");
   failIf(sha256File(artifacts.plan) !== manifest.planSha256, "plan-hash");
   failIf(bindingHash(manifest.bindings) !== manifest.bindingSha256, "binding-hash");
@@ -6623,9 +6731,12 @@ function createLifecycleInternal(options = {}, internal = {}) {
     failIf(
       manifest.runId !== run.entry.id ||
         manifest.phase !== run.entry.phase ||
-        !Array.isArray(manifest.argv) || !same(manifest.argv, exactCreateArgv(run.artifacts.plan)),
+        !Array.isArray(manifest.argv) ||
+        (!same(manifest.argv, exactCreateArgv(run.artifacts.plan)) &&
+          !same(manifest.argv, exactCreateArgv(run.artifacts.planTemp))),
       "manifest-mismatch",
     );
+    validateManifestArgv(manifest, run.artifacts, checkpoints, run.entry);
     assertRegular(run.artifacts.plan, ARTIFACT_MODE, "plan");
     failIf(sha256File(run.artifacts.plan) !== manifest.planSha256, "plan-hash");
     failIf(bindingHash(manifest.bindings) !== manifest.bindingSha256, "binding-hash");
@@ -6662,7 +6773,10 @@ function createLifecycleInternal(options = {}, internal = {}) {
       const directory = runPath(config, runId);
       const names = checkpointNames(directory, { runId, phase: run.phase });
       if (!names.has("invalidated")) {
-        writeCheckpoint(config, directory, runId, run.phase, "invalidated", { reason });
+        writeCheckpoint(config, directory, runId, run.phase, "invalidated", {
+          reason,
+          lastCheckpoint: run.lastCheckpoint,
+        });
       }
       updateRun(configState, runId, {
         status: "invalidated",

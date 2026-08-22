@@ -1088,6 +1088,82 @@ function replaceExisting(filePath, value) {
   writeExclusive(filePath, value);
 }
 
+function checkpointPath(harness, runId, checkpointName) {
+  const entry = readdirSync(path.join(harness.root, runId)).find((name) =>
+    new RegExp(`^\\d{6}-${checkpointName}\\.json$`).test(name),
+  );
+  assert.ok(entry, `missing ${checkpointName} checkpoint`);
+  return path.join(harness.root, runId, entry);
+}
+
+function rewriteManifestArgv(harness, runId, argv) {
+  const runDirectory = path.join(harness.root, runId);
+  const paths = harness.paths(runId);
+  const manifestPath = harness.paths(runId).manifest;
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.argv = argv;
+  manifest.bindings.argv = argv;
+  manifest.bindingSha256 = sha256Bytes(canonicalJson(manifest.bindings));
+  replaceExisting(manifestPath, manifest);
+  const manifestCheckpointPath = checkpointPath(harness, runId, "manifest");
+  const manifestCheckpointSequence = JSON.parse(readFileSync(manifestCheckpointPath, "utf8")).sequence;
+
+  for (const entry of readdirSync(runDirectory, { withFileTypes: true })) {
+    if (!entry.isFile() || /^\d{6}-[a-z0-9-]+\.json$/.test(entry.name)) continue;
+    const filePath = path.join(runDirectory, entry.name);
+    let value;
+    try {
+      value = JSON.parse(readFileSync(filePath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (value?.bindingSha256 !== undefined) {
+      value.bindingSha256 = manifest.bindingSha256;
+      replaceExisting(filePath, value);
+    }
+  }
+
+  for (const entry of readdirSync(runDirectory, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^\d{6}-[a-z0-9-]+\.json$/.test(entry.name)) continue;
+    const filePath = path.join(runDirectory, entry.name);
+    const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+    if (checkpoint.name === "plan-started") checkpoint.argv = argv;
+    if (checkpoint.name === "temp-plan") checkpoint.planSha256 = manifest.planSha256;
+    if (checkpoint.name === "published-plan") {
+      checkpoint.planSha256 = manifest.planSha256;
+      checkpoint.planPath = paths.plan;
+    }
+    if (checkpoint.name === "terraform-exit-known" && checkpoint.sequence < manifestCheckpointSequence) {
+      checkpoint.operation = "create";
+      checkpoint.status = "success";
+      checkpoint.exitCode = 0;
+    }
+    if (checkpoint.name === "manifest") {
+      checkpoint.manifestSha256 = sha256File(manifestPath);
+      checkpoint.planSha256 = manifest.planSha256;
+    }
+    if (checkpoint.name === "guard-receipt") {
+      const receiptPath = existsSync(`${paths.guard}.consumed`) ? `${paths.guard}.consumed` : paths.guard;
+      if (existsSync(receiptPath)) checkpoint.receiptSha256 = sha256File(receiptPath);
+    }
+    if (checkpoint.name === "preflight-receipt") {
+      const receiptPath = existsSync(`${paths.preflight}.consumed`) ? `${paths.preflight}.consumed` : paths.preflight;
+      if (existsSync(receiptPath)) checkpoint.receiptSha256 = sha256File(receiptPath);
+    }
+    if (checkpoint.name === "receipts-consumed") {
+      checkpoint.guardReceiptSha256 = sha256File(`${paths.guard}.consumed`);
+      checkpoint.preflightReceiptSha256 = sha256File(`${paths.preflight}.consumed`);
+    }
+    if (checkpoint.name === "apply-receipt") {
+      checkpoint.receiptSha256 = sha256File(paths.apply);
+    }
+    if (checkpoint.name === "global-state-advancement") {
+      checkpoint.applyReceiptSha256 = sha256File(paths.apply);
+    }
+    replaceExisting(filePath, checkpoint);
+  }
+}
+
 function setProtectedRuntimeSecretsRole(harness, enabled) {
   replaceExisting(
     path.join(harness.workdir, "terraform.tfvars"),
@@ -1121,8 +1197,18 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
   const createdAt = new Date().toISOString();
   const planText = canonicalJson(PLAN_BYTES);
   const planSha256 = sha256Bytes(planText);
+  const planPath = path.join(runDirectory, "plan.tfplan");
+  const planArgv = [
+    "plan",
+    "-refresh=true",
+    "-input=false",
+    "-lock=true",
+    "-lock-timeout=5m",
+    `-out=${planPath}`,
+  ];
   const bindings = {
     repositoryCommit: COMMIT,
+    argv: planArgv,
     backend: REAL_BACKEND.identity,
     liveRevision: "revision-before",
     runtimeIdentityId: RUNTIME_ID,
@@ -1138,11 +1224,11 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     createdAt,
     processExit: 0,
     planSha256,
-    argv: ["plan", "-refresh=true", "-input=false", "-lock=true", "-lock-timeout=5m", `-out=${path.join(runDirectory, "plan.tfplan")}`],
+    argv: planArgv,
     bindings,
     bindingSha256: sha256Bytes(canonicalJson(bindings)),
   };
-  writeExclusive(path.join(runDirectory, "plan.tfplan"), planText);
+  writeExclusive(planPath, planText);
   writeExclusive(path.join(runDirectory, "create-manifest.json"), manifest);
   const show = reviewedRuntimeShow(phase);
   writeExclusive(path.join(runDirectory, "show.json"), show);
@@ -1206,7 +1292,15 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     "global-state-advancement",
   ];
   for (const [index, name] of checkpointNames.entries()) {
-    const details = name === "guard-receipt"
+    const details = name === "plan-started"
+      ? { argv: planArgv }
+      : name === "temp-plan"
+        ? { planSha256 }
+      : name === "published-plan"
+        ? { planSha256, planPath }
+      : name === "terraform-exit-known"
+        ? { operation: "create", status: "success", exitCode: 0 }
+      : name === "guard-receipt"
       ? { receiptSha256: sha256Bytes(canonicalJson(guard)) }
       : name === "vault-descriptor"
         ? { descriptorSha256: sha256Bytes(readFileSync(harness.paths(runId).descriptor)) }
@@ -1229,8 +1323,6 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
               guardReceiptSha256: sha256Bytes(canonicalJson(guard)),
               preflightReceiptSha256: sha256Bytes(canonicalJson(preflight)),
             }
-      : name === "published-plan"
-            ? { planSha256 }
             : name === "show-json"
               ? { showSha256 }
             : name === "manifest"
@@ -1730,6 +1822,22 @@ function advanceThrough(harness, phase) {
     if (phase === "runtime-cutover") harness.setTopology("post");
     if (phase === "credential-cleanup") harness.setRuntimeSecretsEnabled(false);
   }
+  return runId;
+}
+
+function prepareInvalidatedLegacyModel(harness) {
+  initialize(harness);
+  const runId = harness.lifecycle.create("model-bootstrap").runId;
+  harness.lifecycle.guard("model-bootstrap", runId);
+  harness.lifecycle.preflight("model-bootstrap", runId);
+  harness.advance(2 * 60 * 1000 + 1);
+  expectCode(() => harness.lifecycle.apply("model-bootstrap", runId), "preflight-expired");
+  const manifest = JSON.parse(readFileSync(harness.paths(runId).manifest, "utf8"));
+  rewriteManifestArgv(harness, runId, manifest.argv.map((argument) =>
+    argument === `-out=${harness.paths(runId).plan}`
+      ? `-out=${harness.paths(runId).planTemp}`
+      : argument,
+  ));
   return runId;
 }
 
@@ -2830,6 +2938,246 @@ test("production composition uses exact Terraform/Azure argv and metadata-only m
     assert.equal(harness.calls.filter((call) => call.argv[0] === "show").length, 1);
   } finally {
     harness.cleanup();
+  }
+});
+
+test("applied historical model manifest temp argv migrates before runtime creation", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    const modelRunId = advanceThrough(harness, "model-bootstrap");
+    const manifest = JSON.parse(readFileSync(harness.paths(modelRunId).manifest, "utf8"));
+    const legacyArgv = manifest.argv.map((argument) =>
+      argument === `-out=${harness.paths(modelRunId).plan}`
+        ? `-out=${harness.paths(modelRunId).planTemp}`
+        : argument,
+    );
+    rewriteManifestArgv(harness, modelRunId, legacyArgv);
+
+    assert.equal(harness.lifecycle.readState().state, "model-applied");
+    const runtime = harness.lifecycle.create("runtime-cutover");
+    assert.equal(runtime.phase, "runtime-cutover");
+    assert.equal(runtime.status, "created");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("invalidated historical model temp argv is closed and does not replace an applied predecessor", () => {
+  const harness = makeHarness();
+  try {
+    const invalidatedRunId = prepareInvalidatedLegacyModel(harness);
+
+    const invalidated = harness.lifecycle.readState().runs.find((run) => run.id === invalidatedRunId);
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.lastCheckpoint, "preflight-receipt");
+
+    const appliedRunId = advanceThrough(harness, "model-bootstrap");
+    const appliedManifest = JSON.parse(readFileSync(harness.paths(appliedRunId).manifest, "utf8"));
+    rewriteManifestArgv(harness, appliedRunId, appliedManifest.argv.map((argument) =>
+      argument === `-out=${harness.paths(appliedRunId).plan}`
+        ? `-out=${harness.paths(appliedRunId).planTemp}`
+        : argument,
+    ));
+
+    assert.equal(harness.lifecycle.readState().state, "model-applied");
+    assert.equal(harness.lifecycle.create("runtime-cutover").status, "created");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("invalidated legacy model history requires coherent closure evidence", () => {
+  const cases = [
+    ["missing invalidated checkpoint", "checkpoint-integrity", (harness, runId) => {
+      rmSync(checkpointPath(harness, runId, "invalidated"));
+    }],
+    ["invalidated reason", "invalidated-history", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "invalidated");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, reason: "forged-reason" });
+    }],
+    ["invalidated last checkpoint", "invalidated-history", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "invalidated");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, lastCheckpoint: "manifest" });
+    }],
+    ["state last checkpoint", "invalidated-history", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      state.runs.find((run) => run.id === runId).lastCheckpoint = "manifest";
+      appendStateSnapshot(harness, state);
+    }],
+  ];
+
+  for (const [label, code, tamper] of cases) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareInvalidatedLegacyModel(harness);
+      tamper(harness, runId);
+      expectCode(() => harness.lifecycle.readState(), code);
+    } finally {
+      harness.cleanup();
+    }
+    void label;
+  }
+});
+
+test("invalidated legacy model history accepts protected optional checkpoint provenance", () => {
+  const cases = [
+    ["state retains durable checkpoint", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "invalidated");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      delete checkpoint.lastCheckpoint;
+      replaceExisting(filePath, checkpoint);
+      const run = harness.lifecycle.readState().runs.find((candidate) => candidate.id === runId);
+      assert.equal(run.status, "invalidated");
+      assert.equal(run.lastCheckpoint, "preflight-receipt");
+    }],
+    ["both durable checkpoints absent", (harness, runId) => {
+      const checkpointPathname = checkpointPath(harness, runId, "invalidated");
+      const checkpoint = JSON.parse(readFileSync(checkpointPathname, "utf8"));
+      delete checkpoint.lastCheckpoint;
+      replaceExisting(checkpointPathname, checkpoint);
+      const state = harness.lifecycle.readState();
+      delete state.runs.find((candidate) => candidate.id === runId).lastCheckpoint;
+      appendStateSnapshot(harness, state);
+      const run = harness.lifecycle.readState().runs.find((candidate) => candidate.id === runId);
+      assert.equal(run.status, "invalidated");
+      assert.equal(run.lastCheckpoint, undefined);
+    }],
+  ];
+
+  for (const [label, verify] of cases) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareInvalidatedLegacyModel(harness);
+      verify(harness, runId);
+    } finally {
+      harness.cleanup();
+    }
+    void label;
+  }
+});
+
+test("legacy manifest argv stays fail-closed for new runs and arbitrary applied argv", () => {
+  const createdHarness = makeHarness();
+  try {
+    initialize(createdHarness);
+    const created = createdHarness.lifecycle.create("model-bootstrap");
+    const manifest = JSON.parse(readFileSync(createdHarness.paths(created.runId).manifest, "utf8"));
+    rewriteManifestArgv(createdHarness, created.runId, manifest.argv.map((argument) =>
+      argument === `-out=${createdHarness.paths(created.runId).plan}`
+        ? `-out=${createdHarness.paths(created.runId).planTemp}`
+        : argument,
+    ));
+    expectCode(() => createdHarness.lifecycle.guard("model-bootstrap", created.runId), "manifest-mismatch");
+  } finally {
+    createdHarness.cleanup();
+  }
+
+  const appliedHarness = makeHarness();
+  try {
+    initialize(appliedHarness);
+    const runId = advanceThrough(appliedHarness, "model-bootstrap");
+    const manifest = JSON.parse(readFileSync(appliedHarness.paths(runId).manifest, "utf8"));
+    rewriteManifestArgv(appliedHarness, runId, manifest.argv.map((argument) =>
+      argument === `-out=${appliedHarness.paths(runId).plan}`
+        ? `-out=${appliedHarness.paths(runId).unexpectedPlan}`
+        : argument,
+    ));
+    expectCode(() => appliedHarness.lifecycle.create("runtime-cutover"), "manifest-mismatch");
+  } finally {
+    appliedHarness.cleanup();
+  }
+});
+
+test("legacy applied model argv requires every immutable plan and apply proof", () => {
+  const cases = [
+    ["published-plan", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "published-plan");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, planSha256: "b".repeat(64) });
+    }],
+    ["manifest", "manifest-hash", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "manifest");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, manifestSha256: "b".repeat(64) });
+    }],
+    ["binding argv", "binding-hash", (harness, runId) => {
+      const filePath = harness.paths(runId).manifest;
+      const manifest = JSON.parse(readFileSync(filePath, "utf8"));
+      manifest.bindings.argv = manifest.argv.map((argument) =>
+        argument === `-out=${harness.paths(runId).planTemp}`
+          ? `-out=${harness.paths(runId).plan}`
+          : argument,
+      );
+      manifest.bindingSha256 = sha256Bytes(canonicalJson(manifest.bindings));
+      replaceExisting(filePath, manifest);
+      const manifestCheckpointPath = checkpointPath(harness, runId, "manifest");
+      const manifestCheckpoint = JSON.parse(readFileSync(manifestCheckpointPath, "utf8"));
+      replaceExisting(manifestCheckpointPath, { ...manifestCheckpoint, manifestSha256: sha256File(filePath) });
+    }],
+    ["plan-started argv", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "plan-started");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, argv: ["plan", "-out=forged.tfplan"] });
+    }],
+    ["temp-plan hash", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "temp-plan");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, planSha256: "b".repeat(64) });
+    }],
+    ["published-plan path", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "published-plan");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, planPath: `${harness.paths(runId).plan}.forged` });
+    }],
+    ["create exit evidence", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "terraform-exit-known");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, status: "failure" });
+    }],
+    ["apply receipt", "apply-mismatch", (harness, runId) => {
+      const filePath = harness.paths(runId).apply;
+      const receipt = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...receipt, appliedAt: new Date(Date.parse(receipt.appliedAt) + 1000).toISOString() });
+    }],
+    ["global advancement", "phase-apply-proof", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "global-state-advancement");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, to: "runtime-applied" });
+    }],
+    ["binding", "binding-hash", (harness, runId) => {
+      const filePath = harness.paths(runId).manifest;
+      const manifest = JSON.parse(readFileSync(filePath, "utf8"));
+      manifest.bindings.repositoryCommit = "0".repeat(40);
+      replaceExisting(filePath, manifest);
+      const checkpointPathValue = checkpointPath(harness, runId, "manifest");
+      const checkpoint = JSON.parse(readFileSync(checkpointPathValue, "utf8"));
+      replaceExisting(checkpointPathValue, { ...checkpoint, manifestSha256: sha256File(filePath) });
+    }],
+    ["plan", "plan-hash", (harness, runId) => {
+      replaceExisting(harness.paths(runId).plan, "tampered plan\n");
+    }],
+  ];
+
+  for (const [label, code, tamper] of cases) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      const runId = advanceThrough(harness, "model-bootstrap");
+      const manifest = JSON.parse(readFileSync(harness.paths(runId).manifest, "utf8"));
+      rewriteManifestArgv(harness, runId, manifest.argv.map((argument) =>
+        argument === `-out=${harness.paths(runId).plan}`
+          ? `-out=${harness.paths(runId).planTemp}`
+          : argument,
+      ));
+      tamper(harness, runId);
+      expectCode(() => harness.lifecycle.readState(), code);
+    } finally {
+      harness.cleanup();
+    }
+    void label;
   }
 });
 
