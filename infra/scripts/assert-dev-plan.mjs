@@ -7041,14 +7041,17 @@ function cutoverHasExactBenignResourceDrift(plan) {
   if (drift === undefined || drift === null) return true;
   if (!Array.isArray(drift)) return false;
   if (drift.length === 0) return true;
-  // resource_drift is the complete refresh report.  Until a partial real-plan
-  // variant is reviewed, accept both known order-only entries or neither.
-  if (drift.length !== CUTOVER_BENIGN_DRIFT_ADDRESSES.size) return false;
+  const expectedAddresses = drift.length === 1
+    ? new Set([CUTOVER_CONTAINER_APP])
+    : drift.length === CUTOVER_BENIGN_DRIFT_ADDRESSES.size
+      ? CUTOVER_BENIGN_DRIFT_ADDRESSES
+      : undefined;
+  if (expectedAddresses === undefined) return false;
 
   const addresses = new Set(drift.map((entry) => entry?.address));
   if (
-    addresses.size !== CUTOVER_BENIGN_DRIFT_ADDRESSES.size ||
-    [...CUTOVER_BENIGN_DRIFT_ADDRESSES].some(
+    addresses.size !== expectedAddresses.size ||
+    [...expectedAddresses].some(
       (address) => !addresses.has(address),
     )
   ) {

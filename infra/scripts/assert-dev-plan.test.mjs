@@ -5491,12 +5491,30 @@ test("cutover-family accepts reversed Container App identity sets and fresh meta
   }
 });
 
-test("cutover-family accepts only the exact two-entry benign resource drift permutations", () => {
+test("cutover-family accepts the app singleton and exact two-entry benign resource drift permutations", () => {
   for (const [source, mode] of [
     [runtimeCutoverFixture, "azure-generation-cutover"],
     [credentialCleanupFixture, "azure-credential-cleanup"],
     [terminalFixture, "final-rollout-complete"],
   ]) {
+    for (const reverseIdentity of [false, true]) {
+      const candidate = clone(source);
+      if (reverseIdentity) {
+        mutateContainerAppCopies(candidate, (value) => {
+          value.identity[0].identity_ids.reverse();
+        });
+      }
+      candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
+        .filter((entry) => entry.address === containerAppAddress);
+      candidate.relevant_attributes.reverse();
+      candidate.timestamp = "2026-08-22T17:30:00Z";
+      assert.equal(
+        acceptsPlan(candidate, mode),
+        true,
+        `${mode} singleton reverseIdentity=${reverseIdentity}`,
+      );
+    }
+
     for (const reverseEntries of [false, true]) {
       for (let directionMask = 0; directionMask < 4; directionMask += 1) {
         const candidate = clone(source);
@@ -5520,16 +5538,11 @@ test("cutover-family accepts only the exact two-entry benign resource drift perm
       }
     }
 
-    for (const retainedAddress of [
-      containerAppAddress,
-      finalCleanupJobAddress,
-    ]) {
-      rejectsCutoverMutation(source, mode, (candidate) => {
-        candidate.resource_drift = makeBenignCutoverResourceDrift(
-          candidate,
-        ).filter((entry) => entry.address === retainedAddress);
-      });
-    }
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.resource_drift = makeBenignCutoverResourceDrift(
+        candidate,
+      ).filter((entry) => entry.address === finalCleanupJobAddress);
+    });
   }
 });
 
@@ -5565,6 +5578,20 @@ test("cutover-family benign resource drift requires the exact identity set", () 
         });
       }
     }
+    for (const identityIds of [
+      [imagePullIdentity],
+      [imagePullIdentity, runtimeIdentity, wrongIdentity],
+      [imagePullIdentity, wrongIdentity],
+      [imagePullIdentity, imagePullIdentity],
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        const entry = makeBenignCutoverResourceDrift(candidate).find(
+          (driftEntry) => driftEntry.address === containerAppAddress,
+        );
+        setBenignDriftIdentityIds(entry, identityIds);
+        candidate.resource_drift = [entry];
+      });
+    }
   }
 });
 
@@ -5579,7 +5606,11 @@ test("cutover-family benign resource drift rejects structural and metadata drift
       drift[1] = clone(drift[0]);
     },
     (drift) => {
-      drift[1].address = "module.unreviewed.azapi_resource.this";
+      if (drift.length === 1) {
+        drift[0].address = "module.unreviewed.azapi_resource.this";
+      } else {
+        drift[1].address = "module.unreviewed.azapi_resource.this";
+      }
     },
     (drift) => {
       drift[0].module_address = "module.container_app_workload[1]";
@@ -5653,6 +5684,11 @@ test("cutover-family benign resource drift rejects structural and metadata drift
     for (const mutate of mutations) {
       rejectsCutoverMutation(source, mode, (candidate) => {
         candidate.resource_drift = makeBenignCutoverResourceDrift(candidate);
+        mutate(candidate.resource_drift);
+      });
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        candidate.resource_drift = makeBenignCutoverResourceDrift(candidate)
+          .filter((entry) => entry.address === containerAppAddress);
         mutate(candidate.resource_drift);
       });
     }
