@@ -103,6 +103,10 @@ const operatorRateRoleAddress =
   "module.identities_rbac.azurerm_role_assignment.operator_rate_table";
 const cliRoleAddress =
   "module.workload_key_vault.azurerm_role_assignment.terraform_cli_secrets_officer";
+const RETIRED_WORKLOAD_INPUTS = [
+  "key_vault_uri",
+  "runtime_secrets_user_role_assignment_id",
+];
 const OPERATOR_ROLE_ASSIGNMENTS_FOR_TEST = new Set([
   operatorSecurityRoleAddress,
   operatorRateRoleAddress,
@@ -903,7 +907,7 @@ test("final-rollout accepts the reviewed initial and idempotent plans", () => {
   const transition = finalRolloutPlan();
   assert.equal(acceptsPlan(transition, "final-rollout"), true);
   assert.equal(transition.applyable, true);
-  assert.equal(transition.relevant_attributes.length, 46);
+  assert.equal(transition.relevant_attributes.length, 47);
   const idempotent = finalRolloutPlan({ idempotent: true });
   assert.equal(acceptsPlan(idempotent, "final-rollout"), true);
   assert.equal(idempotent.applyable, false);
@@ -1579,9 +1583,9 @@ test("final-rollout binds exact relevant attributes to the action envelope", () 
   const transitionFoundationIds = transition.relevant_attributes.filter(
     isFinalResourceGroupIdReference,
   );
-  assert.equal(transition.relevant_attributes.length, 46);
+  assert.equal(transition.relevant_attributes.length, 47);
   assert.equal(transitionFoundationIds.length, 1);
-  assert.equal(idempotent.relevant_attributes.length, 45);
+  assert.equal(idempotent.relevant_attributes.length, 46);
   assert.deepEqual(
     idempotent.relevant_attributes,
     transition.relevant_attributes.filter(
@@ -2521,8 +2525,8 @@ test("final-rollout enforces exact output action, prior, unknown, and sensitivit
   );
 });
 
-test("final-rollout requires all 102 checks to pass with exact envelopes", () => {
-  assert.equal(finalTransitionFixture.checks.length, 102);
+test("final-rollout requires all 98 checks to pass with exact envelopes", () => {
+  assert.equal(finalTransitionFixture.checks.length, 98);
   assert.equal(
     finalTransitionFixture.checks.every(
       (check) =>
@@ -5125,6 +5129,73 @@ function cutoverChange(planValue, address) {
   return entry;
 }
 
+function mutateContainerAppCopies(planValue, mutate) {
+  const entry = cutoverChange(planValue, containerAppAddress);
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    containerAppAddress,
+  );
+  const prior = finalValueResource(
+    planValue.prior_state.values.root_module,
+    containerAppAddress,
+  );
+  assert.ok(planned, "missing planned Container App resource");
+  assert.ok(prior, "missing prior Container App resource");
+  for (const value of [
+    entry.change.before,
+    entry.change.after,
+    planned.values,
+    prior.values,
+  ]) {
+    mutate(value);
+  }
+}
+
+function mutateContainerAppOutputs(planValue, mutate) {
+  const entry = cutoverChange(planValue, containerAppAddress);
+  const planned = finalValueResource(
+    planValue.planned_values.root_module,
+    containerAppAddress,
+  );
+  const prior = finalValueResource(
+    planValue.prior_state.values.root_module,
+    containerAppAddress,
+  );
+  assert.ok(planned, "missing planned Container App resource");
+  assert.ok(prior, "missing prior Container App resource");
+  for (const value of [
+    entry.change.before,
+    entry.change.after,
+    planned.values,
+    prior.values,
+  ]) {
+    if (Object.hasOwn(value, "output")) mutate(value.output);
+  }
+}
+
+function rebindContainerAppIdEverywhere(planValue) {
+  const entry = cutoverChange(planValue, containerAppAddress);
+  const replacement = entry.change.after.id.replace(
+    /ca-palancar-dev-relay-aeeacd8c$/,
+    "ca-palancar-dev-relay-rebound",
+  );
+  mutateContainerAppCopies(planValue, (value) => {
+    value.id = replacement;
+  });
+  for (const identity of [entry.change.before_identity, entry.change.after_identity]) {
+    if (identity) identity.id = replacement;
+  }
+  for (const output of [
+    planValue.output_changes.relay_container_app_id,
+    planValue.planned_values.outputs.relay_container_app_id,
+    planValue.prior_state.values.outputs.relay_container_app_id,
+  ]) {
+    if (Object.hasOwn(output, "before")) output.before = replacement;
+    if (Object.hasOwn(output, "after")) output.after = replacement;
+    if (Object.hasOwn(output, "value")) output.value = replacement;
+  }
+}
+
 function mutateCutoverNoOpPriorCopy(planValue, address, mutate) {
   const entry = cutoverChange(planValue, address);
   assert.deepEqual(entry.change.actions, ["no-op"]);
@@ -5290,6 +5361,192 @@ test("Azure generation cutover and credential cleanup fixtures pass only their c
     acceptsPlan(credentialCleanupFixture, "azure-generation-cutover"),
     false,
   );
+});
+
+test("cutover and terminal references use the exact 90-check Entra-only workload shape", () => {
+  for (const fixture of [runtimeCutoverFixture, terminalFixture]) {
+    assert.equal(fixture.checks.length, 90);
+    assert.equal(
+      fixture.checks.some((check) =>
+        RETIRED_WORKLOAD_INPUTS.includes(check.address.name),
+      ),
+      false,
+    );
+    const workloadCall =
+      fixture.configuration.root_module.module_calls.container_app_workload;
+    assert.equal(
+      RETIRED_WORKLOAD_INPUTS.some((name) =>
+        Object.hasOwn(workloadCall.expressions, name) ||
+        Object.hasOwn(workloadCall.module.variables, name),
+      ),
+      false,
+    );
+  }
+
+  for (const name of RETIRED_WORKLOAD_INPUTS) {
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      (candidate) => {
+        const workloadCall =
+          candidate.configuration.root_module.module_calls
+            .container_app_workload;
+        workloadCall.expressions[name] = {
+          references: [`module.workload_key_vault.${name}`],
+        };
+      },
+    );
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      (candidate) => {
+        const workloadCall =
+          candidate.configuration.root_module.module_calls
+            .container_app_workload;
+        workloadCall.module.variables[name] = {
+          description: "retired workload dependency",
+        };
+      },
+    );
+    rejectsCutoverMutation(
+      runtimeCutoverFixture,
+      "azure-generation-cutover",
+      (candidate) => {
+        const check = clone(candidate.checks[0]);
+        check.address.name = name;
+        check.address.to_display =
+          `module.container_app_workload.var.${name}`;
+        check.instances[0].address.to_display =
+          `module.container_app_workload[0].var.${name}`;
+        candidate.checks.splice(1, 0, check);
+      },
+    );
+  }
+});
+
+test("cutover modes reject coherent retired dependencies and rebound app identities", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.properties.key_vault_uri =
+          "https://kvpalancardevaeeacd8.vault.azure.net/";
+      });
+      const workloadCall =
+        candidate.configuration.root_module.module_calls.container_app_workload;
+      workloadCall.expressions.key_vault_uri = {
+        references: ["module.workload_key_vault.key_vault_uri"],
+      };
+      workloadCall.module.variables.key_vault_uri = {
+        description: "retired workload dependency",
+      };
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      rebindContainerAppIdEverywhere(candidate);
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.extra = {};
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.properties.extra = {};
+      });
+    });
+  }
+});
+
+test("cutover modes require the exact Container App provider output contract", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    assert.equal(acceptsPlan(source, mode), true);
+    for (const mutate of [
+      (output) => {
+        output.properties.latestRevisionName =
+          "ca-palancar-dev-relay-aeeacd8c--0000000";
+      },
+      (output) => {
+        output.properties.runningStatus = "Stopped";
+      },
+      (output) => {
+        output.predecessor_extra = true;
+      },
+      (output) => {
+        output.properties.configuration.ingress.extra = true;
+      },
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutateContainerAppOutputs(candidate, mutate);
+      });
+    }
+  }
+});
+
+test("Container App nested envelopes reject coherent cross-copy extra fields", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    assert.equal(acceptsPlan(source, mode), true);
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.properties.configuration.identitySettings[0].extra = true;
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.properties.configuration.registries[0].passwordSecretRef =
+          "unexpected";
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.tags.forged = "unexpected";
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.tags.environment = "production";
+      });
+    });
+  }
+});
+
+test("Container App AzAPI controls reject coherent credential and behavior mutations", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    assert.equal(acceptsPlan(source, mode), true);
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.create_headers = {
+          Authorization: "Bearer coherent-forgery",
+        };
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.create_query_parameters = {
+          "api-version": "2026-01-01",
+        };
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.retry.interval_seconds = 11;
+      });
+    });
+  }
 });
 
 test("Azure generation cutover requires the indexed no-action Secrets User move", () => {

@@ -100,6 +100,52 @@ const CUTOVER_RUNTIME_SECRETS_USER =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
 const CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+const CUTOVER_RETIRED_WORKLOAD_DEPENDENCIES = Object.freeze([
+  "key_vault_uri",
+  "runtime_secrets_user_role_assignment_id",
+]);
+// These are AzAPI provider controls, not part of the reviewed Container App
+// body.  Keep them pinned independently so a coherent value copied through
+// the change and state snapshots cannot turn into an unreviewed provider
+// behavior change.
+const CUTOVER_CONTAINER_APP_CONTROL_FIELDS = Object.freeze({
+  create_headers: null,
+  create_query_parameters: null,
+  delete_headers: null,
+  delete_query_parameters: null,
+  ignore_body_changes: null,
+  ignore_casing: false,
+  ignore_missing_property: true,
+  ignore_null_property: false,
+  ignore_other_items_in_list: null,
+  list_unique_id_property: null,
+  locks: null,
+  read_headers: null,
+  read_query_parameters: null,
+  replace_triggers_external_values: null,
+  replace_triggers_refs: null,
+  response_export_values: [
+    "properties.configuration.ingress.fqdn",
+    "properties.latestRevisionName",
+    "properties.runningStatus",
+  ],
+  retry: {
+    error_message_regex: ["IdentityDoesNotExist"],
+    interval_seconds: 10,
+    max_interval_seconds: 30,
+    multiplier: 1.5,
+    randomization_factor: 0.5,
+  },
+  schema_validation_enabled: true,
+  sensitive_body: null,
+  sensitive_body_version: null,
+  timeouts: null,
+  update_headers: null,
+  update_query_parameters: null,
+});
+const CUTOVER_CONTAINER_APP_CONTROL_KEYS = Object.freeze(
+  Object.keys(CUTOVER_CONTAINER_APP_CONTROL_FIELDS),
+);
 const CUTOVER_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "NODE_ENV",
   "PORT",
@@ -174,6 +220,12 @@ const CUTOVER_RESOURCE_INVENTORY = new Set([
 const TERMINAL_REFERENCE_PLAN = JSON.parse(
   readFileSync(
     new URL("./fixtures/final-rollout-transition.plan-fixture.json", import.meta.url),
+    "utf8",
+  ),
+);
+const CUTOVER_GENERATION_REFERENCE_PLAN = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/azure-generation-cutover.plan-fixture.json", import.meta.url),
     "utf8",
   ),
 );
@@ -1058,10 +1110,6 @@ function hasExactKeys(value, keys) {
   );
 }
 
-function hasOnlyKeys(value, keys) {
-  return isObject(value) && Object.keys(value).every((key) => keys.includes(key));
-}
-
 function hasUnknownValue(value) {
   if (value === true) {
     return true;
@@ -1375,6 +1423,7 @@ function hasExactRuntimeContainerApp(change) {
     !hasExactIngress(configuration.ingress) ||
     !Array.isArray(identities) ||
     identities.length !== 1 ||
+    !hasExactKeys(identities[0], ["type", "identity_ids"]) ||
     identities[0]?.type !== "UserAssigned" ||
     !Array.isArray(identityIds) ||
     identityIds.length !== 2 ||
@@ -1433,8 +1482,8 @@ function hasExactRuntimeContainerApp(change) {
   const litellm = containers?.get("litellm");
   if (
     !hasExactNamedEntries(containers, ["relay", "litellm"]) ||
-    !hasOnlyKeys(relay, ["name", "image", "resources", "env", "probes"]) ||
-    !hasOnlyKeys(litellm, ["name", "image", "resources", "env", "probes"]) ||
+    !hasExactKeys(relay, ["name", "image", "resources", "env", "probes"]) ||
+    !hasExactKeys(litellm, ["name", "image", "resources", "env", "probes"]) ||
     !isImmutableAcrImage(relay?.image) ||
     !relay.image.startsWith(`${registry.server}/`) ||
     !isImmutableAcrImage(litellm?.image) ||
@@ -2843,11 +2892,16 @@ function finalAzapiIdentity(after, action) {
   );
 }
 
-function finalHasExactContainerAppProviderOutput(output, defaultDomain) {
+function finalHasExactContainerAppProviderOutput(
+  output,
+  defaultDomain,
+  appName = FINAL_CONTAINER_APP_NAME,
+) {
   if (
     !isObject(output) ||
     !finalExactKeys(output, ["properties"]) ||
-    !isObject(output.properties)
+    !isObject(output.properties) ||
+    typeof appName !== "string"
   ) {
     return false;
   }
@@ -2861,7 +2915,7 @@ function finalHasExactContainerAppProviderOutput(output, defaultDomain) {
     finalExactKeys(properties.configuration, ["ingress"]) &&
     finalExactKeys(properties.configuration.ingress, ["fqdn"]) &&
     properties.configuration.ingress.fqdn ===
-      `${FINAL_CONTAINER_APP_NAME}.${defaultDomain}` &&
+      `${appName}.${defaultDomain}` &&
     typeof properties.latestRevisionName === "string" &&
     FINAL_PRIOR_RELAY_REVISION_NAME.test(properties.latestRevisionName) &&
     properties.runningStatus === "Running"
@@ -6627,8 +6681,6 @@ export function createLegacyFinalReferencePlan(source) {
     "enable_litellm_sidecar",
     "azure_api_base",
     "azure_api_version",
-    "runtime_secrets_user_role_assignment_id",
-    "key_vault_uri",
   ];
   for (const name of extraChecks) {
     const check = structuredClone(plan.checks[0]);
@@ -6714,7 +6766,11 @@ function cutoverExactPlanEnvelope(plan, applyable) {
   );
 }
 
-function cutoverExactResourceChange(change, expectedKeys = undefined) {
+function cutoverExactResourceChange(
+  change,
+  expectedKeys = undefined,
+  expectedAfterUnknown = undefined,
+) {
   const exactKeys = expectedKeys ?? [
     "actions",
     "before",
@@ -6735,7 +6791,9 @@ function cutoverExactResourceChange(change, expectedKeys = undefined) {
     Object.hasOwn(change, "before") &&
     Object.hasOwn(change, "after") &&
     isObject(change.after_unknown) &&
-    !hasUnknownValue(change.after_unknown) &&
+    (expectedAfterUnknown === undefined
+      ? !hasUnknownValue(change.after_unknown)
+      : isDeepStrictEqual(change.after_unknown, expectedAfterUnknown)) &&
     Object.hasOwn(change, "before_sensitive") &&
     Object.hasOwn(change, "after_sensitive") &&
     cutoverHasSensitiveEnvelope(change.before_sensitive) &&
@@ -6790,11 +6848,22 @@ function cutoverExactResourceEntry(entry, requirePrevious = false) {
         "before_sensitive",
         "after_sensitive",
       ];
+  const expectedAfterUnknown =
+    entry?.address === CUTOVER_CONTAINER_APP &&
+    isUpdate(entry?.change?.actions)
+      ? CUTOVER_GENERATION_REFERENCE_PLAN.resource_changes.find(
+          (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+        )?.change.after_unknown
+      : undefined;
   return (
     isObject(entry) &&
     typeof entry.address === "string" &&
     hasExactKeys(entry, expectedOuterKeys) &&
-    cutoverExactResourceChange(entry.change, expectedChangeKeys) &&
+    cutoverExactResourceChange(
+      entry.change,
+      expectedChangeKeys,
+      expectedAfterUnknown,
+    ) &&
     (requirePrevious
       ? entry.previous_address === CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS
       : !Object.hasOwn(entry, "previous_address"))
@@ -7040,6 +7109,34 @@ function cutoverHasExactConfiguration(plan) {
   );
 }
 
+function cutoverHasNoRetiredWorkloadDependencies(configuration) {
+  const workloadCall =
+    configuration?.root_module?.module_calls?.container_app_workload;
+  if (!isObject(workloadCall)) return false;
+
+  function containsRetiredDependency(value) {
+    if (Array.isArray(value)) {
+      return value.some(containsRetiredDependency);
+    }
+    if (!isObject(value)) {
+      return (
+        typeof value === "string" &&
+        CUTOVER_RETIRED_WORKLOAD_DEPENDENCIES.some((name) =>
+          value.includes(name),
+        )
+      );
+    }
+    return Object.entries(value).some(
+      ([key, child]) =>
+        CUTOVER_RETIRED_WORKLOAD_DEPENDENCIES.some((name) =>
+          key.includes(name),
+        ) || containsRetiredDependency(child),
+    );
+  }
+
+  return !containsRetiredDependency(workloadCall);
+}
+
 function cutoverReferenceValueResources() {
   return {
     planned: cutoverCollectValueResources(
@@ -7055,6 +7152,7 @@ function cutoverHasExactStateResourceMetadata(
   resource,
   address,
   referenceResources,
+  state = "planned",
 ) {
   if (!isObject(resource)) return false;
   const reference = referenceResources?.get(address);
@@ -7086,10 +7184,14 @@ function cutoverHasExactStateResourceMetadata(
       "schema_version",
       "values",
       "sensitive_values",
-      "depends_on",
+      ...(state === "prior" ? ["depends_on"] : []),
       ...(address === CUTOVER_RUNTIME_SECRETS_USER ? ["index"] : []),
     ];
-    return (
+    const referenceRole = cutoverFindValueResource(
+      CUTOVER_GENERATION_REFERENCE_PLAN.prior_state.values.root_module,
+      address,
+    );
+    const roleResult = (
       hasExactKeys(resource, roleKeys) &&
       resource.address === address &&
       resource.mode === "managed" &&
@@ -7100,11 +7202,25 @@ function cutoverHasExactStateResourceMetadata(
       (address === CUTOVER_RUNTIME_SECRETS_USER
         ? resource.index === 0
         : !Object.hasOwn(resource, "index")) &&
+      (state !== "prior" ||
+        isDeepStrictEqual(resource.depends_on, referenceRole?.depends_on)) &&
       isObject(resource.values) &&
       isObject(resource.sensitive_values)
     );
+    return roleResult;
   }
   return false;
+}
+
+function cutoverFindValueResource(root, address) {
+  for (const resource of root?.resources ?? []) {
+    if (resource.address === address) return resource;
+  }
+  for (const child of root?.child_modules ?? []) {
+    const resource = cutoverFindValueResource(child, address);
+    if (resource) return resource;
+  }
+  return undefined;
 }
 
 function cutoverExactClientConfig(resource, plan) {
@@ -7148,18 +7264,19 @@ function cutoverExactClientConfig(resource, plan) {
 }
 
 function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
-  if (!planned || !prior) return false;
-  if (
-    !cutoverHasExactStateEnvelopes(plan) ||
-    !cutoverExactModuleHierarchy(
-      plan.planned_values.root_module,
-      TERMINAL_REFERENCE_PLAN.planned_values.root_module,
-    ) ||
-    !cutoverExactModuleHierarchy(
-      plan.prior_state.values.root_module,
-      TERMINAL_REFERENCE_PLAN.prior_state.values.root_module,
-    )
-  ) {
+  if (!planned || !prior) {
+    return false;
+  }
+  const envelopes = cutoverHasExactStateEnvelopes(plan);
+  const plannedHierarchy = cutoverExactModuleHierarchy(
+    plan.planned_values.root_module,
+    TERMINAL_REFERENCE_PLAN.planned_values.root_module,
+  );
+  const priorHierarchy = cutoverExactModuleHierarchy(
+    plan.prior_state.values.root_module,
+    TERMINAL_REFERENCE_PLAN.prior_state.values.root_module,
+  );
+  if (!envelopes || !plannedHierarchy || !priorHierarchy) {
     return false;
   }
   const plannedLocations = cutoverCollectValueResourceLocations(
@@ -7191,8 +7308,8 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
   if (mode === AZURE_GENERATION_CUTOVER_MODE) {
     plannedExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
     plannedExpected.add(CUTOVER_RUNTIME_SECRETS_USER);
-    priorExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
-    priorExpected.add(CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS);
+    priorExpected.delete(CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS);
+    priorExpected.add(CUTOVER_RUNTIME_SECRETS_USER);
   } else if (mode === AZURE_CREDENTIAL_CLEANUP_MODE) {
     plannedExpected.delete(CUTOVER_RUNTIME_SECRETS_USER);
   }
@@ -7201,7 +7318,9 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
     for (const [address, location] of actual) {
       const expected = reference.get(address);
       if (expected !== undefined) {
-        if (location.moduleAddress !== expected.moduleAddress) return false;
+        if (location.moduleAddress !== expected.moduleAddress) {
+          return false;
+        }
       } else if (
         !extraAddresses.has(address) ||
         location.moduleAddress !== "module.workload_key_vault"
@@ -7218,7 +7337,7 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
   );
   const priorExtra = new Set(
     mode === AZURE_GENERATION_CUTOVER_MODE
-      ? [CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS]
+      ? [CUTOVER_RUNTIME_SECRETS_USER]
       : mode === AZURE_CREDENTIAL_CLEANUP_MODE
         ? [CUTOVER_RUNTIME_SECRETS_USER]
         : [],
@@ -7238,19 +7357,25 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
   const exactSet = (actual, expected) =>
     actual.size === expected.size &&
     [...expected].every((address) => actual.has(address));
-  if (!exactSet(new Set(planned.keys()), plannedExpected)) return false;
-  if (!exactSet(new Set(prior.keys()), priorExpected)) return false;
-  if (!cutoverExactClientConfig(prior.get(dataAddress), plan)) return false;
+  const plannedSet = exactSet(new Set(planned.keys()), plannedExpected);
+  const priorSet = exactSet(new Set(prior.keys()), priorExpected);
+  if (!plannedSet || !priorSet) {
+    return false;
+  }
+  const clientConfig = cutoverExactClientConfig(prior.get(dataAddress), plan);
+  if (!clientConfig) {
+    return false;
+  }
   const refs = cutoverReferenceValueResources();
   for (const [address, resource] of planned) {
     if (address === dataAddress) continue;
-    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.planned)) {
+    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.planned, "planned")) {
       return false;
     }
   }
   for (const [address, resource] of prior) {
     if (address === dataAddress) continue;
-    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.prior)) {
+    if (!cutoverHasExactStateResourceMetadata(resource, address, refs.prior, "prior")) {
       return false;
     }
   }
@@ -7331,7 +7456,12 @@ function cutoverValueResourceMetadataMatches(resource, address) {
 
 function cutoverResourceChangeStateCoherent(plan, entry, planned, prior) {
   const action = entry.change.actions;
-  const priorAddress = entry.previous_address ?? entry.address;
+  const previousAddress = entry.previous_address ?? entry.address;
+  const priorAddress =
+    entry.address === CUTOVER_RUNTIME_SECRETS_USER &&
+    !prior?.has(previousAddress)
+      ? entry.address
+      : previousAddress;
   const priorValue = prior?.get(priorAddress);
   const plannedValue = planned?.get(entry.address);
   if (
@@ -7448,15 +7578,23 @@ function cutoverParseApplicationInsightsConnection(value, resource) {
 function cutoverIdentityContext(
   changesByAddress,
   priorResources,
+  plannedOutputs,
+  priorOutputs,
+  outputChanges,
   operatorPrincipal,
   tenant,
 ) {
-  const imagePull = changesByAddress.get(
+  const imagePullChange = changesByAddress.get(
     "module.identities_rbac.azurerm_user_assigned_identity.image_pull",
-  )?.change.after;
-  const runtime = changesByAddress.get(
+  )?.change;
+  const runtimeChange = changesByAddress.get(
     "module.identities_rbac.azurerm_user_assigned_identity.runtime",
-  )?.change.after;
+  )?.change;
+  const environmentChange = changesByAddress.get(
+    "module.container_app_environment.azurerm_container_app_environment.this",
+  )?.change;
+  const imagePull = imagePullChange?.after;
+  const runtime = runtimeChange?.after;
   const imagePullIdentity = imagePull?.id;
   const runtimeIdentity = runtime?.id;
   const cli = priorResources?.get(
@@ -7465,6 +7603,7 @@ function cutoverIdentityContext(
   const appIdentityIds = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change
     .after?.identity?.[0]?.identity_ids;
   const appAfter = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.after;
+  const priorApp = priorResources?.get(CUTOVER_CONTAINER_APP)?.values;
   const storageAfter = changesByAddress.get(
     "module.workload_state.azurerm_storage_account.this",
   )?.change.after;
@@ -7494,9 +7633,40 @@ function cutoverIdentityContext(
     appInsightsAfter?.connection_string,
     appInsightsAfter,
   );
+  const rootOutput = (outputs, name) => outputs?.[name]?.value;
+  const expectedFqdn =
+    typeof appAfter?.name === "string" && typeof defaultDomain === "string"
+      ? `${appAfter.name}.${defaultDomain}`
+      : undefined;
+  const priorFqdn =
+    priorApp?.output?.properties?.configuration?.ingress?.fqdn;
+  const priorRevision = priorApp?.output?.properties?.latestRevisionName;
+  const priorRootRevision = rootOutput(
+    priorOutputs,
+    "relay_latest_revision_name",
+  );
+  const revisionChange = outputChanges?.relay_latest_revision_name;
+  const expectedContainerAppId =
+    typeof resourceGroupAfter?.id === "string"
+      ? `${resourceGroupAfter.id}/providers/Microsoft.App/containerApps/${FINAL_CONTAINER_APP_NAME}`
+      : undefined;
+  const rootOutputsMatch = [
+    ["relay_container_app_id", expectedContainerAppId],
+    ["relay_container_app_name", appAfter?.name],
+    ["container_app_environment_id", environmentAfter?.id],
+    ["container_app_environment_name", environmentAfter?.name],
+    ["container_app_environment_default_domain", defaultDomain],
+    ["relay_origin", relayOrigin],
+  ].every(([name, expected]) => rootOutput(plannedOutputs, name) === expected);
   if (
     !isObject(imagePull) ||
     !isObject(runtime) ||
+    !isDeepStrictEqual(imagePullChange?.actions, ["no-op"]) ||
+    !isDeepStrictEqual(runtimeChange?.actions, ["no-op"]) ||
+    !isDeepStrictEqual(environmentChange?.actions, ["no-op"]) ||
+    !cutoverExactNoOp(imagePullChange ?? {}) ||
+    !cutoverExactNoOp(runtimeChange ?? {}) ||
+    !cutoverExactNoOp(environmentChange ?? {}) ||
     !finalUuid(imagePull.principal_id) ||
     !finalUuid(imagePull.client_id) ||
     !finalUuid(runtime.principal_id) ||
@@ -7530,9 +7700,17 @@ function cutoverIdentityContext(
     !isUserAssignedIdentity(runtime.id) ||
     imagePull.id !== imagePullIdentity ||
     runtime.id !== runtimeIdentity ||
-    !isObject(appAfter.output?.properties) ||
-    appAfter.output.properties.configuration?.ingress?.fqdn !==
-      `${appAfter.name}.${defaultDomain}` ||
+    typeof expectedContainerAppId !== "string" ||
+    appAfter.id !== expectedContainerAppId ||
+    !isObject(appAfter.body?.properties) ||
+    appAfter.body.properties.managedEnvironmentId !== environmentAfter?.id ||
+    !isObject(priorApp?.output?.properties) ||
+    typeof expectedFqdn !== "string" ||
+    priorFqdn !== expectedFqdn ||
+    typeof priorRevision !== "string" ||
+    priorRevision !== priorRootRevision ||
+    priorRevision !== revisionChange?.before ||
+    !rootOutputsMatch ||
     typeof tableEndpoint !== "string" ||
     !/^https:\/\/[a-z0-9.-]+\.table\.core\.windows\.net\/$/.test(
       tableEndpoint,
@@ -7561,7 +7739,7 @@ function cutoverIdentityContext(
     runtimeIdentity,
     resourceGroupId: resourceGroupAfter.id,
     resourceGroupName: resourceGroupAfter.name,
-    containerAppId: appAfter.id,
+    containerAppId: expectedContainerAppId,
     containerAppName: appAfter.name,
     containerEnvironmentId: environmentAfter.id,
     containerEnvironmentName: environmentAfter.name,
@@ -7692,7 +7870,23 @@ function cutoverExactIdentityChange(entry, context) {
   );
 }
 
-function cutoverExactDirectApp(after, expectedImage, context) {
+function cutoverHasExactContainerAppControlFields(value) {
+  return (
+    isObject(value) &&
+    CUTOVER_CONTAINER_APP_CONTROL_KEYS.every(
+      (key) =>
+        Object.hasOwn(value, key) &&
+        isDeepStrictEqual(value[key], CUTOVER_CONTAINER_APP_CONTROL_FIELDS[key]),
+    )
+  );
+}
+
+function cutoverExactDirectApp(
+  after,
+  expectedImage,
+  context,
+  { update = false } = {},
+) {
   const properties = after?.body?.properties;
   const configuration = properties?.configuration;
   const template = properties?.template;
@@ -7702,6 +7896,40 @@ function cutoverExactDirectApp(after, expectedImage, context) {
   const identityIds = identity?.identity_ids;
   const settings = configuration?.identitySettings;
   const env = valuesByName(container?.env);
+  const expectedKeys = [
+    "body",
+    "create_headers",
+    "create_query_parameters",
+    "delete_headers",
+    "delete_query_parameters",
+    "id",
+    "identity",
+    "ignore_body_changes",
+    "ignore_casing",
+    "ignore_missing_property",
+    "ignore_null_property",
+    "ignore_other_items_in_list",
+    "list_unique_id_property",
+    "location",
+    "locks",
+    "name",
+    "parent_id",
+    "read_headers",
+    "read_query_parameters",
+    "replace_triggers_external_values",
+    "replace_triggers_refs",
+    "response_export_values",
+    "retry",
+    "schema_validation_enabled",
+    "sensitive_body",
+    "sensitive_body_version",
+    "tags",
+    "timeouts",
+    "type",
+    "update_headers",
+    "update_query_parameters",
+    ...(update ? [] : ["output"]),
+  ];
   const expectedEnvironment = new Map([
     ["NODE_ENV", "production"],
     ["PORT", "8787"],
@@ -7737,14 +7965,44 @@ function cutoverExactDirectApp(after, expectedImage, context) {
     ["PALANCAR_ALLOW_NULL_BROWSER_ORIGIN", "false"],
     ["PALANCAR_LANGUAGE_BOUNDARY_MODE", EXPECTED_LANGUAGE_BOUNDARY_MODE],
   ]);
+  const probesMatch =
+    update ||
+    (Array.isArray(container?.probes) &&
+      container.probes.length === 2 &&
+      hasExactFinalTcpProbe(container.probes[0], {
+        type: "Liveness",
+        port: 8787,
+        initialDelaySeconds: 10,
+        periodSeconds: 10,
+        timeoutSeconds: 3,
+        failureThreshold: 3,
+      }) &&
+      hasExactProbes(container.probes.slice(1), [
+        {
+          type: "Readiness",
+          path: "/readyz",
+          port: 8787,
+          initialDelaySeconds: 5,
+          periodSeconds: 10,
+          timeoutSeconds: 7,
+          failureThreshold: 3,
+        },
+      ]));
   return (
     isObject(after) &&
-    after.id === context.containerAppId &&
+    hasExactKeys(after, expectedKeys) &&
+    cutoverHasExactContainerAppControlFields(after) &&
+    after.id ===
+      `${context.resourceGroupId}/providers/Microsoft.App/containerApps/${FINAL_CONTAINER_APP_NAME}` &&
     after.location === "eastus2" &&
     after.name === FINAL_CONTAINER_APP_NAME &&
     after.parent_id === context.resourceGroupId &&
     after.type === "Microsoft.App/containerApps@2026-01-01" &&
+    hasExactFinalTags(after.tags) &&
+    isObject(after.body) &&
+    hasExactKeys(after.body, ["properties"]) &&
     isObject(properties) &&
+    hasExactKeys(properties, ["configuration", "managedEnvironmentId", "template"]) &&
     properties.managedEnvironmentId === context.containerEnvironmentId &&
     hasExactKeys(configuration, [
       "activeRevisionsMode",
@@ -7761,11 +8019,14 @@ function cutoverExactDirectApp(after, expectedImage, context) {
     configuration.secrets.length === 0 &&
     Array.isArray(configuration.registries) &&
     configuration.registries.length === 1 &&
-    hasExactKeys(configuration.registries[0], ["identity", "server"]) &&
+    configuration.registries.every((registry) =>
+      hasExactKeys(registry, ["identity", "server"]),
+    ) &&
     isUserAssignedIdentity(configuration.registries[0].identity) &&
     configuration.registries[0].server === context.acrLoginServer &&
     Array.isArray(identityIds) &&
     identityIds.length === 2 &&
+    hasExactKeys(identity, ["identity_ids", "principal_id", "tenant_id", "type"]) &&
     identity?.type === "UserAssigned" &&
     identity?.principal_id === "" &&
     identity?.tenant_id === "" &&
@@ -7777,6 +8038,7 @@ function cutoverExactDirectApp(after, expectedImage, context) {
     configuration.registries[0].identity === identityIds[0] &&
     Array.isArray(settings) &&
     settings.length === 2 &&
+    settings.every((setting) => hasExactKeys(setting, ["identity", "lifecycle"])) &&
     settings[0]?.identity === identityIds[0].replace("resourceGroups", "resourcegroups") &&
     settings[0]?.lifecycle === "None" &&
     settings[1]?.identity === identityIds[1].replace("resourceGroups", "resourcegroups") &&
@@ -7784,7 +8046,12 @@ function cutoverExactDirectApp(after, expectedImage, context) {
     Array.isArray(containers) &&
     containers.length === 1 &&
     hasExactKeys(template, ["containers", "scale"]) &&
-    hasExactKeys(container, ["env", "image", "name", "probes", "resources"]) &&
+    hasExactKeys(
+      container,
+      update
+        ? ["env", "image", "name", "resources"]
+        : ["env", "image", "name", "probes", "resources"],
+    ) &&
     container.name === "relay" &&
     container.image === expectedImage &&
     isImmutableAcrImage(container.image) &&
@@ -7792,34 +8059,21 @@ function cutoverExactDirectApp(after, expectedImage, context) {
     hasExactKeys(container.resources, ["cpu", "memory"]) &&
     container.resources.cpu === 0.25 &&
     container.resources.memory === "0.5Gi" &&
-    Array.isArray(container.probes) &&
-    container.probes.length === 2 &&
-    hasExactFinalTcpProbe(container.probes[0], {
-      type: "Liveness",
-      port: 8787,
-      initialDelaySeconds: 10,
-      periodSeconds: 10,
-      timeoutSeconds: 3,
-      failureThreshold: 3,
-    }) &&
-    hasExactProbes(container.probes.slice(1), [
-      {
-        type: "Readiness",
-        path: "/readyz",
-        port: 8787,
-        initialDelaySeconds: 5,
-        periodSeconds: 10,
-        timeoutSeconds: 7,
-        failureThreshold: 3,
-      },
-    ]) &&
+    probesMatch &&
     hasExactKeys(template.scale, ["maxReplicas", "minReplicas"]) &&
     template.scale.maxReplicas === 1 &&
     template.scale.minReplicas === 1 &&
     hasExactNamedEntries(env, CUTOVER_RUNTIME_ENVIRONMENT_NAMES) &&
     [...env.values()].every((entry) => hasExactKeys(entry, ["name", "value"])) &&
     [...expectedEnvironment].every(([name, value]) => hasEnvValue(env, name, value)) &&
-    !containsHelperTopology(after)
+    !containsHelperTopology(after) &&
+    (update
+      ? !Object.hasOwn(after, "output")
+      : finalHasExactContainerAppProviderOutput(
+          after.output,
+          context.defaultDomain,
+          after.name,
+        ))
   );
 }
 
@@ -7835,11 +8089,53 @@ function cutoverExactPredecessorApp(before, context, predecessorImage) {
   const secrets = valuesByName(configuration?.secrets);
   return (
     isObject(before) &&
-    before.id === context.containerAppId &&
+    hasExactKeys(before, [
+      "body",
+      "create_headers",
+      "create_query_parameters",
+      "delete_headers",
+      "delete_query_parameters",
+      "id",
+      "identity",
+      "ignore_body_changes",
+      "ignore_casing",
+      "ignore_missing_property",
+      "ignore_null_property",
+      "ignore_other_items_in_list",
+      "list_unique_id_property",
+      "location",
+      "locks",
+      "name",
+      "output",
+      "parent_id",
+      "read_headers",
+      "read_query_parameters",
+      "replace_triggers_external_values",
+      "replace_triggers_refs",
+      "response_export_values",
+      "retry",
+      "schema_validation_enabled",
+      "sensitive_body",
+      "sensitive_body_version",
+      "tags",
+      "timeouts",
+      "type",
+      "update_headers",
+      "update_query_parameters",
+    ]) &&
+    cutoverHasExactContainerAppControlFields(before) &&
+    before.id ===
+      `${context.resourceGroupId}/providers/Microsoft.App/containerApps/${FINAL_CONTAINER_APP_NAME}` &&
     before.location === "eastus2" &&
     before.name === FINAL_CONTAINER_APP_NAME &&
     before.parent_id === context.resourceGroupId &&
     before.type === "Microsoft.App/containerApps@2026-01-01" &&
+    hasExactFinalTags(before.tags) &&
+    isObject(before.body) &&
+    hasExactKeys(before.body, ["properties"]) &&
+    isObject(properties) &&
+    hasExactKeys(properties, ["configuration", "managedEnvironmentId", "template"]) &&
+    properties.managedEnvironmentId === context.containerEnvironmentId &&
     hasExactKeys(configuration, [
       "activeRevisionsMode",
       "identitySettings",
@@ -7851,26 +8147,37 @@ function cutoverExactPredecessorApp(before, context, predecessorImage) {
     hasExactIngress(configuration.ingress) &&
     Array.isArray(identityIds) &&
     identityIds.length === 2 &&
+    hasExactKeys(identity, ["identity_ids", "principal_id", "tenant_id", "type"]) &&
     identity.type === "UserAssigned" &&
     identityIds[0] === context.imagePullIdentity &&
     identityIds[1] === context.runtimeIdentity &&
     Array.isArray(configuration.registries) &&
     configuration.registries.length === 1 &&
+    configuration.registries.every((registry) =>
+      hasExactKeys(registry, ["identity", "server"]),
+    ) &&
     configuration.registries[0].identity === identityIds[0] &&
     configuration.registries[0].server === context.acrLoginServer &&
     Array.isArray(configuration.identitySettings) &&
     configuration.identitySettings.length === 2 &&
+    configuration.identitySettings.every((setting) =>
+      hasExactKeys(setting, ["identity", "lifecycle"]),
+    ) &&
     configuration.identitySettings[0].identity === identityIds[0].replace("resourceGroups", "resourcegroups") &&
     configuration.identitySettings[0].lifecycle === "None" &&
     configuration.identitySettings[1].identity === identityIds[1].replace("resourceGroups", "resourcegroups") &&
     configuration.identitySettings[1].lifecycle === "Main" &&
     hasExactNamedEntries(secrets, ["litellm-master-key", "openrouter-api-key"]) &&
+    [...secrets.values()].every((secret) =>
+      hasExactKeys(secret, ["name", "keyVaultUrl", "identity"]),
+    ) &&
     secrets.get("litellm-master-key").identity === context.runtimeIdentity &&
     secrets.get("openrouter-api-key").identity === context.runtimeIdentity &&
     secrets.get("litellm-master-key").keyVaultUrl === `https://${FINAL_KEY_VAULT_HOST}/secrets/litellm-master-key` &&
     secrets.get("openrouter-api-key").keyVaultUrl === `https://${FINAL_KEY_VAULT_HOST}/secrets/openrouter-api-key` &&
     Array.isArray(containers) &&
     containers.length === 2 &&
+    hasExactKeys(template, ["containers", "scale"]) &&
     hasExactKeys(relay, ["env", "image", "name", "probes", "resources"]) &&
     hasExactKeys(sidecar, ["env", "image", "name", "probes", "resources"]) &&
     relay.name === "relay" &&
@@ -7882,8 +8189,10 @@ function cutoverExactPredecessorApp(before, context, predecessorImage) {
     sidecar.image.startsWith(`${CUTOVER_ACR_LOGIN_SERVER}/palancar-litellm-proxy@sha256:`) &&
     relay.resources.cpu === 0.25 &&
     relay.resources.memory === "0.5Gi" &&
+    hasExactKeys(relay.resources, ["cpu", "memory"]) &&
     sidecar.resources.cpu === 0.75 &&
     sidecar.resources.memory === "1.5Gi" &&
+    hasExactKeys(sidecar.resources, ["cpu", "memory"]) &&
     Array.isArray(relay.probes) &&
     relay.probes.length === 2 &&
     hasExactFinalTcpProbe(relay.probes[0], {
@@ -7946,6 +8255,12 @@ function cutoverExactPredecessorApp(before, context, predecessorImage) {
       )}/openai/v1/realtime?intent=transcription`,
     }) &&
     hasExactFinalSidecarEnvironment(sidecar.env)
+    &&
+    finalHasExactContainerAppProviderOutput(
+      before.output,
+      context.defaultDomain,
+      before.name,
+    )
   );
 }
 
@@ -8026,6 +8341,9 @@ function cutoverSensitiveStorageContract(storage, referenceStorage) {
   ]) {
     for (const suffix of ["connection_string", "blob_connection_string"]) {
       const value = storage[`${prefix}_${suffix}`];
+      if (prefix === "secondary" && suffix === "blob_connection_string" && value === "") {
+        continue;
+      }
       const parsed = cutoverParseStorageConnectionString(
         value,
         suffix.startsWith("blob_"),
@@ -8102,6 +8420,10 @@ function cutoverStateSections(plan, expectedEnable, expectedApplyable) {
     !cutoverVariablesMatchReference(plan) ||
     !cutoverHasExactChecks(plan) ||
     !cutoverHasExactRelevantAttributes(plan) ||
+    !cutoverHasNoRetiredWorkloadDependencies(
+      TERMINAL_REFERENCE_PLAN.configuration,
+    ) ||
+    !cutoverHasNoRetiredWorkloadDependencies(plan.configuration) ||
     !cutoverHasExactConfiguration(plan) ||
     Object.keys(plan.variables).some((name) => /litellm|openrouter/i.test(name)) ||
     JSON.stringify(plan.configuration).match(/litellm|openrouter/i) ||
@@ -8114,7 +8436,11 @@ function cutoverStateSections(plan, expectedEnable, expectedApplyable) {
 }
 
 function cutoverAddBinding(bindings, reference, actual) {
-  if (typeof reference !== "string" || typeof actual !== "string") return;
+  if (
+    typeof reference !== "string" ||
+    typeof actual !== "string" ||
+    reference.length === 0
+  ) return;
   if (reference === actual) return;
   if (!bindings.some(([source]) => source === reference)) {
     bindings.push([reference, actual]);
@@ -8194,7 +8520,7 @@ function cutoverBindings(plan, changesByAddress) {
   // exact sensitivity masks below.  They are deliberately not global string
   // bindings: an identical fixture literal in an unmasked location must not
   // acquire live meaning by substitution.
-  for (const key of ["id"]) {
+  for (const key of ["id", "app_id"]) {
     cutoverAddBinding(bindings, referenceAppInsights?.[key], appInsights?.[key]);
   }
 
@@ -8232,26 +8558,62 @@ function cutoverBindings(plan, changesByAddress) {
   for (const key of ["id", "endpoint"]) {
     cutoverAddBinding(bindings, referenceFoundry?.[key], foundry?.[key]);
   }
+  cutoverAddPathBinding(
+    bindings,
+    referenceFoundry,
+    foundry,
+    ["identity", 0, "principal_id"],
+  );
+  for (const name of [PINNED_DEPLOYMENT_NAME, LUNA_DEPLOYMENT_NAME]) {
+    const address =
+      `module.foundry.azurerm_cognitive_deployment.this["${name}"]`;
+    const referenceModel = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+      (entry) => entry.address === address,
+    )?.change.after;
+    const actualModel = changesByAddress.get(address)?.change.after;
+    for (const key of ["id", "rai_policy_name"]) {
+      cutoverAddBinding(bindings, referenceModel?.[key], actualModel?.[key]);
+    }
+    for (const key of ["family", "size", "tier"]) {
+      cutoverAddPathBinding(
+        bindings,
+        referenceModel,
+        actualModel,
+        ["sku", 0, key],
+      );
+    }
+  }
 
   const referenceApp = TERMINAL_REFERENCE_PLAN.resource_changes.find(
     (entry) => entry.address === CUTOVER_CONTAINER_APP,
   )?.change.after;
+  const referenceAppBefore = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (entry) => entry.address === CUTOVER_CONTAINER_APP,
+  )?.change.before;
   const app = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.after;
+  const appBefore = changesByAddress.get(CUTOVER_CONTAINER_APP)?.change.before;
   for (const key of ["id", "name", "parent_id"]) {
     cutoverAddBinding(bindings, referenceApp?.[key], app?.[key]);
   }
   cutoverAddPathBinding(
     bindings,
-    referenceApp,
-    app,
+    referenceAppBefore,
+    appBefore,
     ["output", "properties", "latestRevisionName"],
   );
   cutoverAddPathBinding(
     bindings,
-    referenceApp,
-    app,
+    referenceAppBefore,
+    appBefore,
     ["output", "properties", "configuration", "ingress", "fqdn"],
   );
+  const referenceRevision =
+    TERMINAL_REFERENCE_PLAN.output_changes.relay_latest_revision_name?.before;
+  const generationReferenceRevision =
+    CUTOVER_GENERATION_REFERENCE_PLAN.output_changes.relay_latest_revision_name?.before;
+  const actualRevision = plan.output_changes.relay_latest_revision_name?.before;
+  cutoverAddBinding(bindings, referenceRevision, actualRevision);
+  cutoverAddBinding(bindings, generationReferenceRevision, actualRevision);
 
   const referenceJob = TERMINAL_REFERENCE_PLAN.resource_changes.find(
     (entry) => entry.address === EXPIRY_CLEANUP_JOB,
@@ -8350,6 +8712,67 @@ function cutoverSensitiveMaskHasMarkedValue(mask) {
   return false;
 }
 
+function cutoverSensitiveMaskMatches(
+  actualValue,
+  referenceValue,
+  actualMask,
+  referenceMask,
+  bindings,
+) {
+  if (referenceMask === true) {
+    return (
+      actualMask === true &&
+      actualValue !== undefined &&
+      cutoverOpaqueSensitiveLeafMatches(
+        actualValue,
+        cutoverRebindReference(referenceValue, bindings),
+      )
+    );
+  }
+  if (referenceMask === false) {
+    return actualMask === undefined || actualMask === false;
+  }
+  if (Array.isArray(referenceMask)) {
+    if (actualMask === undefined) {
+      return !cutoverSensitiveMaskHasMarkedValue(referenceMask);
+    }
+    return (
+      Array.isArray(actualMask) &&
+      actualMask.length === referenceMask.length &&
+      referenceMask.every((child, index) =>
+        cutoverSensitiveMaskMatches(
+          actualValue?.[index],
+          referenceValue?.[index],
+          actualMask[index],
+          child,
+          bindings,
+        ),
+      )
+    );
+  }
+  if (isObject(referenceMask)) {
+    if (actualMask === undefined) {
+      return !cutoverSensitiveMaskHasMarkedValue(referenceMask);
+    }
+    if (!isObject(actualMask)) return false;
+    if (
+      Object.keys(actualMask).some((key) =>
+        !Object.hasOwn(referenceMask, key),
+      )
+    ) return false;
+    return Object.entries(referenceMask).every(([key, child]) =>
+      cutoverSensitiveMaskMatches(
+        actualValue?.[key],
+        referenceValue?.[key],
+        actualMask[key],
+        child,
+        bindings,
+      ),
+    );
+  }
+  return false;
+}
+
 function cutoverSensitiveStructureMatches(
   actual,
   reference,
@@ -8437,16 +8860,40 @@ function cutoverExpectedSensitive(entry, bindings) {
 
 function cutoverHasExactChangeEnvelope(entry, bindings) {
   const expected = cutoverExpectedSensitive(entry, bindings);
-  if (
-    !isDeepStrictEqual(entry.change.after_unknown, {}) ||
-    !isDeepStrictEqual(entry.change.before_sensitive, expected.before) ||
-    !isDeepStrictEqual(entry.change.after_sensitive, expected.after)
-  ) {
-    return false;
-  }
   const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
     (candidate) => candidate.address === entry.address,
   );
+  const appUpdate =
+    entry.address === CUTOVER_CONTAINER_APP &&
+    isUpdate(entry.change.actions);
+  const afterSensitiveMatches = appUpdate
+    ? cutoverSensitiveMaskMatches(
+        entry.change.after,
+        reference?.change?.after,
+        entry.change.after_sensitive,
+        expected.after,
+        bindings,
+      )
+    : isDeepStrictEqual(entry.change.after_sensitive, expected.after);
+  const unknownMatches = isDeepStrictEqual(
+    entry.change.after_unknown,
+    appUpdate
+      ? CUTOVER_GENERATION_REFERENCE_PLAN.resource_changes.find(
+          (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+        )?.change.after_unknown
+      : {},
+  );
+  const beforeSensitiveMatches = isDeepStrictEqual(
+    entry.change.before_sensitive,
+    expected.before,
+  );
+  if (
+    !unknownMatches ||
+    !beforeSensitiveMatches ||
+    !afterSensitiveMatches
+  ) {
+    return false;
+  }
   for (const side of ["before", "after"]) {
     const identityKey = `${side}_identity`;
     if (!Object.hasOwn(entry.change, identityKey)) continue;
@@ -8604,6 +9051,9 @@ function cutoverTerminalNoOp(plan, changes) {
   const context = cutoverIdentityContext(
     byAddress,
     prior,
+    plan.planned_values.outputs,
+    plan.prior_state.values.outputs,
+    plan.output_changes,
     plan.variables.operator_principal_id?.value,
     plan.variables.tenant_id?.value,
   );
@@ -8643,7 +9093,7 @@ function cutoverTerminalNoOp(plan, changes) {
       return false;
     }
   }
-  return cutoverExactFoundryModels(byAddress, bindings) && cutoverExactOutputs(plan, false, bindings);
+  return cutoverExactFoundryModels(byAddress, bindings) && cutoverExactOutputs(plan, true, bindings);
 }
 
 function cutoverExactOutputs(plan, terminal, bindings = []) {
@@ -8657,45 +9107,44 @@ function cutoverExactOutputs(plan, terminal, bindings = []) {
     const change = plan.output_changes[name];
     const planned = plan.planned_values.outputs[name];
     const prior = plan.prior_state.values.outputs[name];
-    const reference = TERMINAL_REFERENCE_PLAN.output_changes[name];
+    const referencePlan =
+      !terminal && name === "relay_latest_revision_name"
+        ? CUTOVER_GENERATION_REFERENCE_PLAN
+        : TERMINAL_REFERENCE_PLAN;
+    const reference = referencePlan.output_changes[name];
     const expectedChange = cutoverRebindReference(reference, bindings);
     const expectedPlanned = cutoverRebindReference(
-      TERMINAL_REFERENCE_PLAN.planned_values.outputs[name],
+      referencePlan.planned_values.outputs[name],
       bindings,
     );
     const expectedPrior = cutoverRebindReference(
-      TERMINAL_REFERENCE_PLAN.prior_state.values.outputs[name],
+      referencePlan.prior_state.values.outputs[name],
       bindings,
     );
     const sensitiveOutput =
       reference.before_sensitive === true || reference.after_sensitive === true;
     const outputChangeMatches =
       isObject(change) &&
-      hasExactKeys(change, [
-        "actions",
-        "before",
-        "after",
-        "after_unknown",
-        "before_sensitive",
-        "after_sensitive",
-      ]) &&
+      hasExactKeys(change, Object.keys(expectedChange)) &&
       isDeepStrictEqual(
-        {
-          ...change,
-          before: undefined,
-          after: undefined,
-        },
-        {
-          ...expectedChange,
-          before: undefined,
-          after: undefined,
-        },
+        Object.fromEntries(
+          Object.entries(change).filter(([key]) =>
+            !["before", "after"].includes(key),
+          ),
+        ),
+        Object.fromEntries(
+          Object.entries(expectedChange).filter(([key]) =>
+            !["before", "after"].includes(key),
+          ),
+        ),
       ) &&
       (sensitiveOutput
         ? cutoverOpaqueSensitiveLeafMatches(change.before, reference.before) &&
-          cutoverOpaqueSensitiveLeafMatches(change.after, reference.after)
+          (!Object.hasOwn(expectedChange, "after") ||
+            cutoverOpaqueSensitiveLeafMatches(change.after, reference.after))
         : isDeepStrictEqual(change.before, expectedChange.before) &&
-          isDeepStrictEqual(change.after, expectedChange.after));
+          (!Object.hasOwn(expectedChange, "after") ||
+            isDeepStrictEqual(change.after, expectedChange.after)));
     const plannedMatches =
       isObject(planned) &&
       (sensitiveOutput
@@ -8742,64 +9191,106 @@ function cutoverExactOutputs(plan, terminal, bindings = []) {
 }
 
 function acceptsAzureGenerationCutover(plan, changes) {
-  if (
-    !cutoverStateSections(plan, true, true) ||
-    !cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY)
-  ) return false;
+  const sections = cutoverStateSections(plan, true, true);
+  const addresses = cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY);
+  if (!sections || !addresses) {
+    return false;
+  }
   const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
   const planned = cutoverCollectValueResources(plan.planned_values.root_module);
   const prior = cutoverCollectValueResources(plan.prior_state.values.root_module);
   const context = cutoverIdentityContext(
     byAddress,
     prior,
+    plan.planned_values.outputs,
+    plan.prior_state.values.outputs,
+    plan.output_changes,
     plan.variables.operator_principal_id?.value,
     plan.variables.tenant_id?.value,
   );
   const relayImage = plan.variables.relay_image_digest?.value;
-  if (!planned || !prior || !context || !isImmutableAcrImage(relayImage)) return false;
-  if (!cutoverHasExactStateInventories(
+  if (!planned || !prior || !context || !isImmutableAcrImage(relayImage)) {
+    return false;
+  }
+  const inventories = cutoverHasExactStateInventories(
     plan,
     changes,
     AZURE_GENERATION_CUTOVER_MODE,
     planned,
     prior,
-  )) return false;
+  );
+  if (!inventories) {
+    return false;
+  }
   const bindings = cutoverBindings(plan, byAddress);
-  if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
+  const security = cutoverExactSecuritySchema(plan, byAddress, context);
+  if (!security) {
+    return false;
+  }
   for (const entry of changes) {
-    if (
-      !cutoverExactResourceEntry(entry, entry.address === CUTOVER_RUNTIME_SECRETS_USER) ||
-      !isDeepStrictEqual(
-        entry.change.actions,
-        [entry.address === CUTOVER_CONTAINER_APP ? "update" : "no-op"],
-      ) ||
-      !cutoverHasExactChangeEnvelope(entry, bindings)
-    ) return false;
-    if (!cutoverExactEntryMetadata(entry)) return false;
-    if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
+    const resource = cutoverExactResourceEntry(
+      entry,
+      entry.address === CUTOVER_RUNTIME_SECRETS_USER,
+    );
+    const actions = isDeepStrictEqual(
+      entry.change.actions,
+      [entry.address === CUTOVER_CONTAINER_APP ? "update" : "no-op"],
+    );
+    const envelope = cutoverHasExactChangeEnvelope(entry, bindings);
+    if (!resource || !actions || !envelope) {
+      return false;
+    }
+    const metadata = cutoverExactEntryMetadata(entry);
+    if (!metadata) {
+      return false;
+    }
+    const coherent = cutoverResourceChangeStateCoherent(plan, entry, planned, prior);
+    if (!coherent) {
+      return false;
+    }
     if (entry.address === CUTOVER_CONTAINER_APP) {
       const predecessor = cutoverExactPredecessorApp(
         entry.change.before,
         context,
         CUTOVER_RELAY_PRIOR_IMAGE,
       );
-      const direct = cutoverExactDirectApp(entry.change.after, relayImage, context);
+      const direct = cutoverExactDirectApp(
+        entry.change.after,
+        relayImage,
+        context,
+        { update: true },
+      );
       if (!isUpdate(entry.change.actions) || !predecessor || !direct) {
         return false;
       }
     } else if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
-      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+      const valid = cutoverExactRoleChange(entry, context, "no-op");
+      if (!valid) return false;
     } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
-      if (!cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings)) return false;
+      const valid = cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings);
+      if (!valid) return false;
     } else if (entry.address === CUTOVER_LUNA_DEPLOYMENT) {
-      if (!cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings)) return false;
+      const valid = cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings);
+      if (!valid) return false;
     } else if (CUTOVER_IDENTITY_ADDRESSES.has(entry.address)) {
-      if (!cutoverExactIdentityChange(entry, context)) return false;
+      const valid = cutoverExactIdentityChange(entry, context);
+      if (!valid) return false;
     } else if (CUTOVER_RBAC_ADDRESSES.has(entry.address)) {
-      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+      const valid = cutoverExactRoleChange(entry, context, "no-op");
+      if (!valid) return false;
     } else if (entry.address === EXPIRY_CLEANUP_JOB) {
-      if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === EXPIRY_CLEANUP_JOB), bindings) || !cutoverExactCleanupImage(entry.change.after, plan.variables.expiry_cleanup_image_digest?.value, context.acrLoginServer)) return false;
-    } else if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === entry.address), bindings)) return false;
+      const valid = cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === EXPIRY_CLEANUP_JOB), bindings) && cutoverExactCleanupImage(entry.change.after, plan.variables.expiry_cleanup_image_digest?.value, context.acrLoginServer);
+      if (!valid) return false;
+    } else {
+      const valid = cutoverReferenceAfterMatches(
+        entry.change.after,
+        TERMINAL_REFERENCE_PLAN.resource_changes.find(
+          (x) => x.address === entry.address,
+        ),
+        bindings,
+      );
+      if (!valid) return false;
+    }
   }
   const models = cutoverExactFoundryModels(byAddress, bindings);
   const outputs = cutoverExactOutputs(plan, false, bindings);
@@ -8817,6 +9308,9 @@ function acceptsAzureCredentialCleanup(plan, changes) {
   const context = cutoverIdentityContext(
     byAddress,
     prior,
+    plan.planned_values.outputs,
+    plan.prior_state.values.outputs,
+    plan.output_changes,
     plan.variables.operator_principal_id?.value,
     plan.variables.tenant_id?.value,
   );
@@ -8843,7 +9337,10 @@ function acceptsAzureCredentialCleanup(plan, changes) {
     if (!cutoverExactEntryMetadata(entry)) return false;
     if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
     if (entry.address === CUTOVER_CONTAINER_APP) {
-      if (!cutoverExactNoOp(entry.change) || !cutoverExactDirectApp(entry.change.after, relayImage, context)) return false;
+      if (
+        !cutoverExactNoOp(entry.change) ||
+        !cutoverExactDirectApp(entry.change.after, relayImage, context)
+      ) return false;
     } else if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
       if (!cutoverExactRoleChange(entry, context, "delete")) return false;
     } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
@@ -8859,7 +9356,7 @@ function acceptsAzureCredentialCleanup(plan, changes) {
     } else if (!cutoverReferenceAfterMatches(entry.change.after, TERMINAL_REFERENCE_PLAN.resource_changes.find((x) => x.address === entry.address), bindings)) return false;
   }
   const models = cutoverExactFoundryModels(byAddress, bindings);
-  const outputs = cutoverExactOutputs(plan, false, bindings);
+  const outputs = cutoverExactOutputs(plan, true, bindings);
   return models && outputs;
 }
 
