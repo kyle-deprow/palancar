@@ -5363,6 +5363,63 @@ test("Azure generation cutover and credential cleanup fixtures pass only their c
   );
 });
 
+test("cutover-family relevant attributes are exact order-independent path sets", () => {
+  const cases = [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ];
+  const permutations = [
+    (attributes) => attributes.slice().reverse(),
+    (attributes) => attributes.slice(7).concat(attributes.slice(0, 7)),
+    (attributes) => [
+      ...attributes.filter((_, index) => index % 2 === 1),
+      ...attributes.filter((_, index) => index % 2 === 0),
+    ],
+  ];
+
+  for (const [source, mode] of cases) {
+    for (const permute of permutations) {
+      const candidate = clone(source);
+      candidate.relevant_attributes = permute(candidate.relevant_attributes);
+      assert.equal(acceptsPlan(candidate, mode), true);
+    }
+
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.relevant_attributes.pop();
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.relevant_attributes.push({
+        resource: "module.unreviewed.azurerm_resource.this",
+        attribute: ["id"],
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      candidate.relevant_attributes.push(
+        clone(candidate.relevant_attributes[0]),
+      );
+    });
+    for (const mutate of [
+      (entry) => { entry.extra = true; },
+      (entry) => { entry.resource = 1; },
+      (entry) => { entry.attribute = "id"; },
+      (entry) => { entry.attribute = [0]; },
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        mutate(candidate.relevant_attributes[0]);
+      });
+    }
+    for (const reorderedPath of [
+      ["id", "forged-child"],
+      ["forged-child", "id"],
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        candidate.relevant_attributes[0].attribute = reorderedPath;
+      });
+    }
+  }
+});
+
 test("cutover and terminal references use the exact 90-check Entra-only workload shape", () => {
   for (const fixture of [runtimeCutoverFixture, terminalFixture]) {
     assert.equal(fixture.checks.length, 90);

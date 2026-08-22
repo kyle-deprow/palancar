@@ -229,6 +229,12 @@ const CUTOVER_GENERATION_REFERENCE_PLAN = JSON.parse(
     "utf8",
   ),
 );
+const CUTOVER_CREDENTIAL_CLEANUP_REFERENCE_PLAN = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/azure-credential-cleanup.plan-fixture.json", import.meta.url),
+    "utf8",
+  ),
+);
 const FINAL_REFERENCE_PLAN = createLegacyFinalReferencePlan(
   TERMINAL_REFERENCE_PLAN,
 );
@@ -7088,14 +7094,49 @@ function cutoverHasExactChecks(plan) {
   );
 }
 
-function cutoverHasExactRelevantAttributes(plan) {
+function cutoverRelevantAttributeKey(entry) {
+  if (
+    !isObject(entry) ||
+    !hasExactKeys(entry, ["resource", "attribute"]) ||
+    typeof entry.resource !== "string" ||
+    !Array.isArray(entry.attribute) ||
+    !entry.attribute.every((part) => typeof part === "string")
+  ) {
+    return undefined;
+  }
+  return JSON.stringify([entry.resource, entry.attribute]);
+}
+
+function cutoverHasExactRelevantAttributes(plan, mode) {
+  const reference =
+    mode === AZURE_GENERATION_CUTOVER_MODE
+      ? CUTOVER_GENERATION_REFERENCE_PLAN.relevant_attributes
+      : mode === AZURE_CREDENTIAL_CLEANUP_MODE
+        ? CUTOVER_CREDENTIAL_CLEANUP_REFERENCE_PLAN.relevant_attributes
+        : mode === FINAL_ROLLOUT_COMPLETE_MODE
+          ? TERMINAL_REFERENCE_PLAN.relevant_attributes
+          : undefined;
+  if (
+    !Array.isArray(plan.relevant_attributes) ||
+    !Array.isArray(reference) ||
+    plan.relevant_attributes.length !== reference.length
+  ) {
+    return false;
+  }
+  const actualKeys = plan.relevant_attributes.map(cutoverRelevantAttributeKey);
+  const referenceKeys = reference.map(cutoverRelevantAttributeKey);
+  if (
+    actualKeys.some((key) => key === undefined) ||
+    referenceKeys.some((key) => key === undefined)
+  ) {
+    return false;
+  }
+  const actualSet = new Set(actualKeys);
+  const referenceSet = new Set(referenceKeys);
   return (
-    Array.isArray(plan.relevant_attributes) &&
-    plan.relevant_attributes.length ===
-      TERMINAL_REFERENCE_PLAN.relevant_attributes.length &&
-    plan.relevant_attributes.every((entry, index) =>
-      isDeepStrictEqual(entry, TERMINAL_REFERENCE_PLAN.relevant_attributes[index]),
-    )
+    actualSet.size === actualKeys.length &&
+    referenceSet.size === referenceKeys.length &&
+    [...referenceSet].every((key) => actualSet.has(key))
   );
 }
 
@@ -8406,7 +8447,7 @@ function cutoverVariablesMatchReference(plan) {
   );
 }
 
-function cutoverStateSections(plan, expectedEnable, expectedApplyable) {
+function cutoverStateSections(plan, mode, expectedEnable, expectedApplyable) {
   if (
     !cutoverExactPlanEnvelope(plan, expectedApplyable) ||
     !cutoverHasExactStateEnvelopes(plan) ||
@@ -8419,7 +8460,7 @@ function cutoverStateSections(plan, expectedEnable, expectedApplyable) {
     !hasExactKeys(plan.variables.enable_runtime_secrets_user_assignment, ["value"]) ||
     !cutoverVariablesMatchReference(plan) ||
     !cutoverHasExactChecks(plan) ||
-    !cutoverHasExactRelevantAttributes(plan) ||
+    !cutoverHasExactRelevantAttributes(plan, mode) ||
     !cutoverHasNoRetiredWorkloadDependencies(
       TERMINAL_REFERENCE_PLAN.configuration,
     ) ||
@@ -9191,7 +9232,12 @@ function cutoverExactOutputs(plan, terminal, bindings = []) {
 }
 
 function acceptsAzureGenerationCutover(plan, changes) {
-  const sections = cutoverStateSections(plan, true, true);
+  const sections = cutoverStateSections(
+    plan,
+    AZURE_GENERATION_CUTOVER_MODE,
+    true,
+    true,
+  );
   const addresses = cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY);
   if (!sections || !addresses) {
     return false;
@@ -9299,7 +9345,12 @@ function acceptsAzureGenerationCutover(plan, changes) {
 
 function acceptsAzureCredentialCleanup(plan, changes) {
   if (
-    !cutoverStateSections(plan, false, true) ||
+    !cutoverStateSections(
+      plan,
+      AZURE_CREDENTIAL_CLEANUP_MODE,
+      false,
+      true,
+    ) ||
     !cutoverExactAddressSet(changes, CUTOVER_RESOURCE_INVENTORY)
   ) return false;
   const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
@@ -9362,7 +9413,12 @@ function acceptsAzureCredentialCleanup(plan, changes) {
 
 function acceptsFinalRolloutComplete(plan, changes) {
   return (
-    cutoverStateSections(plan, false, false) &&
+    cutoverStateSections(
+      plan,
+      FINAL_ROLLOUT_COMPLETE_MODE,
+      false,
+      false,
+    ) &&
     plan.applyable === false &&
     cutoverTerminalNoOp(plan, changes)
   );
