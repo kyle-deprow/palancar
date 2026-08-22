@@ -18,7 +18,7 @@ vi.mock('@azure/identity', () => ({
 }));
 
 import {
-  AZURE_FOUNDRY_TOKEN_SCOPE,
+  AZURE_OPENAI_TOKEN_SCOPE,
   AzureManagedIdentityTokenSourceError,
   createAzureManagedIdentityTokenSource
 } from '../src/index.js';
@@ -57,16 +57,16 @@ describe('AzureManagedIdentityTokenSource', () => {
     identityMock.getToken.mockReset();
   });
 
-  it('constructs exactly one managed identity credential and requests the AI scope', async () => {
+  it('constructs exactly one managed identity credential and requests the Azure OpenAI scope', async () => {
     identityMock.getToken.mockResolvedValue(validToken());
     const source = createAzureManagedIdentityTokenSource({ clientId: CLIENT_ID, now: () => NOW });
 
-    expect(AZURE_FOUNDRY_TOKEN_SCOPE).toBe('https://ai.azure.com/.default');
+    expect(AZURE_OPENAI_TOKEN_SCOPE).toBe('https://cognitiveservices.azure.com/.default');
     expect(identityMock.constructor).toHaveBeenCalledOnce();
     expect(identityMock.constructor).toHaveBeenCalledWith({ clientId: CLIENT_ID });
     await expect(source.checkReadiness()).resolves.toBe(true);
     expect(identityMock.getToken).toHaveBeenCalledOnce();
-    expect(identityMock.getToken.mock.calls[0]?.[0]).toBe(AZURE_FOUNDRY_TOKEN_SCOPE);
+    expect(identityMock.getToken.mock.calls[0]?.[0]).toBe(AZURE_OPENAI_TOKEN_SCOPE);
     expect(identityMock.getToken.mock.calls[0]?.[1]).toMatchObject({
       abortSignal: expect.any(AbortSignal)
     });

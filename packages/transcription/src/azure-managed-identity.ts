@@ -1,5 +1,5 @@
 export {
-  AZURE_FOUNDRY_TOKEN_SCOPE as AZURE_REALTIME_TOKEN_SCOPE,
+  AZURE_OPENAI_TOKEN_SCOPE as AZURE_REALTIME_TOKEN_SCOPE,
   AzureManagedIdentityTokenSource,
   AzureManagedIdentityTokenSourceError,
   createAzureManagedIdentityTokenSource

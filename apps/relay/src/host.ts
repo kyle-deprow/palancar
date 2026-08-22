@@ -1516,6 +1516,7 @@ export function parseRelayHostConfig(env: NodeJS.ProcessEnv = process.env): Rela
       name === 'LITELLM_MASTER_KEY' ||
       name.startsWith('OPENAI_') ||
       name.startsWith('AZURE_OPENAI_') ||
+      name === 'AZURE_FOUNDRY_TOKEN_SCOPE' ||
       name === 'AZURE_API_KEY' ||
       (name.startsWith('PALANCAR_GENERATION_') &&
         name !== 'PALANCAR_GENERATION_PROVIDER') ||

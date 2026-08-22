@@ -52,16 +52,18 @@ read model content, keys, or deployment credentials during this check.
   tests. The only deployed generation provider is `azure-openai`.
 - Call the fixed Azure chat-completions route directly from the relay with
   deployment name `gpt-5.6-luna`.
-- Pin the Entra scope in code to `https://ai.azure.com/.default`. The scope and
-  API path/version are not runtime-configurable.
+- Pin the Azure OpenAI Entra scope in code to
+  `https://cognitiveservices.azure.com/.default`. The scope and API
+  path/version are not runtime-configurable.
 - Extract the capable managed-identity source already implemented in
   `packages/transcription/src/azure-managed-identity.ts`; do not create a
   second credential/cache implementation. Instantiate the extracted source
   exactly once in relay host composition and inject it into transcription and
   generation.
-  Both consumers use the same pinned `https://ai.azure.com/.default` scope; the
-  extracted source therefore retains one cache for that fixed scope rather than
-  accepting caller-supplied scopes. It caches until 120 seconds before expiry,
+  Both consumers use the same pinned Azure OpenAI
+  `https://cognitiveservices.azure.com/.default` scope; the extracted source
+  therefore retains one cache for that fixed route scope rather than accepting
+  caller-supplied scopes. It caches until 120 seconds before expiry,
   coalesces refreshes,
   isolates caller cancellation, aborts a refresh when no waiters remain, and
   is closed exactly once during relay shutdown. If either provider fails
@@ -342,8 +344,8 @@ read-only to every worker.
      `packages/azure-auth/test/managed-identity-token-source.test.ts` (new),
      `package.json`, `package-lock.json`, and `tsconfig.base.json`.
    - Move/extract the implementation, retain a compatibility export for the
-     transcription scope, and expose only the one pinned Foundry scope used by
-     both consumers; do not add caller-selectable scopes or change the
+     route-specific Azure OpenAI scope used by both consumers, and expose only
+     that one pinned scope; do not add caller-selectable scopes or change the
      transcription protocol.
    - Verify with `npm run lint`, `npm run typecheck`,
      `npm test --workspace @palancar/azure-auth`,

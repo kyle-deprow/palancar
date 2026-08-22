@@ -782,6 +782,7 @@ describe('azure generation diagnostic', () => {
     'PALANCAR_LITELLM_API_KEY',
     'OPENAI_SCOPE',
     'AZURE_FOUNDRY_TOKEN_SCOPE',
+    'AZURE_OPENAI_TOKEN_SCOPE',
     'CUSTOM_SCOPE',
     'AZURE_API_VERSION',
     'PALANCAR_AZURE_GENERATION_VERSION',

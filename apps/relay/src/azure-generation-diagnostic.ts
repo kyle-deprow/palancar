@@ -477,6 +477,7 @@ function forbiddenEnvironmentFamily(name: string): boolean {
     normalized.startsWith('OPENAI_') ||
     normalized.startsWith('AZURE_OPENAI_') ||
     normalized === 'AZURE_FOUNDRY_TOKEN_SCOPE' ||
+    normalized === 'AZURE_OPENAI_TOKEN_SCOPE' ||
     normalized === 'AZURE_TOKEN_SCOPE' ||
     normalized === 'OPENAI_SCOPE' ||
     normalized.endsWith('_SCOPE') ||

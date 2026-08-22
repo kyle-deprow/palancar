@@ -1,7 +1,7 @@
 import { ManagedIdentityCredential } from '@azure/identity';
 import { types as utilTypes } from 'node:util';
 
-export const AZURE_FOUNDRY_TOKEN_SCOPE = 'https://ai.azure.com/.default' as const;
+export const AZURE_OPENAI_TOKEN_SCOPE = 'https://cognitiveservices.azure.com/.default' as const;
 
 const TOKEN_REFRESH_WINDOW_MS = 120_000 as const;
 const MAX_TOKEN_BYTES = 16 * 1024;
@@ -202,7 +202,7 @@ export class AzureManagedIdentityTokenSource {
         if (this.#closed || controller.signal.aborted) throw sourceError('unavailable');
         let rawToken: unknown;
         try {
-          rawToken = await this.#credential.getToken(AZURE_FOUNDRY_TOKEN_SCOPE, {
+          rawToken = await this.#credential.getToken(AZURE_OPENAI_TOKEN_SCOPE, {
             abortSignal: controller.signal
           });
         } catch {

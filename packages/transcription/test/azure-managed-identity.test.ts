@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  AZURE_FOUNDRY_TOKEN_SCOPE,
+  AZURE_OPENAI_TOKEN_SCOPE,
   AzureManagedIdentityTokenSource as AzureAuthManagedIdentityTokenSource,
   AzureManagedIdentityTokenSourceError as AzureAuthManagedIdentityTokenSourceError,
   createAzureManagedIdentityTokenSource as createAzureAuthManagedIdentityTokenSource
@@ -69,8 +69,8 @@ describe('AzureManagedIdentityTokenSource', () => {
     identityMock.getToken.mockResolvedValue(validToken());
     const source = createAzureManagedIdentityTokenSource({ clientId: CLIENT_ID, now: () => NOW });
 
-    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe(AZURE_FOUNDRY_TOKEN_SCOPE);
-    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe('https://ai.azure.com/.default');
+    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe(AZURE_OPENAI_TOKEN_SCOPE);
+    expect(AZURE_REALTIME_TOKEN_SCOPE).toBe('https://cognitiveservices.azure.com/.default');
     expect(AzureManagedIdentityTokenSource).toBe(AzureAuthManagedIdentityTokenSource);
     expect(AzureManagedIdentityTokenSourceError).toBe(AzureAuthManagedIdentityTokenSourceError);
     expect(createAzureManagedIdentityTokenSource).toBe(createAzureAuthManagedIdentityTokenSource);
