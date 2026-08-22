@@ -13,17 +13,21 @@ function freezeDefinition<TCode extends string>(
   definition: LanguageDefinition<TCode>
 ): LanguageDefinition<TCode> {
   const fixtureSuiteIds = Object.freeze([...definition.fixtureSuiteIds]);
+  const developmentProvisional = definition.developmentProvisional === undefined
+    ? undefined
+    : Object.freeze({
+        ...definition.developmentProvisional,
+        generatedOutputTargetMarginThresholds: Object.freeze({
+          ...definition.developmentProvisional.generatedOutputTargetMarginThresholds
+        })
+      });
   return Object.freeze({
     ...definition,
     fixtureSuiteIds,
     finalCalibration: Object.freeze({ ...definition.finalCalibration }),
-    ...(definition.developmentProvisional === undefined
+    ...(developmentProvisional === undefined
       ? {}
-      : {
-          developmentProvisional: Object.freeze({
-            ...definition.developmentProvisional
-          })
-        }),
+      : { developmentProvisional }),
     ...(definition.partialDisplayCalibration === undefined
       ? {}
       : {
@@ -145,6 +149,7 @@ function validateDevelopmentProvisionalProfile(profile: unknown): void {
       'profileVersion',
       'provisionalScoreThreshold',
       'provisionalMarginThreshold',
+      'generatedOutputTargetMarginThresholds',
       'minimumTextCharacters',
       'minimumWindowCharacters',
       'maximumInputCodePoints',
@@ -164,6 +169,21 @@ function validateDevelopmentProvisionalProfile(profile: unknown): void {
   requireExactNonemptyString(candidate.profileVersion, 'Provisional profile version');
   requireThreshold(candidate.provisionalScoreThreshold, 'Provisional score threshold');
   requireThreshold(candidate.provisionalMarginThreshold, 'Provisional margin threshold');
+  const generatedOutputTargetMarginThresholds = candidate.generatedOutputTargetMarginThresholds;
+  if (
+    typeof generatedOutputTargetMarginThresholds !== 'object' ||
+    generatedOutputTargetMarginThresholds === null
+  ) {
+    throw new TypeError('Generated output target margin thresholds must be an object');
+  }
+  requireExactKeys(
+    generatedOutputTargetMarginThresholds,
+    ['es', 'tr'],
+    'Generated output target margin thresholds'
+  );
+  const targetMargins = generatedOutputTargetMarginThresholds as Record<string, unknown>;
+  requireThreshold(targetMargins.es, 'Generated Spanish output margin threshold');
+  requireThreshold(targetMargins.tr, 'Generated Turkish output margin threshold');
   const minimumTextCharacters = requirePositiveInteger(
     candidate.minimumTextCharacters,
     'Provisional minimum text characters'
@@ -216,6 +236,10 @@ function provisionalProfilesMatch(
     left.profileVersion === right.profileVersion &&
     left.provisionalScoreThreshold === right.provisionalScoreThreshold &&
     left.provisionalMarginThreshold === right.provisionalMarginThreshold &&
+    left.generatedOutputTargetMarginThresholds.es ===
+      right.generatedOutputTargetMarginThresholds.es &&
+    left.generatedOutputTargetMarginThresholds.tr ===
+      right.generatedOutputTargetMarginThresholds.tr &&
     left.minimumTextCharacters === right.minimumTextCharacters &&
     left.minimumWindowCharacters === right.minimumWindowCharacters &&
     left.maximumInputCodePoints === right.maximumInputCodePoints &&
@@ -314,7 +338,7 @@ export const CONTROLLED_FIXTURE_DETECTOR_VERSION =
 export const CONTROLLED_FIXTURE_CALIBRATION_VERSION =
   'controlled-fixture-calibration-1';
 export const DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION = 'eld-small-2.1.0';
-export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-5';
+export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-6';
 export const DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS = 12;
 
 export function countSubstantiveCharacters(text: string): number {
@@ -328,6 +352,10 @@ const developmentProvisional = {
   profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
+  generatedOutputTargetMarginThresholds: Object.freeze({
+    es: 0.05,
+    tr: 0.08
+  }),
   minimumTextCharacters: DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   minimumWindowCharacters: 1,
   maximumInputCodePoints: 512,
@@ -364,7 +392,7 @@ const initialDefinitions = [
   }
 ] as const satisfies readonly LanguageDefinition<TargetLanguage>[];
 
-export const LANGUAGE_REGISTRY_VERSION = '2.3.0';
+export const LANGUAGE_REGISTRY_VERSION = '2.4.0';
 
 export const languageRegistry = createLanguageRegistry(initialDefinitions);
 

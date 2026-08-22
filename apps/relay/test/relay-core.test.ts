@@ -1902,7 +1902,7 @@ describe('relay session core', () => {
           classify: async () => ({
             status: 'provisional',
             detectorVersion: 'eld-small-2.1.0',
-            profileVersion: 'eld-small-dev-5',
+            profileVersion: 'eld-small-dev-6',
             detectedLanguage: selectedLanguage,
             provisionalScore: 0.8,
             decision: 'accept',
@@ -2122,7 +2122,7 @@ describe('relay session core', () => {
       classify: async () => ({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-5',
+        profileVersion: 'eld-small-dev-6',
         detectedLanguage: 'en',
         provisionalScore: 0.9,
         decision: 'reject',
@@ -2179,7 +2179,7 @@ describe('relay session core', () => {
           classify: async () => ({
             status: 'provisional',
             detectorVersion: 'eld-small-2.1.0',
-            profileVersion: 'eld-small-dev-5',
+            profileVersion: 'eld-small-dev-6',
             detectedLanguage: 'unknown',
             provisionalScore,
             decision: 'uncertain',
@@ -2232,7 +2232,7 @@ describe('relay session core', () => {
         classify: async () => ({
           status: 'provisional',
           detectorVersion: 'eld-small-2.1.0',
-          profileVersion: 'eld-small-dev-5',
+          profileVersion: 'eld-small-dev-6',
           detectedLanguage: 'unknown',
           provisionalScore: 0,
           decision: 'reject',

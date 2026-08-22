@@ -223,6 +223,7 @@ describe('development provisional ELD-small boundary', () => {
   ] as const)('accepts substantive symmetric %s source text', async (target, text) => {
     const boundary = createDevelopmentProvisionalLanguageBoundary();
     expect(isDevelopmentProvisionalTextLanguageClassifier(boundary.classifier)).toBe(true);
+    expect(boundary.generatedLanguageValidator.version).toBe('1.1.0');
     expect(
       isDevelopmentProvisionalGeneratedLanguageValidator(
         boundary.generatedLanguageValidator
@@ -295,7 +296,7 @@ describe('development provisional ELD-small boundary', () => {
       await expect(boundary.classifier.classify(fullText, target)).resolves.toEqual({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-5',
+        profileVersion: 'eld-small-dev-6',
         detectedLanguage: 'unknown',
         provisionalScore: 0,
         decision: 'uncertain',
@@ -466,7 +467,8 @@ describe('development provisional ELD-small boundary', () => {
   });
 
   it.each([
-    ['wrong', TEXT.tr],
+    ['Turkish', TEXT.tr],
+    ['English', TEXT.en],
     ['mixed', `${TEXT.en} ${TEXT.es}`],
     ['unknown', 'zxqv zxqv zxqv zxqv'],
     ['short', 'hola'],
@@ -481,6 +483,162 @@ describe('development provisional ELD-small boundary', () => {
     expect(
       isAcceptedGeneratedLanguageEvidence(evidence, 'development-provisional')
     ).toBe(false);
+  });
+
+  it.each([
+    ['Turkish', 'tr', 'tr', 2],
+    ['English', 'es', 'en', 0]
+  ] as const)('marks reliable %s full detections below the shared margin as indeterminate', async (
+    _name,
+    target,
+    topLanguage,
+    index
+  ) => {
+    const text = `reliable ${topLanguage} generated calibration text`;
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => candidate === text
+        ? {
+            language: topLanguage,
+            score: 0.7,
+            secondLanguage: topLanguage === 'en' ? 'es' : 'en',
+            secondScore: 0.64,
+            reliable: true
+          }
+        : tokenLanguage(candidate))
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput(target, 5, { index, text }),
+      { signal: new AbortController().signal }
+    );
+    expect(evidence.checks[index]).toMatchObject({
+      expectedLanguage: topLanguage,
+      detectedLanguage: 'undetermined',
+      verdict: 'indeterminate',
+      provisionalScoreBasisPoints: 7000
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(false);
+  });
+
+  it.each([
+    '¿Podría ayudarme a localizar la estación de tren, por favor?',
+    '¿Sería tan amable de ayudarme a encontrar la estación ferroviaria?'
+  ] as const)('accepts observed real-ELD Spanish generated output at the target margin: %s', async (text) => {
+    const eld = (await import('eld/small')).default;
+    const detector = eld.newInstance();
+    let observedMargin: number | undefined;
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => Object.freeze({
+        detect: (candidate: string) => {
+          const result = detector.detect(candidate);
+          if (candidate === text) {
+            const scores = Object.entries(result.getScores())
+              .sort((left, right) => right[1] - left[1]);
+            observedMargin = (scores[0]?.[1] ?? 0) - (scores[1]?.[1] ?? 0);
+          }
+          return result;
+        }
+      })
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text }),
+      { signal: new AbortController().signal }
+    );
+    expect(observedMargin).toBeGreaterThanOrEqual(0.05);
+    expect(observedMargin).toBeLessThan(0.08);
+    expect(evidence.checks[2]).toMatchObject({
+      expectedLanguage: 'es',
+      detectedLanguage: 'es',
+      verdict: 'match'
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(true);
+  });
+
+  it('keeps the Spanish generated margin change scoped away from source and shared checks', async () => {
+    const calibratedText = 'calibrated Spanish generated output text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((text) => {
+        if (text === calibratedText) {
+          return {
+            language: 'es',
+            score: 0.7,
+            secondLanguage: 'tr',
+            secondScore: 0.64,
+            reliable: true
+          };
+        }
+        return tokenLanguage(text);
+      })
+    });
+    await expect(boundary.classifier.classify(calibratedText, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'unknown',
+      decision: 'uncertain',
+      reason: 'UNKNOWN'
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text: calibratedText }),
+      { signal: new AbortController().signal }
+    );
+    expect(evidence.checks[2]).toMatchObject({
+      detectedLanguage: 'es',
+      verdict: 'match'
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(true);
+  });
+
+  it.each([
+    ['Catalan', "Podria ajudar-me a localitzar l'estació de tren, si us plau?"],
+    ['Portuguese', 'Poderia ajudar-me a localizar a estação de trem, por favor?']
+  ] as const)('rejects real-ELD %s generated output for Spanish', async (_name, text) => {
+    const boundary = createDevelopmentProvisionalLanguageBoundary();
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text }),
+      { signal: new AbortController().signal }
+    );
+    expect(evidence.checks[2]).toMatchObject({
+      expectedLanguage: 'es',
+      detectedLanguage: 'other',
+      verdict: 'mismatch'
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(false);
+  });
+
+  it('rejects an unreliable generated target detection', async () => {
+    const text = 'unreliable Spanish generated output text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => candidate === text
+        ? {
+            language: 'es',
+            score: 0.92,
+            secondLanguage: 'en',
+            secondScore: 0.02,
+            reliable: false
+          }
+        : tokenLanguage(candidate))
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text }),
+      { signal: new AbortController().signal }
+    );
+    expect(evidence.checks[2]).toMatchObject({
+      detectedLanguage: 'undetermined',
+      verdict: 'indeterminate'
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(false);
   });
 
   it('fails source and generated validation closed when the detector throws', async () => {

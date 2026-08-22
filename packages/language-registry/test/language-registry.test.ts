@@ -5,6 +5,7 @@ import {
   DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION,
   DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
+  LANGUAGE_REGISTRY_VERSION,
   countSubstantiveCharacters,
   createLanguageRegistry,
   evaluateLanguageGate,
@@ -30,6 +31,10 @@ const DEVELOPMENT_PROFILE = {
   profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
+  generatedOutputTargetMarginThresholds: {
+    es: 0.05,
+    tr: 0.08
+  },
   minimumTextCharacters: DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   minimumWindowCharacters: 1,
   maximumInputCodePoints: 512,
@@ -114,6 +119,18 @@ describe('language registry', () => {
     ]);
   });
 
+  it('exports the exact frozen generated-output calibration versions and margins', () => {
+    expect(DEVELOPMENT_PROVISIONAL_PROFILE_VERSION).toBe('eld-small-dev-6');
+    expect(LANGUAGE_REGISTRY_VERSION).toBe('2.4.0');
+    for (const definition of listLanguageDefinitions()) {
+      expect(definition.developmentProvisional?.generatedOutputTargetMarginThresholds)
+        .toEqual({ es: 0.05, tr: 0.08 });
+      expect(Object.isFrozen(
+        definition.developmentProvisional?.generatedOutputTargetMarginThresholds
+      )).toBe(true);
+    }
+  });
+
   it('looks up entries generically by registry code', () => {
     for (const code of TARGETS) expect(getLanguageDefinition(code)?.code).toBe(code);
     expect(getLanguageDefinition('fr')).toBeUndefined();
@@ -190,6 +207,19 @@ describe('language registry', () => {
       } as LanguageDefinition<TargetLanguage>
     ])).toThrow(/symmetric/);
     expect(() => createLanguageRegistry([
+      definitions[0] as LanguageDefinition<TargetLanguage>,
+      {
+        ...definitions[1],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          generatedOutputTargetMarginThresholds: {
+            ...DEVELOPMENT_PROFILE.generatedOutputTargetMarginThresholds,
+            es: 0.06
+          }
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/symmetric/);
+    expect(() => createLanguageRegistry([
       {
         ...definitions[0],
         developmentProvisional: {
@@ -225,6 +255,53 @@ describe('language registry', () => {
         }
       } as LanguageDefinition<TargetLanguage>
     ])).toThrow(/minimum sliding window words cannot exceed maximum/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          generatedOutputTargetMarginThresholds: {
+            ...DEVELOPMENT_PROFILE.generatedOutputTargetMarginThresholds,
+            es: 1.01
+          }
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          generatedOutputTargetMarginThresholds: {
+            es: 0.05,
+            tr: 0.08,
+            ca: 0.05
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/unsupported field/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          generatedOutputTargetMarginThresholds: {
+            es: 0.05
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          generatedOutputTargetMarginThresholds: {
+            tr: 0.08
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
   });
 });
 

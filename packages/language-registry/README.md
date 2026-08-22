@@ -41,17 +41,21 @@ decision; both permissions remain false.
 
 The explicit `development-provisional` mode is a dev prototype boundary. It
 accepts exact selected-target `MATCH` or source-only
-`MATCH_IGNORED_SINGLETON` evidence from the symmetric active Spanish/Turkish
-ELD-small profile at or above its raw-score threshold. English, the other
-target, unsupported languages, mixed text, short text, unknowns, and detector
-errors remain closed. The `eld-small-dev-5` profile caps inputs at 512 Unicode
-code points and inspects every overlapping one-through-eight-word window plus
-every qualifying clause. Source classification removes strictly containing
-same-language intervals before applying the two-word or two-singleton mixed
-thresholds; generated-output validation remains strict for any reliable second
-language, including one conflicting word. A conflicting interval counts only
-when its raw score and margin meet the same profile thresholds as a full
-accepted detection; oversized input is uncertain.
+`MATCH_IGNORED_SINGLETON` evidence from the active Spanish/Turkish ELD-small
+profile at or above its raw-score threshold. English, the other target,
+unsupported languages, mixed text, short text, unknowns, and detector errors
+remain closed. The `eld-small-dev-6` profile caps inputs at 512 Unicode code
+points and inspects every overlapping one-through-eight-word window plus every
+qualifying clause. Source/input classification and mixed/subwindow strong
+detections retain the shared `.08` margin. Generated English and Turkish
+full-text retain `.08`; generated Spanish full-text alone uses `.05` to accept
+proven correct Spanish/Catalan-close output, while a different top language
+still rejects. Source classification removes strictly containing same-language
+intervals before applying the two-word or two-singleton mixed thresholds;
+generated-output validation remains strict for any reliable second language,
+including one conflicting word. A conflicting interval counts only when its
+raw score and shared `.08` margin meet the profile thresholds; oversized input
+is uncertain.
 Production-calibrated mode cannot consume this evidence.
 
 Partials never permit generation. Partial transcript display requires the

@@ -19,6 +19,9 @@ export interface DevelopmentProvisionalProfile {
   readonly profileVersion: string;
   readonly provisionalScoreThreshold: number;
   readonly provisionalMarginThreshold: number;
+  readonly generatedOutputTargetMarginThresholds: Readonly<
+    Record<TargetLanguage, number>
+  >;
   readonly minimumTextCharacters: number;
   readonly minimumWindowCharacters: number;
   readonly maximumInputCodePoints: number;

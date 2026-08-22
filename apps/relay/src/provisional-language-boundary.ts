@@ -27,7 +27,7 @@ const SOURCE_MIN_CORE_WORDS = 2;
 const SOURCE_MIN_SINGLETON_CORES = 2;
 const CLASSIFIER_ID = 'eld-small-development-provisional';
 const VALIDATOR_ID = 'eld-small-development-provisional';
-const COMPONENT_VERSION = '1.0.0';
+const COMPONENT_VERSION = '1.1.0';
 const CLASSIFIERS = new WeakSet<object>();
 const VALIDATORS = new WeakSet<object>();
 const READINESS_SANITY_FIXTURES = Object.freeze([
@@ -460,6 +460,15 @@ function isStrongDetection(
   );
 }
 
+function generatedFullTextMarginThreshold(
+  expectedLanguage: GeneratedLanguage,
+  settings: DevelopmentProvisionalProfile
+): number {
+  return expectedLanguage === ENGLISH_LANGUAGE
+    ? settings.provisionalMarginThreshold
+    : settings.generatedOutputTargetMarginThresholds[expectedLanguage];
+}
+
 function strictlyContains(
   outer: AnalysisInterval,
   inner: AnalysisInterval
@@ -650,6 +659,10 @@ function classifyGenerated(
   const text = normalized.text;
   try {
     const full = detect(detector, text);
+    const fullTextMarginThreshold = generatedFullTextMarginThreshold(
+      expectedLanguage,
+      settings
+    );
     if (hasSubstantiveMix(detector, text, settings, full)) {
       return evidence(settings, {
         detectedLanguage: MIXED_LANGUAGE,
@@ -661,7 +674,7 @@ function classifyGenerated(
     if (
       !full.reliable ||
       full.score < settings.provisionalScoreThreshold ||
-      full.margin < settings.provisionalMarginThreshold
+      full.margin < fullTextMarginThreshold
     ) {
       return evidence(settings, {
         detectedLanguage: UNKNOWN_LANGUAGE,
