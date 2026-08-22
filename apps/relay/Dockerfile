@@ -84,6 +84,6 @@ USER node
 
 EXPOSE 8787
 
-HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=6 CMD ["node", "-e", "fetch('http://127.0.0.1:' + process.env.PORT + '/healthz').then(async (response) => { if (!response.ok || (await response.json()).ok !== true) process.exit(1); }).catch(() => process.exit(1))"]
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=6 CMD ["node", "apps/relay/dist/healthcheck.js"]
 
 CMD ["node", "apps/relay/dist/main.js"]
