@@ -4979,7 +4979,7 @@ function diagnosticPlanCleanupJob(value, code) {
       identity[0].identity_ids.length !== 2,
     code,
   );
-  const identityIds = identity[0].identity_ids.map(identityKey);
+  const identityIds = identity[0].identity_ids.map((identityId) => identityKey(identityId, code));
   failIf(new Set(identityIds).size !== identityIds.length, code);
   const body = value.body;
   assertKnownKeys(body, ["properties"], code);
@@ -5006,22 +5006,26 @@ function diagnosticPlanCleanupJob(value, code) {
   const registry = configuration.registries[0];
   assertKnownKeys(registry, ["server", "identity"], code);
   assertRequiredKeys(registry, ["server", "identity"], code);
-  failIf(
-    typeof registry.server !== "string" ||
-      !/^[a-z0-9-]{5,50}\.azurecr\.io$/i.test(registry.server) ||
-      identityKey(registry.identity) !== identityIds[0],
-    code,
-  );
+  failIf(typeof registry.server !== "string" || !/^[a-z0-9-]{5,50}\.azurecr\.io$/i.test(registry.server), code);
+  const imagePull = identityKey(registry.identity, code);
+  failIf(!identityIds.includes(imagePull), code);
+  const runtimeIds = identityIds.filter((identityId) => identityId !== imagePull);
+  failIf(runtimeIds.length !== 1, code);
+  const runtime = runtimeIds[0];
   failIf(!Array.isArray(configuration.identitySettings) || configuration.identitySettings.length !== 2, code);
   const identitySettings = configuration.identitySettings.map((setting) => {
     assertKnownKeys(setting, ["identity", "lifecycle"], code);
     assertRequiredKeys(setting, ["identity", "lifecycle"], code);
-    return { identity: identityKey(setting.identity), lifecycle: setting.lifecycle };
+    return { identity: identityKey(setting.identity, code), lifecycle: setting.lifecycle };
   });
-  failIf(!same(identitySettings, [
-    { identity: identityIds[0], lifecycle: "None" },
-    { identity: identityIds[1], lifecycle: "Main" },
-  ]), code);
+  failIf(
+    !same(identitySettings, [
+      { identity: imagePull, lifecycle: "None" },
+      { identity: runtime, lifecycle: "Main" },
+    ]) ||
+      !same(identitySettings.map((setting) => setting.identity).slice().sort(), identityIds.slice().sort()),
+    code,
+  );
   const template = properties.template;
   assertKnownKeys(template, ["containers"], code);
   assertRequiredKeys(template, ["containers"], code);
@@ -5044,8 +5048,26 @@ function diagnosticPlanCleanupJob(value, code) {
     image: container.image,
     env,
     registryServer: registry.server,
-    identityIds,
+    identityIds: [imagePull, runtime],
   };
+}
+
+function sameDiagnosticPlanCleanupJob(left, right, code) {
+  const normalize = (value) => {
+    if (!isObject(value) || !Array.isArray(value.identity) || value.identity.length === 0 ||
+        !isObject(value.identity[0]) || !Array.isArray(value.identity[0].identity_ids)) {
+      return undefined;
+    }
+    const normalized = structuredClone(value);
+    normalized.identity[0].identity_ids = normalized.identity[0].identity_ids
+      .map((identityId) => identityKey(identityId, code))
+      .sort();
+    return normalized;
+  };
+  const normalizedLeft = normalize(left);
+  const normalizedRight = normalize(right);
+  failIf(normalizedLeft === undefined || normalizedRight === undefined, code);
+  return same(normalizedLeft, normalizedRight);
 }
 
 function reviewedDiagnosticJobShape(show, stateAddress) {
@@ -5058,10 +5080,20 @@ function reviewedDiagnosticJobShape(show, stateAddress) {
   const prior = stateAddress(show.prior_state?.values?.root_module, DIAGNOSTIC_JOB_ADDRESS, DIAGNOSTIC_JOB_MODULE_ADDRESS, "diagnostic-plan-topology");
   const planned = stateAddress(show.planned_values?.root_module, DIAGNOSTIC_JOB_ADDRESS, DIAGNOSTIC_JOB_MODULE_ADDRESS, "diagnostic-plan-topology");
   failIf(prior === undefined || planned === undefined || !isObject(prior.values) || !isObject(planned.values), "diagnostic-plan-topology");
-  failIf(!same(change.before, change.after) || !same(change.before, prior.values) || !same(change.before, planned.values), "diagnostic-plan-topology");
+  failIf(
+    !sameDiagnosticPlanCleanupJob(change.before, change.after, "diagnostic-plan-topology") ||
+      !sameDiagnosticPlanCleanupJob(change.before, prior.values, "diagnostic-plan-topology") ||
+      !sameDiagnosticPlanCleanupJob(change.before, planned.values, "diagnostic-plan-topology"),
+    "diagnostic-plan-topology",
+  );
   const before = diagnosticPlanCleanupJob(change.before, "diagnostic-plan-topology");
   const after = diagnosticPlanCleanupJob(change.after, "diagnostic-plan-topology");
-  failIf(!same(before, after), "diagnostic-plan-topology");
+  const priorShape = diagnosticPlanCleanupJob(prior.values, "diagnostic-plan-topology");
+  const plannedShape = diagnosticPlanCleanupJob(planned.values, "diagnostic-plan-topology");
+  failIf(
+    !same(before, after) || !same(before, priorShape) || !same(before, plannedShape),
+    "diagnostic-plan-topology",
+  );
   const variableDigest = show.variables?.expiry_cleanup_image_digest?.value;
   failIf(variableDigest !== after.image, "diagnostic-plan-image");
   return after;

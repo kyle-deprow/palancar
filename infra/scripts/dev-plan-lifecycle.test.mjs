@@ -3035,6 +3035,95 @@ test("real credential cleanup plan is phase-bound to an exact no-op topology", (
   }
 });
 
+test("reviewed cleanup-job identity arrays accept independent permutations and return canonical identities", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "palancar-reviewed-cleanup-identities-"));
+  const showPath = path.join(directory, "show.json");
+  const cleanupAddress = "module.expiry_cleanup_job[0].azapi_resource.this";
+  const copiesFor = (show) => {
+    const cleanupChange = show.resource_changes.find((entry) => entry.address === cleanupAddress).change;
+    const prior = show.prior_state.values.root_module.resources.find((entry) => entry.address === cleanupAddress);
+    const planned = show.planned_values.root_module.resources.find((entry) => entry.address === cleanupAddress);
+    return [cleanupChange.before, cleanupChange.after, prior.values, planned.values];
+  };
+  try {
+    for (const phase of ["runtime-cutover", "credential-cleanup", "terminal"]) {
+      for (let permutation = 0; permutation < 16; permutation += 1) {
+        const show = reviewedRuntimeShow(phase);
+        const copies = copiesFor(show);
+        for (const [index, copy] of copies.entries()) {
+          if ((permutation & (1 << index)) !== 0) copy.identity[0].identity_ids.reverse();
+        }
+        const imagePull = copies[0].body.properties.configuration.registries[0].identity.toLowerCase();
+        const runtime = copies[0].identity[0].identity_ids
+          .map((identity) => identity.toLowerCase())
+          .find((identity) => identity !== imagePull);
+        replaceExisting(showPath, show);
+        const reviewed = reviewedRuntimeShapes({ show: showPath }, phase);
+        assert.deepEqual(reviewed.cleanupJob.identityIds, [imagePull, runtime]);
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reviewed cleanup-job identity canonicalization rejects bounded identity and unrelated drift", () => {
+  const cleanupAddress = "module.expiry_cleanup_job[0].azapi_resource.this";
+  const copiesFor = (show) => {
+    const cleanupChange = show.resource_changes.find((entry) => entry.address === cleanupAddress).change;
+    const prior = show.prior_state.values.root_module.resources.find((entry) => entry.address === cleanupAddress);
+    const planned = show.planned_values.root_module.resources.find((entry) => entry.address === cleanupAddress);
+    return [cleanupChange.before, cleanupChange.after, prior.values, planned.values];
+  };
+  const cases = [
+    ["missing identity", (copies) => copies.forEach((copy) => { copy.identity[0].identity_ids.pop(); })],
+    ["extra identity", (copies) => copies.forEach((copy) => { copy.identity[0].identity_ids.push(`${copy.identity[0].identity_ids[1]}/extra`); })],
+    ["duplicate identity", (copies) => copies.forEach((copy) => { copy.identity[0].identity_ids[1] = copy.identity[0].identity_ids[0]; })],
+    ["unknown identity", (copies) => copies.forEach((copy) => {
+      copy.identity[0].identity_ids[1] = `${copy.identity[0].identity_ids[1]}/unknown`;
+    })],
+    ["registry outside identity set", (copies) => copies.forEach((copy) => {
+      copy.body.properties.configuration.registries[0].identity = `${copy.identity[0].identity_ids[0]}/outside`;
+    })],
+    ["registry bound to runtime identity", (copies) => copies.forEach((copy) => {
+      copy.body.properties.configuration.registries[0].identity = copy.identity[0].identity_ids[1];
+    })],
+    ["swapped identity settings", (copies) => copies.forEach((copy) => {
+      copy.body.properties.configuration.identitySettings.reverse();
+    })],
+    ["duplicate identity settings", (copies) => copies.forEach((copy) => {
+      copy.body.properties.configuration.identitySettings[1].identity =
+        copy.body.properties.configuration.identitySettings[0].identity;
+    })],
+    ["wrong identity lifecycle", (copies) => copies.forEach((copy) => {
+      copy.body.properties.configuration.identitySettings[0].lifecycle = "Main";
+    })],
+    ["wrong identity settings set", (copies) => copies.forEach((copy) => {
+      const settings = copy.body.properties.configuration.identitySettings;
+      settings[1].identity = `${settings[1].identity}/unknown`;
+    })],
+    ["unrelated cleanup-job difference", (copies, show) => {
+      const change = show.resource_changes.find((entry) => entry.address === cleanupAddress).change;
+      change.after.name = "unexpected-cleanup-job";
+    }],
+  ];
+  for (const [, mutate] of cases) {
+    const directory = mkdtempSync(path.join(tmpdir(), "palancar-reviewed-cleanup-identity-negative-"));
+    const showPath = path.join(directory, "show.json");
+    try {
+      const show = reviewedRuntimeShow("credential-cleanup");
+      mutate(copiesFor(show), show);
+      writeExclusive(showPath, show);
+      expectCode(
+        () => reviewedRuntimeShapes({ show: showPath }, "credential-cleanup"),
+        "diagnostic-plan-topology",
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("runtime post reconciliation retains the real predecessor contract and isolates active retired references", () => {
   const directory = mkdtempSync(path.join(tmpdir(), "palancar-reviewed-runtime-"));
   const showPath = path.join(directory, "show.json");
