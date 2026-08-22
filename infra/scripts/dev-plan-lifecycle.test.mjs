@@ -84,6 +84,8 @@ const {
 
 const PLAN_BYTES = Buffer.from("synthetic saved terraform plan\n", "utf8");
 const SHA = "a".repeat(64);
+const SEED_VERIFIER_SOURCE = "seed verifier source\n";
+const SEED_VERIFIER_SHA = sha256Bytes(SEED_VERIFIER_SOURCE);
 const BLOB = "e".repeat(40);
 const COMMIT = "f".repeat(40);
 const REPO_ROOT = process.cwd();
@@ -168,6 +170,7 @@ const RUNTIME_CLIENT = "00000000-0000-0000-0000-000000000012";
 const RUNTIME_PRINCIPAL = "00000000-0000-0000-0000-000000000013";
 const CLEANUP_IMAGE = "palancardevacraeeacd8c.azurecr.io/palancar-expiry-cleanup@sha256:" + "c".repeat(64);
 const CLEANUP_JOB_PARENT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime`;
+const ACR_LOGIN_SERVER = "palancardevacraeeacd8c.azurecr.io";
 const CLEANUP_ENV = Object.freeze([
   { name: "AZURE_CLIENT_ID", value: RUNTIME_CLIENT },
   { name: "PALANCAR_WORKLOAD_TABLE_ENDPOINT", value: "https://palancardevstateaeeacd8c.table.core.windows.net" },
@@ -188,6 +191,23 @@ const SYSTEM_DATA_ACTOR = "synthetic-user";
 
 function cleanupEnvironment() {
   return CLEANUP_ENV.map((entry) => ({ ...entry }));
+}
+
+function fakeImageDescriptor(reference) {
+  const repository = reference.includes("palancar-relay") ? "palancar-relay" : "palancar-expiry-cleanup";
+  const digest = reference.slice(reference.indexOf("@") + 1);
+  return {
+    version: 1,
+    reference,
+    repository,
+    manifestDigest: digest,
+    manifestMediaType: "application/vnd.oci.image.manifest.v1+json",
+    configDigest: `sha256:${(repository === "palancar-relay" ? "a" : "b").repeat(64)}`,
+    configMediaType: "application/vnd.oci.image.config.v1+json",
+    os: "linux",
+    architecture: "amd64",
+    variant: null,
+  };
 }
 const GENERATION_PATHS = [
   "packages/generation/src/azure-openai.ts",
@@ -583,6 +603,7 @@ function makeHarness(overrides = {}) {
   chmodSync(workdir, 0o700);
   for (const file of [
     "infra/scripts/dev-plan-lifecycle.mjs",
+    "infra/scripts/verify-acr-image-platform.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
@@ -597,11 +618,13 @@ function makeHarness(overrides = {}) {
   const tfvarsPath = path.join(workdir, "terraform.tfvars");
   writeBackend(backendConfigPath);
   writeTerraformCache(workdir);
-  writeExclusive(tfvarsPath, `operator_principal_id = "${OBJECT_ID}"\n`);
+  writeExclusive(tfvarsPath, `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "${REVIEWED_RELAY_IMAGE}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`);
   const closure = `${root}-closure`;
   let tick = Date.now();
   let serial = 7;
   let lineage = "lineage-1";
+  let acrLoginServer = ACR_LOGIN_SERVER;
+  let postPlanAcrLoginServer;
   let revision = "revision-before";
   let applyStatus = "success";
   let modelCase = "ok";
@@ -629,8 +652,13 @@ function makeHarness(overrides = {}) {
   let diagnosticRunId;
   let diagnosticPlanSha;
   let reviewedShowMutator = (value) => value;
+  let verifierStatus = "success";
+  let verifierMutator = (value) => value;
+  let verifierFailureReference;
+  let guardStatus = "success";
   const httpCalls = [];
   const calls = [];
+  const verifierCalls = [];
   const run = (request) => {
     calls.push({
       command: request.command,
@@ -652,6 +680,16 @@ function makeHarness(overrides = {}) {
       }
       if (request.argv[0] === "rev-parse") return { status: 0, stdout: `${BLOB}\n` };
       if (request.argv[0] === "hash-object") return { status: 0, stdout: `${BLOB}\n` };
+    }
+    if (request.command === "/usr/bin/node" && path.basename(request.argv[0]) === "verify-acr-image-platform.mjs") {
+      verifierCalls.push({ argv: [...request.argv], env: { ...request.env } });
+      if (verifierStatus === "timeout") return { status: null, exitCode: null, stdout: "", stderr: "", timedOut: true };
+      if (verifierStatus === "failure") return { status: 1, exitCode: 1, stdout: "", stderr: "rejected\n" };
+      if (verifierStatus === "oversize") return { status: 0, stdout: `${"x".repeat(64 * 1024)}\n`, stderr: "" };
+      if (verifierFailureReference === request.argv[4]) return { status: 1, exitCode: 1, stdout: "", stderr: "rejected\n" };
+      if (verifierStatus === "malformed") return { status: 0, stdout: "{}\n", stderr: "" };
+      const descriptor = verifierMutator(fakeImageDescriptor(request.argv[4]), request);
+      return { status: 0, stdout: `${JSON.stringify(descriptor)}\n`, stderr: "" };
     }
     if (request.command === "/usr/bin/az") {
       if (request.argv[0] === "account" && request.argv[1] === "get-access-token") {
@@ -1117,6 +1155,7 @@ function makeHarness(overrides = {}) {
           stdout: JSON.stringify({
             resource_group_name: { value: "rg-runtime" },
             region: { value: "eastus2" },
+            acr_login_server: { value: acrLoginServer },
             foundry_account_id: {
               value: `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-runtime/providers/Microsoft.CognitiveServices/accounts/foundry-test`,
             },
@@ -1140,6 +1179,7 @@ function makeHarness(overrides = {}) {
       if (request.argv[0] === "plan") {
         const planPath = request.argv.find((arg) => arg.startsWith("-out=")).slice(5);
         writeExclusive(planPath, PLAN_BYTES);
+        if (postPlanAcrLoginServer !== undefined) acrLoginServer = postPlanAcrLoginServer;
         return { status: 0, stdout: "" };
       }
       if (request.argv[0] === "show") {
@@ -1158,7 +1198,9 @@ function makeHarness(overrides = {}) {
         return { status: applyStatus === "success" ? 0 : applyStatus === "failure" ? 1 : null, stdout: "" };
       }
     }
-    if (request.command.endsWith("assert-dev-plan.mjs")) return { status: 0, stdout: "" };
+    if (request.command.endsWith("assert-dev-plan.mjs")) {
+      return { status: guardStatus === "success" ? 0 : 1, stdout: "" };
+    }
     return { status: 0, stdout: "" };
   };
   const cleanupRunner = ({ operation, runId, root: cleanupRoot }) => {
@@ -1317,6 +1359,8 @@ function makeHarness(overrides = {}) {
     backendConfigPath,
     calls,
     setSerial(value) { serial = value; },
+    setAcrLoginServer(value) { acrLoginServer = value; },
+    setPostPlanAcrLoginServer(value) { postPlanAcrLoginServer = value; },
     setLineage(value) { lineage = value; },
     setRevision(value) { revision = value; },
     setTopology(value) {
@@ -1342,9 +1386,14 @@ function makeHarness(overrides = {}) {
     setDiagnosticPostRuntimeIdentityStatus(value) { diagnosticPostRuntimeIdentityStatus = value; },
     setDiagnosticStartClockAdvance(value) { diagnosticStartClockAdvanceMs = value; },
     setReviewedShowMutator(value) { reviewedShowMutator = value; },
+    setVerifierStatus(value) { verifierStatus = value; },
+    setVerifierMutator(value) { verifierMutator = value; },
+    setVerifierFailureReference(value) { verifierFailureReference = value; },
+    setGuardStatus(value) { guardStatus = value; },
     advance(ms) { tick += ms; },
     paths(runId) { return lifecycle.paths(runId); },
     httpCalls,
+    verifierCalls,
     cleanup() {
       rmSync(root, { recursive: true, force: true });
       rmSync(`${root}.kernel.lock`, { force: true });
@@ -1489,7 +1538,7 @@ function rewriteManifestArgv(harness, runId, argv) {
 function setProtectedRuntimeSecretsRole(harness, enabled) {
   replaceExisting(
     path.join(harness.workdir, "terraform.tfvars"),
-    `enable_runtime_secrets_user_assignment = ${enabled ? "true" : "false"}\noperator_principal_id = "${OBJECT_ID}"\n`,
+    `enable_runtime_secrets_user_assignment = ${enabled ? "true" : "false"}\noperator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "${REVIEWED_RELAY_IMAGE}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`,
   );
 }
 
@@ -1528,6 +1577,14 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     "-lock-timeout=5m",
     `-out=${planPath}`,
   ];
+  const imagePlatforms = {
+    version: 1,
+    verifierSha256: SEED_VERIFIER_SHA,
+    images: [
+      fakeImageDescriptor(CLEANUP_IMAGE),
+      fakeImageDescriptor(REVIEWED_RELAY_IMAGE),
+    ],
+  };
   const bindings = {
     repositoryCommit: COMMIT,
     argv: planArgv,
@@ -1538,6 +1595,8 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     runtimeIdentityPrincipalId: RUNTIME_PRINCIPAL,
     accountId: FOUNDry_ACCOUNT_ID,
     runtimeOpenAiRoleAssignmentId: `${FOUNDry_ACCOUNT_ID}/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000020`,
+    acrLoginServer: ACR_LOGIN_SERVER,
+    imagePlatforms,
   };
   const manifest = {
     version: 1,
@@ -1551,6 +1610,7 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     bindingSha256: sha256Bytes(canonicalJson(bindings)),
   };
   writeExclusive(planPath, planText);
+  writeExclusive(harness.paths(runId).verifier, SEED_VERIFIER_SOURCE);
   writeExclusive(path.join(runDirectory, "create-manifest.json"), manifest);
   const show = reviewedRuntimeShow(phase);
   writeExclusive(path.join(runDirectory, "show.json"), show);
@@ -1578,7 +1638,7 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
     bindingSha256: manifest.bindingSha256,
     createdAt,
     result: "passed",
-    verifierSha256: SHA,
+    verifierSha256: SEED_VERIFIER_SHA,
   };
   const apply = {
     version: 1,
@@ -1598,6 +1658,7 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
   if (phase === "credential-cleanup") writeSeedCleanupArtifacts(harness, runId);
   const checkpointNames = [
     "run-directory",
+    "image-platform-verified",
     "plan-started",
     "temp-plan",
     "published-plan",
@@ -1616,6 +1677,8 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
   for (const [index, name] of checkpointNames.entries()) {
     const details = name === "plan-started"
       ? { argv: planArgv }
+      : name === "image-platform-verified"
+        ? { verifierSha256: imagePlatforms.verifierSha256, verifierPath: "verify-acr-image-platform.mjs", descriptorSetSha256: sha256Bytes(canonicalJson(imagePlatforms.images)) }
       : name === "temp-plan"
         ? { planSha256 }
       : name === "published-plan"
@@ -1701,6 +1764,13 @@ function forceUnknownRun(harness, runId) {
     "receipts-consumed",
     "terraform-exit-ambiguous",
   ];
+  const checkpointBase = Math.max(
+    ...readdirSync(path.join(harness.root, runId))
+      .map((entry) => /^(\d{6})-[a-z0-9-]+\.json$/.exec(entry)?.[1])
+      .filter(Boolean)
+      .map(Number),
+    0,
+  ) + 1;
   const guard = {
     version: 1,
     type: "guard",
@@ -1754,11 +1824,11 @@ function forceUnknownRun(harness, runId) {
             }
           : {};
     writeExclusive(
-      path.join(harness.root, runId, `${String(index + 7).padStart(6, "0")}-${name}.json`),
+      path.join(harness.root, runId, `${String(checkpointBase + index).padStart(6, "0")}-${name}.json`),
       {
         version: 1,
         type: "lifecycle-checkpoint",
-        sequence: index + 7,
+        sequence: checkpointBase + index,
         name,
         runId,
         phase: manifest.phase,
@@ -1780,11 +1850,11 @@ function forceUnknownRun(harness, runId) {
   };
   writeExclusive(harness.paths(runId).apply, apply);
   writeExclusive(
-    path.join(harness.root, runId, `${String(7 + checkpointNames.length).padStart(6, "0")}-apply-receipt.json`),
+    path.join(harness.root, runId, `${String(checkpointBase + checkpointNames.length).padStart(6, "0")}-apply-receipt.json`),
     {
       version: 1,
       type: "lifecycle-checkpoint",
-      sequence: 7 + checkpointNames.length,
+      sequence: checkpointBase + checkpointNames.length,
       name: "apply-receipt",
       runId,
       phase: manifest.phase,
@@ -1794,6 +1864,252 @@ function forceUnknownRun(harness, runId) {
   );
   run.status = "unknown";
   appendStateSnapshot(harness, state);
+}
+
+function seedLegacyAppliedModel(harness, runId = "legacy-model") {
+  const runDirectory = path.join(harness.root, runId);
+  mkdirSync(runDirectory, { mode: 0o700 });
+  const artifacts = harness.paths(runId);
+  const runCreatedAt = new Date().toISOString();
+  const manifestCreatedAt = new Date(Date.parse(runCreatedAt) + 77).toISOString();
+  const guardCheckpointCreatedAt = new Date(Date.parse(manifestCreatedAt) + 1).toISOString();
+  const guardedAt = new Date(Date.parse(guardCheckpointCreatedAt) + 26).toISOString();
+  const planText = canonicalJson(PLAN_BYTES);
+  const planSha256 = sha256Bytes(planText);
+  const planArgv = [
+    "plan",
+    "-refresh=true",
+    "-input=false",
+    "-lock=true",
+    "-lock-timeout=5m",
+    `-out=${artifacts.planTemp}`,
+  ];
+  const dependencyBlobs = [
+    "infra/scripts/assert-dev-plan.mjs",
+    "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+    "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
+  ].map((relativePath) => ({ path: relativePath, blob: BLOB, sha256: SHA }));
+  const bindings = {
+    argv: planArgv,
+    azureContextHash: sha256Bytes(canonicalJson({
+      cloud: "AzureCloud",
+      subscription: REAL_BACKEND.identity.subscription_id,
+      tenant: REAL_BACKEND.identity.tenant_id,
+    })),
+    backend: REAL_BACKEND.identity,
+    backendConfigurationSha256: BACKEND_SHA256,
+    backendSha256: BACKEND_SHA256,
+    callerHash: sha256Bytes(canonicalJson({
+      cloud: "AzureCloud",
+      subscription: SUBSCRIPTION,
+      tenant: TENANT,
+      userType: "user",
+      objectId: OBJECT_ID,
+    })),
+    cwd: harness.workdir,
+    dependencyBlobs,
+    guard: GUARD_MAPPINGS["model-bootstrap"],
+    guardSha256: SHA,
+    lifecycleSha256: SHA,
+    liveRevision: "revision-before",
+    phase: "model-bootstrap",
+    planSha256,
+    repositoryCommit: COMMIT,
+    stateLineage: "legacy-lineage",
+    stateSerial: 0,
+    terraformSha256: SHA,
+    workspace: "default",
+  };
+  const manifest = {
+    version: 1,
+    runId,
+    phase: "model-bootstrap",
+    createdAt: manifestCreatedAt,
+    processExit: 0,
+    planSha256,
+    argv: planArgv,
+    bindings,
+    bindingSha256: sha256Bytes(canonicalJson(bindings)),
+  };
+  writeExclusive(artifacts.planTemp, planText);
+  writeExclusive(artifacts.plan, planText);
+  rmSync(artifacts.planTemp);
+  writeExclusive(artifacts.manifest, manifest);
+  const show = reviewedRuntimeShow("model-bootstrap");
+  writeExclusive(artifacts.show, show);
+  const showSha256 = sha256Bytes(canonicalJson(show));
+  const guard = {
+    version: 1,
+    type: "guard",
+    runId,
+    phase: "model-bootstrap",
+    planSha256,
+    bindingSha256: manifest.bindingSha256,
+    createdAt: manifestCreatedAt,
+    guard: GUARD_MAPPINGS["model-bootstrap"],
+    showSha256,
+    guardArgv: [`--mode=${GUARD_MAPPINGS["model-bootstrap"]}`],
+    stdinSha256: showSha256,
+    result: "passed",
+  };
+  const preflight = {
+    version: 1,
+    type: "preflight",
+    runId,
+    phase: "model-bootstrap",
+    planSha256,
+    bindingSha256: manifest.bindingSha256,
+    createdAt: guardedAt,
+    result: "passed",
+    verifierSha256: SHA,
+  };
+  const apply = {
+    version: 1,
+    type: "apply",
+    runId,
+    phase: "model-bootstrap",
+    planSha256,
+    bindingSha256: manifest.bindingSha256,
+    createdAt: manifestCreatedAt,
+    status: "applied",
+    appliedAt: guardedAt,
+  };
+  writeExclusive(`${artifacts.guard}.consumed`, guard);
+  writeExclusive(`${artifacts.preflight}.consumed`, preflight);
+  writeExclusive(artifacts.apply, apply);
+  writeExclusive(path.join(runDirectory, "tf-cli.tfrc"), "");
+  const checkpointNames = [
+    "run-directory",
+    "plan-started",
+    "temp-plan",
+    "published-plan",
+    "terraform-exit-known",
+    "manifest",
+    "show-json",
+    "guard-receipt",
+    "preflight-receipt",
+    "applying",
+    "receipts-consumed",
+    "terraform-exit-known",
+    "apply-receipt",
+    "global-state-advancement",
+  ];
+  let exitIndex = 0;
+  for (const [index, name] of checkpointNames.entries()) {
+    const details = name === "plan-started"
+      ? { argv: planArgv }
+      : name === "temp-plan"
+        ? { planSha256 }
+        : name === "published-plan"
+          ? { planSha256, planPath: artifacts.plan }
+          : name === "terraform-exit-known"
+            ? exitIndex++ === 0
+              ? { operation: "create", status: "success", exitCode: 0 }
+              : { status: "success", exitCode: 0 }
+            : name === "manifest"
+              ? { manifestSha256: sha256File(artifacts.manifest), planSha256 }
+              : name === "show-json"
+                ? { showSha256 }
+              : name === "guard-receipt"
+                  ? {
+                      guard: GUARD_MAPPINGS["model-bootstrap"],
+                      receiptSha256: sha256File(`${artifacts.guard}.consumed`),
+                      showSha256,
+                    }
+                : name === "preflight-receipt"
+                    ? {
+                        receiptSha256: sha256File(`${artifacts.preflight}.consumed`),
+                        verifierSha256: SHA,
+                      }
+                    : name === "receipts-consumed"
+                      ? {
+                          guardReceiptSha256: sha256File(`${artifacts.guard}.consumed`),
+                          preflightReceiptSha256: sha256File(`${artifacts.preflight}.consumed`),
+                        }
+                      : name === "apply-receipt"
+                        ? { receiptSha256: sha256File(artifacts.apply), status: "applied" }
+                        : name === "global-state-advancement"
+                          ? {
+                              from: "manual-Luna-absent",
+                              to: "model-applied",
+                              applyReceiptSha256: sha256File(artifacts.apply),
+                            }
+                : name === "applying"
+                            ? { applyingAt: guardedAt, planSha256 }
+                            : {};
+    writeExclusive(path.join(runDirectory, `${String(index + 1).padStart(6, "0")}-${name}.json`), {
+      version: 1,
+      type: "lifecycle-checkpoint",
+      sequence: index + 1,
+      name,
+      runId,
+      phase: "model-bootstrap",
+      createdAt: name === "guard-receipt" ? guardCheckpointCreatedAt : manifestCreatedAt,
+      ...details,
+    });
+  }
+  const state = JSON.parse(readFileSync(path.join(harness.root, "state.json"), "utf8"));
+  state.state = "model-applied";
+  state.runs.push({
+    id: runId,
+    phase: "model-bootstrap",
+    status: "applied",
+    appliedAt: guardedAt,
+    applyingAt: guardedAt,
+    createdAt: runCreatedAt,
+    guardedAt,
+    lastCheckpoint: "global-state-advancement",
+    preflightAt: guardedAt,
+  });
+  appendStateSnapshot(harness, state);
+  return runId;
+}
+
+function rewriteLegacyBinding(harness, runId, mutate) {
+  const paths = harness.paths(runId);
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8"));
+  mutate(manifest.bindings);
+  manifest.bindingSha256 = sha256Bytes(canonicalJson(manifest.bindings));
+  replaceExisting(paths.manifest, manifest);
+
+  const manifestCheckpointPath = checkpointPath(harness, runId, "manifest");
+  const manifestCheckpoint = JSON.parse(readFileSync(manifestCheckpointPath, "utf8"));
+  replaceExisting(manifestCheckpointPath, {
+    ...manifestCheckpoint,
+    manifestSha256: sha256File(paths.manifest),
+  });
+
+  for (const receiptPath of [paths.guard + ".consumed", paths.preflight + ".consumed", paths.apply]) {
+    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    receipt.bindingSha256 = manifest.bindingSha256;
+    replaceExisting(receiptPath, receipt);
+  }
+  for (const name of ["guard-receipt", "preflight-receipt", "apply-receipt"]) {
+    const checkpointPathname = checkpointPath(harness, runId, name);
+    const checkpoint = JSON.parse(readFileSync(checkpointPathname, "utf8"));
+    const receiptPath = name === "guard-receipt"
+      ? `${paths.guard}.consumed`
+      : name === "preflight-receipt"
+        ? `${paths.preflight}.consumed`
+        : paths.apply;
+    replaceExisting(checkpointPathname, {
+      ...checkpoint,
+      receiptSha256: sha256File(receiptPath),
+    });
+  }
+  const consumedPath = checkpointPath(harness, runId, "receipts-consumed");
+  const consumed = JSON.parse(readFileSync(consumedPath, "utf8"));
+  replaceExisting(consumedPath, {
+    ...consumed,
+    guardReceiptSha256: sha256File(`${paths.guard}.consumed`),
+    preflightReceiptSha256: sha256File(`${paths.preflight}.consumed`),
+  });
+  const advancementPath = checkpointPath(harness, runId, "global-state-advancement");
+  const advancement = JSON.parse(readFileSync(advancementPath, "utf8"));
+  replaceExisting(advancementPath, {
+    ...advancement,
+    applyReceiptSha256: sha256File(paths.apply),
+  });
 }
 
 function waitForPath(filePath, timeoutMs = 1500) {
@@ -4350,6 +4666,250 @@ test("applied historical model manifest temp argv migrates before runtime creati
   }
 });
 
+test("explicit legacy applied model journal recovers and permits runtime replacement create", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    const runId = seedLegacyAppliedModel(harness);
+    const recovered = harness.lifecycle.readState();
+    const run = recovered.runs.find((candidate) => candidate.id === runId);
+    assert.equal(recovered.state, "model-applied");
+    assert.equal(run.status, "applied");
+    assert.equal(run.lastCheckpoint, "global-state-advancement");
+    const runEntries = readdirSync(path.join(harness.root, runId)).sort();
+    assert.equal(runEntries.includes(".plan.tfplan.tmp"), false);
+    assert.equal(
+        Object.hasOwn(
+        JSON.parse(readFileSync(path.join(harness.root, runId, "000012-terraform-exit-known.json"), "utf8")),
+        "operation",
+      ),
+      false,
+    );
+    assert.deepEqual(runEntries, [
+      "000001-run-directory.json",
+      "000002-plan-started.json",
+      "000003-temp-plan.json",
+      "000004-published-plan.json",
+      "000005-terraform-exit-known.json",
+      "000006-manifest.json",
+      "000007-show-json.json",
+      "000008-guard-receipt.json",
+      "000009-preflight-receipt.json",
+      "000010-applying.json",
+      "000011-receipts-consumed.json",
+      "000012-terraform-exit-known.json",
+      "000013-apply-receipt.json",
+      "000014-global-state-advancement.json",
+      "apply-receipt.json",
+      "create-manifest.json",
+      "guard-receipt.json.consumed",
+      "plan.tfplan",
+      "preflight-receipt.json.consumed",
+      "show.json",
+      "tf-cli.tfrc",
+    ]);
+    const runtime = harness.lifecycle.create("runtime-cutover");
+    assert.equal(runtime.phase, "runtime-cutover");
+    assert.equal(runtime.status, "created");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("legacy applied model compatibility rejects mixed, non-applied, later-phase, and checkpoint variants", () => {
+  const cases = [
+    ["mixed image binding", "image-platform-checkpoint", (harness, runId) => {
+      const manifestPath = harness.paths(runId).manifest;
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      manifest.bindings.acrLoginServer = ACR_LOGIN_SERVER;
+      manifest.bindingSha256 = sha256Bytes(canonicalJson(manifest.bindings));
+      replaceExisting(manifestPath, manifest);
+      const manifestCheckpointPath = checkpointPath(harness, runId, "manifest");
+      const checkpoint = JSON.parse(readFileSync(manifestCheckpointPath, "utf8"));
+      replaceExisting(manifestCheckpointPath, {
+        ...checkpoint,
+        manifestSha256: sha256File(manifestPath),
+      });
+      const applyPath = harness.paths(runId).apply;
+      const apply = JSON.parse(readFileSync(applyPath, "utf8"));
+      apply.bindingSha256 = manifest.bindingSha256;
+      replaceExisting(applyPath, apply);
+      const applyCheckpointPath = checkpointPath(harness, runId, "apply-receipt");
+      const applyCheckpoint = JSON.parse(readFileSync(applyCheckpointPath, "utf8"));
+      replaceExisting(applyCheckpointPath, {
+        ...applyCheckpoint,
+        receiptSha256: sha256File(applyPath),
+      });
+      const advancementPath = checkpointPath(harness, runId, "global-state-advancement");
+      const advancement = JSON.parse(readFileSync(advancementPath, "utf8"));
+      replaceExisting(advancementPath, {
+        ...advancement,
+        applyReceiptSha256: sha256File(applyPath),
+      });
+    }],
+    ["created status", "manifest-mismatch", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      state.runs.find((candidate) => candidate.id === runId).status = "created";
+      appendStateSnapshot(harness, state);
+    }],
+    ["later phase", "checkpoint-context", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      state.runs.find((candidate) => candidate.id === runId).phase = "runtime-cutover";
+      appendStateSnapshot(harness, state);
+    }],
+    ["unknown run key", "legacy-manifest", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      state.runs.find((candidate) => candidate.id === runId).unexpected = true;
+      appendStateSnapshot(harness, state);
+    }],
+    ["missing run key", "legacy-manifest", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      delete state.runs.find((candidate) => candidate.id === runId).preflightAt;
+      appendStateSnapshot(harness, state);
+    }],
+    ["run timestamp after manifest", "legacy-manifest", (harness, runId) => {
+      const manifest = JSON.parse(readFileSync(harness.paths(runId).manifest, "utf8"));
+      const state = harness.lifecycle.readState();
+      state.runs.find((candidate) => candidate.id === runId).createdAt =
+        new Date(Date.parse(manifest.createdAt) + 1).toISOString();
+      appendStateSnapshot(harness, state);
+    }],
+    ["run timestamp too far before manifest", "legacy-manifest", (harness, runId) => {
+      const manifest = JSON.parse(readFileSync(harness.paths(runId).manifest, "utf8"));
+      const state = harness.lifecycle.readState();
+      state.runs.find((candidate) => candidate.id === runId).createdAt =
+        new Date(Date.parse(manifest.createdAt) - 1001).toISOString();
+      appendStateSnapshot(harness, state);
+    }],
+    ["guard checkpoint after guarded time", "legacy-manifest", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      const run = state.runs.find((candidate) => candidate.id === runId);
+      const filePath = checkpointPath(harness, runId, "guard-receipt");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, {
+        ...checkpoint,
+        createdAt: new Date(Date.parse(run.guardedAt) + 1).toISOString(),
+      });
+    }],
+    ["guard checkpoint too far before guarded time", "legacy-manifest", (harness, runId) => {
+      const state = harness.lifecycle.readState();
+      const run = state.runs.find((candidate) => candidate.id === runId);
+      const filePath = checkpointPath(harness, runId, "guard-receipt");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, {
+        ...checkpoint,
+        createdAt: new Date(Date.parse(run.guardedAt) - 1001).toISOString(),
+      });
+    }],
+    ["checkpoint mutation", "checkpoint-integrity", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "show-json");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, name: "show-json-mutated" });
+    }],
+    ["unknown binding key", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.unexpected = true;
+      });
+    }],
+    ["missing binding key", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        delete bindings.stateLineage;
+      });
+    }],
+    ["binding semantic drift", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.workspace = "workspace-drift";
+      });
+    }],
+    ["binding cross-hash drift", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.backendSha256 = SHA;
+      });
+    }],
+    ["azure context hash drift", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.azureContextHash = SHA;
+      });
+    }],
+    ["missing historical dependency", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.dependencyBlobs.pop();
+      });
+    }],
+    ["extra historical dependency", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.dependencyBlobs.push({
+          path: "infra/scripts/extra.mjs",
+          blob: BLOB,
+          sha256: SHA,
+        });
+      });
+    }],
+    ["substituted historical dependency", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.dependencyBlobs[0].path = "infra/scripts/verify-acr-image-platform.mjs";
+      });
+    }],
+    ["unsorted historical dependencies", "legacy-binding", (harness, runId) => {
+      rewriteLegacyBinding(harness, runId, (bindings) => {
+        bindings.dependencyBlobs.reverse();
+      });
+    }],
+    ["binding hash drift", "binding-hash", (harness, runId) => {
+      const manifestPath = harness.paths(runId).manifest;
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      manifest.bindings.workspace = "workspace-drift";
+      replaceExisting(manifestPath, manifest);
+      const checkpointPathname = checkpointPath(harness, runId, "manifest");
+      const checkpoint = JSON.parse(readFileSync(checkpointPathname, "utf8"));
+      replaceExisting(checkpointPathname, {
+        ...checkpoint,
+        manifestSha256: sha256File(manifestPath),
+      });
+    }],
+    ["unknown checkpoint key", "legacy-checkpoint-schema", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "show-json");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, unexpected: true });
+    }],
+    ["missing checkpoint key", "legacy-checkpoint-schema", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "show-json");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      delete checkpoint.showSha256;
+      replaceExisting(filePath, checkpoint);
+    }],
+    ["checkpoint cross-hash drift", "show-json-hash", (harness, runId) => {
+      const filePath = checkpointPath(harness, runId, "show-json");
+      const checkpoint = JSON.parse(readFileSync(filePath, "utf8"));
+      replaceExisting(filePath, { ...checkpoint, showSha256: SHA });
+    }],
+    ["extra artifact", "legacy-artifacts", (harness, runId) => {
+      writeExclusive(path.join(harness.root, runId, "unexpected.json"), "unexpected\n");
+    }],
+    ["missing artifact", "legacy-artifacts-missing", (harness, runId) => {
+      rmSync(harness.paths(runId).show);
+    }],
+  ];
+  for (const [label, code, mutate] of cases) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      const runId = seedLegacyAppliedModel(harness);
+      mutate(harness, runId);
+      assert.throws(
+        () => harness.lifecycle.readState(),
+        (error) => {
+          assert.equal(error?.code, code, label);
+          return true;
+        },
+      );
+    } finally {
+      harness.cleanup();
+    }
+    void label;
+  }
+});
+
 test("invalidated historical model temp argv is closed and does not replace an applied predecessor", () => {
   const harness = makeHarness();
   try {
@@ -5363,7 +5923,7 @@ test("C2 test execution adapters are isolated and cache one immutable context sn
       const count = (command, argv) => calls.filter(
         (call) => call.command === command && call.argv[0] === argv,
       ).length;
-      assert.equal(count("/usr/bin/git", "rev-parse"), 7);
+      assert.equal(count("/usr/bin/git", "rev-parse"), 8);
       assert.equal(count(TERRAFORM_PATH, "state"), 1);
       assert.equal(count(TERRAFORM_PATH, "output"), 1);
       assert.equal(count(TERRAFORM_PATH, "workspace"), 1);
@@ -5387,18 +5947,33 @@ test("C2 test publisher production profile is no-replace, durable, and does not 
   assert.match(publisher, /fsyncDirectory/);
   assert.doesNotMatch(publisher, /spawnSync/);
 
-  const harness = productionHarness();
-  try {
-    initialize(harness);
-    const created = harness.lifecycle.create("model-bootstrap");
-    symlinkSync(harness.paths(created.runId).plan, harness.paths(created.runId).show);
-    expectCode(
-      () => harness.lifecycle.guard("model-bootstrap", created.runId),
-      "show-json-exists",
-    );
-    assert.equal(harness.lifecycle.readState().runs[0].status, "created");
-  } finally {
-    harness.cleanup();
+  for (const kind of ["show-symlink", "guard-directory"]) {
+    const harness = productionHarness();
+    try {
+      initialize(harness);
+      const created = harness.lifecycle.create("model-bootstrap");
+      const beforeCalls = harness.calls.length;
+      const beforeVerifierCalls = harness.verifierCalls.length;
+      if (kind === "show-symlink") {
+        symlinkSync(harness.paths(created.runId).plan, harness.paths(created.runId).show);
+      } else {
+        mkdirSync(harness.paths(created.runId).guard, { mode: 0o700 });
+      }
+      expectCode(
+        () => harness.lifecycle.guard("model-bootstrap", created.runId),
+        "guard-artifact-integrity",
+      );
+      const afterCalls = harness.calls.slice(beforeCalls);
+      assert.equal(harness.verifierCalls.length, beforeVerifierCalls);
+      assert.equal(afterCalls.some((call) => call.command === "/usr/bin/node" && path.basename(call.argv[0]) === "verify-acr-image-platform.mjs"), false);
+      assert.equal(afterCalls.some((call) => call.argv[0] === "show"), false);
+      assert.equal(afterCalls.some((call) => call.command.endsWith("assert-dev-plan.mjs")), false);
+      assert.equal(harness.lifecycle.readState().runs.find((run) => run.id === created.runId).status, "invalidated");
+      const replacement = harness.lifecycle.create("model-bootstrap");
+      assert.equal(replacement.status, "created");
+    } finally {
+      harness.cleanup();
+    }
   }
 });
 
@@ -5445,6 +6020,7 @@ test("C2 production composition never receives the test adapters and retains rea
 test("create persists each plan boundary and faults never permit a replay", () => {
   for (const checkpoint of [
     "run-directory",
+    "image-platform-verified",
     "plan-started",
     "temp-plan",
     "published-plan",
@@ -5874,8 +6450,11 @@ test("supersede rejects active, wrong, and reused expired cleanup runs", () => {
     expectCode(() => harness.lifecycle.supersede("credential-cleanup", old.runId), "cleanup-operation-context");
     replaceExisting(cleanupPath, cleanup);
     const replacement = harness.lifecycle.supersede("credential-cleanup", old.runId);
+    const oldManifest = JSON.parse(readFileSync(harness.paths(old.runId).manifest, "utf8"));
     assert.equal(replacement.supersedes, old.runId);
     const replacementManifest = JSON.parse(readFileSync(harness.paths(replacement.runId).manifest, "utf8"));
+    assert.deepEqual(replacementManifest.bindings.imagePlatforms, oldManifest.bindings.imagePlatforms);
+    assert.equal(harness.verifierCalls.length, 14);
     assert.deepEqual(replacementManifest.supersession, {
       oldRunId: old.runId,
       cleanupManifestSha256: sha256Bytes(readFileSync(harness.paths(old.runId).cleanupOperation)),
@@ -6136,5 +6715,435 @@ test("Sol probe: plan artifact hashing uses the 64 MiB plan ceiling", () => {
     assert.equal(sha256File(filePath), sha256Bytes(bytes));
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("image platform verification binds sorted descriptors, precedes Terraform, and is reused", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    const before = harness.calls.length;
+    const created = harness.lifecycle.create("model-bootstrap");
+    const calls = harness.calls.slice(before);
+    const verifierIndices = calls
+      .map((call, index) => call.command === "/usr/bin/node" ? index : -1)
+      .filter((index) => index >= 0);
+    const planIndex = calls.findIndex((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan");
+    assert.equal(verifierIndices.length, 2);
+    assert.ok(verifierIndices.every((index) => index < planIndex));
+    const manifest = JSON.parse(readFileSync(harness.paths(created.runId).manifest, "utf8"));
+    const imagePlatforms = manifest.bindings.imagePlatforms;
+    assert.deepEqual(Object.keys(imagePlatforms).sort(), ["images", "verifierSha256", "version"]);
+    assert.deepEqual(imagePlatforms.images.map((image) => image.repository), [
+      "palancar-expiry-cleanup", "palancar-relay",
+    ]);
+    assert.equal(manifest.bindingSha256, sha256Bytes(canonicalJson(manifest.bindings)));
+    const imageCheckpoint = JSON.parse(readFileSync(
+      path.join(harness.root, created.runId, "000002-image-platform-verified.json"),
+      "utf8",
+    ));
+    assert.equal(imageCheckpoint.verifierSha256, imagePlatforms.verifierSha256);
+    assert.equal(imageCheckpoint.verifierPath, "verify-acr-image-platform.mjs");
+    assert.equal(imageCheckpoint.descriptorSetSha256, sha256Bytes(canonicalJson(imagePlatforms.images)));
+    const verifierPath = harness.paths(created.runId).verifier;
+    const reviewedVerifierPath = path.join(
+      harness.options.repoRoot,
+      "infra/scripts/verify-acr-image-platform.mjs",
+    );
+    assert.equal(readFileSync(verifierPath, "utf8"), readFileSync(reviewedVerifierPath, "utf8"));
+    assert.equal(path.resolve(verifierPath), path.join(harness.root, created.runId, "verify-acr-image-platform.mjs"));
+    const verifierStat = lstatSync(verifierPath);
+    assert.equal(verifierStat.isSymbolicLink(), false);
+    assert.equal(verifierStat.isFile(), true);
+    assert.equal(verifierStat.mode & 0o777, 0o600);
+    if (typeof process.getuid === "function") assert.equal(verifierStat.uid, process.getuid());
+    assert.doesNotMatch(JSON.stringify(manifest), /protected-test-token|refreshToken|access_token|sig=/i);
+
+    harness.lifecycle.guard("model-bootstrap", created.runId);
+    assert.equal(harness.verifierCalls.length, 4);
+    harness.lifecycle.preflight("model-bootstrap", created.runId);
+    assert.equal(harness.verifierCalls.length, 4);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("automatic Terraform variable sources are rejected before run registration", () => {
+  const names = [
+    "terraform.tfvars.json",
+    ".auto.tfvars",
+    ".auto.tfvars.json",
+    "override.auto.tfvars",
+    "override.auto.tfvars.json",
+  ];
+  for (const name of names) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      writeExclusive(path.join(harness.workdir, name), "forbidden\n");
+      expectCode(() => harness.lifecycle.create("model-bootstrap"), "terraform-variable-sources");
+      assert.equal(harness.lifecycle.readState().runs.length, 0, name);
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  for (const kind of ["symlink", "directory"]) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      const target = path.join(harness.workdir, "automatic-target");
+      if (kind === "symlink") {
+        writeExclusive(target, "forbidden\n");
+        symlinkSync(target, path.join(harness.workdir, ".auto.tfvars"));
+      } else {
+        mkdirSync(path.join(harness.workdir, ".auto.tfvars.json"), { mode: 0o700 });
+      }
+      expectCode(() => harness.lifecycle.create("model-bootstrap"), "terraform-variable-sources");
+      assert.equal(harness.lifecycle.readState().runs.length, 0, kind);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("malformed ACR output invalidates the registered run and permits replacement", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    harness.setAcrLoginServer("bad.azurecr.io");
+    expectCode(() => harness.lifecycle.create("model-bootstrap"), "acr-login-server");
+    const invalidated = harness.lifecycle.readState().runs.at(-1);
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.reason, "acr-login-server");
+    assert.equal(existsSync(harness.paths(invalidated.id).plan), false);
+    assert.equal(existsSync(harness.paths(invalidated.id).manifest), false);
+    harness.setAcrLoginServer(ACR_LOGIN_SERVER);
+    const replacement = harness.lifecycle.create("model-bootstrap");
+    assert.equal(replacement.status, "created");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("production post-plan context drift is detected without snapshot reuse", () => {
+  const harness = productionHarness();
+  try {
+    initialize(harness);
+    harness.setPostPlanAcrLoginServer("bad.azurecr.io");
+    expectCode(() => harness.lifecycle.create("model-bootstrap"), "acr-login-server");
+    const run = harness.lifecycle.readState().runs.at(-1);
+    assert.equal(run.status, "invalidated");
+    assert.equal(run.reason, "acr-login-server");
+    assert.equal(harness.verifierCalls.length, 2);
+    assert.equal(existsSync(harness.paths(run.id).manifest), false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("image verification uses one uncached pre/post context pair and exact verifier bindings", () => {
+  const harness = productionHarness();
+  try {
+    initialize(harness);
+    const before = harness.calls.length;
+    const created = harness.lifecycle.create("model-bootstrap");
+    const calls = harness.calls.slice(before);
+    const verifierCalls = calls.filter((call) => call.command === "/usr/bin/node");
+    assert.equal(verifierCalls.length, 2);
+    assert.equal(
+      calls.filter((call) => call.command === "/usr/bin/git" && ["rev-parse", "hash-object"].includes(call.argv[0])).length,
+      30,
+    );
+    assert.equal(
+      calls.filter((call) => call.command === "/usr/bin/az" && (
+        (call.argv[0] === "account" && call.argv[1] === "show") ||
+        (call.argv[0] === "ad" && call.argv[1] === "signed-in-user") ||
+        (call.argv[0] === "role" && call.argv[1] === "assignment")
+      )).length,
+      6,
+    );
+    assert.equal(
+      calls.filter((call) => call.command === TERRAFORM_PATH && ["state", "output", "workspace"].includes(call.argv[0])).length,
+      6,
+    );
+    assert.equal(calls.filter((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan").length, 1);
+    for (const call of verifierCalls) {
+      assert.deepEqual(call.argv, [
+        harness.paths(created.runId).verifier,
+        "verify",
+        SUBSCRIPTION,
+        ACR_LOGIN_SERVER,
+        call.argv[4].includes("palancar-relay") ? REVIEWED_RELAY_IMAGE : CLEANUP_IMAGE,
+      ]);
+      assert.equal(call.timeoutMs, 120 * 1000);
+      assert.equal(call.maxOutputBytes, 64 * 1024);
+    }
+    const manifest = JSON.parse(readFileSync(harness.paths(created.runId).manifest, "utf8"));
+    assert.equal(manifest.bindings.acrLoginServer, ACR_LOGIN_SERVER);
+    assert.deepEqual(Object.keys(manifest.bindings.imagePlatforms.images[0]).sort(), [
+      "architecture", "configDigest", "configMediaType", "manifestDigest", "manifestMediaType",
+      "os", "reference", "repository", "variant", "version",
+    ]);
+    const checkpointValues = readdirSync(path.join(harness.root, created.runId))
+      .filter((entry) => entry.endsWith(".json"))
+      .map((entry) => readFileSync(path.join(harness.root, created.runId, entry), "utf8"));
+    const serialized = JSON.stringify({ calls, verifierCalls, manifest, checkpointValues });
+    assert.doesNotMatch(serialized, /protected-test-token|refreshToken|access_token|sig=|regid=|skt=/i);
+
+    const beforeGuard = harness.calls.length;
+    harness.lifecycle.guard("model-bootstrap", created.runId);
+    const guardCalls = harness.calls.slice(beforeGuard);
+    assert.equal(guardCalls.filter((call) => call.command === "/usr/bin/node").length, 2);
+    assert.equal(harness.verifierCalls.length, 4);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("image verification is required for all lifecycle phase creates", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    advanceThrough(harness, "model-bootstrap");
+    advanceThrough(harness, "runtime-cutover");
+    setProtectedRuntimeSecretsRole(harness, false);
+    advanceThrough(harness, "credential-cleanup");
+    writeRevocationEvidence(harness);
+    const terminal = harness.lifecycle.create("terminal");
+    harness.lifecycle.guard("terminal", terminal.runId);
+    assert.equal(harness.verifierCalls.length, 16);
+    assert.equal(new Set(harness.verifierCalls.map((call) => call.argv[4])).size, 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("image verification failures are fixed, pre-plan, and invalidate without Terraform", () => {
+  for (const failure of ["failure", "timeout", "malformed", "oversize"]) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      harness.setVerifierStatus(failure);
+      expectCode(() => harness.lifecycle.create("model-bootstrap"), "image-platform-verification");
+      assert.equal(harness.calls.some((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan"), false);
+      const run = harness.lifecycle.readState().runs.at(-1);
+      assert.equal(run.status, "invalidated");
+      assert.equal(run.reason, "image-platform-verification");
+      assert.equal(existsSync(harness.paths(run.id).plan), false);
+      assert.equal(existsSync(harness.paths(run.id).manifest), false);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("image verifier rejects every bounded descriptor and protected-reference mismatch", () => {
+  const descriptorCases = [
+    ["arm64", (descriptor) => ({ ...descriptor, architecture: "arm64" })],
+    ["oci-index", (descriptor) => ({ ...descriptor, manifestMediaType: "application/vnd.oci.image.index.v1+json" })],
+    ["docker-list", (descriptor) => ({ ...descriptor, manifestMediaType: "application/vnd.docker.distribution.manifest.list.v2+json" })],
+    ["extra-descriptor-key", (descriptor) => ({ ...descriptor, extra: true })],
+    ["wrong-reference", (descriptor) => ({ ...descriptor, reference: descriptor.reference.replace(/sha256:[a-f0-9]+$/, `sha256:${"d".repeat(64)}`) })],
+    ["wrong-repository", (descriptor) => ({ ...descriptor, repository: "palancar-other" })],
+    ["wrong-digest", (descriptor) => ({ ...descriptor, manifestDigest: `sha256:${"d".repeat(64)}` })],
+    ["wrong-media-pair", (descriptor) => ({ ...descriptor, configMediaType: "application/vnd.docker.container.image.v1+json" })],
+  ];
+  for (const [name, mutator] of descriptorCases) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      harness.setVerifierMutator(mutator);
+      expectCode(() => harness.lifecycle.create("model-bootstrap"), "image-platform-verification");
+      assert.equal(harness.calls.some((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan"), false, name);
+      const run = harness.lifecycle.readState().runs.at(-1);
+      assert.equal(run.status, "invalidated", name);
+      assert.equal(existsSync(harness.paths(run.id).plan), false, name);
+      assert.equal(existsSync(harness.paths(run.id).manifest), false, name);
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  const tfvarsCases = [
+    ["wrong-host", `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "wrong.azurecr.io/palancar-relay@sha256:${"e".repeat(64)}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`],
+    ["wrong-repository", `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "${ACR_LOGIN_SERVER}/palancar-other@sha256:${"e".repeat(64)}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`],
+    ["missing-assignment", `operator_principal_id = "${OBJECT_ID}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`],
+    ["malformed-assignment", `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = var.relay_image_digest\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`],
+    ["interpolation", `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "${ACR_LOGIN_SERVER}/palancar-relay@sha256:\${var.digest}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`],
+  ];
+  for (const [name, tfvars] of tfvarsCases) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      replaceExisting(path.join(harness.workdir, "terraform.tfvars"), tfvars);
+      expectCode(() => harness.lifecycle.create("model-bootstrap"), "image-platform-verification");
+      assert.equal(harness.calls.some((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan"), false, name);
+      const run = harness.lifecycle.readState().runs.at(-1);
+      assert.equal(run.status, "invalidated", name);
+      assert.equal(existsSync(harness.paths(run.id).plan), false, name);
+      assert.equal(existsSync(harness.paths(run.id).manifest), false, name);
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  const secondImage = makeHarness();
+  try {
+    initialize(secondImage);
+    secondImage.setVerifierFailureReference(CLEANUP_IMAGE);
+    expectCode(() => secondImage.lifecycle.create("model-bootstrap"), "image-platform-verification");
+    assert.equal(secondImage.verifierCalls.length, 2);
+    assert.equal(secondImage.calls.some((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan"), false);
+    const run = secondImage.lifecycle.readState().runs.at(-1);
+    assert.equal(existsSync(secondImage.paths(run.id).manifest), false);
+  } finally {
+    secondImage.cleanup();
+  }
+});
+
+test("guard revalidation rejects verifier source drift and remote descriptor change or disappearance", () => {
+  const sourceDrift = makeHarness();
+  try {
+    initialize(sourceDrift);
+    const created = sourceDrift.lifecycle.create("model-bootstrap");
+    replaceExisting(
+      path.join(sourceDrift.options.repoRoot, "infra/scripts/verify-acr-image-platform.mjs"),
+      "reviewed source drift\n",
+    );
+    expectCode(() => sourceDrift.lifecycle.guard("model-bootstrap", created.runId), "image-platform-verification");
+    assert.equal(existsSync(sourceDrift.paths(created.runId).guard), false);
+    assert.equal(sourceDrift.lifecycle.readState().runs.find((run) => run.id === created.runId).status, "invalidated");
+  } finally {
+    sourceDrift.cleanup();
+  }
+
+  for (const mutator of [
+    (descriptor) => ({ ...descriptor, manifestDigest: `sha256:${"d".repeat(64)}` }),
+    () => undefined,
+  ]) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      const created = harness.lifecycle.create("model-bootstrap");
+      harness.setVerifierMutator(mutator);
+      expectCode(() => harness.lifecycle.guard("model-bootstrap", created.runId), "image-platform-verification");
+      assert.equal(existsSync(harness.paths(created.runId).guard), false);
+      assert.equal(harness.lifecycle.readState().runs.find((run) => run.id === created.runId).status, "invalidated");
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("image checkpoint and model show drift invalidate before publishing guard evidence", () => {
+  for (const mode of ["hash", "artifact", "symlink", "replacement", "mode"]) {
+    const harness = makeHarness();
+    try {
+      initialize(harness);
+      const created = harness.lifecycle.create("model-bootstrap");
+      const checkpoint = checkpointPath(harness, created.runId, "image-platform-verified");
+      if (mode === "hash") {
+        const value = JSON.parse(readFileSync(checkpoint, "utf8"));
+        value.verifierSha256 = "d".repeat(64);
+        replaceExisting(checkpoint, value);
+      } else if (mode === "artifact") {
+        rmSync(harness.paths(created.runId).verifier);
+      } else if (mode === "symlink") {
+        rmSync(harness.paths(created.runId).verifier);
+        symlinkSync(harness.paths(created.runId).plan, harness.paths(created.runId).verifier);
+      } else if (mode === "replacement") {
+        replaceExisting(harness.paths(created.runId).verifier, "replacement\n");
+      } else {
+        chmodSync(harness.paths(created.runId).verifier, 0o644);
+      }
+      expectCode(() => harness.lifecycle.guard("model-bootstrap", created.runId), "out-of-order-operation");
+      assert.equal(existsSync(harness.paths(created.runId).show), false);
+      assert.equal(existsSync(harness.paths(created.runId).guard), false);
+      const invalidated = harness.lifecycle.readState().runs.find((run) => run.id === created.runId);
+      assert.equal(invalidated.status, "invalidated");
+      assert.equal(invalidated.reason, "image-platform-checkpoint");
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    const created = harness.lifecycle.create("model-bootstrap");
+    harness.setReviewedShowMutator((show) => ({
+      ...structuredClone(show),
+      variables: {
+        ...show.variables,
+        relay_image_digest: { value: `${ACR_LOGIN_SERVER}/palancar-relay@sha256:${"d".repeat(64)}` },
+      },
+    }));
+    expectCode(() => harness.lifecycle.guard("model-bootstrap", created.runId), "image-platform-verification");
+    assert.equal(existsSync(harness.paths(created.runId).show), false);
+    assert.equal(existsSync(harness.paths(created.runId).guard), false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("guard rejection publishes no immutable show or receipt and allows replacement create", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    const created = harness.lifecycle.create("model-bootstrap");
+    harness.setReviewedShowMutator((show) => {
+      const next = structuredClone(show);
+      next.resource_changes = [];
+      return next;
+    });
+    harness.setGuardStatus("failure");
+    expectCode(() => harness.lifecycle.guard("model-bootstrap", created.runId), "guard-rejected");
+    assert.equal(harness.calls.filter((call) => call.command.endsWith("assert-dev-plan.mjs")).length, 1);
+    assert.equal(existsSync(harness.paths(created.runId).show), false);
+    assert.equal(existsSync(harness.paths(created.runId).guard), false);
+    const invalidated = harness.lifecycle.readState().runs.find((run) => run.id === created.runId);
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.reason, "guard-rejected");
+
+    harness.setReviewedShowMutator((show) => show);
+    harness.setGuardStatus("success");
+    const replacement = harness.lifecycle.create("model-bootstrap");
+    assert.equal(replacement.status, "created");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("image tfvars and guard-bound image drift fail closed without a guard receipt", () => {
+  const malformed = makeHarness();
+  try {
+    initialize(malformed);
+    replaceExisting(
+      path.join(malformed.workdir, "terraform.tfvars"),
+      `operator_principal_id = "${OBJECT_ID}"\nrelay_image_digest = "${REVIEWED_RELAY_IMAGE}"\nrelay_image_digest = "${REVIEWED_RELAY_IMAGE}"\nexpiry_cleanup_image_digest = "${CLEANUP_IMAGE}"\n`,
+    );
+    expectCode(() => malformed.lifecycle.create("model-bootstrap"), "image-platform-verification");
+    assert.equal(malformed.calls.some((call) => call.command === TERRAFORM_PATH && call.argv[0] === "plan"), false);
+  } finally {
+    malformed.cleanup();
+  }
+
+  const guard = makeHarness();
+  try {
+    initialize(guard);
+    advanceThrough(guard, "model-bootstrap");
+    const created = guard.lifecycle.create("runtime-cutover");
+    guard.setReviewedShowMutator((show) => {
+      const next = structuredClone(show);
+      const app = next.resource_changes.find((entry) => entry.address === "module.container_app_workload[0].azapi_resource.this");
+      app.change.after.body.properties.template.containers[0].image = `${ACR_LOGIN_SERVER}/palancar-relay@sha256:${"d".repeat(64)}`;
+      return next;
+    });
+    expectCode(() => guard.lifecycle.guard("runtime-cutover", created.runId), "image-platform-verification");
+    assert.equal(existsSync(guard.paths(created.runId).guard), false);
+    assert.equal(guard.lifecycle.readState().runs.find((run) => run.id === created.runId).status, "invalidated");
+  } finally {
+    guard.cleanup();
   }
 });

@@ -136,6 +136,20 @@ const REVOCATION_LOCK_MAX_BYTES = 128;
 const EXECUTABLE_MAX_BYTES = 256 * 1024 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES = JSON_MAX_BYTES;
 const COMMAND_TIMEOUT_MS = 120 * 1000;
+const IMAGE_VERIFIER_TIMEOUT_MS = 120 * 1000;
+const IMAGE_VERIFIER_OUTPUT_MAX_BYTES = 64 * 1024;
+const IMAGE_VERIFIER_PATH = "infra/scripts/verify-acr-image-platform.mjs";
+const IMAGE_VERIFIER_ARTIFACT_NAME = "verify-acr-image-platform.mjs";
+const ACR_LOGIN_SERVER_RE = /^[a-z0-9]{5,50}\.azurecr\.io$/;
+const IMAGE_REFERENCE_RE = /^([a-z0-9]{5,50}\.azurecr\.io)\/(palancar-relay|palancar-expiry-cleanup)@(sha256:[a-f0-9]{64})$/;
+const IMAGE_DESCRIPTOR_KEYS = Object.freeze([
+  "version", "reference", "repository", "manifestDigest", "manifestMediaType",
+  "configDigest", "configMediaType", "os", "architecture", "variant",
+]);
+const IMAGE_MANIFEST_MEDIA_TYPES = Object.freeze({
+  "application/vnd.oci.image.manifest.v1+json": "application/vnd.oci.image.config.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json": "application/vnd.docker.container.image.v1+json",
+});
 const APPLY_TIMEOUT_MS = 15 * 60 * 1000;
 const ARTIFACT_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -160,6 +174,7 @@ const STATE_FILE_RE = /^state-(\d{12})\.json$/;
 const CHECKPOINT_FILE_RE = /^(\d{6})-([a-z0-9-]+)\.json$/;
 const CHECKPOINT_ORDER = Object.freeze([
   "run-directory",
+  "image-platform-verified",
   "plan-started",
   "terraform-exit-ambiguous",
   "temp-plan",
@@ -196,6 +211,7 @@ const GENERATION_PATHS = Object.freeze([
 const REVIEWED_DEPENDENCIES = Object.freeze({
   "model-bootstrap": Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
+    IMAGE_VERIFIER_PATH,
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
@@ -205,6 +221,7 @@ const REVIEWED_DEPENDENCIES = Object.freeze({
   ]),
   "runtime-cutover": Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
+    IMAGE_VERIFIER_PATH,
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
@@ -213,6 +230,7 @@ const REVIEWED_DEPENDENCIES = Object.freeze({
   ]),
   "credential-cleanup": Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
+    IMAGE_VERIFIER_PATH,
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
@@ -221,6 +239,7 @@ const REVIEWED_DEPENDENCIES = Object.freeze({
   ]),
   terminal: Object.freeze([
     "infra/scripts/dev-plan-lifecycle.mjs",
+    IMAGE_VERIFIER_PATH,
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
@@ -450,6 +469,7 @@ function testSnapshot(key, producer) {
   const execution = currentTestExecution();
   const operation = execution?.operation;
   if (operation === undefined) return producer();
+  if (execution.adapterProfile === "production") return producer();
   if (operation.snapshots.has(key)) return operation.snapshots.get(key);
   const snapshot = freezeDeep(producer());
   operation.snapshots.set(key, snapshot);
@@ -1110,6 +1130,306 @@ function validateManifestArgv(manifest, artifacts, checkpoints, run) {
   );
 }
 
+function validateLegacyAppliedModelJournal(artifacts, checkpoints, manifest, run) {
+  const code = "legacy-manifest";
+  const runKeys = [
+    "appliedAt", "applyingAt", "createdAt", "guardedAt", "id", "lastCheckpoint",
+    "phase", "preflightAt", "status",
+  ];
+  assertKnownKeys(run, runKeys, code);
+  assertRequiredKeys(run, runKeys, code);
+  failIf(
+    run.phase !== "model-bootstrap" ||
+    run.status !== "applied" ||
+    run.lastCheckpoint !== "global-state-advancement",
+    code,
+  );
+  failIf(!RUN_ID_RE.test(run.id), code);
+  for (const key of ["appliedAt", "applyingAt", "createdAt", "guardedAt", "preflightAt"]) {
+    failIf(typeof run[key] !== "string" || !Number.isFinite(jsonDate(run[key])), code);
+  }
+  const runCreatedAt = jsonDate(run.createdAt);
+  const manifestCreatedAt = jsonDate(manifest.createdAt);
+  failIf(
+    !Number.isFinite(manifestCreatedAt) ||
+      runCreatedAt > manifestCreatedAt ||
+      manifestCreatedAt - runCreatedAt > 1000,
+    code,
+  );
+  const expectedNames = [
+    "run-directory",
+    "plan-started",
+    "temp-plan",
+    "published-plan",
+    "terraform-exit-known",
+    "manifest",
+    "show-json",
+    "guard-receipt",
+    "preflight-receipt",
+    "applying",
+    "receipts-consumed",
+    "terraform-exit-known",
+    "apply-receipt",
+    "global-state-advancement",
+  ];
+  failIf(!same(checkpoints.map((checkpoint) => checkpoint.name), expectedNames), "legacy-checkpoint-order");
+
+  const commonCheckpointKeys = [
+    "createdAt", "name", "phase", "runId", "sequence", "type", "version",
+  ];
+  const checkpointKeys = new Map([
+    ["run-directory", commonCheckpointKeys],
+    ["plan-started", [...commonCheckpointKeys, "argv"]],
+    ["temp-plan", [...commonCheckpointKeys, "planSha256"]],
+    ["published-plan", [...commonCheckpointKeys, "planPath", "planSha256"]],
+    ["terraform-exit-known:create", [...commonCheckpointKeys, "exitCode", "operation", "status"]],
+    ["manifest", [...commonCheckpointKeys, "manifestSha256", "planSha256"]],
+    ["show-json", [...commonCheckpointKeys, "showSha256"]],
+    ["guard-receipt", [...commonCheckpointKeys, "guard", "receiptSha256", "showSha256"]],
+    ["preflight-receipt", [...commonCheckpointKeys, "receiptSha256", "verifierSha256"]],
+    ["applying", [...commonCheckpointKeys, "applyingAt", "planSha256"]],
+    ["receipts-consumed", [...commonCheckpointKeys, "guardReceiptSha256", "preflightReceiptSha256"]],
+    ["terraform-exit-known:apply", [...commonCheckpointKeys, "exitCode", "status"]],
+    ["apply-receipt", [...commonCheckpointKeys, "receiptSha256", "status"]],
+    ["global-state-advancement", [...commonCheckpointKeys, "applyReceiptSha256", "from", "to"]],
+  ]);
+  const seenExit = { value: 0 };
+  for (const checkpoint of checkpoints) {
+    const key = checkpoint.name === "terraform-exit-known"
+      ? `terraform-exit-known:${seenExit.value++ === 0 ? "create" : "apply"}`
+      : checkpoint.name;
+    const keys = checkpointKeys.get(key);
+    failIf(keys === undefined, "legacy-checkpoint-schema");
+    assertKnownKeys(checkpoint, keys, "legacy-checkpoint-schema");
+    assertRequiredKeys(checkpoint, keys, "legacy-checkpoint-schema");
+    failIf(
+      checkpoint.version !== 1 ||
+        checkpoint.type !== "lifecycle-checkpoint" ||
+        checkpoint.runId !== run.id ||
+        checkpoint.phase !== "model-bootstrap" ||
+        typeof checkpoint.createdAt !== "string" ||
+        !Number.isFinite(jsonDate(checkpoint.createdAt)),
+      "legacy-checkpoint-schema",
+    );
+  }
+
+  const expectedArtifacts = new Set([
+    ...expectedNames.map((name, index) => `${String(index + 1).padStart(6, "0")}-${name}.json`),
+    "apply-receipt.json",
+    "create-manifest.json",
+    "guard-receipt.json.consumed",
+    "plan.tfplan",
+    "preflight-receipt.json.consumed",
+    "show.json",
+    "tf-cli.tfrc",
+  ]);
+  for (const entry of readdirSync(path.dirname(artifacts.manifest), { withFileTypes: true })) {
+    failIf(
+      entry.isSymbolicLink() || !entry.isFile() || !expectedArtifacts.has(entry.name),
+      "legacy-artifacts",
+    );
+  }
+  for (const name of expectedArtifacts) {
+    assertRegular(path.join(path.dirname(artifacts.manifest), name), ARTIFACT_MODE, "legacy-artifacts");
+  }
+  failIf(readFileSync(path.join(path.dirname(artifacts.manifest), "tf-cli.tfrc")).byteLength !== 0, "legacy-artifacts");
+
+  const planStarted = checkpointNamed(checkpoints, "plan-started");
+  failIf(!same(planStarted.argv, exactCreateArgv(artifacts.planTemp)), "checkpoint-integrity");
+  const tempPlan = checkpointNamed(checkpoints, "temp-plan");
+  failIf(!isSha(tempPlan.planSha256) || tempPlan.planSha256 !== manifest.planSha256, "checkpoint-integrity");
+  const published = checkpointNamed(checkpoints, "published-plan");
+  failIf(
+    published.planSha256 !== manifest.planSha256 || published.planPath !== artifacts.plan,
+    "checkpoint-integrity",
+  );
+  const exits = checkpoints.filter((checkpoint) => checkpoint.name === "terraform-exit-known");
+  failIf(
+    exits.length !== 2 ||
+      exits[0].operation !== "create" ||
+      Object.hasOwn(exits[1], "operation") ||
+      exits.some((checkpoint) => checkpoint.status !== "success" || checkpoint.exitCode !== 0),
+    "checkpoint-integrity",
+  );
+
+  assertKnownKeys(manifest, [
+    "argv", "bindingSha256", "bindings", "createdAt", "phase", "planSha256",
+    "processExit", "runId", "version",
+  ], code);
+  assertRequiredKeys(manifest, [
+    "argv", "bindingSha256", "bindings", "createdAt", "phase", "planSha256",
+    "processExit", "runId", "version",
+  ], code);
+  failIf(
+    manifest.version !== 1 ||
+      manifest.runId !== run.id ||
+      manifest.phase !== "model-bootstrap" ||
+      !Number.isFinite(manifestCreatedAt) ||
+      manifest.processExit !== 0 ||
+      !Array.isArray(manifest.argv) ||
+      !same(manifest.argv, exactCreateArgv(artifacts.planTemp)) ||
+      !isSha(manifest.planSha256) ||
+      !isSha(manifest.bindingSha256),
+    code,
+  );
+  const transitionTimes = [
+    manifestCreatedAt,
+    jsonDate(run.guardedAt),
+    jsonDate(run.preflightAt),
+    jsonDate(run.applyingAt),
+    jsonDate(run.appliedAt),
+  ];
+  failIf(
+    transitionTimes.some((value) => !Number.isFinite(value)) ||
+      transitionTimes.some((value, index) => index > 0 && value < transitionTimes[index - 1]),
+    code,
+  );
+  const guardCheckpoint = checkpointNamed(checkpoints, "guard-receipt");
+  const guardCheckpointAt = jsonDate(guardCheckpoint.createdAt);
+  const guardedAt = jsonDate(run.guardedAt);
+  failIf(
+    !Number.isFinite(guardCheckpointAt) ||
+      guardCheckpointAt < manifestCreatedAt ||
+      guardedAt < guardCheckpointAt ||
+      guardedAt - guardCheckpointAt > 1000,
+    code,
+  );
+  const bindingKeys = [
+    "argv", "azureContextHash", "backend", "backendConfigurationSha256", "backendSha256",
+    "callerHash", "cwd", "dependencyBlobs", "guard", "guardSha256", "lifecycleSha256",
+    "liveRevision", "phase", "planSha256", "repositoryCommit", "stateLineage", "stateSerial",
+    "terraformSha256", "workspace",
+  ];
+  assertKnownKeys(manifest.bindings, bindingKeys, "legacy-binding");
+  assertRequiredKeys(manifest.bindings, bindingKeys, "legacy-binding");
+  const bindings = manifest.bindings;
+  const backend = normalizeBackend(bindings.backend);
+  const expectedAzureContextHash = hashJson({
+    cloud: "AzureCloud",
+    subscription: backend.identity.subscription_id,
+    tenant: backend.identity.tenant_id,
+  });
+  failIf(
+    !Array.isArray(bindings.argv) ||
+      !same(bindings.argv, manifest.argv) ||
+      !isSha(bindings.azureContextHash) ||
+      !isSha(bindings.backendConfigurationSha256) ||
+      !isSha(bindings.backendSha256) ||
+      bindings.backendSha256 !== backend.sha256 ||
+      bindings.backendConfigurationSha256 !== bindings.backendSha256 ||
+      !isSha(bindings.callerHash) ||
+      typeof bindings.cwd !== "string" || bindings.cwd.length === 0 ||
+      !Array.isArray(bindings.dependencyBlobs) ||
+      bindings.dependencyBlobs.length === 0 ||
+      bindings.azureContextHash !== expectedAzureContextHash ||
+      !isSha(bindings.guardSha256) ||
+      !isSha(bindings.lifecycleSha256) ||
+      typeof bindings.liveRevision !== "string" || bindings.liveRevision.length === 0 ||
+      bindings.phase !== "model-bootstrap" ||
+      bindings.planSha256 !== manifest.planSha256 ||
+      !isCommit(bindings.repositoryCommit) ||
+      typeof bindings.stateLineage !== "string" || bindings.stateLineage.length === 0 ||
+      !Number.isSafeInteger(bindings.stateSerial) || bindings.stateSerial < 0 ||
+      !isSha(bindings.terraformSha256) ||
+      bindings.workspace !== "default" ||
+      bindings.guard !== GUARD_MAPPINGS["model-bootstrap"],
+    "legacy-binding",
+  );
+  const dependencyPaths = new Set();
+  for (const dependency of bindings.dependencyBlobs) {
+    assertKnownKeys(dependency, ["blob", "path", "sha256"], "legacy-binding");
+    assertRequiredKeys(dependency, ["blob", "path", "sha256"], "legacy-binding");
+    failIf(
+      typeof dependency.path !== "string" || dependency.path.length === 0 ||
+        dependencyPaths.has(dependency.path) ||
+        !/^[a-f0-9]{40}$/.test(dependency.blob) ||
+        !isSha(dependency.sha256),
+      "legacy-binding",
+    );
+    dependencyPaths.add(dependency.path);
+  }
+  failIf(!same(
+    bindings.dependencyBlobs.map((dependency) => dependency.path),
+    [
+      "infra/scripts/assert-dev-plan.mjs",
+      "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+      "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
+    ],
+  ), "legacy-binding");
+  failIf(bindingHash(bindings) !== manifest.bindingSha256, "binding-hash");
+
+  const manifestCheckpoint = checkpointNamed(checkpoints, "manifest");
+  failIf(
+    manifestCheckpoint.planSha256 !== manifest.planSha256 ||
+      manifestCheckpoint.manifestSha256 !== sha256File(artifacts.manifest, JSON_MAX_BYTES),
+    "checkpoint-integrity",
+  );
+  assertRegular(artifacts.plan, ARTIFACT_MODE, "plan");
+  failIf(sha256File(artifacts.plan, JSON_MAX_BYTES) !== manifest.planSha256, "plan-hash");
+  failIf(
+    !isObject(manifest.bindings) ||
+      !same(manifest.bindings.argv, manifest.argv) ||
+      bindingHash(manifest.bindings) !== manifest.bindingSha256,
+    "binding-hash",
+  );
+
+  const showCheckpoint = checkpointNamed(checkpoints, "show-json");
+  assertCheckpointArtifact(artifacts.show, showCheckpoint, "showSha256", "show-json");
+  const guard = readReceiptAtCheckpoint(
+    `${artifacts.guard}.consumed`,
+    checkpointNamed(checkpoints, "guard-receipt"),
+    manifest,
+    "guard",
+  );
+  failIf(guard.showSha256 !== showCheckpoint.showSha256, "show-hash");
+  const preflight = readReceiptAtCheckpoint(
+    `${artifacts.preflight}.consumed`,
+    checkpointNamed(checkpoints, "preflight-receipt"),
+    manifest,
+    "preflight",
+  );
+  failIf(
+    !isSha(preflight.verifierSha256) ||
+      guard.createdAt !== manifest.createdAt ||
+      preflight.createdAt !== run.preflightAt,
+    "preflight-receipt-schema",
+  );
+  const consumed = checkpointNamed(checkpoints, "receipts-consumed");
+  failIf(
+    consumed.guardReceiptSha256 !== sha256File(`${artifacts.guard}.consumed`, JSON_MAX_BYTES) ||
+      consumed.preflightReceiptSha256 !== sha256File(`${artifacts.preflight}.consumed`, JSON_MAX_BYTES),
+    "checkpoint-integrity",
+  );
+  const apply = readReceiptAtCheckpoint(
+    artifacts.apply,
+    checkpointNamed(checkpoints, "apply-receipt"),
+    manifest,
+    "apply",
+    ["applied"],
+  );
+  const applying = checkpointNamed(checkpoints, "applying");
+  failIf(
+    applying.applyingAt !== run.applyingAt ||
+      apply.status !== "applied" ||
+      typeof apply.appliedAt !== "string" ||
+      !Number.isFinite(jsonDate(apply.appliedAt)) ||
+      apply.appliedAt !== run.appliedAt,
+    "phase-apply-proof",
+  );
+  failIf(
+    guard.createdAt !== manifest.createdAt,
+    "legacy-manifest",
+  );
+  const advancement = checkpointNamed(checkpoints, "global-state-advancement");
+  failIf(
+    advancement.from !== STATE_FOR_PHASE[run.phase] ||
+      advancement.to !== ADVANCED_STATE[run.phase] ||
+      !isSha(advancement.applyReceiptSha256) ||
+      advancement.applyReceiptSha256 !== sha256File(artifacts.apply, JSON_MAX_BYTES),
+    "phase-apply-proof",
+  );
+}
+
 function immutableManifest(runDirectory, artifacts, checkpoints, run) {
   const checkpoint = checkpointNamed(checkpoints, "manifest");
   assertCheckpointArtifact(artifacts.manifest, checkpoint, "manifestSha256", "manifest");
@@ -1123,11 +1443,59 @@ function immutableManifest(runDirectory, artifacts, checkpoints, run) {
   validateManifestArgv(manifest, artifacts, checkpoints, run);
   assertRegular(artifacts.plan, ARTIFACT_MODE, "plan");
   failIf(sha256File(artifacts.plan) !== manifest.planSha256, "plan-hash");
+  const bindings = isObject(manifest.bindings) ? manifest.bindings : {};
+  const hasImagePlatforms = Object.hasOwn(bindings, "imagePlatforms");
+  const hasAcrLoginServer = Object.hasOwn(bindings, "acrLoginServer");
+  const hasImageCheckpoint = checkpoints.some((checkpoint) => checkpoint.name === "image-platform-verified");
+  const hasVerifierArtifact = existsSync(artifacts.verifier);
+  const hasAnyImageEvidence = hasImagePlatforms || hasAcrLoginServer || hasImageCheckpoint || hasVerifierArtifact;
+  const hasCompleteImageEvidence = hasImagePlatforms && hasAcrLoginServer && hasImageCheckpoint && hasVerifierArtifact;
+  failIf(hasAnyImageEvidence && !hasCompleteImageEvidence, "image-platform-checkpoint");
+  const legacyAppliedModel = !hasAnyImageEvidence &&
+    run.phase === "model-bootstrap" &&
+    run.status === "applied" &&
+    run.lastCheckpoint === "global-state-advancement";
+  if (legacyAppliedModel) {
+    validateLegacyAppliedModelJournal(artifacts, checkpoints, manifest, run);
+  } else if (!hasAnyImageEvidence && run.status !== "invalidated") {
+    reject("image-platform-checkpoint");
+  } else if (hasCompleteImageEvidence) {
+    const imagePlatforms = validateImagePlatformBinding(
+      manifest.bindings?.imagePlatforms,
+      manifest.bindings?.acrLoginServer,
+    );
+    const imageCheckpoint = checkpointNamed(checkpoints, "image-platform-verified");
+    validateImagePlatformCheckpoint(imageCheckpoint, imagePlatforms);
+    assertImmutableVerifierArtifact(artifacts.verifier, imagePlatforms.verifierSha256, "image-platform-checkpoint");
+  }
   failIf(bindingHash(manifest.bindings) !== manifest.bindingSha256, "binding-hash");
   const published = checkpointNamed(checkpoints, "published-plan");
   failIf(published.planSha256 !== manifest.planSha256, "checkpoint-integrity");
   failIf(checkpoint.manifestSha256 !== sha256File(artifacts.manifest), "checkpoint-integrity");
   return manifest;
+}
+
+function validateImagePlatformCheckpoint(checkpoint, binding) {
+  assertKnownKeys(checkpoint, [
+    "version", "type", "sequence", "name", "runId", "phase", "createdAt",
+    "verifierSha256", "verifierPath", "descriptorSetSha256",
+  ], "image-platform-checkpoint");
+  assertRequiredKeys(checkpoint, [
+    "version", "type", "sequence", "name", "runId", "phase", "createdAt",
+    "verifierSha256", "verifierPath", "descriptorSetSha256",
+  ], "image-platform-checkpoint");
+  failIf(
+    checkpoint.version !== 1 ||
+      checkpoint.type !== "lifecycle-checkpoint" ||
+      checkpoint.name !== "image-platform-verified" ||
+      !isSha(checkpoint.verifierSha256) ||
+      checkpoint.verifierPath !== IMAGE_VERIFIER_ARTIFACT_NAME ||
+      !isSha(checkpoint.descriptorSetSha256) ||
+      checkpoint.verifierSha256 !== binding.verifierSha256 ||
+      checkpoint.descriptorSetSha256 !== hashJson(binding.images),
+    "image-platform-checkpoint",
+  );
+  return checkpoint;
 }
 
 function assertReceiptSchema(receipt, manifest, type, statusValues = undefined) {
@@ -1508,6 +1876,11 @@ function normalizeContext(raw, expected) {
   }
   const callerHash = calculatedCallerHash;
   const azureContextHash = calculatedAzureContextHash;
+  const imagePlatforms = expected.imagePlatforms ?? raw.imagePlatforms;
+  if (imagePlatforms !== undefined) {
+    validateImagePlatformBinding(imagePlatforms, raw.acrLoginServer);
+    failIf(!same(raw.imagePlatforms, imagePlatforms), "image-platform-binding");
+  }
   const bindings = {
     planSha256: expected.planSha256,
     terraformSha256: raw.terraformSha256,
@@ -1533,6 +1906,8 @@ function normalizeContext(raw, expected) {
     azureContextHash,
     callerHash,
     guard: GUARD_MAPPINGS[expected.phase],
+    acrLoginServer: raw.acrLoginServer,
+    ...(imagePlatforms === undefined ? {} : { imagePlatforms }),
   };
   failIf(!isSha(bindings.planSha256), "plan-hash");
   failIf(!isSha(bindings.terraformSha256), "terraform-hash");
@@ -1578,6 +1953,7 @@ function normalizeContext(raw, expected) {
   );
   failIf(!same(bindings.argv, expected.argv), "argv-context");
   failIf(!isSha(bindings.backendConfigurationSha256), "backend-hash");
+  failIf(typeof bindings.acrLoginServer !== "string" || !ACR_LOGIN_SERVER_RE.test(bindings.acrLoginServer), "acr-login-server");
   return bindings;
 }
 
@@ -1658,7 +2034,7 @@ function checkWorktree(repoRoot, phase, processRunner) {
   failIf(sha256Bytes(diff) !== GENERATION_DIFF_SHA256, "worktree-generation-diff");
 }
 
-function boundedProcessResult(result) {
+function boundedProcessResult(result, maxOutputBytes = COMMAND_OUTPUT_MAX_BYTES) {
   if (result === undefined || result === null) {
     return { status: "ambiguous", exitCode: null, stdout: "", stderr: "" };
   }
@@ -1672,8 +2048,8 @@ function boundedProcessResult(result) {
     : typeof result.stderr === "string"
       ? result.stderr
       : "";
-  failIf(Buffer.byteLength(stdout) > COMMAND_OUTPUT_MAX_BYTES, "command-output-too-large");
-  failIf(Buffer.byteLength(stderr) > COMMAND_OUTPUT_MAX_BYTES, "command-output-too-large");
+  failIf(Buffer.byteLength(stdout) > maxOutputBytes, "command-output-too-large");
+  failIf(Buffer.byteLength(stderr) > maxOutputBytes, "command-output-too-large");
   if (result.timedOut === true || result.status === null || result.signal !== undefined && result.status === null) {
     return { status: "ambiguous", exitCode: null, stdout: "", stderr: "", timedOut: true };
   }
@@ -1700,7 +2076,7 @@ function commandResult(command, args, options, processRunner) {
     env: { ...options.env },
     input: options.input,
     timeoutMs: options.timeoutMs ?? COMMAND_TIMEOUT_MS,
-    maxOutputBytes: COMMAND_OUTPUT_MAX_BYTES,
+    maxOutputBytes: options.maxOutputBytes ?? COMMAND_OUTPUT_MAX_BYTES,
     killSignal: "SIGKILL",
     processGroup: options.processGroup === true,
   };
@@ -1718,14 +2094,14 @@ function commandResult(command, args, options, processRunner) {
           encoding: "utf8",
           timeout: request.timeoutMs + APPLY_TERM_GRACE_MS + APPLY_KILL_GRACE_MS,
           killSignal: request.killSignal,
-          maxBuffer: COMMAND_OUTPUT_MAX_BYTES,
+          maxBuffer: request.maxOutputBytes,
           stdio: childStdioWithKernelLock(["ignore", "pipe", "pipe"]),
         },
       );
       if (helper.status !== 0 || helper.error || typeof helper.stdout !== "string") {
         return { status: "ambiguous", exitCode: null, stdout: "", stderr: "" };
       }
-      if (Buffer.byteLength(helper.stdout) > COMMAND_OUTPUT_MAX_BYTES) {
+      if (Buffer.byteLength(helper.stdout) > request.maxOutputBytes) {
         return { status: "ambiguous", exitCode: null, stdout: "", stderr: "" };
       }
       const parsed = JSON.parse(helper.stdout);
@@ -1747,14 +2123,14 @@ function commandResult(command, args, options, processRunner) {
         encoding: "utf8",
         timeout: request.timeoutMs,
         killSignal: request.killSignal,
-        maxBuffer: COMMAND_OUTPUT_MAX_BYTES,
+        maxBuffer: request.maxOutputBytes,
         stdio: ["pipe", "pipe", "pipe"],
       });
     }
   } catch {
     return { status: "ambiguous", exitCode: null, stdout: "", stderr: "" };
   }
-  return boundedProcessResult(result);
+  return boundedProcessResult(result, request.maxOutputBytes);
 }
 
 function runCommand(config, command, args, options = {}) {
@@ -2028,10 +2404,12 @@ function defaultReviewIdentity(config) {
     const dependencies = paths.map((relativePath) =>
       reviewedFileIdentity(config.repoRoot, relativePath, config.processRunner),
     );
+    const guard = dependencies.find((entry) => entry.path === "infra/scripts/assert-dev-plan.mjs");
+    failIf(!isObject(guard), "reviewed-dependencies");
     return {
       repositoryCommit: gitResult(config.repoRoot, ["rev-parse", "HEAD"], config.processRunner).trim(),
       lifecycleSha256: dependencies[0].sha256,
-      guardSha256: dependencies[1].sha256,
+      guardSha256: guard.sha256,
       dependencyBlobs: dependencies.slice(1),
     };
   });
@@ -2057,7 +2435,10 @@ function parseTerraformStateJson(state) {
 }
 
 function defaultContext(config, request) {
-  return testSnapshot(`context:${config.workdir}:${request.phase}:${request.operation ?? config.contextOperation ?? "bootstrap"}`, () => {
+  const imageSnapshotKey = config.imagePlatforms === undefined ? "no-image" : hashJson(config.imagePlatforms);
+  return testSnapshot(
+    `context:${config.workdir}:${request.phase}:${request.operation ?? config.contextOperation ?? "bootstrap"}:${config.contextOperation ?? "bootstrap"}:${imageSnapshotKey}`,
+    () => {
     const backend = defaultBackendIdentity(config);
     const account = defaultAccount(config);
     defaultTerraformStateCache(config, backend.identity, account);
@@ -2096,8 +2477,11 @@ function defaultContext(config, request) {
       runtimeIdentityPrincipalId: outputs.runtimeIdentityPrincipalId,
       accountId: outputs.accountId,
       runtimeOpenAiRoleAssignmentId: outputs.runtimeOpenAiRoleAssignmentId,
+      acrLoginServer: outputs.acrLoginServer,
+      ...(config.imagePlatforms === undefined ? {} : { imagePlatforms: config.imagePlatforms }),
     };
-  });
+    },
+  );
 }
 
 function normalizeInjectedContext(raw, expected) {
@@ -2143,6 +2527,7 @@ function artifactPaths(runDirectory) {
     diagnosticSubmission: path.join(runDirectory, "diagnostic-submission.json"),
     diagnostic: path.join(runDirectory, "diagnostic-receipt.json"),
     absence: path.join(runDirectory, "cleanup-absence-receipt.json"),
+    verifier: path.join(runDirectory, IMAGE_VERIFIER_ARTIFACT_NAME),
   };
 }
 
@@ -2257,6 +2642,10 @@ function validateCheckpointSequence(checkpoints, phase) {
   };
   consume("run-directory", true);
   if (core.length === 1) return;
+  if (core[index] === "image-platform-verified") {
+    index += 1;
+    if (index === core.length) return;
+  }
   consume("plan-started", true);
   if (index < core.length && core[index] === "terraform-exit-ambiguous") {
     index += 1;
@@ -2564,7 +2953,7 @@ function runErrorInvalidates(code) {
   if (["plan-expired", "preflight-expired"].includes(code)) {
     return false;
   }
-  return /(?:mismatch|hash|integrity|symlink|mode|owner|noncanonical|replacement|context|receipt|artifact|checkpoint|state-history)/.test(code);
+  return /(?:mismatch|hash|integrity|symlink|mode|owner|noncanonical|replacement|context|receipt|artifact|checkpoint|state-history|image-platform|diagnostic-plan-image|acr-login-server|reviewed-file|guard-rejected)/.test(code);
 }
 
 function assertAppliedPhaseProof(config, state, phase) {
@@ -2582,7 +2971,7 @@ function assertAppliedPhaseProof(config, state, phase) {
     directory,
     artifacts,
     checkpoints,
-    { id: completed.id, phase },
+    completed,
   );
   const apply = readReceiptAtCheckpoint(
     artifacts.apply,
@@ -3516,6 +3905,30 @@ function recoverStateFromCheckpoints(config, state) {
       checkpoints = readCheckpoints(directory, { runId: run.id, phase: run.phase });
       names = new Set(checkpoints.map((checkpoint) => checkpoint.name));
     }
+    if (!["invalidated", "superseded"].includes(run.status) && names.has("image-platform-verified")) {
+      try {
+        const imageCheckpoint = checkpointNamed(checkpoints, "image-platform-verified");
+        failIf(
+          imageCheckpoint.verifierPath !== IMAGE_VERIFIER_ARTIFACT_NAME ||
+            !isSha(imageCheckpoint.verifierSha256),
+          "image-platform-checkpoint",
+        );
+        assertImmutableVerifierArtifact(artifacts.verifier, imageCheckpoint.verifierSha256, "image-platform-checkpoint");
+      } catch (error) {
+        if (!(error instanceof LifecycleError) || !error.code.startsWith("image-platform-checkpoint")) throw error;
+        if (!names.has("invalidated")) {
+          writeCheckpoint(config, directory, run.id, run.phase, "invalidated", {
+            reason: "image-platform-checkpoint",
+            recovered: true,
+          });
+        }
+        run.status = "invalidated";
+        run.reason = "image-platform-checkpoint";
+        run.invalidatedAt = nowIso(config.now);
+        changed = true;
+        continue;
+      }
+    }
     if (
       !["invalidated", "superseded"].includes(run.status) &&
       !names.has("manifest") &&
@@ -3761,6 +4174,19 @@ function requireState(config) {
   return state;
 }
 
+function rejectAutomaticTerraformVariableSources(workdir) {
+  let entries;
+  try {
+    entries = readdirSync(workdir, { withFileTypes: true });
+  } catch {
+    reject("terraform-variable-sources");
+  }
+  const automatic = /^(?:terraform\.tfvars\.json|.*\.auto\.tfvars(?:\.json)?)$/;
+  for (const entry of entries) {
+    failIf(automatic.test(entry.name), "terraform-variable-sources");
+  }
+}
+
 function addTerminalInventoryEntry(inventory, root, filePath, label = undefined) {
   const relative = label ?? path.relative(root, filePath);
   failIf(relative === "" || relative.startsWith("..") || path.isAbsolute(relative), "terminal-receipt-path");
@@ -3772,6 +4198,7 @@ function validatedRunEvidence(config, inventory, entry, artifacts, checkpoints) 
   const directory = runPath(config, entry.id);
   const allowed = new Set([
     "plan.tfplan",
+    IMAGE_VERIFIER_ARTIFACT_NAME,
     "tf-cli.tfrc",
     "create-manifest.json",
     "show.json",
@@ -3865,11 +4292,13 @@ function validateFinalTerminalEvidence(config, runDirectory, advancement, state)
     runId: advancement.runId,
     phase: "terminal",
   });
+  const terminal = state.runs.find((run) => run.id === advancement.runId && run.phase === "terminal");
+  failIf(!terminal, "terminal-run");
   const manifest = immutableManifest(
     runDirectory,
     artifacts,
     checkpoints,
-    { id: advancement.runId, phase: "terminal" },
+    terminal,
   );
   assertCheckpointArtifact(artifacts.terminal, advancement, "terminalReceiptSha256", "terminal-receipt");
   failIf(!Array.isArray(advancement.receiptInventory), "terminal-receipt-inventory");
@@ -3883,32 +4312,32 @@ function validateFinalTerminalEvidence(config, runDirectory, advancement, state)
     assertKnownKeys(entry, ["label", "sha256"], "terminal-receipt-inventory");
     assertRequiredKeys(entry, ["label", "sha256"], "terminal-receipt-inventory");
   }
-  const terminal = readJson(artifacts.terminal, "terminal-receipts");
-  assertReceiptMatches(terminal, manifest, "terminal");
-  assertKnownKeys(terminal, [
+  const terminalReceipt = readJson(artifacts.terminal, "terminal-receipts");
+  assertReceiptMatches(terminalReceipt, manifest, "terminal");
+  assertKnownKeys(terminalReceipt, [
     "version", "type", "runId", "phase", "planSha256", "bindingSha256", "createdAt",
     "result", "receiptInventory", "receiptSetSha256",
   ], "terminal-receipt-schema");
-  assertRequiredKeys(terminal, [
+  assertRequiredKeys(terminalReceipt, [
     "version", "type", "runId", "phase", "planSha256", "bindingSha256", "createdAt",
     "result", "receiptInventory", "receiptSetSha256",
   ], "terminal-receipt-schema");
-  failIf(terminal.version !== 1 || terminal.result !== "verified", "terminal-receipt-schema");
+  failIf(terminalReceipt.version !== 1 || terminalReceipt.result !== "verified", "terminal-receipt-schema");
   const inventory = terminalPredecessorEvidence(config, state, {
     runDirectory,
     runId: advancement.runId,
     manifest,
     artifacts,
   });
-  failIf(!same(terminal.receiptInventory, inventory), "terminal-receipt-inventory");
+  failIf(!same(terminalReceipt.receiptInventory, inventory), "terminal-receipt-inventory");
   failIf(!same(advancement.receiptInventory, inventory), "terminal-receipt-inventory");
   failIf(
-    !isSha(terminal.receiptSetSha256) ||
+    !isSha(terminalReceipt.receiptSetSha256) ||
       !isSha(advancement.receiptSetSha256) ||
-      terminal.receiptSetSha256 !== advancement.receiptSetSha256,
+      terminalReceipt.receiptSetSha256 !== advancement.receiptSetSha256,
     "terminal-receipt-set",
   );
-  failIf(hashJson(inventory) !== terminal.receiptSetSha256, "terminal-receipt-set");
+  failIf(hashJson(inventory) !== terminalReceipt.receiptSetSha256, "terminal-receipt-set");
 }
 
 function createRunDirectory(config, runId) {
@@ -4073,6 +4502,235 @@ function resourceIdParts(resourceId, code) {
   return { subscription: match[1], resourceGroup: match[2], account: match[3] };
 }
 
+function parseImageReference(value, code) {
+  const match = typeof value === "string" ? IMAGE_REFERENCE_RE.exec(value) : null;
+  failIf(match === null, code);
+  return { host: match[1], repository: match[2], digest: match[3], reference: value };
+}
+
+function parseProtectedImageTfvars(config, acrLoginServer) {
+  const tfvarsPath = path.join(config.workdir, "terraform.tfvars");
+  const stat = assertPrivateRegular(tfvarsPath, "image-platform-tfvars");
+  failIf(stat.size > JSON_MAX_BYTES, "image-platform-tfvars-too-large");
+  const source = boundedFileText(tfvarsPath, JSON_MAX_BYTES, "image-platform-tfvars");
+  const values = new Map();
+  const names = ["relay_image_digest", "expiry_cleanup_image_digest"];
+  const assignmentPattern = /^(relay_image_digest|expiry_cleanup_image_digest)\s*=\s*("[^"]*")\s*$/;
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.replace(/#[^\r\n]*$/, "").trim();
+    if (line.length === 0) continue;
+    const targetMention = names.some((name) => new RegExp(`\\b${name}\\b`).test(line));
+    const match = assignmentPattern.exec(line);
+    if (match !== null) {
+      failIf(values.has(match[1]), "image-platform-tfvars-duplicate");
+      const parsed = parseImageReference(match[2].slice(1, -1), "image-platform-tfvars-value");
+      values.set(match[1], parsed);
+      continue;
+    }
+    failIf(targetMention, "image-platform-tfvars-assignment");
+  }
+  failIf(values.size !== names.length, "image-platform-tfvars-missing");
+  const relay = values.get("relay_image_digest");
+  const cleanup = values.get("expiry_cleanup_image_digest");
+  failIf(relay.host !== acrLoginServer || cleanup.host !== acrLoginServer, "image-platform-host");
+  failIf(relay.repository !== "palancar-relay" || cleanup.repository !== "palancar-expiry-cleanup", "image-platform-repository");
+  return { relay, cleanup };
+}
+
+function validateImagePlatformDescriptor(value, reference, repository, acrLoginServer, code) {
+  assertKnownKeys(value, IMAGE_DESCRIPTOR_KEYS, code);
+  assertRequiredKeys(value, IMAGE_DESCRIPTOR_KEYS, code);
+  const parsed = parseImageReference(value.reference, code);
+  failIf(
+    value.version !== 1 ||
+      parsed.host !== acrLoginServer ||
+      parsed.repository !== repository ||
+      value.reference !== reference ||
+      value.repository !== repository ||
+      value.manifestDigest !== parsed.digest ||
+      !/^sha256:[a-f0-9]{64}$/.test(value.configDigest) ||
+      !Object.hasOwn(IMAGE_MANIFEST_MEDIA_TYPES, value.manifestMediaType) ||
+      value.configMediaType !== IMAGE_MANIFEST_MEDIA_TYPES[value.manifestMediaType] ||
+      value.os !== "linux" ||
+      value.architecture !== "amd64" ||
+      value.variant !== null,
+    code,
+  );
+  return value;
+}
+
+function parseImageVerifierOutput(result, reference, repository, acrLoginServer) {
+  const code = "image-platform-verification";
+  failIf(result.status !== "success" || result.stderr !== "", code);
+  const output = result.stdout;
+  failIf(typeof output !== "string" || output.length === 0 || !output.endsWith("\n"), code);
+  const body = output.slice(0, -1);
+  failIf(
+    body.includes("\n") || body.includes("\r") || body.trim() !== body ||
+      Buffer.byteLength(output) > IMAGE_VERIFIER_OUTPUT_MAX_BYTES,
+    code,
+  );
+  let value;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    reject(code);
+  }
+  return validateImagePlatformDescriptor(value, reference, repository, acrLoginServer, code);
+}
+
+function imageVerifierIdentity(reviewed, code = "image-platform-verification") {
+  const entry = reviewed.dependencyBlobs.find((candidate) => candidate.path === IMAGE_VERIFIER_PATH);
+  failIf(!isObject(entry) || !isSha(entry.sha256) || typeof entry.path !== "string", code);
+  return entry;
+}
+
+function imagePlatformBinding(verifierSha256, descriptors) {
+  const images = [...descriptors].sort((left, right) =>
+    left.repository < right.repository ? -1 : left.repository > right.repository ? 1 : 0,
+  );
+  failIf(
+    images.length !== 2 ||
+      images[0].repository !== "palancar-expiry-cleanup" ||
+      images[1].repository !== "palancar-relay" ||
+      !isSha(verifierSha256),
+    "image-platform-binding",
+  );
+  return { version: 1, verifierSha256, images };
+}
+
+function validateImagePlatformBinding(value, expectedAcrLoginServer, code = "image-platform-binding") {
+  failIf(
+    typeof expectedAcrLoginServer !== "string" || !ACR_LOGIN_SERVER_RE.test(expectedAcrLoginServer),
+    code,
+  );
+  assertKnownKeys(value, ["version", "verifierSha256", "images"], code);
+  assertRequiredKeys(value, ["version", "verifierSha256", "images"], code);
+  failIf(value.version !== 1 || !isSha(value.verifierSha256) || !Array.isArray(value.images), code);
+  failIf(value.images.length !== 2, code);
+  const seen = new Set();
+  for (const descriptor of value.images) {
+    const parsed = parseImageReference(descriptor?.reference, code);
+    failIf(seen.has(parsed.repository), code);
+    seen.add(parsed.repository);
+    validateImagePlatformDescriptor(
+      descriptor,
+      descriptor.reference,
+      parsed.repository,
+      expectedAcrLoginServer,
+      code,
+    );
+    failIf(parsed.host !== expectedAcrLoginServer, code);
+  }
+  failIf(!seen.has("palancar-relay") || !seen.has("palancar-expiry-cleanup"), code);
+  failIf(value.images[0].repository !== "palancar-expiry-cleanup" || value.images[1].repository !== "palancar-relay", code);
+  return value;
+}
+
+function assertImmutableVerifierArtifact(filePath, expectedSha256, code = "image-platform-verification") {
+  failIf(
+    typeof filePath !== "string" || path.basename(filePath) !== IMAGE_VERIFIER_ARTIFACT_NAME ||
+      !isSha(expectedSha256),
+    code,
+  );
+  assertRegular(filePath, ARTIFACT_MODE, code);
+  failIf(statSync(filePath).size > EXECUTABLE_MAX_BYTES, code);
+  failIf(sha256File(filePath, EXECUTABLE_MAX_BYTES) !== expectedSha256, code);
+}
+
+function materializeReviewedVerifier(config, artifacts, reviewed, code = "image-platform-verification") {
+  const entry = imageVerifierIdentity(reviewed, code);
+  const source = path.join(config.repoRoot, IMAGE_VERIFIER_PATH);
+  assertReviewedVerifierSource(config, entry.sha256, code);
+  let bytes;
+  try {
+    bytes = readFileSync(source);
+  } catch {
+    reject(code);
+  }
+  failIf(sha256Bytes(bytes) !== entry.sha256, code);
+  exclusiveText(artifacts.verifier, bytes, code);
+  assertImmutableVerifierArtifact(artifacts.verifier, entry.sha256, code);
+  return artifacts.verifier;
+}
+
+function assertReviewedVerifierSource(config, expectedSha256, code = "image-platform-verification") {
+  const source = path.join(config.repoRoot, IMAGE_VERIFIER_PATH);
+  const stat = assertRegular(source, null, code);
+  failIf(stat.size > EXECUTABLE_MAX_BYTES, code);
+  failIf(sha256File(source, EXECUTABLE_MAX_BYTES) !== expectedSha256, code);
+}
+
+function runImageVerifier(config, phase, env, subscription, verifierSha256, verifierPath, reference, repository, acrLoginServer) {
+  assertImmutableVerifierArtifact(verifierPath, verifierSha256, "image-platform-verification");
+  const result = runCommand(
+    { ...config, childEnvironment: env },
+    "/usr/bin/node",
+    [verifierPath, "verify", subscription, acrLoginServer, reference],
+    {
+      phase: "image-platform-verification",
+      cwd: config.repoRoot,
+      env,
+      timeoutMs: IMAGE_VERIFIER_TIMEOUT_MS,
+      maxOutputBytes: IMAGE_VERIFIER_OUTPUT_MAX_BYTES,
+      fresh: true,
+    },
+  );
+  return {
+    descriptor: parseImageVerifierOutput(result, reference, repository, acrLoginServer),
+    verifierSha256,
+  };
+}
+
+function verifyImagePlatforms(config, phase, env, context, expected = undefined, verifierPath = undefined) {
+  const code = "image-platform-verification";
+  try {
+    failIf(!isObject(context) || !isObject(context.backend), code);
+    const subscription = context.backend.subscription_id ?? context.azure?.subscription;
+    failIf(
+      subscription !== context.backend.subscription_id ||
+        typeof subscription !== "string" ||
+        typeof context.acrLoginServer !== "string" ||
+        !ACR_LOGIN_SERVER_RE.test(context.acrLoginServer),
+      code,
+    );
+    const refs = parseProtectedImageTfvars(config, context.acrLoginServer);
+    const verifier = imageVerifierIdentity(context, code);
+    assertReviewedVerifierSource(config, verifier.sha256, code);
+    failIf(typeof verifierPath !== "string", code);
+    assertImmutableVerifierArtifact(verifierPath, verifier.sha256, code);
+    const relay = runImageVerifier(
+      config,
+      phase,
+      env,
+      subscription,
+      verifier.sha256,
+      verifierPath,
+      refs.relay.reference,
+      refs.relay.repository,
+      context.acrLoginServer,
+    );
+    const cleanup = runImageVerifier(
+      config,
+      phase,
+      env,
+      subscription,
+      verifier.sha256,
+      verifierPath,
+      refs.cleanup.reference,
+      refs.cleanup.repository,
+      context.acrLoginServer,
+    );
+    const binding = imagePlatformBinding(verifier.sha256, [relay.descriptor, cleanup.descriptor]);
+    validateImagePlatformBinding(binding, context.acrLoginServer, code);
+    if (expected !== undefined) failIf(!same(binding, expected), code);
+    return binding;
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === code) throw error;
+    reject(code);
+  }
+}
+
 function defaultOutputs(config) {
   return testSnapshot(`terraform-outputs:${config.workdir}:${config.contextOperation ?? "bootstrap"}`, () => {
     const output = runCommand(config, TERRAFORM_PATH, ["output", "-json"]);
@@ -4087,9 +4745,12 @@ function defaultOutputs(config) {
     failIf(accountParts.subscription !== config.account.subscription, "binding-mismatch");
     const resourceGroup = get("resource_group_name");
     failIf(resourceGroup !== accountParts.resourceGroup, "resource-context");
+    const acrLoginServer = get("acr_login_server");
+    failIf(typeof acrLoginServer !== "string" || !ACR_LOGIN_SERVER_RE.test(acrLoginServer), "acr-login-server");
     const outputs = {
       resourceGroup,
       region: get("region"),
+      acrLoginServer,
       accountId: get("foundry_account_id"),
       account: accountParts.account,
       foundryResourceGroup: accountParts.resourceGroup,
@@ -5099,9 +5760,9 @@ function reviewedDiagnosticJobShape(show, stateAddress) {
   return after;
 }
 
-function reviewedRuntimeShapes(artifacts, phase) {
+function reviewedRuntimeShapes(artifacts, phase, showOverride = undefined) {
   failIf(!["runtime-cutover", "credential-cleanup", "terminal"].includes(phase), "diagnostic-plan-phase");
-  const show = parseJsonText(boundedFileText(artifacts.show, JSON_MAX_BYTES, "show-json"), "show-json");
+  const show = showOverride ?? parseJsonText(boundedFileText(artifacts.show, JSON_MAX_BYTES, "show-json"), "show-json");
   const address = "module.container_app_workload[0].azapi_resource.this";
   const moduleAddress = "module.container_app_workload[0]";
   const stateAddress = (root, targetAddress, targetModuleAddress, code) => {
@@ -5143,6 +5804,61 @@ function reviewedRuntimeShapes(artifacts, phase) {
 
 function reviewedRuntimeImage(artifacts) {
   return reviewedRuntimeShapes(artifacts, "runtime-cutover").image;
+}
+
+function assertGuardBoundImages(artifacts, phase, binding, acrLoginServer, show) {
+  try {
+    validateImagePlatformBinding(binding, acrLoginServer, "image-platform-verification");
+    failIf(!isObject(show), "image-platform-verification");
+    const relay = binding.images.find((image) => image.repository === "palancar-relay");
+    const cleanup = binding.images.find((image) => image.repository === "palancar-expiry-cleanup");
+    failIf(relay === undefined || cleanup === undefined, "image-platform-verification");
+    failIf(show.variables?.relay_image_digest?.value !== relay.reference, "image-platform-verification");
+    failIf(show.variables?.expiry_cleanup_image_digest?.value !== cleanup.reference, "image-platform-verification");
+
+    const targetNames = new Map([
+      ["module.container_app_workload[0].azapi_resource.this", "relay"],
+      ["module.container_app_workload[0]", "relay"],
+      ["module.expiry_cleanup_job[0].azapi_resource.this", "expiry-cleanup"],
+      ["module.expiry_cleanup_job[0]", "expiry-cleanup"],
+    ]);
+    const expectedImages = new Map([
+      ["relay", relay.reference],
+      ["expiry-cleanup", cleanup.reference],
+    ]);
+    const walk = (value, target = undefined) => {
+      if (Array.isArray(value)) {
+        for (const child of value) walk(child, target);
+        return;
+      }
+      if (!isObject(value)) return;
+      const nextTarget = typeof value.address === "string" && targetNames.has(value.address)
+        ? targetNames.get(value.address)
+        : target;
+      if (nextTarget !== undefined && Object.hasOwn(value, "name") && value.name === nextTarget && Object.hasOwn(value, "image")) {
+        failIf(value.image !== expectedImages.get(nextTarget), "image-platform-verification");
+      }
+      for (const child of Object.values(value)) walk(child, nextTarget);
+    };
+    walk(show.resource_changes?.map((entry) => ({
+      address: entry?.address,
+      change: { after: entry?.change?.after },
+    })));
+    walk(show.planned_values);
+    walk(show.configuration);
+
+    if (["runtime-cutover", "credential-cleanup", "terminal"].includes(phase)) {
+      const reviewed = reviewedRuntimeShapes(artifacts, phase, show);
+      failIf(reviewed.image !== relay.reference || reviewed.cleanupJob.image !== cleanup.reference, "image-platform-verification");
+    }
+  } catch (error) {
+    if (error instanceof LifecycleError && [
+      "image-platform-verification", "image-platform-binding", "diagnostic-plan-image", "diagnostic-plan-topology",
+    ].includes(error.code)) {
+      reject("image-platform-verification");
+    }
+    throw error;
+  }
 }
 
 function validateDiagnosticIdentity(value, manifest, job, code) {
@@ -7234,6 +7950,7 @@ function requireRuntimeOutputs(outputs) {
 }
 
 function defaultMetadataCheck(config) {
+  rejectAutomaticTerraformVariableSources(config.workdir);
   const directory = path.join(config.root, `.init-${process.pid}-${randomBytes(6).toString("hex")}`);
   mkdirSync(directory, { mode: DIRECTORY_MODE });
   try {
@@ -7629,15 +8346,17 @@ function createLifecycleInternal(options = {}, internal = {}) {
   config.kernelLockPath = path.join(path.dirname(config.root), `${path.basename(config.root)}.kernel.lock`);
   failIf(path.isAbsolute(config.root) === false, "evidence-root");
 
-  function operationContext(phase, operation, run, planPath, argv, env) {
+  function operationContext(phase, operation, run, planPath, argv, env, imagePlatformsOverride = undefined) {
+    const imagePlatforms = imagePlatformsOverride ?? run?.manifest?.bindings?.imagePlatforms ?? config.imagePlatforms;
     const expected = {
       phase,
       planSha256: run?.manifest?.planSha256,
       cwd: config.workdir,
       argv,
+      ...(imagePlatforms === undefined ? {} : { imagePlatforms }),
     };
     const raw = defaultContext(
-      { ...config, childEnvironment: env, contextOperation: operation },
+      { ...config, childEnvironment: env, contextOperation: operation, ...(imagePlatforms === undefined ? {} : { imagePlatforms }) },
       { phase, operation, planPath, argv, env },
     );
     return normalizeInjectedContext(raw, expected);
@@ -7663,6 +8382,12 @@ function createLifecycleInternal(options = {}, internal = {}) {
     validateManifestArgv(manifest, run.artifacts, checkpoints, run.entry);
     assertRegular(run.artifacts.plan, ARTIFACT_MODE, "plan");
     failIf(sha256File(run.artifacts.plan) !== manifest.planSha256, "plan-hash");
+    const imagePlatforms = validateImagePlatformBinding(
+      manifest.bindings?.imagePlatforms,
+      manifest.bindings?.acrLoginServer,
+    );
+    validateImagePlatformCheckpoint(checkpointNamed(checkpoints, "image-platform-verified"), imagePlatforms);
+    assertImmutableVerifierArtifact(run.artifacts.verifier, imagePlatforms.verifierSha256, "image-platform-checkpoint");
     failIf(bindingHash(manifest.bindings) !== manifest.bindingSha256, "binding-hash");
     failIf(!checkpointSet.has("published-plan") || !checkpointSet.has("manifest"), "checkpoint-integrity");
     for (const checkpoint of checkpoints) {
@@ -7761,6 +8486,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       checkInheritedEnvironment(config.inheritedEnvironment);
       if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
       if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
+      rejectAutomaticTerraformVariableSources(config.workdir);
       const runId = makeRunId();
       operationRunId = runId;
       const runDirectory = createRunDirectory(config, runId);
@@ -7776,6 +8502,22 @@ function createLifecycleInternal(options = {}, internal = {}) {
       const env = buildChildEnvironment(runDirectory, config.inheritedEnvironment);
       const planArgv = exactCreateArgv(artifacts.plan);
       const manifestArgv = planArgv;
+      const prePlanRaw = defaultContext(
+        { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
+        { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+      );
+      const prePlanContext = normalizedContextBeforePlan(
+        prePlanRaw,
+        { phase, cwd: config.workdir, argv: manifestArgv },
+      );
+      const verifierPath = materializeReviewedVerifier(config, artifacts, prePlanContext);
+      const imagePlatforms = verifyImagePlatforms(config, phase, env, prePlanContext, undefined, verifierPath);
+      writeCheckpoint(config, runDirectory, runId, phase, "image-platform-verified", {
+        verifierSha256: imagePlatforms.verifierSha256,
+        verifierPath: IMAGE_VERIFIER_ARTIFACT_NAME,
+        descriptorSetSha256: hashJson(imagePlatforms.images),
+      });
+      updateRun(state, runId, { lastCheckpoint: "image-platform-verified" });
       const planStartedAt = nowIso(config.now);
       writeCheckpoint(config, runDirectory, runId, phase, "plan-started", {
         argv: manifestArgv,
@@ -7783,11 +8525,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
       });
       updateRun(state, runId, { lastCheckpoint: "plan-started" });
       const beforePlan = normalizedContextBeforePlan(
-        defaultContext(
-          { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
-          { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
-        ),
-        { phase, cwd: config.workdir, argv: manifestArgv },
+        { ...prePlanRaw, imagePlatforms },
+        { phase, cwd: config.workdir, argv: manifestArgv, imagePlatforms },
       );
       let result;
       try {
@@ -7846,6 +8585,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         artifacts.plan,
         manifestArgv,
         env,
+        imagePlatforms,
       );
       failIf(!sameCompletePlanContext(beforePlan, context), "binding-mismatch");
       const startedManifest = { phase, createdAt: planStartedAt };
@@ -7880,7 +8620,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       if (operationState !== undefined && operationRunId !== undefined) {
         try {
           withLock(config, () => {
-            handleRunFailure(requireState(config), operationRunId, error);
+            handleRunFailure(operationState, operationRunId, error);
           });
         } catch {
           // Preserve the original operation error.  A failed invalidation is
@@ -7905,9 +8645,43 @@ function createLifecycleInternal(options = {}, internal = {}) {
       assertRunStatus(run.entry, ["created"]);
       let env;
       try {
+        for (const evidencePath of [
+          run.artifacts.show,
+          run.artifacts.guard,
+          `${run.artifacts.guard}.consumed`,
+        ]) {
+          try {
+            lstatSync(evidencePath);
+            reject("guard-artifact-integrity");
+          } catch (error) {
+            if (error instanceof LifecycleError) throw error;
+            if (error?.code !== "ENOENT") reject("guard-artifact-integrity");
+          }
+        }
         const manifest = readManifest(run);
         env = buildChildEnvironment(run.runDirectory, config.inheritedEnvironment);
-        revalidate(run, "guard", manifest, env);
+        assertReviewedVerifierSource(
+          config,
+          manifest.bindings.imagePlatforms.verifierSha256,
+          "image-platform-verification",
+        );
+        let guardContext;
+        try {
+          guardContext = revalidate(run, "guard", manifest, env);
+        } catch (error) {
+          if (error instanceof LifecycleError && error.code === "reviewed-file-changed") {
+            reject("image-platform-verification");
+          }
+          throw error;
+        }
+        verifyImagePlatforms(
+          config,
+          phase,
+          env,
+          guardContext,
+          manifest.bindings.imagePlatforms,
+          run.artifacts.verifier,
+        );
         const shown = defaultShowExecutor({
           operation: "guard",
           phase,
@@ -7922,16 +8696,19 @@ function createLifecycleInternal(options = {}, internal = {}) {
         const input = typeof shown === "string" ? shown : shown?.stdout;
         failIf(typeof input !== "string" || input.length === 0, "terraform-show");
         failIf(Buffer.byteLength(input) > JSON_MAX_BYTES, "terraform-show-too-large");
+        let show;
         try {
-          JSON.parse(input);
+          show = JSON.parse(input);
         } catch {
           reject("terraform-show-json");
         }
-        exclusiveText(run.artifacts.show, input, "show-json");
-        writeCheckpoint(config, run.runDirectory, runId, phase, "show-json", {
-          showSha256: sha256Bytes(input),
-        });
-        updateRun(state, runId, { lastCheckpoint: "show-json" });
+        assertGuardBoundImages(
+          run.artifacts,
+          phase,
+          manifest.bindings.imagePlatforms,
+          manifest.bindings.acrLoginServer,
+          show,
+        );
         const guardResult = defaultGuardExecutor({
           operation: "guard",
           phase,
@@ -7944,6 +8721,11 @@ function createLifecycleInternal(options = {}, internal = {}) {
           processRunner: config.processRunner,
         });
         failIf(parseStatus(guardResult) !== "success", "guard-rejected");
+        exclusiveText(run.artifacts.show, input, "show-json");
+        writeCheckpoint(config, run.runDirectory, runId, phase, "show-json", {
+          showSha256: sha256Bytes(input),
+        });
+        updateRun(state, runId, { lastCheckpoint: "show-json" });
         const receipt = receiptFor("guard", manifest, {
           guard: GUARD_MAPPINGS[phase],
           showSha256: sha256Bytes(input),
@@ -8831,6 +9613,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
     checkInheritedEnvironment(config.inheritedEnvironment);
     if (phase === "runtime-cutover") protectedRuntimeSecretsRoleEnabled(config, true);
     if (phase === "credential-cleanup") protectedRuntimeSecretsRoleEnabled(config, false);
+    rejectAutomaticTerraformVariableSources(config.workdir);
     const runId = makeRunId();
     onRunId(runId);
     const runDirectory = createRunDirectory(config, runId);
@@ -8847,6 +9630,22 @@ function createLifecycleInternal(options = {}, internal = {}) {
     const env = buildChildEnvironment(runDirectory, config.inheritedEnvironment);
     const planArgv = exactCreateArgv(artifacts.plan);
     const manifestArgv = planArgv;
+    const prePlanRaw = defaultContext(
+      { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
+      { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
+    );
+    const prePlanContext = normalizedContextBeforePlan(
+      prePlanRaw,
+      { phase, cwd: config.workdir, argv: manifestArgv },
+    );
+    const verifierPath = materializeReviewedVerifier(config, artifacts, prePlanContext);
+    const imagePlatforms = verifyImagePlatforms(config, phase, env, prePlanContext, undefined, verifierPath);
+    writeCheckpoint(config, runDirectory, runId, phase, "image-platform-verified", {
+      verifierSha256: imagePlatforms.verifierSha256,
+      verifierPath: IMAGE_VERIFIER_ARTIFACT_NAME,
+      descriptorSetSha256: hashJson(imagePlatforms.images),
+    });
+    updateRun(state, runId, { lastCheckpoint: "image-platform-verified" });
     const planStartedAt = nowIso(config.now);
     writeCheckpoint(config, runDirectory, runId, phase, "plan-started", {
       argv: manifestArgv,
@@ -8854,11 +9653,8 @@ function createLifecycleInternal(options = {}, internal = {}) {
       });
       updateRun(state, runId, { lastCheckpoint: "plan-started" });
     const beforePlan = normalizedContextBeforePlan(
-      defaultContext(
-        { ...config, childEnvironment: env, contextOperation: "create-before-plan" },
-        { phase, operation: "create", planPath: artifacts.plan, argv: manifestArgv, env },
-      ),
-      { phase, cwd: config.workdir, argv: manifestArgv },
+      { ...prePlanRaw, imagePlatforms },
+      { phase, cwd: config.workdir, argv: manifestArgv, imagePlatforms },
     );
     let result;
     try {
@@ -8910,6 +9706,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
       artifacts.plan,
       manifestArgv,
       env,
+      imagePlatforms,
     );
     failIf(!sameCompletePlanContext(beforePlan, context), "binding-mismatch");
     try {
