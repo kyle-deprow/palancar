@@ -512,6 +512,7 @@ function makeHarness(overrides = {}) {
   let diagnosticJobMutator = (value) => value;
   let diagnosticRuntimeIdentityShowCount = 0;
   let diagnosticRuntimeIdentityMutator = (value) => value;
+  let diagnosticImagePullIdentityMutator = (value) => value;
   let diagnosticPostRuntimeIdentityStatus = "success";
   let diagnosticStartClockAdvanceMs = 0;
   let diagnosticRequestId;
@@ -728,9 +729,14 @@ function makeHarness(overrides = {}) {
       if (request.argv[0] === "identity" && request.argv[1] === "show") {
         const identityId = request.argv[request.argv.indexOf("--ids") + 1];
         if (identityId === IMAGE_PULL_ID) {
+          const imagePullIdentity = diagnosticImagePullIdentityMutator({
+            id: IMAGE_PULL_ID,
+            clientId: IMAGE_PULL_CLIENT,
+            principalId: IMAGE_PULL_PRINCIPAL,
+          });
           return {
             status: 0,
-            stdout: JSON.stringify({ id: IMAGE_PULL_ID, clientId: IMAGE_PULL_CLIENT, principalId: IMAGE_PULL_PRINCIPAL }),
+            stdout: JSON.stringify(imagePullIdentity),
           };
         }
         diagnosticRuntimeIdentityShowCount += 1;
@@ -1216,6 +1222,7 @@ function makeHarness(overrides = {}) {
     setDiagnosticRestMode(value) { diagnosticRestMode = value; },
     setDiagnosticJobMutator(value) { diagnosticJobMutator = value; },
     setDiagnosticRuntimeIdentityMutator(value) { diagnosticRuntimeIdentityMutator = value; },
+    setDiagnosticImagePullIdentityMutator(value) { diagnosticImagePullIdentityMutator = value; },
     setDiagnosticPostRuntimeIdentityStatus(value) { diagnosticPostRuntimeIdentityStatus = value; },
     setDiagnosticStartClockAdvance(value) { diagnosticStartClockAdvanceMs = value; },
     setReviewedShowMutator(value) { reviewedShowMutator = value; },
@@ -2271,6 +2278,69 @@ test("diagnostic refreshes runtime identity after terminal execution and never r
       assert.equal(existsSync(failed.paths(failedRunId).diagnostic), false);
     } finally {
       failed.cleanup();
+    }
+  }
+});
+
+test("diagnostic identity proofs case-fold resource IDs and retain Terraform canonical receipts", () => {
+  const harness = makeHarness();
+  try {
+    const uppercaseResourceId = (identity) => ({ ...identity, id: identity.id.toUpperCase() });
+    const runId = prepareRuntimeGuarded(harness);
+    harness.setDiagnosticRuntimeIdentityMutator(uppercaseResourceId);
+    harness.setDiagnosticImagePullIdentityMutator(uppercaseResourceId);
+    harness.setDiagnosticRestMode("absolute-match");
+
+    assert.deepEqual(harness.lifecycle.diagnostic("runtime-cutover", runId), {
+      runId,
+      phase: "runtime-cutover",
+      status: "diagnostic-passed",
+      execution: "diagnostic-execution-1",
+    });
+
+    const receipt = JSON.parse(readFileSync(harness.paths(runId).diagnostic, "utf8"));
+    assert.equal(receipt.identity.before.resourceId, RUNTIME_ID);
+    assert.equal(receipt.identity.after.resourceId, RUNTIME_ID);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("diagnostic identity proofs reject changed resource-ID segments and exact UUID mismatches", () => {
+  const resourceIdMutations = [
+    (id) => id.replace(`/subscriptions/${SUBSCRIPTION}/`, `/subscriptions/${"0".repeat(SUBSCRIPTION.length)}/`),
+    (id) => id.replace("/resourceGroups/rg-runtime/", "/resourceGroups/rg-other/"),
+    (id) => id.replace("/providers/Microsoft.ManagedIdentity/", "/providers/Microsoft.Other/"),
+    (id) => id.replace("/userAssignedIdentities/runtime", "/systemAssignedIdentities/runtime"),
+    (id) => id.replace(/\/runtime$/, "/runtime-other"),
+  ];
+  for (const mutateResourceId of resourceIdMutations) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      harness.setDiagnosticRuntimeIdentityMutator((identity) => ({
+        ...identity,
+        id: mutateResourceId(identity.id),
+      }));
+      expectCode(() => harness.lifecycle.diagnostic("runtime-cutover", runId), "diagnostic-identity");
+      assert.equal(existsSync(harness.paths(runId).diagnosticIntent), false);
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  for (const mutateIdentity of [
+    (identity) => ({ ...identity, clientId: RUNTIME_CLIENT.replace("12", "99") }),
+    (identity) => ({ ...identity, principalId: RUNTIME_PRINCIPAL.replace("13", "99") }),
+  ]) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      harness.setDiagnosticRuntimeIdentityMutator(mutateIdentity);
+      expectCode(() => harness.lifecycle.diagnostic("runtime-cutover", runId), "diagnostic-identity");
+      assert.equal(existsSync(harness.paths(runId).diagnosticIntent), false);
+    } finally {
+      harness.cleanup();
     }
   }
 });

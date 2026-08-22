@@ -5118,18 +5118,18 @@ function validateDiagnosticIdentity(value, manifest, job, code) {
   assertRequiredKeys(value, ["resourceId", "principalId", "clientId", "planSha256", "job"], code);
   assertKnownKeys(value.job, ["requestId", "executionName"], code);
   assertRequiredKeys(value.job, ["requestId", "executionName"], code);
+  const resourceId = canonicalResourceId(value.resourceId, manifest.bindings.runtimeIdentityId, code);
   failIf(
-      value.resourceId !== manifest.bindings.runtimeIdentityId ||
-      value.principalId !== manifest.bindings.runtimeIdentityPrincipalId ||
-      !UUID_RE.test(value.principalId) ||
-      value.clientId !== manifest.bindings.runtimeIdentityClientId ||
-      !UUID_RE.test(value.clientId) ||
-      value.planSha256 !== manifest.planSha256 ||
-      value.job.requestId !== job.requestId ||
-      value.job.executionName !== job.executionName,
+    value.principalId !== manifest.bindings.runtimeIdentityPrincipalId ||
+    !UUID_RE.test(value.principalId) ||
+    value.clientId !== manifest.bindings.runtimeIdentityClientId ||
+    !UUID_RE.test(value.clientId) ||
+    value.planSha256 !== manifest.planSha256 ||
+    value.job.requestId !== job.requestId ||
+    value.job.executionName !== job.executionName,
     code,
   );
-  return value;
+  return { ...value, resourceId };
 }
 
 function validateDiagnosticOpenAiRole(value, manifest, principalId, code) {
@@ -5194,11 +5194,11 @@ function requiredDiagnostic(request) {
     requestId: value.submission.requestId,
     executionName: value.submission.executionName,
   };
-  validateDiagnosticIdentity(identityBefore, manifest, job, "diagnostic-identity");
-  validateDiagnosticIdentity(identityAfter, manifest, job, "diagnostic-identity");
-  failIf(!same(identityBefore, identityAfter), "diagnostic-identity-transition");
-  validateDiagnosticOpenAiRole(roleBefore, manifest, identityBefore.principalId, "diagnostic-openai-role");
-  validateDiagnosticOpenAiRole(roleAfter, manifest, identityAfter.principalId, "diagnostic-openai-role");
+  const canonicalIdentityBefore = validateDiagnosticIdentity(identityBefore, manifest, job, "diagnostic-identity");
+  const canonicalIdentityAfter = validateDiagnosticIdentity(identityAfter, manifest, job, "diagnostic-identity");
+  failIf(!same(canonicalIdentityBefore, canonicalIdentityAfter), "diagnostic-identity-transition");
+  validateDiagnosticOpenAiRole(roleBefore, manifest, canonicalIdentityBefore.principalId, "diagnostic-openai-role");
+  validateDiagnosticOpenAiRole(roleAfter, manifest, canonicalIdentityAfter.principalId, "diagnostic-openai-role");
   failIf(!same(roleBefore, roleAfter), "diagnostic-openai-role-transition");
   failIf(
     value.imageDigest !== reviewedRuntimeImage(request.artifacts) ||
@@ -5250,15 +5250,15 @@ function diagnosticManagedIdentity(config, identityId, expected = {}, code = "di
     principalId: value.principalId,
     clientId: value.clientId,
   };
+  const resourceId = canonicalResourceId(identity.resourceId, identityId, code);
   failIf(
-    identity.resourceId !== identityId ||
-      !UUID_RE.test(identity.principalId ?? "") ||
-      !UUID_RE.test(identity.clientId ?? "") ||
-      (expected.principalId !== undefined && identity.principalId !== expected.principalId) ||
-      (expected.clientId !== undefined && identity.clientId !== expected.clientId),
+    !UUID_RE.test(identity.principalId ?? "") ||
+    !UUID_RE.test(identity.clientId ?? "") ||
+    (expected.principalId !== undefined && identity.principalId !== expected.principalId) ||
+    (expected.clientId !== undefined && identity.clientId !== expected.clientId),
     code,
   );
-  return identity;
+  return { ...identity, resourceId };
 }
 
 function diagnosticIdentity(config, outputs, manifest, job, proof = undefined, fresh = false) {
@@ -5947,9 +5947,18 @@ function assertHttpsEndpoint(value, code) {
   return `https://${url.hostname}`;
 }
 
-function identityKey(value) {
-  failIf(typeof value !== "string" || !value.startsWith("/subscriptions/"), "runtime-identity");
+function identityKey(value, code = "runtime-identity") {
+  failIf(
+    typeof value !== "string" ||
+      !/^\/subscriptions\/[^/]+(?:\/[^/]+)*$/i.test(value),
+    code,
+  );
   return value.toLowerCase();
+}
+
+function canonicalResourceId(value, expected, code) {
+  failIf(identityKey(value, code) !== identityKey(expected, code), code);
+  return expected;
 }
 
 function assertEnvironmentEntries(entries, code) {
