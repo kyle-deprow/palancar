@@ -5129,18 +5129,18 @@ function cutoverChange(planValue, address) {
   return entry;
 }
 
-function mutateContainerAppCopies(planValue, mutate) {
-  const entry = cutoverChange(planValue, containerAppAddress);
+function mutateCutoverResourceCopies(planValue, address, mutate) {
+  const entry = cutoverChange(planValue, address);
   const planned = finalValueResource(
     planValue.planned_values.root_module,
-    containerAppAddress,
+    address,
   );
   const prior = finalValueResource(
     planValue.prior_state.values.root_module,
-    containerAppAddress,
+    address,
   );
-  assert.ok(planned, "missing planned Container App resource");
-  assert.ok(prior, "missing prior Container App resource");
+  assert.ok(planned, `missing planned resource ${address}`);
+  assert.ok(prior, `missing prior resource ${address}`);
   for (const value of [
     entry.change.before,
     entry.change.after,
@@ -5149,6 +5149,22 @@ function mutateContainerAppCopies(planValue, mutate) {
   ]) {
     mutate(value);
   }
+}
+
+function mutateContainerAppCopies(planValue, mutate) {
+  mutateCutoverResourceCopies(planValue, containerAppAddress, mutate);
+}
+
+function setContainerAppIdentityIdsEverywhere(planValue, identityIds) {
+  mutateContainerAppCopies(planValue, (value) => {
+    value.identity[0].identity_ids = clone(identityIds);
+  });
+}
+
+function reverseIdentityIdsEverywhere(planValue, address) {
+  mutateCutoverResourceCopies(planValue, address, (value) => {
+    value.identity[0].identity_ids.reverse();
+  });
 }
 
 function mutateContainerAppOutputs(planValue, mutate) {
@@ -5420,6 +5436,133 @@ test("cutover-family relevant attributes are exact order-independent path sets",
   }
 });
 
+test("cutover-family accepts reversed Container App identity sets and fresh metadata", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    for (const resourceDrift of [undefined, null, []]) {
+      const candidate = clone(source);
+      mutateContainerAppCopies(candidate, (value) => {
+        value.identity[0].identity_ids.reverse();
+      });
+      candidate.relevant_attributes.reverse();
+      candidate.timestamp = "2026-08-22T17:30:00Z";
+      if (resourceDrift === undefined) {
+        delete candidate.resource_drift;
+      } else {
+        candidate.resource_drift = resourceDrift;
+      }
+      assert.equal(acceptsPlan(candidate, mode), true, `${mode} drift=${String(resourceDrift)}`);
+    }
+  }
+});
+
+test("cutover-family keeps expiry-cleanup Job identity sets ordered", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      reverseIdentityIdsEverywhere(candidate, finalCleanupJobAddress);
+    });
+  }
+});
+
+test("cutover-family does not broaden unordered identity_ids by address or path", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.identity[0].identity_ids.reverse();
+      });
+      const entry = cutoverChange(candidate, containerAppAddress);
+      entry.address = `${containerAppAddress}.malformed`;
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.identity.push({
+          ...clone(value.identity[0]),
+          identity_ids: clone(value.identity[0].identity_ids).reverse(),
+        });
+      });
+    });
+  }
+});
+
+test("cutover-family rejects non-exact Container App identity sets", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    const [imagePullIdentity, runtimeIdentity] = cutoverChange(
+      source,
+      containerAppAddress,
+    ).change.after.identity[0].identity_ids;
+    const wrongIdentity = runtimeIdentity.replace(
+      /id-palancar-dev-runtime$/,
+      "id-palancar-dev-unexpected",
+    );
+    for (const identityIds of [
+      [imagePullIdentity, imagePullIdentity],
+      [imagePullIdentity],
+      [imagePullIdentity, runtimeIdentity, wrongIdentity],
+      [imagePullIdentity, wrongIdentity],
+    ]) {
+      rejectsCutoverMutation(source, mode, (candidate) => {
+        setContainerAppIdentityIdsEverywhere(candidate, identityIds);
+      });
+    }
+  }
+});
+
+test("cutover-family keeps registry and identitySettings roles pinned", () => {
+  for (const [source, mode] of [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ]) {
+    const [imagePullIdentity, runtimeIdentity] = cutoverChange(
+      source,
+      containerAppAddress,
+    ).change.after.identity[0].identity_ids;
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        value.body.properties.configuration.registries[0].identity =
+          runtimeIdentity;
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        const settings = value.body.properties.configuration.identitySettings;
+        [settings[0].identity, settings[1].identity] = [
+          settings[1].identity,
+          settings[0].identity,
+        ];
+      });
+    });
+    rejectsCutoverMutation(source, mode, (candidate) => {
+      mutateContainerAppCopies(candidate, (value) => {
+        const settings = value.body.properties.configuration.identitySettings;
+        settings[0].identity = runtimeIdentity.replace(
+          "resourceGroups",
+          "resourcegroups",
+        );
+        settings[1].identity = imagePullIdentity.replace(
+          "resourceGroups",
+          "resourcegroups",
+        );
+      });
+    });
+  }
+});
+
 test("cutover and terminal references use the exact 90-check Entra-only workload shape", () => {
   for (const fixture of [runtimeCutoverFixture, terminalFixture]) {
     assert.equal(fixture.checks.length, 90);
@@ -5653,9 +5796,6 @@ test("Azure generation cutover is direct-Entra, one-container, immutable, and se
       cutoverChange(candidate, appAddress).change.after.body.properties.template.containers[0].env.push(
         { name: "AZURE_API_KEY", value: "fixture-secret" },
       );
-    },
-    (candidate) => {
-      cutoverChange(candidate, appAddress).change.after.identity[0].identity_ids.reverse();
     },
     (candidate) => {
       cutoverChange(candidate, appAddress).change.after.body.properties.template.containers[0].resources.cpu =
@@ -5988,9 +6128,6 @@ test("Azure generation cutover binds both managed identities and every role fiel
     "module.identities_rbac.azurerm_role_assignment.runtime_openai";
   for (const mutate of [
     (candidate) => {
-      cutoverChange(candidate, lunaContainerAppAddress).change.after.identity[0].identity_ids.reverse();
-    },
-    (candidate) => {
       cutoverChange(candidate, lunaContainerAppAddress).change.after.identity[0].identity_ids[1] += "/unexpected";
     },
     (candidate) => {
@@ -6097,7 +6234,7 @@ test("new guard modes reject action reasons, imports, deposed state, and drift m
       candidate.resource_changes[0].deposed = "fixture";
     },
     (candidate) => {
-      candidate.resource_drift = [];
+      candidate.resource_drift = [{ address: "fixture" }];
     },
     (candidate) => {
       candidate.deferred_changes = [];
