@@ -5359,6 +5359,55 @@ function assertDiagnosticJobTags(value, code) {
   failIf(!same(value, DIAGNOSTIC_JOB_TAGS), code);
 }
 
+function parseAzureSystemDataTimestamp(value, code) {
+  failIf(typeof value !== "string", code);
+  const match = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})?$/u.exec(value);
+  failIf(match === null, code);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = match[7] ?? "";
+  const suffix = match[8];
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  failIf(
+    month < 1 ||
+      month > 12 ||
+      day < 1 ||
+      day > daysInMonth[month - 1] ||
+      hour > 23 ||
+      minute > 59 ||
+      second > 59,
+    code,
+  );
+  failIf(suffix === undefined && fraction.length !== 7, code);
+
+  let offsetMinutes = 0;
+  if (suffix !== undefined && suffix !== "Z") {
+    const offsetMatch = /^([+-])([0-9]{2}):([0-9]{2})$/u.exec(suffix);
+    failIf(offsetMatch === null, code);
+    const offsetHours = Number(offsetMatch[2]);
+    const offsetMinutePart = Number(offsetMatch[3]);
+    failIf(
+      offsetHours > 14 ||
+        offsetMinutePart > 59 ||
+        (offsetHours === 14 && offsetMinutePart !== 0),
+      code,
+    );
+    offsetMinutes = (offsetMatch[1] === "+" ? 1 : -1) *
+      (offsetHours * 60 + offsetMinutePart);
+  }
+
+  const utcDate = new Date(0);
+  utcDate.setUTCFullYear(year, month - 1, day);
+  utcDate.setUTCHours(hour, minute, second, 0);
+  const epochMilliseconds = utcDate.getTime() - offsetMinutes * 60 * 1000;
+  return BigInt(epochMilliseconds) * 1_000_000n + BigInt(fraction.padEnd(9, "0"));
+}
+
 function assertDiagnosticSystemData(value, code) {
   const keys = [
     "createdAt", "createdBy", "createdByType",
@@ -5367,16 +5416,11 @@ function assertDiagnosticSystemData(value, code) {
   assertKnownKeys(value, keys, code);
   assertRequiredKeys(value, keys, code);
   failIf(keys.some((key) => !validRevocationString(value[key], 256) || /[\u0080-\u009f]/u.test(value[key])), code);
-  const isoTimestamp = /^(?:\d{4})-(?:\d{2})-(?:\d{2})T(?:\d{2}):(?:\d{2}):(?:\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
-  const createdAt = Date.parse(value.createdAt);
-  const lastModifiedAt = Date.parse(value.lastModifiedAt);
+  const createdAt = parseAzureSystemDataTimestamp(value.createdAt, code);
+  const lastModifiedAt = parseAzureSystemDataTimestamp(value.lastModifiedAt, code);
   failIf(
     value.createdByType !== "User" ||
       value.lastModifiedByType !== "User" ||
-      !isoTimestamp.test(value.createdAt) ||
-      !isoTimestamp.test(value.lastModifiedAt) ||
-      !Number.isFinite(createdAt) ||
-      !Number.isFinite(lastModifiedAt) ||
       createdAt > lastModifiedAt ||
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.createdBy) ||
       value.createdBy !== value.lastModifiedBy,

@@ -2368,6 +2368,111 @@ test("diagnostic Job contract accepts display regions and omitted null container
   }
 });
 
+test("diagnostic Job contract accepts strict Azure systemData timestamp forms", () => {
+  const cases = [
+    [
+      "suffixless seven digits",
+      "2026-08-22T00:00:00.1234567",
+      "2026-08-22T00:00:00.1234568",
+    ],
+    [
+      "year zero leap day",
+      "0000-02-29T00:00:00.0000000",
+      "0000-03-01T00:00:00.0000000",
+    ],
+    [
+      "uppercase Z",
+      "2026-08-22T00:00:00.123456789Z",
+      "2026-08-22T00:00:00.123456790Z",
+    ],
+    [
+      "positive offset equivalent instant",
+      "2026-08-22T05:30:00+05:30",
+      "2026-08-22T00:00:00Z",
+    ],
+    [
+      "negative offset equivalent instant",
+      "2026-08-21T20:00:00-04:00",
+      "2026-08-22T00:00:00Z",
+    ],
+  ];
+  for (const [label, createdAt, lastModifiedAt] of cases) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      harness.setDiagnosticJobMutator((job) => {
+        const next = structuredClone(job);
+        next.systemData.createdAt = createdAt;
+        next.systemData.lastModifiedAt = lastModifiedAt;
+        return next;
+      });
+      assert.deepEqual(harness.lifecycle.diagnostic("runtime-cutover", runId), {
+        runId,
+        phase: "runtime-cutover",
+        status: "diagnostic-passed",
+        execution: "diagnostic-execution-1",
+      }, label);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("diagnostic Job contract rejects incompatible Azure systemData timestamps before intent or start", () => {
+  const validTimestamp = "2026-08-22T00:00:00Z";
+  const cases = [
+    ["suffixless no fraction", "2026-08-22T00:00:00", validTimestamp],
+    ["suffixless six digits", "2026-08-22T00:00:00.123456", validTimestamp],
+    ["suffixless eight digits", "2026-08-22T00:00:00.12345678", validTimestamp],
+    ["invalid month", "2026-13-22T00:00:00Z", validTimestamp],
+    ["invalid leap day", "2025-02-29T00:00:00Z", validTimestamp],
+    ["invalid day", "2026-04-31T00:00:00Z", validTimestamp],
+    ["invalid hour", "2026-08-22T24:00:00Z", validTimestamp],
+    ["invalid minute", "2026-08-22T00:60:00Z", validTimestamp],
+    ["invalid second", "2026-08-22T00:00:60Z", validTimestamp],
+    ["offset fourteen with minutes", "2026-08-22T00:00:00+14:01", validTimestamp],
+    ["offset over fourteen", "2026-08-22T00:00:00+15:00", validTimestamp],
+    ["offset minute sixty", "2026-08-22T00:00:00+01:60", validTimestamp],
+    ["lowercase suffix", "2026-08-22T00:00:00z", validTimestamp],
+    ["leading whitespace", " 2026-08-22T00:00:00Z", validTimestamp],
+    ["trailing whitespace", "2026-08-22T00:00:00Z ", validTimestamp],
+    ["trailing control", "2026-08-22T00:00:00Z\u0000", validTimestamp],
+    [
+      "reversed suffixless fractional order",
+      "2026-08-22T00:00:00.7654321",
+      "2026-08-22T00:00:00.1234567",
+    ],
+    [
+      "reversed year zero leap-day order",
+      "0000-03-01T00:00:00.0000000",
+      "0000-02-29T00:00:00.0000000",
+    ],
+    [
+      "correct offset ordering",
+      "2026-08-22T00:30:00-01:00",
+      "2026-08-22T00:00:00Z",
+    ],
+  ];
+  for (const [, createdAt, lastModifiedAt] of cases) {
+    const harness = makeHarness();
+    try {
+      const runId = prepareRuntimeGuarded(harness);
+      harness.setDiagnosticJobMutator((job) => {
+        const next = structuredClone(job);
+        next.systemData.createdAt = createdAt;
+        next.systemData.lastModifiedAt = lastModifiedAt;
+        return next;
+      });
+      expectCode(() => harness.lifecycle.diagnostic("runtime-cutover", runId), "diagnostic-job");
+      assert.equal(existsSync(harness.paths(runId).diagnosticIntent), false);
+      assert.equal(harness.calls.some((call) =>
+        call.argv[0] === "containerapp" && call.argv[1] === "job" && call.argv[2] === "start"), false);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
 test("diagnostic reconciliation rejects a canonical nextLink cycle without retrying start", () => {
   const harness = makeHarness();
   try {
