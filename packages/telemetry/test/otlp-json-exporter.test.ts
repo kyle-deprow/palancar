@@ -491,7 +491,7 @@ describe('strict enqueue boundary', () => {
       ['deterministic-mock', '1.0.0'],
       ['deterministic-mock-generation', '1.0.0'],
       ['azure-realtime', 'ga-transcription-websocket'],
-      ['litellm-chat', '1.1.0']
+      ['azure-openai-chat', '1.0.0']
     ] as const;
     const errorPairs = [
       ['unknown', 'unknown_failure'],

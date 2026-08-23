@@ -675,8 +675,7 @@ const EXPORT_PROVIDER_VERSIONS = new Map<string, string>([
   ['deterministic-mock', '1.0.0'],
   ['deterministic-mock-generation', '1.0.0'],
   ['azure-realtime', 'ga-transcription-websocket'],
-  ['azure-openai-chat', '1.0.0'],
-  ['litellm-chat', '1.1.0']
+  ['azure-openai-chat', '1.0.0']
 ]);
 
 const EXPORT_ERROR_IDS = new Map<TelemetryErrorCategory, string>([

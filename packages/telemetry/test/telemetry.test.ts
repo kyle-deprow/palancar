@@ -249,16 +249,16 @@ describe('telemetry vocabulary and record sanitization', () => {
         targetLanguage: TARGET_LANGUAGES.ES,
         operation: TELEMETRY_OPERATIONS.GENERATION,
         outcome: TELEMETRY_OUTCOMES.FAILURE,
-        providerId: 'litellm-chat',
-        providerVersion: '1.1.0'
+        providerId: 'azure-openai-chat',
+        providerVersion: '1.0.0'
       });
       expect(record).toMatchObject({
         name,
         count: 1,
         operation: TELEMETRY_OPERATIONS.GENERATION,
         outcome: TELEMETRY_OUTCOMES.FAILURE,
-        providerId: 'litellm-chat',
-        providerVersion: '1.1.0'
+        providerId: 'azure-openai-chat',
+        providerVersion: '1.0.0'
       });
       expect(record).not.toHaveProperty('errorCategory');
       expect(record).not.toHaveProperty('errorId');
