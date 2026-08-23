@@ -7369,7 +7369,7 @@ function normalizeLiveContainer(container, code, source) {
     name: container.name,
     image: container.image,
     env,
-    probes,
+    ...(probes.length === 0 ? {} : { probes }),
     ...(command === undefined ? {} : { command }),
     ...(args === undefined ? {} : { args }),
     ...(resources === undefined ? {} : { resources }),
@@ -7380,8 +7380,10 @@ function normalizeLiveScale(scale, code) {
   if (scale === undefined) return undefined;
   assertKnownKeys(scale, ["minReplicas", "maxReplicas", "cooldownPeriod", "pollingInterval", "rules"], code);
   assertRequiredKeys(scale, ["minReplicas", "maxReplicas"], code);
-  if (Object.hasOwn(scale, "cooldownPeriod")) failIf(scale.cooldownPeriod !== 300, code);
-  if (Object.hasOwn(scale, "pollingInterval")) failIf(scale.pollingInterval !== 30, code);
+  // Newer API responses report null for unset cooldown/polling instead of
+  // omitting the keys or echoing the platform defaults.
+  if (Object.hasOwn(scale, "cooldownPeriod")) failIf(scale.cooldownPeriod !== 300 && scale.cooldownPeriod !== null, code);
+  if (Object.hasOwn(scale, "pollingInterval")) failIf(scale.pollingInterval !== 30 && scale.pollingInterval !== null, code);
   if (Object.hasOwn(scale, "rules")) failIf(scale.rules !== null, code);
   return { minReplicas: scale.minReplicas, maxReplicas: scale.maxReplicas };
 }
