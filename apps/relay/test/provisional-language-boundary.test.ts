@@ -23,6 +23,13 @@ const TEXT = Object.freeze({
   es: 'Buenos días. ¿Dónde está la estación?',
   tr: 'Merhaba. Tren istasyonu nerede?'
 });
+const REAL_SOURCE_TEXT = Object.freeze({
+  esDisculpe: 'Disculpe, ¿dónde está la estación de tren?',
+  esQuestion: '¿Dónde está la estación de tren?',
+  trSize: 'Size yardım etmek istiyorum.',
+  trQuestion: 'Merhaba, tren istasyonu nerede?',
+  catalan: "Podria ajudar-me a localitzar l'estació de tren, si us plau?"
+});
 
 interface DetectorSelection {
   readonly language: string;
@@ -238,6 +245,155 @@ describe('development provisional ELD-small boundary', () => {
   });
 
   it.each([
+    ['es', REAL_SOURCE_TEXT.esDisculpe],
+    ['es', REAL_SOURCE_TEXT.esQuestion],
+    ['tr', REAL_SOURCE_TEXT.trSize],
+    ['tr', REAL_SOURCE_TEXT.trQuestion]
+  ] as const)('accepts real-world %s source text at its registry margin', async (target, text) => {
+    await expect(
+      createDevelopmentProvisionalLanguageBoundary().classifier.classify(text, target)
+    ).resolves.toMatchObject({
+      status: 'provisional',
+      detectedLanguage: target,
+      decision: 'accept',
+      reason: 'MATCH'
+    });
+  });
+
+  it.each([
+    ['es', TEXT.en],
+    ['tr', TEXT.en]
+  ] as const)('rejects English source text for a %s session', async (target, text) => {
+    await expect(
+      createDevelopmentProvisionalLanguageBoundary().classifier.classify(text, target)
+    ).resolves.toMatchObject({
+      status: 'provisional',
+      detectedLanguage: 'en',
+      decision: 'reject',
+      reason: 'ENGLISH'
+    });
+  });
+
+  it.each([
+    ['es', REAL_SOURCE_TEXT.catalan, 'ca'],
+    ['es', TEXT.tr, 'tr'],
+    ['tr', TEXT.es, 'es']
+  ] as const)('rejects a detected non-selected language in a %s session', async (
+    target,
+    text,
+    detectedLanguage
+  ) => {
+    await expect(
+      createDevelopmentProvisionalLanguageBoundary().classifier.classify(text, target)
+    ).resolves.toMatchObject({
+      status: 'provisional',
+      detectedLanguage,
+      decision: 'reject',
+      reason: 'UNSELECTED_LANGUAGE'
+    });
+  });
+
+  it.each(['es', 'tr'] as const)('keeps mixed source text closed for a %s session', async (target) => {
+    const mixed = target === 'es'
+      ? `${TEXT.en} ${TEXT.es}`
+      : `${TEXT.es} ${TEXT.tr}`;
+    const result = await createDevelopmentProvisionalLanguageBoundary().classifier.classify(
+      mixed,
+      target
+    );
+    expect(result).toMatchObject({ status: 'provisional' });
+    expect(result.status === 'provisional' && result.decision).not.toBe('accept');
+    expect(['MIXED', 'UNSELECTED_LANGUAGE', 'UNKNOWN']).toContain(
+      result.status === 'provisional' ? result.reason : undefined
+    );
+  });
+
+  it.each(['es', 'tr'] as const)('keeps too-short source text uncertain for a %s session', async (target) => {
+    await expect(
+      createDevelopmentProvisionalLanguageBoundary().classifier.classify('hola', target)
+    ).resolves.toMatchObject({
+      status: 'provisional',
+      detectedLanguage: 'unknown',
+      decision: 'uncertain',
+      reason: 'TOO_SHORT'
+    });
+  });
+
+  it('uses the lowered source margin only for a selected full detection', async () => {
+    const selectedText = 'selected target low margin source text';
+    const unselectedText = 'unselected language low margin source text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((text) => {
+        if (text === selectedText) {
+          return {
+            language: 'es',
+            score: 0.7,
+            secondLanguage: 'ca',
+            secondScore: 0.65,
+            reliable: true
+          };
+        }
+        if (text === unselectedText) {
+          return {
+            language: 'ca',
+            score: 0.7,
+            secondLanguage: 'es',
+            secondScore: 0.65,
+            reliable: true
+          };
+        }
+        const detected = tokenLanguage(text);
+        return detected === 'zz' ? 'es' : detected;
+      })
+    });
+
+    await expect(boundary.classifier.classify(selectedText, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'es',
+      decision: 'accept',
+      reason: 'MATCH'
+    });
+    await expect(boundary.classifier.classify(unselectedText, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'unknown',
+      decision: 'uncertain',
+      reason: 'UNKNOWN'
+    });
+  });
+
+  it('keeps a non-target source conflict below the generic margin threshold', async () => {
+    const text = 'selected source text with conflictword otherconflict';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => {
+        if (candidate === text) {
+          return {
+            language: 'es',
+            score: 0.7,
+            secondLanguage: 'ca',
+            secondScore: 0.65,
+            reliable: true
+          };
+        }
+        if (candidate === 'conflictword otherconflict') {
+          return {
+            language: 'ca',
+            score: 0.7,
+            secondLanguage: 'es',
+            secondScore: 0.64,
+            reliable: true
+          };
+        }
+        const detected = tokenLanguage(candidate);
+        return detected === 'zz' ? 'es' : detected;
+      })
+    });
+
+    await expect(boundary.classifier.classify(text, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'es',
+      decision: 'accept',
+      reason: 'MATCH'
+    });
+  });
+
+  it.each([
     ['es', 0.8462327011788826],
     ['tr', 0.726775956284153]
   ] as const)(
@@ -296,7 +452,7 @@ describe('development provisional ELD-small boundary', () => {
       await expect(boundary.classifier.classify(fullText, target)).resolves.toEqual({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-6',
+        profileVersion: 'eld-small-dev-7',
         detectedLanguage: 'unknown',
         provisionalScore: 0,
         decision: 'uncertain',
@@ -559,7 +715,7 @@ describe('development provisional ELD-small boundary', () => {
     )).toBe(true);
   });
 
-  it('keeps the Spanish generated margin change scoped away from source and shared checks', async () => {
+  it('uses the source margin independently from the generated Spanish margin', async () => {
     const calibratedText = 'calibrated Spanish generated output text';
     const boundary = createDevelopmentProvisionalLanguageBoundary({
       loadDetector: () => detectorFor((text) => {
@@ -572,13 +728,14 @@ describe('development provisional ELD-small boundary', () => {
             reliable: true
           };
         }
-        return tokenLanguage(text);
+        const detected = tokenLanguage(text);
+        return detected === 'zz' ? 'es' : detected;
       })
     });
     await expect(boundary.classifier.classify(calibratedText, 'es')).resolves.toMatchObject({
-      detectedLanguage: 'unknown',
-      decision: 'uncertain',
-      reason: 'UNKNOWN'
+      detectedLanguage: 'es',
+      decision: 'accept',
+      reason: 'MATCH'
     });
     const evidence = await boundary.generatedLanguageValidator.validate(
       generatedInput('es', 5, { index: 2, text: calibratedText }),

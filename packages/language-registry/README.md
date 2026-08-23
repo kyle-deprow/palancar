@@ -44,18 +44,21 @@ accepts exact selected-target `MATCH` or source-only
 `MATCH_IGNORED_SINGLETON` evidence from the active Spanish/Turkish ELD-small
 profile at or above its raw-score threshold. English, the other target,
 unsupported languages, mixed text, short text, unknowns, and detector errors
-remain closed. The `eld-small-dev-6` profile caps inputs at 512 Unicode code
+remain closed. The `eld-small-dev-7` profile caps inputs at 512 Unicode code
 points and inspects every overlapping one-through-eight-word window plus every
-qualifying clause. Source/input classification and mixed/subwindow strong
+qualifying clause. Selected-target source classification uses registry-driven
+source margins of `.04` for Spanish and `.08` for Turkish; non-selected full
 detections retain the shared `.08` margin. Generated English and Turkish
 full-text retain `.08`; generated Spanish full-text alone uses `.05` to accept
 proven correct Spanish/Catalan-close output, while a different top language
 still rejects. Source classification removes strictly containing same-language
 intervals before applying the two-word or two-singleton mixed thresholds;
 generated-output validation remains strict for any reliable second language,
-including one conflicting word. A conflicting interval counts only when its
-raw score and shared `.08` margin meet the profile thresholds; oversized input
-is uncertain.
+including one conflicting word. A source conflict interval counts only when its raw score meets the profile
+threshold and its margin meets the generic provisional margin; the lowered
+selected-target source margin applies only to intervals detected as the
+selected target;
+oversized input is uncertain.
 Production-calibrated mode cannot consume this evidence.
 
 Partials never permit generation. Partial transcript display requires the

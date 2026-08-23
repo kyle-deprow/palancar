@@ -31,6 +31,10 @@ const DEVELOPMENT_PROFILE = {
   profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
+  sourceTargetMarginThresholds: {
+    es: 0.04,
+    tr: 0.08
+  },
   generatedOutputTargetMarginThresholds: {
     es: 0.05,
     tr: 0.08
@@ -119,10 +123,15 @@ describe('language registry', () => {
     ]);
   });
 
-  it('exports the exact frozen generated-output calibration versions and margins', () => {
-    expect(DEVELOPMENT_PROVISIONAL_PROFILE_VERSION).toBe('eld-small-dev-6');
-    expect(LANGUAGE_REGISTRY_VERSION).toBe('2.4.0');
+  it('exports the exact frozen provisional profile versions and margins', () => {
+    expect(DEVELOPMENT_PROVISIONAL_PROFILE_VERSION).toBe('eld-small-dev-7');
+    expect(LANGUAGE_REGISTRY_VERSION).toBe('2.5.0');
     for (const definition of listLanguageDefinitions()) {
+      expect(definition.developmentProvisional?.sourceTargetMarginThresholds)
+        .toEqual({ es: 0.04, tr: 0.08 });
+      expect(Object.isFrozen(
+        definition.developmentProvisional?.sourceTargetMarginThresholds
+      )).toBe(true);
       expect(definition.developmentProvisional?.generatedOutputTargetMarginThresholds)
         .toEqual({ es: 0.05, tr: 0.08 });
       expect(Object.isFrozen(
@@ -212,6 +221,19 @@ describe('language registry', () => {
         ...definitions[1],
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
+          sourceTargetMarginThresholds: {
+            ...DEVELOPMENT_PROFILE.sourceTargetMarginThresholds,
+            es: 0.03
+          }
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/symmetric/);
+    expect(() => createLanguageRegistry([
+      definitions[0] as LanguageDefinition<TargetLanguage>,
+      {
+        ...definitions[1],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
           generatedOutputTargetMarginThresholds: {
             ...DEVELOPMENT_PROFILE.generatedOutputTargetMarginThresholds,
             es: 0.06
@@ -255,6 +277,53 @@ describe('language registry', () => {
         }
       } as LanguageDefinition<TargetLanguage>
     ])).toThrow(/minimum sliding window words cannot exceed maximum/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          sourceTargetMarginThresholds: {
+            ...DEVELOPMENT_PROFILE.sourceTargetMarginThresholds,
+            es: 1.01
+          }
+        }
+      } as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          sourceTargetMarginThresholds: {
+            es: 0.04,
+            tr: 0.08,
+            ca: 0.04
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/unsupported field/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          sourceTargetMarginThresholds: {
+            es: 0.04
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
+    expect(() => createLanguageRegistry([
+      {
+        ...definitions[0],
+        developmentProvisional: {
+          ...DEVELOPMENT_PROFILE,
+          sourceTargetMarginThresholds: {
+            tr: 0.08
+          }
+        }
+      } as unknown as LanguageDefinition<TargetLanguage>
+    ])).toThrow(/between 0 and 1/);
     expect(() => createLanguageRegistry([
       {
         ...definitions[0],

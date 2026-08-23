@@ -17,6 +17,7 @@ import {
   type ClassifiedLanguageEvidence,
   type DevelopmentProvisionalProfile,
   type ProvisionalLanguageEvidence,
+  type TargetLanguage,
   type TextLanguageClassifier
 } from '@palancar/language-registry';
 
@@ -451,13 +452,24 @@ function hasSubstantiveMix(
 
 function isStrongDetection(
   detection: Detection,
-  settings: DevelopmentProvisionalProfile
+  settings: DevelopmentProvisionalProfile,
+  marginThreshold = settings.provisionalMarginThreshold
 ): boolean {
   return (
     detection.reliable &&
     detection.score >= settings.provisionalScoreThreshold &&
-    detection.margin >= settings.provisionalMarginThreshold
+    detection.margin >= marginThreshold
   );
+}
+
+function sourceMarginThreshold(
+  expectedLanguage: TargetLanguage,
+  detectedLanguage: string,
+  settings: DevelopmentProvisionalProfile
+): number {
+  return detectedLanguage === expectedLanguage
+    ? settings.sourceTargetMarginThresholds[expectedLanguage]
+    : settings.provisionalMarginThreshold;
 }
 
 function generatedFullTextMarginThreshold(
@@ -486,7 +498,7 @@ function sourceConflictReason(
   detector: EldDetector,
   text: string,
   settings: DevelopmentProvisionalProfile,
-  selectedLanguage: string,
+  selectedLanguage: TargetLanguage,
   fullDetection: Detection
 ): 'MIXED' | 'MATCH_IGNORED_SINGLETON' | undefined {
   const detections = new Map<string, Detection>([[text, fullDetection]]);
@@ -498,7 +510,11 @@ function sourceConflictReason(
       detections.set(interval.text, detection);
     }
     if (
-      isStrongDetection(detection, settings) &&
+      isStrongDetection(
+        detection,
+        settings,
+        sourceMarginThreshold(selectedLanguage, detection.language, settings)
+      ) &&
       detection.language !== selectedLanguage
     ) {
       const key = `${interval.lexicalStart}:${interval.wordLength}:${detection.language}`;
@@ -550,7 +566,7 @@ function evidence(
 function classifySource(
   detector: EldDetector,
   rawText: unknown,
-  expectedLanguage: GeneratedLanguage
+  expectedLanguage: TargetLanguage
 ): ProvisionalLanguageEvidence {
   const settings = profile();
   const normalized = normalizedText(rawText, settings);
@@ -576,10 +592,15 @@ function classifySource(
   const text = normalized.text;
   try {
     const full = detect(detector, text);
+    const fullTextMarginThreshold = sourceMarginThreshold(
+      expectedLanguage,
+      full.language,
+      settings
+    );
     if (
       !full.reliable ||
       full.score < settings.provisionalScoreThreshold ||
-      full.margin < settings.provisionalMarginThreshold
+      full.margin < fullTextMarginThreshold
     ) {
       return evidence(settings, {
         detectedLanguage: UNKNOWN_LANGUAGE,
@@ -594,7 +615,7 @@ function classifySource(
         provisionalScore: full.score,
         decision: 'reject',
         reason:
-          full.language === ENGLISH_LANGUAGE && expectedLanguage !== ENGLISH_LANGUAGE
+          full.language === ENGLISH_LANGUAGE
             ? 'ENGLISH'
             : 'UNSELECTED_LANGUAGE'
       });

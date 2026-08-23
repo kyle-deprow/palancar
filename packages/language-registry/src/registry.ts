@@ -17,6 +17,9 @@ function freezeDefinition<TCode extends string>(
     ? undefined
     : Object.freeze({
         ...definition.developmentProvisional,
+        sourceTargetMarginThresholds: Object.freeze({
+          ...definition.developmentProvisional.sourceTargetMarginThresholds
+        }),
         generatedOutputTargetMarginThresholds: Object.freeze({
           ...definition.developmentProvisional.generatedOutputTargetMarginThresholds
         })
@@ -149,6 +152,7 @@ function validateDevelopmentProvisionalProfile(profile: unknown): void {
       'profileVersion',
       'provisionalScoreThreshold',
       'provisionalMarginThreshold',
+      'sourceTargetMarginThresholds',
       'generatedOutputTargetMarginThresholds',
       'minimumTextCharacters',
       'minimumWindowCharacters',
@@ -169,6 +173,21 @@ function validateDevelopmentProvisionalProfile(profile: unknown): void {
   requireExactNonemptyString(candidate.profileVersion, 'Provisional profile version');
   requireThreshold(candidate.provisionalScoreThreshold, 'Provisional score threshold');
   requireThreshold(candidate.provisionalMarginThreshold, 'Provisional margin threshold');
+  const sourceTargetMarginThresholds = candidate.sourceTargetMarginThresholds;
+  if (
+    typeof sourceTargetMarginThresholds !== 'object' ||
+    sourceTargetMarginThresholds === null
+  ) {
+    throw new TypeError('Source target margin thresholds must be an object');
+  }
+  requireExactKeys(
+    sourceTargetMarginThresholds,
+    ['es', 'tr'],
+    'Source target margin thresholds'
+  );
+  const sourceTargetMargins = sourceTargetMarginThresholds as Record<string, unknown>;
+  requireThreshold(sourceTargetMargins.es, 'Source Spanish target margin threshold');
+  requireThreshold(sourceTargetMargins.tr, 'Source Turkish target margin threshold');
   const generatedOutputTargetMarginThresholds = candidate.generatedOutputTargetMarginThresholds;
   if (
     typeof generatedOutputTargetMarginThresholds !== 'object' ||
@@ -236,6 +255,10 @@ function provisionalProfilesMatch(
     left.profileVersion === right.profileVersion &&
     left.provisionalScoreThreshold === right.provisionalScoreThreshold &&
     left.provisionalMarginThreshold === right.provisionalMarginThreshold &&
+    left.sourceTargetMarginThresholds.es ===
+      right.sourceTargetMarginThresholds.es &&
+    left.sourceTargetMarginThresholds.tr ===
+      right.sourceTargetMarginThresholds.tr &&
     left.generatedOutputTargetMarginThresholds.es ===
       right.generatedOutputTargetMarginThresholds.es &&
     left.generatedOutputTargetMarginThresholds.tr ===
@@ -338,7 +361,7 @@ export const CONTROLLED_FIXTURE_DETECTOR_VERSION =
 export const CONTROLLED_FIXTURE_CALIBRATION_VERSION =
   'controlled-fixture-calibration-1';
 export const DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION = 'eld-small-2.1.0';
-export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-6';
+export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-7';
 export const DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS = 12;
 
 export function countSubstantiveCharacters(text: string): number {
@@ -352,6 +375,10 @@ const developmentProvisional = {
   profileVersion: DEVELOPMENT_PROVISIONAL_PROFILE_VERSION,
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
+  sourceTargetMarginThresholds: Object.freeze({
+    es: 0.04,
+    tr: 0.08
+  }),
   generatedOutputTargetMarginThresholds: Object.freeze({
     es: 0.05,
     tr: 0.08
@@ -392,7 +419,7 @@ const initialDefinitions = [
   }
 ] as const satisfies readonly LanguageDefinition<TargetLanguage>[];
 
-export const LANGUAGE_REGISTRY_VERSION = '2.4.0';
+export const LANGUAGE_REGISTRY_VERSION = '2.5.0';
 
 export const languageRegistry = createLanguageRegistry(initialDefinitions);
 
