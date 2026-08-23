@@ -273,7 +273,12 @@ export function createTestHostSecurityComposition(): RelaySecurityComposition {
   });
   const maintenance = {
     checkReadiness: async (): Promise<void> => undefined,
-    cleanupExpired: async () => ({ visited: 0, removed: 0 })
+    cleanupExpired: async () => ({
+      visited: 0,
+      removed: 0,
+      removedByTable: { security: 0, rate: 0 },
+      exhausted: true
+    })
   };
   return Object.freeze({ mode: 'azure-table', runtime, maintenance });
 }
