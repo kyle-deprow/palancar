@@ -26,6 +26,7 @@ import {
   type GenerationProvider,
   type GenerationProviderCompletion,
 } from '@palancar/generation';
+import type { FrameRejectionReason } from '@palancar/audio';
 import {
   AzureRealtimeTranscriptionAdapter,
   DETERMINISTIC_MOCK_CAPABILITIES,
@@ -47,6 +48,7 @@ import {
   type SecurityStateMaintenanceStore,
   type SessionLease
 } from '@palancar/security-state';
+import { AudioGrantMeter } from '@palancar/security-state/testing';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, type RawData } from 'ws';
 
@@ -63,6 +65,7 @@ import {
   parseRelayHostConfig,
   type RelayHost,
   type RelayHostConfig,
+  type RelayProductionMetricInput,
   type RelayUpgradeAudience
 } from '../src/index.js';
 import { createDisabledRelayMetricSink } from '../src/telemetry.js';
@@ -469,7 +472,9 @@ function rawHttpResponse(port: number, request: string): Promise<{
   });
 }
 
-function sessionStartText(): string {
+function sessionStartText(
+  limitOverrides: Partial<typeof DEFAULT_NEGOTIATED_LIMITS> = {}
+): string {
   return JSON.stringify({
     type: 'session.start',
     protocolVersion: 1,
@@ -478,7 +483,7 @@ function sessionStartText(): string {
     languageRegistryVersion: LANGUAGE_REGISTRY_VERSION,
     gatePolicyVersion: GATE_POLICY_VERSION,
     clientBuild: 'relay-host-test-1.0.0',
-    requestedLimits: DEFAULT_NEGOTIATED_LIMITS
+    requestedLimits: { ...DEFAULT_NEGOTIATED_LIMITS, ...limitOverrides }
   });
 }
 
@@ -4651,6 +4656,415 @@ describe('relay HTTP/WebSocket host', () => {
       await waitForClose(socket);
     }
   );
+
+  it('maps every host-reachable acceptor rejection through core classification', async () => {
+    await host.stop();
+    const records: RelayProductionMetricInput[] = [];
+    const security = testSecurityWith();
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: {
+        ...productionTestMetricSink(),
+        record: (input) => records.push(input)
+      },
+      security
+    });
+    await host.start();
+
+    // decodeAudioFrame guarantees structural validity before the host acceptor sees a frame.
+    type HostReachableRejectionReason = Exclude<FrameRejectionReason, 'malformed-frame'>;
+    type ReserveAudioFailure = 'quota-exceeded' | 'rate-limited' | 'state-unavailable';
+    const expectedMetricName = 'audio.samples.rejected' as const;
+    type HostExpectedMetric =
+      | Readonly<{
+          readonly name: 'audio.samples.rejected';
+          readonly sampleCount: number;
+          readonly operation: 'audio';
+          readonly outcome: 'rejected';
+        }>
+      | Readonly<{
+          readonly name: 'utterance.abort';
+          readonly count: 1;
+          readonly operation: 'utterance';
+          readonly outcome: 'aborted';
+        }>
+      | Readonly<{
+          readonly name: 'provider.failure';
+          readonly count: 1;
+          readonly operation: 'transcription';
+          readonly outcome: 'failure';
+        }>
+      | Readonly<{
+          readonly name: 'state_store.failure';
+          readonly count: 1;
+          readonly operation: 'state_store';
+          readonly outcome: 'failure';
+        }>;
+    type HostRejectionCase = {
+      readonly limitOverrides?: Partial<typeof DEFAULT_NEGOTIATED_LIMITS>;
+      readonly before: readonly Uint8Array[];
+      readonly rejected: Uint8Array;
+      readonly rejectedSampleCount: number;
+      readonly reserveAudioFailure?: ReserveAudioFailure;
+      readonly message:
+        | { readonly type: 'error'; readonly code: 'flow_control' }
+        | {
+            readonly type: 'utterance.aborted';
+            readonly category: 'duration' | 'provider_loss' | 'stale_conflict';
+          };
+      readonly close: Readonly<{ readonly code: number; readonly reason: string }>;
+      readonly expectedMetrics: readonly HostExpectedMetric[];
+    };
+    const sample = Uint8Array.of(1, 2);
+    const differentSample = Uint8Array.of(3, 4);
+    const grantBoundaryFrames = [
+      frame(0, 0),
+      frame(1, 1_600),
+      frame(2, 3_200),
+      frame(3, 4_800),
+      frame(4, 6_400)
+    ] as const;
+    const expectedRejectedMetric = (sampleCount: number): HostExpectedMetric => ({
+      name: expectedMetricName,
+      sampleCount,
+      operation: 'audio',
+      outcome: 'rejected'
+    });
+    const expectedAbortMetric: HostExpectedMetric = {
+      name: 'utterance.abort',
+      count: 1,
+      operation: 'utterance',
+      outcome: 'aborted'
+    };
+    const expectedQuotaMetrics: readonly HostExpectedMetric[] = [{
+      name: 'utterance.abort',
+      count: 1,
+      operation: 'utterance',
+      outcome: 'aborted'
+    }];
+    const expectedStateMetrics: readonly HostExpectedMetric[] = [
+      {
+        name: 'utterance.abort',
+        count: 1,
+        operation: 'utterance',
+        outcome: 'aborted'
+      },
+      {
+        name: 'state_store.failure',
+        count: 1,
+        operation: 'state_store',
+        outcome: 'failure'
+      }
+    ];
+    type HostRejectionCaseName =
+      | HostReachableRejectionReason
+      | 'reserve-quota-exceeded'
+      | 'reserve-rate-limited'
+      | 'reserve-state-unavailable';
+    const cases: Readonly<Record<HostRejectionCaseName, HostRejectionCase>> = {
+      'payload-limit': {
+        limitOverrides: { maxAudioPayloadBytes: 2 },
+        before: [],
+        rejected: frame(0, 0, Uint8Array.of(1, 2, 3, 4)),
+        rejectedSampleCount: 2,
+        message: { type: 'error', code: 'flow_control' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(2), expectedAbortMetric]
+      },
+      'utterance-limit': {
+        limitOverrides: { maxUtteranceSamples: 2 },
+        before: [frame(0, 0, sample)],
+        rejected: frame(1, 2, sample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'duration' },
+        close: { code: 4408, reason: 'duration_limit' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      'conflicting-duplicate': {
+        before: [frame(0, 0, sample)],
+        rejected: frame(0, 0, differentSample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'stale_conflict' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      gap: {
+        before: [],
+        rejected: frame(1, 1, sample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'stale_conflict' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      overlap: {
+        before: [frame(0, 0, sample)],
+        rejected: frame(1, 0, sample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'stale_conflict' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      'stale-frame': {
+        limitOverrides: { maxRetainedReplaySamples: 1 },
+        before: [frame(0, 0, sample), frame(1, 1, sample)],
+        rejected: frame(0, 0, sample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'stale_conflict' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      'wrong-utterance': {
+        before: [],
+        rejected: frameFor(SECOND_UTTERANCE_ID, 0, 0, sample),
+        rejectedSampleCount: 1,
+        message: { type: 'utterance.aborted', category: 'stale_conflict' },
+        close: { code: 1002, reason: 'protocol_error' },
+        expectedMetrics: [expectedRejectedMetric(1), expectedAbortMetric]
+      },
+      'reserve-quota-exceeded': {
+        before: grantBoundaryFrames,
+        rejected: frame(5, 8_000, sample),
+        rejectedSampleCount: 1,
+        reserveAudioFailure: 'quota-exceeded',
+        message: { type: 'utterance.aborted', category: 'duration' },
+        close: { code: 4408, reason: 'flow_control' },
+        expectedMetrics: expectedQuotaMetrics
+      },
+      'reserve-rate-limited': {
+        before: grantBoundaryFrames,
+        rejected: frame(5, 8_000, sample),
+        rejectedSampleCount: 1,
+        reserveAudioFailure: 'rate-limited',
+        message: { type: 'utterance.aborted', category: 'duration' },
+        close: { code: 4408, reason: 'flow_control' },
+        expectedMetrics: expectedQuotaMetrics
+      },
+      'reserve-state-unavailable': {
+        before: grantBoundaryFrames,
+        rejected: frame(5, 8_000, sample),
+        rejectedSampleCount: 1,
+        reserveAudioFailure: 'state-unavailable',
+        message: { type: 'utterance.aborted', category: 'provider_loss' },
+        close: { code: 4503, reason: 'provider_unavailable' },
+        expectedMetrics: expectedStateMetrics
+      }
+    };
+
+    let activeReserveAudioFailure: ReserveAudioFailure | undefined;
+    let reserveAudioCallsForCase = 0;
+    const originalReserveAudio = security.runtime.reserveAudio;
+    const reserveAudio = vi.spyOn(security.runtime, 'reserveAudio').mockImplementation(async (input) => {
+      reserveAudioCallsForCase += 1;
+      if (activeReserveAudioFailure !== undefined && reserveAudioCallsForCase > 1) {
+        throw new SecurityStateError(activeReserveAudioFailure);
+      }
+      return originalReserveAudio(input);
+    });
+
+    for (const testCase of Object.values(cases)) {
+      const caseMetricStart = records.length;
+      const issued = await issueTicket(host);
+      const socket = await openSocket(host, String(issued.ticket));
+      try {
+        activeReserveAudioFailure = testCase.reserveAudioFailure;
+        reserveAudioCallsForCase = 0;
+        const readyMessage = nextMessage(socket, (message) => message.type === 'session.ready');
+        socket.send(sessionStartText(testCase.limitOverrides));
+        const ready = await readyMessage;
+        socket.send(JSON.stringify({
+          type: 'utterance.start',
+          sessionId: String(ready.sessionId),
+          sessionEpoch: Number(ready.sessionEpoch),
+          utteranceId: UTTERANCE_ID
+        }));
+
+        const rejection = nextMessage(socket, (message) => message.type === testCase.message.type);
+        const closed = waitForCloseDetails(socket);
+        for (const precedingFrame of testCase.before) {
+          socket.send(precedingFrame);
+        }
+        socket.send(testCase.rejected);
+
+        await expect(rejection).resolves.toMatchObject(testCase.message);
+        await expect(closed).resolves.toEqual(testCase.close);
+        const caseRecords = records.slice(caseMetricStart);
+        for (const expectedMetric of testCase.expectedMetrics) {
+          expect(caseRecords.filter((record) => record.name === expectedMetric.name)).toEqual([
+            expect.objectContaining(expectedMetric)
+          ]);
+        }
+        const classifiedMetricNames = new Set([
+          expectedMetricName,
+          'utterance.abort',
+          'provider.failure',
+          'state_store.failure'
+        ]);
+        expect(caseRecords.filter((record) => classifiedMetricNames.has(record.name))).toHaveLength(
+          testCase.expectedMetrics.length
+        );
+      } finally {
+        activeReserveAudioFailure = undefined;
+        if (socket.readyState !== WebSocket.CLOSED) {
+          socket.terminate();
+        }
+      }
+    }
+    reserveAudio.mockRestore();
+  });
+
+  it('routes an undecodable binary frame through core protocol handling', async () => {
+    await host.stop();
+    const records: RelayProductionMetricInput[] = [];
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: {
+        ...productionTestMetricSink(),
+        record: (input) => records.push(input)
+      },
+      security: testSecurityWith()
+    });
+    await host.start();
+
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    try {
+      const readyMessage = nextMessage(socket, (message) => message.type === 'session.ready');
+      socket.send(sessionStartText());
+      const ready = await readyMessage;
+      socket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID
+      }));
+
+      const error = nextMessage(socket, (message) => message.type === 'error');
+      const closed = waitForCloseDetails(socket);
+      socket.send(Uint8Array.of(0), { binary: true });
+
+      await expect(error).resolves.toMatchObject({
+        type: 'error',
+        code: 'flow_control',
+        scope: 'audio'
+      });
+      await expect(closed).resolves.toEqual({ code: 1002, reason: 'protocol_error' });
+      expect(records.filter((record) => record.name === 'state_store.failure')).toHaveLength(0);
+      expect(records.filter((record) => record.name === 'provider.failure')).toHaveLength(0);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.terminate();
+      }
+    }
+  });
+
+  it('routes host utterance-limit rejections through core duration handling', async () => {
+    await host.stop();
+    const records: RelayProductionMetricInput[] = [];
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: {
+        ...productionTestMetricSink(),
+        record: (input) => records.push(input)
+      },
+      security: testSecurityWith()
+    });
+    await host.start();
+
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const readyMessage = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText({ maxUtteranceSamples: 2 }));
+    const ready = await readyMessage;
+    socket.send(JSON.stringify({
+      type: 'utterance.start',
+      sessionId: String(ready.sessionId),
+      sessionEpoch: Number(ready.sessionEpoch),
+      utteranceId: UTTERANCE_ID
+    }));
+
+    const aborted = nextMessage(socket, (message) => message.type === 'utterance.aborted');
+    const closed = waitForCloseDetails(socket);
+    socket.send(frame(0, 0, new Uint8Array([1, 2, 3, 4])));
+    socket.send(frame(1, 2, new Uint8Array([5, 6])));
+
+    await expect(aborted).resolves.toMatchObject({
+      type: 'utterance.aborted',
+      category: 'duration'
+    });
+    await expect(closed).resolves.toEqual({ code: 4408, reason: 'duration_limit' });
+    expect(records.filter((record) => record.name === 'state_store.failure')).toHaveLength(0);
+  });
+
+  it('fails closed when an audio grant makes no progress', async () => {
+    await host.stop();
+    const security = testSecurityWith();
+    const records: RelayProductionMetricInput[] = [];
+    const reserve = vi.spyOn(security.runtime, 'reserveAudio');
+    const realSnapshot = AudioGrantMeter.prototype.snapshot;
+    const snapshot = vi.spyOn(AudioGrantMeter.prototype, 'snapshot').mockImplementation(function (this: AudioGrantMeter) {
+      const current = realSnapshot.call(this);
+      return current.fromOriginalSampleOffset === 8_000
+        ? { ...current, remainingOriginalSamples: 0 }
+        : current;
+    });
+    const accept = vi.spyOn(AudioGrantMeter.prototype, 'accept');
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: {
+        ...productionTestMetricSink(),
+        record: (input) => records.push(input)
+      },
+      security
+    });
+    await host.start();
+
+    try {
+      const issued = await issueTicket(host);
+      const socket = await openSocket(host, String(issued.ticket));
+      const readyMessage = nextMessage(socket, (message) => message.type === 'session.ready');
+      socket.send(sessionStartText());
+      const ready = await readyMessage;
+      socket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId: String(ready.sessionId),
+        sessionEpoch: Number(ready.sessionEpoch),
+        utteranceId: UTTERANCE_ID
+      }));
+      const grantBoundaryAck = nextMessage(socket, (message) =>
+        message.type === 'audio.ack' && message.highestContiguousExclusiveOffset === 8_000
+      );
+      for (let sequence = 0; sequence < 5; sequence += 1) {
+        socket.send(frame(sequence, sequence * 1_600));
+      }
+      await grantBoundaryAck;
+
+      const closed = waitForCloseDetails(socket);
+      socket.send(frame(5, 8_000, new Uint8Array([1, 2])));
+      await expect(closed).resolves.toEqual({ code: 4503, reason: 'provider_unavailable' });
+      expect(reserve).toHaveBeenCalledTimes(2);
+      expect(accept.mock.calls.some(([range]) =>
+        range.fromOriginalSampleOffset === range.throughOriginalSampleOffset
+      )).toBe(false);
+      expect(records.filter((record) => record.name === 'state_store.failure')).toHaveLength(1);
+      expect(records.filter((record) => record.name === 'provider.failure')).toHaveLength(0);
+      socket.terminate();
+    } finally {
+      snapshot.mockRestore();
+      accept.mockRestore();
+    }
+  });
 
   it('reserves audio in exact 8,000-sample ranges rather than writing per frame', async () => {
     await host.stop();

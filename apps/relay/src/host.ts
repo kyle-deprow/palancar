@@ -2745,40 +2745,52 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
         if (connection.socket.readyState !== WebSocket.OPEN) {
           return;
         }
-        let result: RelayStepResult;
+        let result!: RelayStepResult;
         if (isBinary) {
           const bytes = rawDataBuffer(data);
           if (bytes === undefined) {
             closeConnection(connection, 1003, 'unsupported_data');
             return;
           }
+          const audioBytes = new Uint8Array(bytes);
           try {
-            const frame = decodeAudioFrame(new Uint8Array(bytes));
-            const secured = connection.audio;
-            if (secured === undefined || secured.utteranceId !== frame.utteranceId) {
-              result = core.handleSecurityFailure('state');
-            } else {
-              const accepted = secured.acceptor.accept(frame);
-              if (accepted.status === 'accepted') {
-                let from = frame.offset;
-                const through = frame.offset + accepted.chargeSamples;
-                while (from < through) {
-                  const snapshot = secured.meter.snapshot();
-                  if (snapshot.remainingOriginalSamples === 0) {
-                    secured.meter = await reserveGrant(frame.utteranceId, from);
+            let frame: ReturnType<typeof decodeAudioFrame> | undefined;
+            try {
+              frame = decodeAudioFrame(audioBytes);
+            } catch {
+              // Keep undecodable binary on the core's protocol-error path.
+              result = core.handleBinary(audioBytes);
+            }
+            if (frame !== undefined) {
+              const secured = connection.audio;
+              if (secured === undefined || secured.utteranceId !== frame.utteranceId) {
+                result = core.handleBinary(audioBytes);
+              } else {
+                const accepted = secured.acceptor.accept(frame);
+                if (accepted.status === 'accepted') {
+                  let from = frame.offset;
+                  const through = frame.offset + accepted.chargeSamples;
+                  while (from < through) {
+                    const snapshot = secured.meter.snapshot();
+                    if (snapshot.remainingOriginalSamples === 0) {
+                      secured.meter = await reserveGrant(frame.utteranceId, from);
+                    }
+                    const available = secured.meter.snapshot().remainingOriginalSamples;
+                    if (available === 0) {
+                      throw new SecurityStateError('state-unavailable');
+                    }
+                    const next = Math.min(through, from + available);
+                    secured.meter.accept({
+                      fromOriginalSampleOffset: from,
+                      throughOriginalSampleOffset: next
+                    });
+                    from = next;
                   }
-                  const available = secured.meter.snapshot().remainingOriginalSamples;
-                  const next = Math.min(through, from + available);
-                  secured.meter.accept({
-                    fromOriginalSampleOffset: from,
-                    throughOriginalSampleOffset: next
-                  });
-                  from = next;
+                } else if (accepted.status === 'rejected') {
+                  result = core.handleBinary(audioBytes);
                 }
-              } else if (accepted.status === 'rejected') {
-                result = core.handleSecurityFailure('state');
+                result ??= core.handleBinary(audioBytes);
               }
-              result ??= core.handleBinary(new Uint8Array(bytes));
             }
           } catch (error) {
             await failSecurity(error);
