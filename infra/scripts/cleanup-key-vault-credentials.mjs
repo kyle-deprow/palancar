@@ -112,7 +112,9 @@ const COMMIT_RE = /^[0-9a-f]{40}$/u;
 const STATES = Object.freeze(["start-inventory-validated", "attempting", "unknown", "complete"]);
 const ACCEPTED_DELETE_STATUS = new Set([200, 202, 204]);
 const MAX_HTTP_BODY_BYTES = 256 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
+// Must exceed the live Terraform state (already ~194 KiB and growing with
+// each relay revision); matches the lifecycle's 8 MiB bounded-JSON reads.
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_INVENTORY_PAGES = 64;
 const MAX_INVENTORY_ITEMS = 4096;
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
