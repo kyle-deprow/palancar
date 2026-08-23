@@ -489,6 +489,13 @@ function rebindStateEnvelope(harness, sequence, mutate) {
   const anchor = readJson(anchorPath);
   anchor.stateSha256 = state.stateSha256;
   anchor.stateFileSha256 = createHash("sha256").update(readFileSync(statePath)).digest("hex");
+  anchor.manifestSha256 = state.manifestSha256;
+  anchor.absenceReceiptSha256 = state.absenceReceiptSha256;
+  anchor.mutationTailSequence = state.mutationTailSequence;
+  anchor.mutationTailSha256 = state.mutationTailSha256;
+  anchor.preflightReceiptSha256 = state.preflightReceiptSha256;
+  anchor.preflightVerifierId = state.preflightVerifierId;
+  anchor.preflightVerifierSha256 = state.preflightVerifierSha256;
   anchor.anchorSha256 = hashJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256")));
   unlinkSync(anchorPath);
   writeExclusive(anchorPath, anchor);
@@ -497,6 +504,13 @@ function rebindStateEnvelope(harness, sequence, mutate) {
   const head = readJson(headPath);
   head.stateSha256 = state.stateSha256;
   head.stateFileSha256 = createHash("sha256").update(readFileSync(statePath)).digest("hex");
+  head.manifestSha256 = state.manifestSha256;
+  head.absenceReceiptSha256 = state.absenceReceiptSha256;
+  head.mutationTailSequence = state.mutationTailSequence;
+  head.mutationTailSha256 = state.mutationTailSha256;
+  head.preflightReceiptSha256 = state.preflightReceiptSha256;
+  head.preflightVerifierId = state.preflightVerifierId;
+  head.preflightVerifierSha256 = state.preflightVerifierSha256;
   head.headSha256 = hashJson(Object.fromEntries(Object.entries(head).filter(([key]) => key !== "headSha256")));
   unlinkSync(headPath);
   writeExclusive(headPath, head);
@@ -507,6 +521,13 @@ function rebindStateEnvelope(harness, sequence, mutate) {
   commitment.stateFileSha256 = createHash("sha256").update(readFileSync(statePath)).digest("hex");
   commitment.anchorSha256 = createHash("sha256").update(readFileSync(anchorPath)).digest("hex");
   commitment.headSha256 = createHash("sha256").update(readFileSync(headPath)).digest("hex");
+  commitment.manifestSha256 = state.manifestSha256;
+  commitment.absenceReceiptSha256 = state.absenceReceiptSha256;
+  commitment.mutationTailSequence = state.mutationTailSequence;
+  commitment.mutationTailSha256 = state.mutationTailSha256;
+  commitment.preflightReceiptSha256 = state.preflightReceiptSha256;
+  commitment.preflightVerifierId = state.preflightVerifierId;
+  commitment.preflightVerifierSha256 = state.preflightVerifierSha256;
   commitment.commitmentSha256 = hashJson(Object.fromEntries(Object.entries(commitment).filter(([key]) => key !== "commitmentSha256")));
   unlinkSync(commitmentPath);
   writeExclusive(commitmentPath, commitment);
@@ -759,6 +780,128 @@ test("start writes exclusive protected artifacts and exact context bindings", as
   }
 });
 
+test("the five cleanup pinning invariants reject self-rehashed mutations", async () => {
+  // 1. Sequence 0 cannot be published as completed.
+  {
+    const harness = makeHarness({
+      autoPreflight: false,
+      processRunner: () => ({ status: null, timedOut: true, stdout: "" }),
+    });
+    await expectCode(harness.cleanup.start(harness.runId), "token-timeout");
+    const versionPath = harness.path("cleanup-manifest-000000.json");
+    rewriteJson(versionPath, (value) => {
+      value.status = "completed";
+      value.sha256 = hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "sha256")));
+    });
+    const headPath = harness.path(OPERATION_MANIFEST_FILENAME);
+    rewriteJson(headPath, (head) => {
+      const version = readJson(versionPath);
+      Object.assign(head, version, {
+        manifestFilename: "cleanup-manifest-000000.json",
+        manifestSha256: createHash("sha256").update(readFileSync(versionPath)).digest("hex"),
+        previousHeadSha256: null,
+      });
+      head.headSha256 = hashJson(Object.fromEntries(Object.entries(head).filter(([key]) => key !== "headSha256")));
+    });
+    const intentPath = path.join(commitmentDirectory(harness), "cleanup-operation-head-intent-000000.json");
+    rewriteJson(intentPath, (intent) => {
+      intent.manifestSha256 = createHash("sha256").update(readFileSync(versionPath)).digest("hex");
+      intent.intentSha256 = hashJson(Object.fromEntries(Object.entries(intent).filter(([key]) => key !== "intentSha256")));
+    });
+    const anchorPath = path.join(commitmentDirectory(harness), "cleanup-operation-head-000000.json");
+    rewriteJson(anchorPath, (anchor) => {
+      anchor.manifestSha256 = createHash("sha256").update(readFileSync(versionPath)).digest("hex");
+      anchor.headSha256 = createHash("sha256").update(readFileSync(headPath)).digest("hex");
+      anchor.intentSha256 = createHash("sha256").update(readFileSync(intentPath)).digest("hex");
+      anchor.anchorSha256 = hashJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256")));
+    });
+    await expectCode(harness.cleanup.resume(harness.runId), "operation-manifest-context");
+  }
+
+  // 2. A mutation intent cannot detach its preflight tuple from its state.
+  {
+    let crashed = true;
+    const harness = makeHarness({
+      faultAt: ({ event }) => {
+        if (crashed && event === "after-mutation-request") {
+          crashed = false;
+          return true;
+        }
+        return false;
+      },
+    });
+    await harness.cleanup.start(harness.runId);
+    await assert.rejects(harness.cleanup.resume(harness.runId));
+    harness.setFault(undefined);
+    const intentPath = path.join(commitmentDirectory(harness), "cleanup-mutation-intent-000000.json");
+    const commitmentPath = path.join(commitmentDirectory(harness), "cleanup-mutation-commitment-000000.json");
+    const intent = rewriteJson(intentPath, (value) => {
+      value.preflightReceiptSha256 = "b".repeat(64);
+      value.intentSha256 = hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "intentSha256")));
+    });
+    rewriteJson(commitmentPath, (commitment) => {
+      commitment.intent = intent;
+      commitment.intentSha256 = intent.intentSha256;
+      commitment.intentFileSha256 = createHash("sha256").update(`${canonicalJson(intent)}\n`).digest("hex");
+      commitment.commitmentSha256 = hashJson(Object.fromEntries(Object.entries(commitment).filter(([key]) => key !== "commitmentSha256")));
+    });
+    harness.httpCalls.length = 0;
+    await expectCode(harness.cleanup.resume(harness.runId), "mutation-intent-state-preflight");
+    assert.equal(harness.httpCalls.some((request) => request.method === "DELETE"), false);
+  }
+
+  // 3. Sequence 0 has one anchor filename, with no numeric variant.
+  for (const alongside of [false, true]) {
+    const harness = makeHarness();
+    await harness.cleanup.start(harness.runId);
+    const canonicalPath = harness.path("cleanup-state-anchor.json");
+    writeExclusive(harness.path("cleanup-state-anchor-000000.json"), readJson(canonicalPath));
+    if (!alongside) unlinkSync(canonicalPath);
+    harness.httpCalls.length = 0;
+    await expectCode(harness.cleanup.resume(harness.runId), "state-name");
+    assert.equal(harness.httpCalls.some((request) => request.method === "DELETE"), false);
+  }
+
+  // 4. Only the start checkpoint may carry a null preflight tuple.
+  {
+    let crashed = true;
+    const harness = makeHarness({
+      faultAt: ({ event, filePath }) => {
+        if (crashed && event === "after-directory-fsync" && /cleanup-state-anchor-000001\.json$/u.test(filePath ?? "")) {
+          crashed = false;
+          return true;
+        }
+        return false;
+      },
+    });
+    await harness.cleanup.start(harness.runId);
+    await assert.rejects(harness.cleanup.resume(harness.runId));
+    harness.setFault(undefined);
+    rebindStateEnvelope(harness, 1, (state) => {
+      state.preflightReceiptSha256 = null;
+      state.preflightVerifierId = null;
+      state.preflightVerifierSha256 = null;
+    });
+    await expectCode(harness.cleanup.resume(harness.runId), "state-preflight-verifier");
+  }
+
+  // 5. Terminal state and absence receipt carry the same complete preflight tuple.
+  {
+    const harness = makeHarness();
+    await harness.cleanup.start(harness.runId);
+    harness.active.clear();
+    await harness.cleanup.resume(harness.runId);
+    rewriteJson(harness.path(ABSENCE_RECEIPT_FILENAME), (receipt) => {
+      receipt.preflightReceiptSha256 = "b".repeat(64);
+      receipt.sha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "sha256")));
+    });
+    rebindStateEnvelope(harness, 1, (state) => {
+      state.absenceReceiptSha256 = createHash("sha256").update(readFileSync(harness.path(ABSENCE_RECEIPT_FILENAME))).digest("hex");
+    });
+    await expectCode(harness.cleanup.resume(harness.runId), "absence-receipt-linkage");
+  }
+});
+
 test("every nested durable schema is directly mutated through its intended validator", async () => {
   const cases = [
     {
@@ -1003,7 +1146,7 @@ test("operation head and immutable manifest divergence cannot be authorized by p
   const headPath = harness.path(OPERATION_MANIFEST_FILENAME);
   const head = readJson(headPath);
   const immutablePath = harness.path(head.manifestFilename);
-  head.status = "prepared";
+  head.previousManifestSha256 = "0".repeat(64);
   head.sha256 = hashJson(Object.fromEntries(Object.entries(head).filter(([key]) => ![
     "manifestFilename", "manifestSha256", "previousHeadSha256", "headSha256", "sha256",
   ].includes(key))));
