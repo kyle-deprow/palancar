@@ -1355,6 +1355,32 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
   });
 
+  it("lands a server-directed flow abort in Ready while keeping the session alive", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+
+    transport.emit({
+      type: "utterance.aborted",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      category: "flow",
+    });
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+    expect(harness.runtime.snapshot.cleanupState).toBe("active");
+    expect(transport.closed).toBe(false);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+  });
+
   it.each([
     { name: "authentication ticket", kind: "ticket" as const },
     { name: "protocol", kind: "protocol" as const },

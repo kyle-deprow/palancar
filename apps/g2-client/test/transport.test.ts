@@ -1538,7 +1538,7 @@ describe("G2 relay transport", () => {
     expect(socket.sent).toHaveLength(sentAfterCommit);
   });
 
-  it("retains a committed queue for delayed ACKs until the server retires the utterance", async () => {
+  it("retains a committed queue while ignoring delayed ACKs until the server retires the utterance", async () => {
     const errors: RelayTransportError[] = [];
     const { transport } = createTransport(undefined, (error) => errors.push(error));
     const socket = await openReady(transport);
@@ -1547,9 +1547,11 @@ describe("G2 relay transport", () => {
     transport.pushPcm(Uint8Array.of(1, 2, 3, 4));
     transport.commitUtterance();
 
+    const queueBeforeDelayedAck = transport.snapshot.queue;
     socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 2)));
     expect(errors).toHaveLength(0);
     expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+    expect(transport.snapshot.queue).toEqual(queueBeforeDelayedAck);
 
     transport.startUtterance(SECOND_UTTERANCE_ID);
     expect(errors.at(-1)?.kind).toBe("audio");
@@ -1624,42 +1626,287 @@ describe("G2 relay transport", () => {
     });
   });
 
-  it("handles pause and flow abort ACKs without emitting fatal events", async () => {
+  it("gates PCM sending during a server pause without aborting the utterance", async () => {
     const errors: RelayTransportError[] = [];
-    const events: RelayTransportCallbackEvent[] = [];
-    FakeWebSocket.instances.length = 0;
-    const transport = new RelayTransport({
-      relayOrigin: "https://relay.example",
-      credentialProvider: new FakeCredentialProvider(),
-      fetch: async () => ticketResponse(),
-      WebSocket: fakeWebSocketConstructor,
-      onEvent: (event) => events.push(event),
-      onTransportError: (error) => errors.push(error),
-    });
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
     const socket = await openReady(transport);
     transport.startUtterance(UTTERANCE_ID);
     socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
     const sentWhilePaused = socket.sent.length;
     transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
-    expect(socket.sent).toHaveLength(sentWhilePaused + 1);
-    expect(sentControl(socket, socket.sent.length - 1).type).toBe("utterance.cancel");
+    expect(socket.sent).toHaveLength(sentWhilePaused);
+    expect(errors).toHaveLength(0);
+    expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+    expect(transport.snapshot.queue?.nextCapturedOffset).toBe(960);
+  });
 
-    FakeWebSocket.instances.length = 0;
-    const second = new RelayTransport({
-      relayOrigin: "https://relay.example",
-      credentialProvider: new FakeCredentialProvider(),
-      fetch: async () => ticketResponse(),
-      WebSocket: fakeWebSocketConstructor,
-      onEvent: (event) => events.push(event),
-      onTransportError: (error) => errors.push(error),
+  it("ignores delayed pause/resume ACKs after cancelling without draining or mutating", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+
+    const cancelIndex = socket.sent.length;
+    transport.cancelUtterance();
+    expect(sentControl(socket, cancelIndex)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
     });
-    const secondSocket = await openReady(second);
-    second.startUtterance(UTTERANCE_ID);
-    second.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
-    secondSocket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "abort")));
-    expect(second.snapshot.activeUtteranceId).toBeUndefined();
-    expect(errors.some((error) => error.kind === "audio")).toBe(true);
-    expect(events.some((event) => event.type === "fatal")).toBe(false);
+
+    const snapshotBeforeDelayedAcks = transport.snapshot;
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "pause")));
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "normal")));
+
+    expect(socket.sent.slice(cancelIndex).filter((value) => typeof value !== "string")).toHaveLength(0);
+    expect(sentControlTypes(socket).filter((type) =>
+      type === "utterance.cancel" || type === "utterance.commit",
+    )).toEqual(["utterance.cancel"]);
+    expect(transport.snapshot).toEqual(snapshotBeforeDelayedAcks);
+  });
+
+  it("ignores a stale mismatched ACK after cancelling without reporting an audio error", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    transport.cancelUtterance();
+
+    const sentAfterCancel = socket.sent.length;
+    socket.message(JSON.stringify(audioAck(SECOND_UTTERANCE_ID, 0, "normal")));
+
+    expect(errors).toHaveLength(0);
+    expect(socket.sent).toHaveLength(sentAfterCancel);
+    expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+  });
+
+  it("ignores a late ACK for a retired utterance after the next utterance starts", async () => {
+    const errors: RelayTransportError[] = [];
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error), (event) => {
+      events.push(event);
+    });
+    const socket = await openReady(transport);
+    events.length = 0;
+
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(utteranceAborted()));
+    transport.startUtterance(SECOND_UTTERANCE_ID);
+    const sentAfterSecondStart = socket.sent.length;
+
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "normal")));
+
+    expect(errors).toHaveLength(0);
+    expect(socket.sent).toHaveLength(sentAfterSecondStart);
+    expect(transport.snapshot.activeUtteranceId).toBe(SECOND_UTTERANCE_ID);
+    expect(events.filter((event) => event.type === "utterance.aborted")).toEqual([
+      utteranceAborted(),
+    ]);
+  });
+
+  it("reports a mismatched ACK for a live utterance as an audio error", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+
+    socket.message(JSON.stringify(audioAck(SECOND_UTTERANCE_ID, 0, "normal")));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "audio", recoveryDisposition: "stop" });
+    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
+    });
+  });
+
+  it("ignores a delayed flow-abort ACK after cancelling without a duplicate terminal callback", async () => {
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(undefined, undefined, (event) => events.push(event));
+    const socket = await openReady(transport);
+    events.length = 0;
+
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+    transport.cancelUtterance();
+
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "abort")));
+    expect(events).toHaveLength(0);
+    expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+
+    socket.message(JSON.stringify(utteranceAborted()));
+    expect(events).toEqual([utteranceAborted()]);
+  });
+
+  it("deduplicates a synthetic flow abort and a later server utterance.aborted event", async () => {
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(undefined, undefined, (event) => events.push(event));
+    const socket = await openReady(transport);
+    events.length = 0;
+
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "abort")));
+    socket.message(JSON.stringify(utteranceAborted(UTTERANCE_ID, "cancellation")));
+
+    expect(events.filter((event) => event.type === "utterance.aborted")).toEqual([{
+      type: "utterance.aborted",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      category: "flow",
+    }]);
+  });
+
+  it("suppresses a late server abort for a flow-aborted utterance after the next utterance starts", async () => {
+    const errors: RelayTransportError[] = [];
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error), (event) => {
+      events.push(event);
+    });
+    const socket = await openReady(transport);
+    events.length = 0;
+
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "abort")));
+    transport.startUtterance(SECOND_UTTERANCE_ID);
+    const sentAfterSecondStart = socket.sent.length;
+
+    socket.message(JSON.stringify(utteranceAborted(UTTERANCE_ID, "cancellation")));
+
+    expect(errors).toHaveLength(0);
+    expect(socket.sent).toHaveLength(sentAfterSecondStart);
+    expect(transport.snapshot.activeUtteranceId).toBe(SECOND_UTTERANCE_ID);
+    expect(events.filter((event) => event.type === "utterance.aborted")).toEqual([{
+      type: "utterance.aborted",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      category: "flow",
+    }]);
+  });
+
+  it("resumes paused PCM in sequence and preserves original sample offsets", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
+
+    const first = Uint8Array.from({ length: 1_920 }, (_, index) => index % 256);
+    const second = Uint8Array.from({ length: 1_920 }, (_, index) => (index + 1) % 256);
+    transport.pushPcm(first);
+    transport.pushPcm(second);
+    expect(socket.sent).toHaveLength(2);
+
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "normal")));
+    const resumedFrames = socket.sent.slice(2).map((value) => {
+      if (typeof value === "string") throw new Error("Expected binary audio frame");
+      return decodeAudioFrame(value);
+    });
+    expect(resumedFrames.map((frame) => ({ sequence: frame.sequence, offset: frame.offset }))).toEqual([
+      { sequence: 0, offset: 0 },
+      { sequence: 1, offset: 960 },
+    ]);
+
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => (index + 2) % 256));
+    const allFrames = socket.sent.slice(2).map((value) => {
+      if (typeof value === "string") throw new Error("Expected binary audio frame");
+      return decodeAudioFrame(value);
+    });
+    expect(allFrames.map((frame) => ({ sequence: frame.sequence, offset: frame.offset }))).toEqual([
+      { sequence: 0, offset: 0 },
+      { sequence: 1, offset: 960 },
+      { sequence: 2, offset: 1_920 },
+    ]);
+  });
+
+  it("cancels a paused stop after flushing retained odd PCM without committing", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
+
+    transport.pushPcm(Uint8Array.of(1, 2, 3));
+    transport.commitUtterance();
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "normal")));
+
+    const frames = socket.sent.flatMap((value) => {
+      if (typeof value === "string") return [];
+      return [decodeAudioFrame(value)];
+    });
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.payload).toEqual(Uint8Array.of(1, 2));
+
+    const terminalControls = socket.sent.flatMap((value) => {
+      if (typeof value !== "string") return [];
+      const message = JSON.parse(value) as { readonly type: string };
+      return message.type === "utterance.cancel" || message.type === "utterance.commit"
+        ? [message.type]
+        : [];
+    });
+    expect(terminalControls).toEqual(["utterance.cancel"]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "audio", recoveryDisposition: "stop" });
+    expect(transport.snapshot.activeUtteranceId).toBe(UTTERANCE_ID);
+  });
+
+  it("turns a server flow abort into an utterance-aborted event without ending the session", async () => {
+    const errors: RelayTransportError[] = [];
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(
+      undefined,
+      (error) => errors.push(error),
+      (event) => events.push(event),
+    );
+    const socket = await openReady(transport);
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.from({ length: 1_920 }, (_, index) => index % 256));
+
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 960, "abort")));
+
+    expect(events).toContainEqual({
+      type: "utterance.aborted",
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      category: "flow",
+    });
+    expect(errors).toHaveLength(0);
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+    });
+    expect(transport.snapshot.activeUtteranceId).toBeUndefined();
+  });
+
+  it("bounds PCM retained during a long pause and reports overflow as a graceful audio abort", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openSocket(transport);
+    socket.message(JSON.stringify(readyMessage({
+      ...DEFAULT_NEGOTIATED_LIMITS,
+      maxUnacknowledgedSamples: 2,
+      maxRetainedReplaySamples: 2,
+      maxUtteranceSamples: 2,
+    })));
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
+    transport.pushPcm(Uint8Array.of(1, 2, 3, 4));
+    transport.pushPcm(Uint8Array.of(5, 6));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "audio", recoveryDisposition: "stop" });
+    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
+    });
+    expect(socket.sent.filter((value) => typeof value !== "string")).toHaveLength(0);
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      activeUtteranceId: UTTERANCE_ID,
+    });
   });
 
   it("classifies an audio queue overflow as a stop-scoped audio error after cancelling", async () => {

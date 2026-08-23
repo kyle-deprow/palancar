@@ -6,6 +6,7 @@ import {
   assertSessionStart,
   assertSessionTicketRequest,
   assertSessionTicketResponse,
+  assertUtteranceAborted,
   assertUtteranceCancel,
   assertUtteranceCommit,
   assertUtteranceStart,
@@ -47,6 +48,7 @@ const MAX_READY_TIMEOUT_MS = 2_147_483_647 as const;
 const WEBSOCKET_CONNECTING = 0;
 const WEBSOCKET_OPEN = 1;
 const WEBSOCKET_CLOSED = 3;
+const RETIRED_UTTERANCE_CAPACITY = 8;
 
 const RELAY_CLOSE_RECOVERY_DISPOSITIONS = new Map<
   number,
@@ -80,6 +82,33 @@ type EmittedServerEvent = Exclude<
   ServerControlMessage,
   { readonly type: "audio.ack" } | { readonly type: "error" }
 >;
+
+function utteranceIdentityKey(
+  sessionId: string,
+  sessionEpoch: number,
+  utteranceId: string,
+): string {
+  return `${sessionId}\u0000${sessionEpoch}\u0000${utteranceId}`;
+}
+
+function serverUtteranceIdentity(event: ServerControlMessage): string | undefined {
+  if (!("utteranceId" in event)) return undefined;
+  return utteranceIdentityKey(event.sessionId, event.sessionEpoch, event.utteranceId);
+}
+
+function terminalUtteranceIdentity(event: RelayTransportEvent): string | undefined {
+  switch (event.type) {
+    case "utterance.aborted":
+    case "suggestions.ready":
+      return utteranceIdentityKey(event.sessionId, event.sessionEpoch, event.utteranceId);
+    case "language.decision":
+      return event.decision === "target"
+        ? undefined
+        : utteranceIdentityKey(event.sessionId, event.sessionEpoch, event.utteranceId);
+    default:
+      return undefined;
+  }
+}
 
 export type RelayTransportEvent = EmittedServerEvent;
 export interface RelayTransportLostEvent {
@@ -182,7 +211,9 @@ export interface RelayTransportSnapshot {
 interface ActiveUtterance {
   readonly utteranceId: string;
   readonly queue: ClientRetainedAudioQueue;
+  readonly pendingFrames: EncodedAudioFrame[];
   paused: boolean;
+  commitRequested: boolean;
   phase: "streaming" | "committing" | "cancelling";
 }
 
@@ -470,6 +501,7 @@ export class RelayTransport {
   readonly #onServerEvent: ((event: RelayTransportEvent) => void) | undefined;
   readonly #onTransportError: ((error: RelayTransportError) => void) | undefined;
   readonly #expectedTerminalClose = new WeakSet<BrowserWebSocket>();
+  readonly #retiredUtterances = new Set<string>();
 
   #socket: BrowserWebSocket | undefined;
   #pendingOpenResolve: (() => void) | undefined;
@@ -695,7 +727,9 @@ export class RelayTransport {
     const active: ActiveUtterance = {
       utteranceId,
       queue,
+      pendingFrames: [],
       paused: false,
+      commitRequested: false,
       phase: "streaming",
     };
     this.#active = active;
@@ -720,10 +754,6 @@ export class RelayTransport {
       this.#abortActive();
       return;
     }
-    if (active.paused) {
-      this.#abortActive();
-      return;
-    }
 
     const result = active.queue.push(pcm);
     if (result.status === "overflow") {
@@ -731,9 +761,8 @@ export class RelayTransport {
       return;
     }
 
-    for (const frame of result.frames) {
-      if (!this.#sendAudioFrame(frame)) return;
-    }
+    active.pendingFrames.push(...result.frames);
+    if (!active.paused) this.#drainPendingAudio(active);
   }
 
   commitUtterance(): void {
@@ -741,48 +770,19 @@ export class RelayTransport {
     const session = this.#session;
     if (active === undefined || active.phase !== "streaming" || session === undefined) return;
 
-    const flush = active.queue.flush();
-    for (const frame of flush.frames) {
-      if (!this.#sendAudioFrame(frame)) {
-        if (this.#active === active && active.phase === "streaming") {
-          active.phase = "cancelling";
-        }
-        return;
-      }
-    }
-    if (flush.status === "incomplete-sample") {
-      this.#abortActive(true);
+    active.commitRequested = true;
+    if (active.paused) {
+      active.phase = "committing";
       return;
     }
-
-    const finalOriginalSampleOffset = active.queue.state.nextCapturedOffset;
-    const message = assertUtteranceCommit({
-      type: "utterance.commit",
-      sessionId: session.sessionId,
-      sessionEpoch: session.sessionEpoch,
-      utteranceId: active.utteranceId,
-      finalOriginalSampleOffset,
-    });
-    if (this.#sendControl(message)) {
-      active.phase = "committing";
-    }
+    this.#commitActive(active);
   }
 
   cancelUtterance(): void {
     const active = this.#active;
     const session = this.#session;
-    if (active === undefined || active.phase !== "streaming" || session === undefined) return;
-
-    const message = assertUtteranceCancel({
-      type: "utterance.cancel",
-      sessionId: session.sessionId,
-      sessionEpoch: session.sessionEpoch,
-      utteranceId: active.utteranceId,
-      finalOriginalSampleOffset: active.queue.state.nextCapturedOffset,
-    });
-    if (this.#sendControl(message)) {
-      active.phase = "cancelling";
-    }
+    if (active === undefined || session === undefined) return;
+    this.#sendUtteranceCancel();
   }
 
   endSession(reason: "user_requested" | "app_shutdown" | "transport_error" = "user_requested"): void {
@@ -793,7 +793,7 @@ export class RelayTransport {
       this.#expectedTerminalClose.add(source.socket);
     }
     try {
-      if (this.#active?.phase === "streaming" && !this.#sendUtteranceCancel()) return;
+      if (this.#active !== undefined && !this.#sendUtteranceCancel()) return;
       if (!this.#isSourceCurrent(source)) return;
       const message = assertClientControlMessage({
         type: "session.end",
@@ -1057,6 +1057,58 @@ export class RelayTransport {
     }
   }
 
+  #drainPendingAudio(active: ActiveUtterance): boolean {
+    if (active.paused) return true;
+    while (active.pendingFrames.length > 0) {
+      const frame = active.pendingFrames[0];
+      if (frame === undefined) return true;
+      if (!this.#sendAudioFrame(frame)) return false;
+      active.pendingFrames.shift();
+    }
+    return true;
+  }
+
+  #commitActive(active: ActiveUtterance): void {
+    if (
+      active.paused ||
+      !active.commitRequested ||
+      (active.phase !== "streaming" && active.phase !== "committing")
+    ) return;
+    if (!this.#drainPendingAudio(active)) return;
+
+    const session = this.#session;
+    if (session === undefined) {
+      this.#abortActive();
+      return;
+    }
+
+    const flush = active.queue.flush();
+    for (const frame of flush.frames) {
+      if (!this.#sendAudioFrame(frame)) {
+        if (this.#active === active && active.phase === "streaming") {
+          active.phase = "cancelling";
+        }
+        return;
+      }
+    }
+    if (flush.status === "incomplete-sample") {
+      this.#abortActive(true);
+      return;
+    }
+
+    const message = assertUtteranceCommit({
+      type: "utterance.commit",
+      sessionId: session.sessionId,
+      sessionEpoch: session.sessionEpoch,
+      utteranceId: active.utteranceId,
+      finalOriginalSampleOffset: active.queue.state.nextCapturedOffset,
+    });
+    if (this.#sendControl(message)) {
+      active.commitRequested = false;
+      active.phase = "committing";
+    }
+  }
+
   #sendAudioFrame(frame: EncodedAudioFrame): boolean {
     const source = this.#currentSource();
     const socket = source.socket;
@@ -1111,6 +1163,12 @@ export class RelayTransport {
         }
         return;
       } else {
+        const utteranceIdentity = serverUtteranceIdentity(message);
+        if (
+          utteranceIdentity !== undefined &&
+          !this.#matchesActiveUtterance(utteranceIdentity) &&
+          this.#retiredUtterances.has(utteranceIdentity)
+        ) return;
         this.#retireActiveForEvent(message);
       }
       this.#emitServerEvent(source, message);
@@ -1125,7 +1183,20 @@ export class RelayTransport {
   ): void {
     const active = this.#active;
     const session = this.#session;
-    if (active === undefined) return;
+    const identity = utteranceIdentityKey(
+      message.sessionId,
+      message.sessionEpoch,
+      message.utteranceId,
+    );
+    const live =
+      active !== undefined &&
+      !this.#isTerminalUtterance(active) &&
+      session !== undefined &&
+      message.sessionId === session.sessionId &&
+      message.sessionEpoch === session.sessionEpoch &&
+      message.utteranceId === active.utteranceId;
+    if (!live && this.#retiredUtterances.has(identity)) return;
+    if (active === undefined || this.#isTerminalUtterance(active)) return;
     if (
       session === undefined ||
       message.sessionId !== session.sessionId ||
@@ -1142,15 +1213,28 @@ export class RelayTransport {
       return;
     }
     if (message.flowState === "abort") {
+      const aborted = assertUtteranceAborted({
+        type: "utterance.aborted",
+        sessionId: message.sessionId,
+        sessionEpoch: message.sessionEpoch,
+        utteranceId: message.utteranceId,
+        category: "flow",
+      });
       this.#active = undefined;
-      this.#report(source, "audio");
+      this.#emitServerEvent(source, aborted);
       return;
     }
     active.paused = message.flowState === "pause";
+    if (!active.paused) {
+      if (!this.#drainPendingAudio(active)) return;
+      if (active.commitRequested) this.#commitActive(active);
+    }
   }
 
   #emitServerEvent(source: TransportSource, event: RelayTransportEvent): void {
     if (!this.#isSourceCurrent(source)) return;
+    const terminalIdentity = terminalUtteranceIdentity(event);
+    if (terminalIdentity !== undefined && !this.#rememberRetiredUtterance(terminalIdentity)) return;
     try {
       this.#onServerEvent?.(event);
     } catch {
@@ -1243,7 +1327,9 @@ export class RelayTransport {
   #sendUtteranceCancel(): boolean {
     const active = this.#active;
     const session = this.#session;
-    if (active === undefined || active.phase !== "streaming" || session === undefined) return true;
+    if (active === undefined || session === undefined) return true;
+    if (this.#isTerminalUtterance(active)) return true;
+    if (active.phase !== "streaming" && active.phase !== "committing") return true;
     const message = assertUtteranceCancel({
       type: "utterance.cancel",
       sessionId: session.sessionId,
@@ -1252,8 +1338,16 @@ export class RelayTransport {
       finalOriginalSampleOffset: active.queue.state.nextCapturedOffset,
     });
     if (!this.#sendControl(message)) return false;
+    active.commitRequested = false;
     active.phase = "cancelling";
     return true;
+  }
+
+  #isTerminalUtterance(active: ActiveUtterance): boolean {
+    return (
+      active.phase === "cancelling" ||
+      (active.phase === "committing" && !active.commitRequested)
+    );
   }
 
   #abortActive(lockPhase = false): void {
@@ -1263,7 +1357,7 @@ export class RelayTransport {
       this.#report(source, "audio");
       return;
     }
-    if (active.phase === "streaming") this.#sendUtteranceCancel();
+    if (!this.#sendUtteranceCancel()) return;
     if (!this.#isSourceCurrent(source) || this.#active !== active) return;
     if (lockPhase && this.#active === active && active.phase === "streaming") {
       active.phase = "cancelling";
@@ -1353,9 +1447,34 @@ export class RelayTransport {
 
   #clearSessionState(): void {
     this.#active = undefined;
+    this.#retiredUtterances.clear();
     this.#session = undefined;
     this.#targetLanguage = undefined;
     this.#negotiatedLimits = undefined;
+  }
+
+  #rememberRetiredUtterance(identity: string): boolean {
+    if (this.#retiredUtterances.has(identity)) return false;
+    this.#retiredUtterances.add(identity);
+    if (this.#retiredUtterances.size > RETIRED_UTTERANCE_CAPACITY) {
+      const oldest = this.#retiredUtterances.values().next().value as string | undefined;
+      if (oldest !== undefined) this.#retiredUtterances.delete(oldest);
+    }
+    return true;
+  }
+
+  #matchesActiveUtterance(identity: string): boolean {
+    const active = this.#active;
+    const session = this.#session;
+    return (
+      active !== undefined &&
+      session !== undefined &&
+      identity === utteranceIdentityKey(
+        session.sessionId,
+        session.sessionEpoch,
+        active.utteranceId,
+      )
+    );
   }
 
   #assertExpectedSessionReady(
