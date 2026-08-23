@@ -1,3 +1,9 @@
+import {
+  isIso6391LanguageCode,
+  snapshotOwnDataProperties
+} from './types.js';
+import type { TranscriptionLanguageConfiguration } from './types.js';
+
 export const AZURE_REALTIME_INPUT_AUDIO_FORMAT = 'audio/pcm' as const;
 /** One 100 ms 16 kHz relay frame after 16->24 kHz conversion. */
 export const DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES = 4_800 as const;
@@ -43,11 +49,14 @@ export interface AzureRealtimeSessionUpdateMessage {
         readonly turn_detection: null;
         readonly transcription: Readonly<{
           readonly model: string;
+          readonly language?: string;
         }>;
       }>;
     }>;
   }>;
 }
+
+export type AzureRealtimeSessionUpdateOptions = TranscriptionLanguageConfiguration;
 
 export interface AzureRealtimeInputAudioAppendMessage {
   readonly type: 'input_audio_buffer.append';
@@ -90,6 +99,39 @@ function validateDeployment(deployment: unknown): asserts deployment is string {
   }
 }
 
+function validateSessionUpdateOptions(
+  options: unknown
+): TranscriptionLanguageConfiguration {
+  if (options === undefined) {
+    return Object.freeze({ languageMode: 'automatic' });
+  }
+  const snapshot = snapshotOwnDataProperties(options);
+  if (snapshot === undefined) {
+    fail('invalid-options');
+  }
+  const languageMode = snapshot.languageMode;
+  const keys = Object.keys(snapshot);
+  if (languageMode === 'automatic') {
+    if (keys.length !== 1 || keys[0] !== 'languageMode') {
+      fail('invalid-options');
+    }
+    return Object.freeze({ languageMode: 'automatic' });
+  }
+  if (
+    languageMode !== 'selected-target' ||
+    keys.length !== 2 ||
+    !keys.includes('languageMode') ||
+    !keys.includes('languageHint') ||
+    !isIso6391LanguageCode(snapshot.languageHint)
+  ) {
+    fail('invalid-options');
+  }
+  return Object.freeze({
+    languageMode: 'selected-target',
+    languageHint: snapshot.languageHint
+  });
+}
+
 function validateAppendOptions(
   options: unknown
 ): number {
@@ -127,9 +169,14 @@ function encodeBase64(bytes: Uint8Array): string {
 }
 
 export function buildAzureRealtimeSessionUpdateMessage(
-  deployment: string
+  deployment: string,
+  options?: AzureRealtimeSessionUpdateOptions
 ): AzureRealtimeSessionUpdateMessage {
   validateDeployment(deployment);
+  const languageConfiguration = validateSessionUpdateOptions(options);
+  const transcription = languageConfiguration.languageMode === 'automatic'
+    ? { model: deployment }
+    : { model: deployment, language: languageConfiguration.languageHint };
   return Object.freeze({
     type: 'session.update',
     session: Object.freeze({
@@ -141,7 +188,7 @@ export function buildAzureRealtimeSessionUpdateMessage(
             rate: 24000
           }),
           turn_detection: null,
-          transcription: Object.freeze({ model: deployment })
+          transcription: Object.freeze(transcription)
         })
       })
     })

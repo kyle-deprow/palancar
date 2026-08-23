@@ -8,7 +8,11 @@ import {
   type AzureRealtimeSocketFactory
 } from '../src/azure-adapter.js';
 import { buildAzureRealtimeSessionUpdateMessage } from '../src/azure-client.js';
-import type { NormalizedTranscriptionEvent, TranscriptionSession } from '../src/types.js';
+import type {
+  NormalizedTranscriptionEvent,
+  TranscriptionSession,
+  TranscriptionSessionConfiguration
+} from '../src/types.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
 const UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
@@ -140,7 +144,7 @@ function sessionCreated(): string {
   });
 }
 
-function sessionUpdated(sessionId = 'azure-session-1'): string {
+function sessionUpdated(sessionId = 'azure-session-1', language?: string): string {
   return serverEvent('session.updated', {
     session: {
       type: 'transcription',
@@ -150,7 +154,10 @@ function sessionUpdated(sessionId = 'azure-session-1'): string {
         input: {
           format: { type: 'audio/pcm', rate: 24000 },
           turn_detection: null,
-          transcription: { model: 'transcribe-prod' }
+          transcription: {
+            model: 'transcribe-prod',
+            ...(language === undefined ? {} : { language })
+          }
         }
       }
     }
@@ -289,7 +296,12 @@ function makeSession(
   socket: FakeSocket,
   events: NormalizedTranscriptionEvent[],
   failures: unknown[] = [],
-  options: Partial<ConstructorParameters<typeof AzureRealtimeTranscriptionAdapter>[0]> = {}
+  options: Partial<ConstructorParameters<typeof AzureRealtimeTranscriptionAdapter>[0]> = {},
+  configuration: TranscriptionSessionConfiguration = {
+    serverVadMode: 'disabled',
+    languageMode: 'automatic',
+    manualCommitCadenceMs: 600
+  }
 ): TranscriptionSession {
   const factory: AzureRealtimeSocketFactory = () => socket;
   const adapter = new AzureRealtimeTranscriptionAdapter({
@@ -305,11 +317,7 @@ function makeSession(
   return adapter.createSession({
     sessionId: SESSION_ID,
     sessionEpoch: 1,
-    configuration: {
-      serverVadMode: 'disabled',
-      languageMode: 'automatic',
-      manualCommitCadenceMs: 600
-    },
+    configuration,
     onEvent: (event) => events.push(event),
     onFailure: (failure) => failures.push(failure)
   });
@@ -421,6 +429,7 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
       onEvent: () => undefined,
       onFailure: () => undefined
     });
+    expect(session.capabilities.languageModes).toEqual(['automatic', 'selected-target']);
 
     session.start({ utteranceId: UTTERANCE_ID });
     await Promise.resolve();
@@ -431,6 +440,114 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     const update = JSON.parse(socket.sent[0] ?? '{}') as Record<string, unknown>;
     expect(update).not.toHaveProperty('language');
     expect(JSON.stringify(update)).not.toContain('selectedTargetLanguage');
+  });
+
+  it.each(['es', 'tr'] as const)('sends and verifies the selected-target %s hint', async (language) => {
+    const socket = new FakeSocket();
+    const failures: unknown[] = [];
+    const configuration = {
+      serverVadMode: 'disabled' as const,
+      languageMode: 'selected-target' as const,
+      languageHint: language,
+      manualCommitCadenceMs: 600
+    };
+    const session = makeSession(
+      socket,
+      [],
+      failures,
+      {},
+      configuration
+    );
+    configuration.languageHint = language === 'es' ? 'tr' : 'es';
+    session.start({ utteranceId: UTTERANCE_ID });
+    await Promise.resolve();
+    socket.open();
+    const update = JSON.parse(socket.sent[0] ?? '{}') as {
+      readonly session: {
+        readonly audio: {
+          readonly input: { readonly transcription: unknown };
+        };
+      };
+    };
+    expect(update.session.audio.input.transcription).toEqual({
+      model: 'transcribe-prod',
+      language
+    });
+    expect(JSON.stringify(update)).not.toContain('selectedTargetLanguage');
+    socket.message(sessionCreated());
+    socket.message(sessionUpdated('azure-session-1', language));
+    expect(session.state.connectionState).toBe('ready');
+    expect(failures).toEqual([]);
+  });
+
+  it.each([undefined, 'tr'] as const)('rejects selected-target readiness echo %s', async (echoedLanguage) => {
+    const socket = new FakeSocket();
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      [],
+      failures,
+      {},
+      {
+        serverVadMode: 'disabled',
+        languageMode: 'selected-target',
+        languageHint: 'es',
+        manualCommitCadenceMs: 600
+      }
+    );
+    session.start({ utteranceId: UTTERANCE_ID });
+    await Promise.resolve();
+    socket.open();
+    socket.message(sessionCreated());
+    socket.message(sessionUpdated('azure-session-1', echoedLanguage));
+    expect(session.state.connectionState).toBe('failed');
+    expect(failures).toMatchObject([{ reason: 'configuration' }]);
+  });
+
+  it('rejects hostile session configuration objects before socket work', () => {
+    const socketFactory = vi.fn(() => new FakeSocket());
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'test-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory
+    });
+    let getterReads = 0;
+    const getterConfiguration = { languageMode: 'selected-target' } as Record<string, unknown>;
+    Object.defineProperty(getterConfiguration, 'languageHint', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return 'es';
+      }
+    });
+    const create = (configuration: unknown): void => {
+      adapter.createSession({
+        sessionId: SESSION_ID,
+        sessionEpoch: 1,
+        configuration: configuration as never,
+        onEvent: () => undefined,
+        onFailure: () => undefined
+      });
+    };
+    expect(() => create(getterConfiguration)).toThrow(/configuration/i);
+    expect(getterReads).toBe(0);
+    expect(() => create(new Proxy({
+      serverVadMode: 'disabled',
+      languageMode: 'selected-target',
+      languageHint: 'es',
+      manualCommitCadenceMs: 600
+    }, { get: () => { throw new Error('proxy getter must not run'); } }))).toThrow(/configuration/i);
+    expect(() => create({
+      serverVadMode: 'disabled',
+      languageMode: 'selected-target',
+      languageHint: 'zz',
+      manualCommitCadenceMs: 600
+    })).toThrow(/hint/i);
+    expect(socketFactory).not.toHaveBeenCalled();
   });
 
   it('prepends configuration ahead of audio queued before socket readiness', async () => {
@@ -1402,6 +1519,11 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     await Promise.resolve();
     socket.open();
     expect(messageTypes(socket)).toEqual(['session.update']);
+    expect(JSON.parse(socket.sent[0] ?? '{}').session.audio.input.transcription).toEqual({
+      model: 'transcribe-prod'
+    });
+    expect(JSON.parse(socket.sent[0] ?? '{}').session.audio.input.transcription)
+      .not.toHaveProperty('language');
     await Promise.resolve();
     expect(settled).not.toHaveBeenCalled();
     socket.message(sessionCreated());

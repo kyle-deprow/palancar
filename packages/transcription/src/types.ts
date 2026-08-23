@@ -1,10 +1,105 @@
+import { types as utilTypes } from 'node:util';
+
 import type {
   TranscriptFinal,
   TranscriptPartial
 } from '@palancar/contracts';
 import type { LanguageEvidenceSource } from '@palancar/language-registry';
 
-export type TranscriptionLanguageMode = 'automatic';
+// Kept private so callers cannot mutate the admission set. The exported
+// predicate is the only language-code boundary shared by all adapters.
+const ISO_639_1_LANGUAGE_CODES: ReadonlySet<string> = new Set([
+  'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
+  'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs',
+  'ca', 'ce', 'ch', 'co', 'cr', 'cs', 'cu', 'cv', 'cy',
+  'da', 'de', 'dv', 'dz',
+  'ee', 'el', 'en', 'eo', 'es', 'et', 'eu',
+  'fa', 'ff', 'fi', 'fj', 'fo', 'fr', 'fy',
+  'ga', 'gd', 'gl', 'gn', 'gu', 'gv',
+  'ha', 'he', 'hi', 'ho', 'hr', 'ht', 'hu', 'hy', 'hz',
+  'ia', 'id', 'ie', 'ig', 'ii', 'ik', 'io', 'is', 'it', 'iu',
+  'ja', 'jv',
+  'ka', 'kg', 'ki', 'kj', 'kk', 'kl', 'km', 'kn', 'ko', 'kr', 'ks', 'ku',
+  'kv', 'kw', 'ky',
+  'la', 'lb', 'lg', 'li', 'ln', 'lo', 'lt', 'lu', 'lv',
+  'mg', 'mh', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my',
+  'na', 'nb', 'nd', 'ne', 'ng', 'nl', 'nn', 'no', 'nr', 'nv', 'ny',
+  'oc', 'oj', 'om', 'or', 'os',
+  'pa', 'pi', 'pl', 'ps', 'pt',
+  'qu',
+  'rm', 'rn', 'ro', 'ru', 'rw',
+  'sa', 'sc', 'sd', 'se', 'sg', 'si', 'sk', 'sl', 'sm', 'sn', 'so', 'sq',
+  'sr', 'ss', 'st', 'su', 'sv', 'sw',
+  'ta', 'te', 'tg', 'th', 'ti', 'tk', 'tl', 'tn', 'to', 'tr', 'ts', 'tt',
+  'tw', 'ty',
+  'ug', 'uk', 'ur', 'uz',
+  've', 'vi', 'vo',
+  'wa', 'wo',
+  'xh',
+  'yi', 'yo',
+  'za', 'zh', 'zu'
+]);
+
+export function isIso6391LanguageCode(value: unknown): value is string {
+  return typeof value === 'string' && ISO_639_1_LANGUAGE_CODES.has(value);
+}
+
+/** Snapshot a non-proxy, own-data-only record without invoking caller code. */
+export function snapshotOwnDataProperties(
+  value: unknown
+): Readonly<Record<string, unknown>> | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value)
+    ) {
+      return undefined;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return undefined;
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.some((key) => typeof key !== 'string')) {
+      return undefined;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of ownKeys) {
+      const descriptor = descriptors[key as string];
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value')
+      ) {
+        return undefined;
+      }
+      Object.defineProperty(snapshot, key, {
+        configurable: false,
+        enumerable: true,
+        value: descriptor.value,
+        writable: false
+      });
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    return undefined;
+  }
+}
+
+export type TranscriptionLanguageConfiguration =
+  | {
+      readonly languageMode: 'automatic';
+    }
+  | {
+      readonly languageMode: 'selected-target';
+      readonly languageHint: string;
+    };
+
+export type TranscriptionLanguageMode =
+  TranscriptionLanguageConfiguration['languageMode'];
 
 export type ServerVadMode = 'enabled' | 'disabled';
 
@@ -50,11 +145,10 @@ export interface TranscriptionCapabilities {
   }>;
 }
 
-export interface TranscriptionSessionConfiguration {
+export type TranscriptionSessionConfiguration = {
   readonly serverVadMode: ServerVadMode;
-  readonly languageMode: TranscriptionLanguageMode;
   readonly manualCommitCadenceMs: number;
-}
+} & TranscriptionLanguageConfiguration;
 
 export interface NormalizedLanguageEvidence {
   readonly detectedLanguage?: string;

@@ -57,7 +57,7 @@ export const DETERMINISTIC_MOCK_CAPABILITIES: Readonly<TranscriptionCapabilities
       supported: true,
       cadencesMs: Object.freeze([600, 800, 1_000, 3_000])
     }),
-    languageModes: Object.freeze(['automatic'] as const),
+    languageModes: Object.freeze(['automatic', 'selected-target'] as const),
     partialResults: Object.freeze({ supported: true }),
     providerRetention: Object.freeze({
       status: 'not-applicable-synthetic',

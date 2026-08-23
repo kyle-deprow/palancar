@@ -54,6 +54,107 @@ describe('Azure Realtime client message builders', () => {
     expect(Object.isFrozen(message.session.audio.input.transcription)).toBe(true);
   });
 
+  it.each(['es', 'tr'] as const)('builds a selected-target transcription update for %s', (language) => {
+    const message = buildAzureRealtimeSessionUpdateMessage('transcribe-prod', {
+      languageMode: 'selected-target',
+      languageHint: language
+    });
+    expect(message.session.audio.input.transcription).toEqual({
+      model: 'transcribe-prod',
+      language
+    });
+    expect(message).not.toHaveProperty('selectedTargetLanguage');
+    expect(JSON.stringify(message)).not.toContain('selectedTargetLanguage');
+    expect(Object.isFrozen(message.session.audio.input.transcription)).toBe(true);
+  });
+
+  it('rejects malformed or non-exact language options', () => {
+    for (const options of [
+      { languageMode: 'automatic', languageHint: 'es' },
+      { languageMode: 'selected-target' },
+      { languageMode: 'selected-target', languageHint: 'ES' },
+      { languageMode: 'selected-target', languageHint: 'spa' },
+      { languageMode: 'selected-target', languageHint: ' es' },
+      { languageMode: 'selected-target', languageHint: 'es', extra: true },
+      { languageMode: 'unknown' },
+      null,
+      'automatic'
+    ]) {
+      expectReason(
+        () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', options as never),
+        'invalid-options'
+      );
+    }
+  });
+
+  it('rejects hostile option objects without invoking or mutating caller state', () => {
+    let getterReads = 0;
+    const changingGetter = { languageMode: 'selected-target' } as Record<string, unknown>;
+    Object.defineProperty(changingGetter, 'languageHint', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return getterReads === 1 ? 'es' : 'tr';
+      }
+    });
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', changingGetter as never),
+      'invalid-options'
+    );
+    expect(getterReads).toBe(0);
+
+    const throwingGetter = { languageMode: 'selected-target' } as Record<string, unknown>;
+    Object.defineProperty(throwingGetter, 'languageHint', {
+      enumerable: true,
+      get: () => { throw new Error('getter must not run'); }
+    });
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', throwingGetter as never),
+      'invalid-options'
+    );
+
+    const proxy = new Proxy({ languageMode: 'selected-target', languageHint: 'es' }, {
+      get: () => { throw new Error('proxy getter must not run'); }
+    });
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', proxy as never),
+      'invalid-options'
+    );
+
+    const symbolKey = {
+      languageMode: 'selected-target',
+      languageHint: 'es',
+      [Symbol('unexpected')]: true
+    } as never;
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', symbolKey),
+      'invalid-options'
+    );
+
+    const hiddenKey = { languageMode: 'selected-target', languageHint: 'es' } as Record<string, unknown>;
+    Object.defineProperty(hiddenKey, 'unexpected', { value: true, enumerable: false });
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', hiddenKey as never),
+      'invalid-options'
+    );
+
+    const invalidLanguage = { languageMode: 'selected-target', languageHint: 'zz' };
+    const before = { ...invalidLanguage };
+    expectReason(
+      () => buildAzureRealtimeSessionUpdateMessage('transcribe-prod', invalidLanguage as never),
+      'invalid-options'
+    );
+    expect(invalidLanguage).toEqual(before);
+
+    const validLanguage = { languageMode: 'selected-target', languageHint: 'es' };
+    const message = buildAzureRealtimeSessionUpdateMessage('transcribe-prod', validLanguage as never);
+    validLanguage.languageHint = 'tr';
+    expect(message.session.audio.input.transcription).toEqual({
+      model: 'transcribe-prod',
+      language: 'es'
+    });
+  });
+
   it('builds base64 append messages and synchronously owns the source bytes', () => {
     const pcm = Uint8Array.from([0, 1, 2, 253, 254, 255]);
     const message = buildAzureRealtimeInputAudioAppendMessage(pcm, { maxBytes: 6 });

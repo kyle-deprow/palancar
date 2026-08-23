@@ -660,16 +660,67 @@ describe('Azure Realtime GA server event parser', () => {
       },
       include: null
     };
-    expect(parseServerEvent(providerEvent({
+    const nullLanguageResult = parseServerEvent(providerEvent({
       type: 'session.updated',
       event_id: 'event_live_nullable_transcription',
       session: liveSession
-    }))).toMatchObject({
+    }));
+    expect(nullLanguageResult).toMatchObject({
       session: { phase: 'configured', configured: true }
     });
+    if (nullLanguageResult.type === 'session.updated') {
+      expect(nullLanguageResult.session).not.toHaveProperty('language');
+    }
+
+    const absentLanguage = {
+      ...liveSession,
+      audio: {
+        input: {
+          ...liveSession.audio.input,
+          transcription: { model: EXPECTED_DEPLOYMENT, prompt: null }
+        }
+      }
+    };
+    const absentResult = parseServerEvent(providerEvent({
+      type: 'session.updated',
+      event_id: 'event_live_absent_language',
+      session: absentLanguage
+    }));
+    expect(absentResult).toMatchObject({
+      session: { phase: 'configured', configured: true }
+    });
+    if (absentResult.type === 'session.updated') {
+      expect(absentResult.session).not.toHaveProperty('language');
+    }
+
+    const selectedLanguage = {
+      ...liveSession,
+      audio: {
+        input: {
+          ...liveSession.audio.input,
+          transcription: {
+            model: EXPECTED_DEPLOYMENT,
+            language: 'es',
+            prompt: null
+          }
+        }
+      }
+    };
+    const selectedResult = parseServerEvent(providerEvent({
+      type: 'session.updated',
+      event_id: 'event_live_selected_language',
+      session: selectedLanguage
+    }));
+    expect(selectedResult).toMatchObject({
+      session: { phase: 'configured', configured: true, language: 'es' }
+    });
+    if (selectedResult.type === 'session.updated') {
+      expect(Object.isFrozen(selectedResult.session)).toBe(true);
+    }
 
     for (const [field, value] of [
       ['language', 'mixed'],
+      ['language', 'zz'],
       ['language', 42],
       ['prompt', 42],
       ['prompt', { invalid: true }]

@@ -14,6 +14,13 @@ import {
   type DeterministicMockScript,
   type DeterministicMockTranscriptionAdapterConfiguration
 } from './mock.js';
+import {
+  validateTranscriptionSessionConfiguration
+} from './configuration.js';
+export {
+  validateTranscriptionSessionConfiguration
+} from './configuration.js';
+export { isIso6391LanguageCode } from './types.js';
 import type {
   CancelResult,
   CloseResult,
@@ -102,31 +109,20 @@ function hasExactKeys(value: Record<string, unknown>, allowed: ReadonlySet<strin
   return keys.length === allowed.size && keys.every((key) => allowed.has(key));
 }
 
-function validateConfiguration(
-  input: TranscriptionSessionConfiguration
-): Readonly<TranscriptionSessionConfiguration> {
-  if (!isPlainObject(input) || !hasExactKeys(input, new Set([
-    'serverVadMode',
-    'languageMode',
-    'manualCommitCadenceMs'
-  ]))) {
-    throw new TypeError('Invalid transcription session configuration');
+function validateDeterministicMockSessionConfiguration(
+  configuration: Readonly<TranscriptionSessionConfiguration>
+): void {
+  if (!DETERMINISTIC_MOCK_CAPABILITIES.serverVad.modes.includes(configuration.serverVadMode)) {
+    throw new RangeError('Unsupported deterministic mock server VAD mode');
   }
-  if (!DETERMINISTIC_MOCK_CAPABILITIES.serverVad.modes.includes(input.serverVadMode)) {
-    throw new RangeError('Unsupported server VAD mode');
+  if (!DETERMINISTIC_MOCK_CAPABILITIES.languageModes.includes(configuration.languageMode)) {
+    throw new RangeError('Unsupported deterministic mock language mode');
   }
-  if (!DETERMINISTIC_MOCK_CAPABILITIES.languageModes.includes(input.languageMode)) {
-    throw new RangeError('Unsupported transcription language mode');
+  if (!DETERMINISTIC_MOCK_CAPABILITIES.manualCommit.cadencesMs.includes(
+    configuration.manualCommitCadenceMs
+  )) {
+    throw new RangeError('Unsupported deterministic mock commit cadence');
   }
-  if (
-    !Number.isInteger(input.manualCommitCadenceMs) ||
-    !DETERMINISTIC_MOCK_CAPABILITIES.manualCommit.cadencesMs.includes(
-      input.manualCommitCadenceMs
-    )
-  ) {
-    throw new RangeError('Unsupported manual commit cadence');
-  }
-  return Object.freeze({ ...input });
 }
 
 function copyLanguageEvidence(input: unknown): Readonly<NormalizedLanguageEvidence> {
@@ -346,7 +342,9 @@ export class DeterministicMockTranscriptionSession implements TranscriptionSessi
     this.#sessionId = input.sessionId;
     this.#sessionEpoch = input.sessionEpoch;
     this.#mockConfiguration = validatedMockConfiguration;
-    this.configuration = validateConfiguration(input.configuration);
+    const configuration = validateTranscriptionSessionConfiguration(input.configuration);
+    validateDeterministicMockSessionConfiguration(configuration);
+    this.configuration = configuration;
     this.#onEvent = input.onEvent;
     this.#onDeliveryFailure = input.onDeliveryFailure;
     this.#resampler = new IdentityAudioResampler(16_000);

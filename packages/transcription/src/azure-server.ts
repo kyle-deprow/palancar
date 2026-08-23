@@ -1,4 +1,8 @@
 import { MAX_CONTROL_MESSAGE_BYTES } from '@palancar/contracts';
+import {
+  isIso6391LanguageCode,
+  snapshotOwnDataProperties
+} from './types.js';
 
 export const MAX_AZURE_REALTIME_SERVER_EVENT_JSON_BYTES = MAX_CONTROL_MESSAGE_BYTES;
 export const DEFAULT_AZURE_REALTIME_SERVER_EVENT_MAX_BYTES =
@@ -58,38 +62,6 @@ const AUDIO_FORMAT_TYPES = new Set([
 const INCLUDE_VALUES = new Set([
   'item.input_audio_transcription.logprobs'
 ] as const);
-const LANGUAGE_CODE = /^[a-z]{2}$/;
-const ISO_639_1_LANGUAGE_CODES = new Set<string>([
-  'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
-  'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs',
-  'ca', 'ce', 'ch', 'co', 'cr', 'cs', 'cu', 'cv', 'cy',
-  'da', 'de', 'dv', 'dz',
-  'ee', 'el', 'en', 'eo', 'es', 'et', 'eu',
-  'fa', 'ff', 'fi', 'fj', 'fo', 'fr', 'fy',
-  'ga', 'gd', 'gl', 'gn', 'gu', 'gv',
-  'ha', 'he', 'hi', 'ho', 'hr', 'ht', 'hu', 'hy', 'hz',
-  'ia', 'id', 'ie', 'ig', 'ii', 'ik', 'io', 'is', 'it', 'iu',
-  'ja', 'jv',
-  'ka', 'kg', 'ki', 'kj', 'kk', 'kl', 'km', 'kn', 'ko', 'kr', 'ks', 'ku',
-  'kv', 'kw', 'ky',
-  'la', 'lb', 'lg', 'li', 'ln', 'lo', 'lt', 'lu', 'lv',
-  'mg', 'mh', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my',
-  'na', 'nb', 'nd', 'ne', 'ng', 'nl', 'nn', 'no', 'nr', 'nv', 'ny',
-  'oc', 'oj', 'om', 'or', 'os',
-  'pa', 'pi', 'pl', 'ps', 'pt',
-  'qu',
-  'rm', 'rn', 'ro', 'ru', 'rw',
-  'sa', 'sc', 'sd', 'se', 'sg', 'si', 'sk', 'sl', 'sm', 'sn', 'so', 'sq',
-  'sr', 'ss', 'st', 'su', 'sv', 'sw',
-  'ta', 'te', 'tg', 'th', 'ti', 'tk', 'tl', 'tn', 'to', 'tr', 'ts', 'tt',
-  'tw', 'ty',
-  'ug', 'uk', 'ur', 'uz',
-  've', 'vi', 'vo',
-  'wa', 'wo',
-  'xh',
-  'yi', 'yo',
-  'za', 'zh', 'zu'
-]);
 const TRANSCRIPTION_DELAYS = new Set([
   'minimal',
   'low',
@@ -136,6 +108,7 @@ export interface AzureRealtimeSessionSummary {
   readonly id: string;
   readonly phase: 'basic' | 'configured';
   readonly configured: boolean;
+  readonly language?: string;
 }
 
 export interface AzureRealtimeSessionEvent {
@@ -630,7 +603,7 @@ function isLanguageCode(value: unknown): value is string {
   return isBoundedString(
     value,
     MAX_AZURE_REALTIME_SERVER_LANGUAGE_CODE_BYTES
-  ) && LANGUAGE_CODE.test(value) && ISO_639_1_LANGUAGE_CODES.has(value);
+  ) && isIso6391LanguageCode(value);
 }
 
 function validateSessionLanguageCodes(value: unknown): void {
@@ -681,23 +654,30 @@ function validateSessionKeywords(value: unknown): void {
   }
 }
 
+interface SessionTranscriptionValidation {
+  readonly modelMatches: boolean;
+  readonly language?: string;
+}
+
 function validateSessionTranscription(
   value: unknown,
   expectedDeployment: string
-): boolean {
-  if (!isPlainObject(value) || !hasExactKeys(
-    value,
-    [],
-    ['model', 'language', 'languages', 'keywords', 'prompt', 'delay']
-  )) {
+): SessionTranscriptionValidation {
+  const snapshot = snapshotOwnDataProperties(value);
+  if (snapshot === undefined) {
     fail('invalid-field');
   }
-  const model = valueOf(value, 'model');
-  const language = valueOf(value, 'language');
-  const languages = valueOf(value, 'languages');
-  const keywords = valueOf(value, 'keywords');
-  const prompt = valueOf(value, 'prompt');
-  const delay = valueOf(value, 'delay');
+  const allowedKeys = ['model', 'language', 'languages', 'keywords', 'prompt', 'delay'];
+  const keys = Object.keys(snapshot);
+  if (keys.some((key) => !allowedKeys.includes(key))) {
+    fail('invalid-field');
+  }
+  const model = snapshot.model;
+  const language = snapshot.language;
+  const languages = snapshot.languages;
+  const keywords = snapshot.keywords;
+  const prompt = snapshot.prompt;
+  const delay = snapshot.delay;
   if (model !== undefined && !isBoundedString(
     model,
     MAX_AZURE_REALTIME_SERVER_PROVIDER_STRING_BYTES
@@ -725,7 +705,11 @@ function validateSessionTranscription(
   )) {
     fail('invalid-field');
   }
-  return model === expectedDeployment;
+  const normalizedLanguage = isLanguageCode(language) ? language : undefined;
+  return Object.freeze({
+    modelMatches: model === expectedDeployment,
+    ...(normalizedLanguage === undefined ? {} : { language: normalizedLanguage })
+  });
 }
 
 function validateSessionNoiseReduction(value: unknown): void {
@@ -831,12 +815,20 @@ function isBoundedSegmentSecond(value: unknown): value is number {
   );
 }
 
-function validateSessionAudio(value: unknown, expectedDeployment: string): boolean {
+interface SessionAudioValidation {
+  readonly configured: boolean;
+  readonly language?: string;
+}
+
+function validateSessionAudio(
+  value: unknown,
+  expectedDeployment: string
+): SessionAudioValidation {
   if (!isPlainObject(value) || !hasExactKeys(value, [], ['input'])) {
     fail('invalid-field');
   }
   if (!Object.hasOwn(value, 'input')) {
-    return false;
+    return { configured: false };
   }
 
   const input = valueOf(value, 'input');
@@ -853,16 +845,19 @@ function validateSessionAudio(value: unknown, expectedDeployment: string): boole
   const hasTurnDetection = Object.hasOwn(input, 'turn_detection');
   let expectedFormat = false;
   let expectedModel = false;
+  let language: string | undefined;
   if (hasFormat) {
     expectedFormat = validateSessionFormat(valueOf(input, 'format'));
   }
   if (hasTranscription) {
     const transcription = valueOf(input, 'transcription');
     if (transcription !== null) {
-      expectedModel = validateSessionTranscription(
+      const transcriptionValidation = validateSessionTranscription(
         transcription,
         expectedDeployment
       );
+      expectedModel = transcriptionValidation.modelMatches;
+      language = transcriptionValidation.language;
     }
   }
 
@@ -878,14 +873,17 @@ function validateSessionAudio(value: unknown, expectedDeployment: string): boole
       validateSessionTurnDetection(turnDetection);
     }
   }
-  return (
-    hasFormat &&
-    hasTranscription &&
-    hasTurnDetection &&
-    expectedFormat &&
-    expectedModel &&
-    valueOf(input, 'turn_detection') === null
-  );
+  return Object.freeze({
+    configured: (
+      hasFormat &&
+      hasTranscription &&
+      hasTurnDetection &&
+      expectedFormat &&
+      expectedModel &&
+      valueOf(input, 'turn_detection') === null
+    ),
+    ...(language === undefined ? {} : { language })
+  });
 }
 
 function validateSessionInclude(value: unknown): void {
@@ -949,11 +947,14 @@ function parseSession(
   }
   const hasAudio = Object.hasOwn(value, 'audio');
   let hasConfiguredAudio = false;
+  let sessionLanguage: string | undefined;
   if (hasAudio) {
-    hasConfiguredAudio = validateSessionAudio(
+    const audioValidation = validateSessionAudio(
       valueOf(value, 'audio'),
       expectedDeployment
     );
+    hasConfiguredAudio = audioValidation.configured;
+    sessionLanguage = audioValidation.language;
   }
   if (Object.hasOwn(value, 'include')) {
     validateSessionInclude(valueOf(value, 'include'));
@@ -963,7 +964,8 @@ function parseSession(
     type: 'transcription',
     id,
     phase: configured ? 'configured' : 'basic',
-    configured
+    configured,
+    ...(sessionLanguage === undefined ? {} : { language: sessionLanguage })
   });
 }
 

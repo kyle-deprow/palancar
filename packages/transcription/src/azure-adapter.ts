@@ -13,6 +13,7 @@ import {
   buildAzureRealtimeSessionUpdateMessage,
   type AzureRealtimeClientMessage
 } from './azure-client.js';
+import { validateTranscriptionSessionConfiguration } from './configuration.js';
 import {
   AzureRealtimeServerEventError,
   parseAzureRealtimeServerEvent,
@@ -135,7 +136,7 @@ const AZURE_CAPABILITIES: Readonly<TranscriptionCapabilities> = Object.freeze({
     supported: true,
     cadencesMs: Object.freeze([AZURE_REALTIME_TRANSCRIPTION_COMMIT_CADENCE_MS])
   }),
-  languageModes: Object.freeze(['automatic'] as const),
+  languageModes: Object.freeze(['automatic', 'selected-target'] as const),
   partialResults: Object.freeze({ supported: true }),
   providerRetention: Object.freeze({ status: 'unverified', evidenceVersion: 'pending-adr-0002' })
 });
@@ -698,16 +699,34 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     if (typeof input.onFailure !== 'function') {
       throw new TypeError('Transcription failure callback must be a function');
     }
-    if (input.configuration.languageMode !== 'automatic' ||
-        input.configuration.serverVadMode !== 'disabled' ||
-        input.configuration.manualCommitCadenceMs !== AZURE_REALTIME_TRANSCRIPTION_COMMIT_CADENCE_MS) {
-      throw new RangeError('Azure Realtime requires automatic language and 600 ms manual commits');
+    const inputConfiguration = input.configuration;
+    const configuration = validateTranscriptionSessionConfiguration(inputConfiguration);
+    if (
+      configuration.serverVadMode !== 'disabled' ||
+      !AZURE_CAPABILITIES.languageModes.includes(configuration.languageMode) ||
+      !AZURE_CAPABILITIES.manualCommit.cadencesMs.includes(
+        configuration.manualCommitCadenceMs
+      )
+    ) {
+      throw new RangeError('Azure Realtime requires disabled server VAD and 600 ms manual commits');
     }
-    this.#input = Object.freeze({ ...input });
+    this.#input = Object.freeze({
+      sessionId: input.sessionId,
+      sessionEpoch: input.sessionEpoch,
+      configuration,
+      onEvent: input.onEvent,
+      onFailure: input.onFailure,
+      ...(input.onDeliveryFailure === undefined
+        ? {}
+        : { onDeliveryFailure: input.onDeliveryFailure }),
+      ...(input.maxUtteranceSamples === undefined
+        ? {}
+        : { maxUtteranceSamples: input.maxUtteranceSamples })
+    });
     this.#adapter = adapter;
     this.#sessionId = input.sessionId;
     this.#sessionEpoch = input.sessionEpoch;
-    this.configuration = Object.freeze({ ...input.configuration });
+    this.configuration = configuration;
   }
 
   get state(): Readonly<TranscriptionSessionState> {
@@ -983,8 +1002,16 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       if (this.#sessionUpdateSent) return;
       this.#socketOpen = true;
       this.#connectionState = 'configuring';
-      const update = buildAzureRealtimeSessionUpdateMessage(this.#adapter.deployment);
       try {
+        const update = buildAzureRealtimeSessionUpdateMessage(
+          this.#adapter.deployment,
+          this.configuration.languageMode === 'automatic'
+            ? { languageMode: 'automatic' }
+            : {
+                languageMode: 'selected-target',
+                languageHint: this.configuration.languageHint
+              }
+        );
         this.#enqueueMessage(update, 'session.update', true);
         this.#pump();
       } catch {
@@ -1206,6 +1233,13 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         if (!event.session.configured || this.#configured || !this.#socketOpen ||
             !this.#sessionUpdateSent || !this.#sessionCreatedReceived ||
             event.session.phase !== 'configured' || event.session.id !== this.#providerSessionId) {
+          this.#fail('configuration');
+          return;
+        }
+        if (
+          this.configuration.languageMode === 'selected-target' &&
+          event.session.language !== this.configuration.languageHint
+        ) {
           this.#fail('configuration');
           return;
         }

@@ -20,6 +20,7 @@ import {
   createMetadataEvidenceRecord,
   isMetadataEvidenceRecord,
   parseMetadataEvidenceJsonLines,
+  validateTranscriptionSessionConfiguration,
   type MockLanguageEvidenceCategory,
   type NormalizedTranscriptionEvent,
   type NormalizedTranscriptionPartial,
@@ -134,7 +135,7 @@ describe('provider-neutral capabilities', () => {
       resampling: { mode: 'native', stateful: false },
       serverVad: { supported: true, modes: ['enabled', 'disabled'] },
       manualCommit: { supported: true, cadencesMs: [600, 800, 1_000, 3_000] },
-      languageModes: ['automatic'],
+      languageModes: ['automatic', 'selected-target'],
       partialResults: { supported: true },
       providerRetention: {
         status: 'not-applicable-synthetic',
@@ -161,6 +162,110 @@ describe('provider-neutral capabilities', () => {
         );
       }
     }
+  });
+
+  it('admits provider-neutral safe cadences while the deterministic mock enforces its capabilities', () => {
+    const configuration = {
+      serverVadMode: 'enabled' as const,
+      languageMode: 'automatic' as const,
+      manualCommitCadenceMs: 5_000
+    };
+    expect(validateTranscriptionSessionConfiguration(configuration)).toEqual(configuration);
+    expect(() => createSession({ configuration })).toThrow(/cadence/i);
+  });
+
+  it.each(['es', 'tr'] as const)('accepts and freezes selected-target hint %s', (languageHint) => {
+    const configuration = {
+      serverVadMode: 'enabled' as const,
+      languageMode: 'selected-target' as const,
+      languageHint: languageHint as string,
+      manualCommitCadenceMs: 600
+    };
+    const session = createSession({ configuration });
+    expect(session.configuration).toEqual(configuration);
+    expect(Object.isFrozen(session.configuration)).toBe(true);
+    configuration.languageHint = 'en';
+    if (session.configuration.languageMode !== 'selected-target') {
+      throw new Error('Expected selected-target configuration');
+    }
+    expect(session.configuration.languageHint).toBe(languageHint);
+  });
+
+  it.each(['es', 'tr'] as const)('completes a selected-target mock utterance for %s', (languageHint) => {
+    const events: NormalizedTranscriptionEvent[] = [];
+    const session = createSession({
+      events,
+      fixtureTargetLanguage: languageHint,
+      configuration: {
+        serverVadMode: 'enabled',
+        languageMode: 'selected-target',
+        languageHint,
+        manualCommitCadenceMs: 600
+      }
+    });
+    start(session);
+    pushSamples(session, 0, 28_800);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: `${languageHint}-selected-target-final`,
+      languageEvidence: { detectedLanguage: languageHint }
+    });
+  });
+
+  it('rejects proxies, accessors, hidden keys, symbols, and unknown ISO codes before snapshotting', () => {
+    let getterReads = 0;
+    const changingGetter = { languageMode: 'selected-target' } as Record<string, unknown>;
+    Object.defineProperty(changingGetter, 'languageHint', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return getterReads === 1 ? 'es' : 'tr';
+      }
+    });
+    expect(() => createSession({
+      configuration: changingGetter as never
+    })).toThrow(/configuration/i);
+    expect(getterReads).toBe(0);
+
+    const throwingGetter = { languageMode: 'selected-target' } as Record<string, unknown>;
+    Object.defineProperty(throwingGetter, 'languageHint', {
+      enumerable: true,
+      get: () => { throw new Error('getter must not run'); }
+    });
+    expect(() => createSession({
+      configuration: throwingGetter as never
+    })).toThrow(/configuration/i);
+
+    const proxy = new Proxy({ languageMode: 'selected-target', languageHint: 'es' }, {
+      get: () => { throw new Error('proxy getter must not run'); }
+    });
+    expect(() => createSession({ configuration: proxy as never })).toThrow(/configuration/i);
+
+    const symbolKey = {
+      serverVadMode: 'enabled',
+      languageMode: 'selected-target',
+      languageHint: 'es',
+      manualCommitCadenceMs: 600,
+      [Symbol('unexpected')]: true
+    } as never;
+    expect(() => createSession({ configuration: symbolKey })).toThrow(/configuration/i);
+
+    const hiddenKey = {
+      serverVadMode: 'enabled',
+      languageMode: 'selected-target',
+      languageHint: 'es',
+      manualCommitCadenceMs: 600
+    } as Record<string, unknown>;
+    Object.defineProperty(hiddenKey, 'unexpected', { value: true, enumerable: false });
+    expect(() => createSession({ configuration: hiddenKey as never })).toThrow(/configuration/i);
+
+    const unknownLanguage = {
+      serverVadMode: 'enabled',
+      languageMode: 'selected-target',
+      languageHint: 'zz',
+      manualCommitCadenceMs: 600
+    };
+    expect(() => createSession({ configuration: unknownLanguage as never })).toThrow(/hint/i);
   });
 
   it('executes every cadence in automatic language mode', () => {
@@ -203,7 +308,25 @@ describe('provider-neutral capabilities', () => {
   it.each([
     [{ ...DEFAULT_CONFIGURATION, serverVadMode: 'other' }, 'VAD'],
     [{ ...DEFAULT_CONFIGURATION, languageMode: 'other' }, 'language'],
-    [{ ...DEFAULT_CONFIGURATION, manualCommitCadenceMs: 999 }, 'cadence']
+    [{ ...DEFAULT_CONFIGURATION, manualCommitCadenceMs: 999 }, 'cadence'],
+    [{ ...DEFAULT_CONFIGURATION, languageHint: 'es' }, 'configuration'],
+    [{ ...DEFAULT_CONFIGURATION, languageMode: 'selected-target' }, 'configuration'],
+    [{
+      ...DEFAULT_CONFIGURATION,
+      languageMode: 'selected-target',
+      languageHint: 'ES'
+    }, 'hint'],
+    [{
+      ...DEFAULT_CONFIGURATION,
+      languageMode: 'selected-target',
+      languageHint: 'spa'
+    }, 'hint'],
+    [{
+      ...DEFAULT_CONFIGURATION,
+      languageMode: 'selected-target',
+      languageHint: 'es',
+      selectedTargetLanguage: 'es'
+    }, 'configuration']
   ])('rejects unsupported configuration %# without mutation', (configuration, label) => {
     const snapshot = { ...configuration };
     expect(() => createSession({
@@ -619,6 +742,29 @@ describe('normalized deterministic events', () => {
     expectErrorReason(() =>
       sequence.accept({ ...base, revision: 2, segmentId: 'segment-2' })
     , 'stale-revision');
+  });
+
+  it.each(['eng', 'es-MX'] as const)('retains previously valid evidence language code %s', (detectedLanguage) => {
+    const sequence = new NormalizedEventSequence(SESSION_ID, 1, UTTERANCE_ID);
+    sequence.advanceAcceptedHighWaterMark(2);
+    const event: NormalizedTranscriptionPartial = {
+      type: 'transcript.partial',
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      utteranceId: UTTERANCE_ID,
+      segmentId: 'segment-1',
+      revision: 1,
+      text: 'synthetic-partial',
+      providerEventTime: TIMESTAMP,
+      languageEvidence: {
+        detectedLanguage,
+        confidence: 0.9,
+        detectorVersion: 'mock-1',
+        source: 'controlled-fixture'
+      },
+      acceptedThroughOriginalSampleOffset: 2
+    };
+    expect(sequence.accept(event).languageEvidence.detectedLanguage).toBe(detectedLanguage);
   });
 
   it('rejects invalid extensions and offset regression without sequence mutation', () => {
