@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { LinearPcm16To24AudioResampler } from '@palancar/audio';
 import {
   AZURE_REALTIME_TRANSCRIPTION_APPEND_MAX_BYTES,
   AzureRealtimeTranscriptionAdapter,
@@ -144,7 +145,11 @@ function sessionCreated(): string {
   });
 }
 
-function sessionUpdated(sessionId = 'azure-session-1', language?: string): string {
+function sessionUpdated(
+  sessionId = 'azure-session-1',
+  language?: string,
+  serverVadMode: 'enabled' | 'disabled' = 'disabled'
+): string {
   return serverEvent('session.updated', {
     session: {
       type: 'transcription',
@@ -153,7 +158,14 @@ function sessionUpdated(sessionId = 'azure-session-1', language?: string): strin
       audio: {
         input: {
           format: { type: 'audio/pcm', rate: 24000 },
-          turn_detection: null,
+          turn_detection: serverVadMode === 'enabled'
+            ? {
+                type: 'server_vad',
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500
+              }
+            : null,
           transcription: {
             model: 'transcribe-prod',
             ...(language === undefined ? {} : { language })
@@ -216,16 +228,16 @@ function cleared(): string {
   return serverEvent('input_audio_buffer.cleared', {});
 }
 
-function speechStarted(): string {
+function speechStarted(itemId = 'speech-item'): string {
   return serverEvent('input_audio_buffer.speech_started', {
-    item_id: 'speech-item',
+    item_id: itemId,
     audio_start_ms: 0
   });
 }
 
-function speechStopped(): string {
+function speechStopped(itemId = 'speech-item'): string {
   return serverEvent('input_audio_buffer.speech_stopped', {
-    item_id: 'speech-item',
+    item_id: itemId,
     audio_end_ms: 1
   });
 }
@@ -292,6 +304,16 @@ function providerError(): string {
   });
 }
 
+function emptyCommitError(): string {
+  return serverEvent('error', {
+    error: {
+      type: 'invalid_request_error',
+      code: 'input_audio_buffer_commit_empty',
+      message: 'Error committing input audio buffer: buffer too small.'
+    }
+  });
+}
+
 function makeSession(
   socket: FakeSocket,
   events: NormalizedTranscriptionEvent[],
@@ -337,7 +359,11 @@ async function openSession(session: TranscriptionSession, socket: FakeSocket): P
   expect(JSON.parse(socket.sent[0] ?? '{}').session.audio.input.transcription)
     .not.toHaveProperty('language');
   socket.message(sessionCreated());
-  socket.message(sessionUpdated());
+  socket.message(sessionUpdated(
+    'azure-session-1',
+    undefined,
+    session.configuration.serverVadMode
+  ));
 }
 
 function appendMessages(socket: FakeSocket): readonly Record<string, unknown>[] {
@@ -516,6 +542,34 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     expect(failures).toMatchObject([{ reason: 'configuration' }]);
   });
 
+  it.each([
+    ['disabled', 'enabled'],
+    ['enabled', 'disabled']
+  ] as const)('fails closed when the echoed turn-detection mode changes from %s to %s',
+    async (requestedMode, echoedMode) => {
+      const socket = new FakeSocket();
+      const failures: unknown[] = [];
+      const session = makeSession(
+        socket,
+        [],
+        failures,
+        {},
+        {
+          serverVadMode: requestedMode,
+          languageMode: 'automatic',
+          manualCommitCadenceMs: 600
+        }
+      );
+      session.start({ utteranceId: UTTERANCE_ID });
+      await Promise.resolve();
+      socket.open();
+      socket.message(sessionCreated());
+      socket.message(sessionUpdated('azure-session-1', undefined, echoedMode));
+
+      expect(session.state.connectionState).toBe('failed');
+      expect(failures).toMatchObject([{ reason: 'configuration' }]);
+    });
+
   it('rejects hostile session configuration objects before socket work', () => {
     const socketFactory = vi.fn(() => new FakeSocket());
     const adapter = new AzureRealtimeTranscriptionAdapter({
@@ -647,6 +701,525 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
       acceptedThroughOriginalSampleOffset: 0
     });
     expect(session.state.activeUtteranceId).toBeUndefined();
+  });
+
+  it('uses provider VAD commits without cadence commits and preserves delta/completion revisions', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    expect(messageTypes(socket)).not.toContain('input_audio_buffer.commit');
+    socket.message(speechStarted());
+    socket.message(speechStopped());
+    socket.message(committed('item-vad-1', null));
+    socket.message(delta('item-vad-1', 'hola'));
+    socket.message(delta('item-vad-1', ' mundo'));
+    expect(events.filter((event) => event.type === 'transcript.partial').map((event) => event.text))
+      .toEqual(['hola', 'hola mundo']);
+    socket.message(completed('item-vad-1', '  authoritative transcript  '));
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      text: 'authoritative transcript'
+    });
+
+    session.finalize(UTTERANCE_ID);
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(1);
+    socket.message(committed('item-vad-tail-1', 'item-vad-1'));
+    socket.message(completed('item-vad-tail-1', 'authoritative transcript'));
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'authoritative transcript',
+      acceptedThroughOriginalSampleOffset: 9_600
+    });
+  });
+
+  it('fails closed when chained VAD commits exceed provider audio progress', async () => {
+    const socket = new FakeSocket();
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      [],
+      failures,
+      { maxUtteranceSamples: 9_600 },
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+
+    let previousItemId: string | null = null;
+    for (let index = 0; index < 7; index += 1) {
+      const itemId = `item-vad-bound-${index}`;
+      socket.message(committed(itemId, previousItemId));
+      previousItemId = itemId;
+    }
+
+    expect(failures).toMatchObject([{ reason: 'protocol' }]);
+    expect(session.state.connectionState).toBe('failed');
+  });
+
+  it('keeps a warm adapter from exhausting the startup queue on its next VAD session', async () => {
+    const sockets = [new FakeSocket(), new FakeSocket()] as const;
+    let socketIndex = 0;
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'test-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => {
+        const socket = sockets[socketIndex++];
+        if (socket === undefined) throw new Error('unexpected socket allocation');
+        return socket;
+      }
+    });
+
+    const runUtterance = async (
+      utteranceId: string,
+      itemId: string,
+      text: string,
+      streamBeforeReady: boolean
+    ): Promise<void> => {
+      const session = adapter.createSession({
+        sessionId: SESSION_ID,
+        sessionEpoch: 1,
+        configuration: {
+          serverVadMode: 'enabled',
+          languageMode: 'automatic',
+          manualCommitCadenceMs: 600
+        },
+        onEvent: (event) => events.push(event),
+        onFailure: (failure) => failures.push(failure)
+      });
+      session.start({ utteranceId });
+      await Promise.resolve();
+
+      const socket = sockets[socketIndex - 1];
+      if (socket === undefined) throw new Error('missing session socket');
+      const samples = streamBeforeReady ? 33_600 : 32_000;
+      if (!streamBeforeReady) {
+        socket.open();
+        socket.message(sessionCreated());
+        socket.message(sessionUpdated('azure-session-1', undefined, 'enabled'));
+      }
+      for (let offset = 0; offset < samples; offset += 1_600) {
+        session.pushAudio({
+          utteranceId,
+          originalSampleOffset: offset,
+          pcm: new Uint8Array(1_600 * 2)
+        });
+      }
+      expect(failures).toEqual([]);
+      if (streamBeforeReady) {
+        socket.open();
+        socket.message(sessionCreated());
+        socket.message(sessionUpdated('azure-session-1', undefined, 'enabled'));
+      }
+      socket.message(speechStarted());
+      socket.message(speechStopped());
+      session.finalize(utteranceId);
+      socket.message(committed(itemId, null));
+      socket.message(completed(itemId, text));
+      socket.message(committed(`${itemId}-tail`, itemId));
+      socket.message(completed(`${itemId}-tail`, text));
+
+      expect(session.state.connectionState).toBe('idle');
+      expect(session.state.acceptedThroughOriginalSampleOffset).toBe(0);
+      expect(failures).toEqual([]);
+      session.close();
+    };
+
+    await runUtterance(UTTERANCE_ID, 'item-warm-1', 'first utterance', false);
+    await runUtterance(NEXT_UTTERANCE_ID, 'item-warm-2', 'second utterance', true);
+
+    expect(socketIndex).toBe(2);
+    expect(sockets[0]).not.toBe(sockets[1]);
+    expect(events.filter((event) => event.type === 'transcript.final').map((event) => event.text))
+      .toEqual(['first utterance', 'second utterance']);
+    expect(failures).toEqual([]);
+  });
+
+  it('finalizes enabled VAD with one manual commit for residual audio', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_601 * 2)
+    });
+
+    session.finalize(UTTERANCE_ID);
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(1);
+    socket.message(committed('item-residual-1', null));
+    socket.message(delta('item-residual-1', 'residual'));
+    socket.message(completed('item-residual-1', 'residual final'));
+    socket.message(emptyCommitError());
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: 'transcript.final', text: 'residual final' });
+  });
+
+  it('settles the manual final commit for a VAD-opened item with no speech stop', async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      const events: NormalizedTranscriptionEvent[] = [];
+      const failures: unknown[] = [];
+      const session = makeSession(
+        socket,
+        events,
+        failures,
+        {},
+        { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+      );
+      await openSession(session, socket);
+
+      session.pushAudio({
+        utteranceId: UTTERANCE_ID,
+        originalSampleOffset: 0,
+        pcm: new Uint8Array(9_600 * 2)
+      });
+      socket.message(speechStarted('item_A'));
+
+      socket.autoCompleteSends = false;
+      session.finalize(UTTERANCE_ID);
+      while (messageTypes(socket).at(-1) !== 'input_audio_buffer.commit') {
+        socket.completeNextSend();
+      }
+      expect(socket.pendingSendCallbacks).toHaveLength(1);
+
+      socket.message(committed('item_A', null));
+      socket.message(itemAdded('item_A', null));
+      socket.message(itemDone('item_A', null));
+      for (let index = 0; index < 10; index += 1) {
+        socket.message(delta('item_A', index === 9 ? 'transcript' : 'perfect '));
+      }
+      socket.message(completed('item_A', 'perfect transcript'));
+
+      expect(failures).toEqual([]);
+      expect(events.at(-1)).toMatchObject({
+        type: 'transcript.final',
+        text: 'perfect transcript'
+      });
+      vi.advanceTimersByTime(10_000);
+      expect(failures).toEqual([]);
+      socket.completeNextSend();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits only the provider-observed VAD boundary across mid-stream appends', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    socket.message(speechStopped());
+    socket.message(committed('item-vad-midstream', null));
+    socket.message(completed('item-vad-midstream', 'prefix'));
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      acceptedThroughOriginalSampleOffset: 9_599
+    });
+
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 9_600,
+      pcm: new Uint8Array(2 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(1);
+
+    socket.message(committed('item-manual-tail', 'item-vad-midstream'));
+    socket.message(completed('item-manual-tail', 'tail'));
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'prefix tail',
+      acceptedThroughOriginalSampleOffset: 9_602
+    });
+  });
+
+  it.each([
+    ['VAD before the manual commit send callback', 'vad-before-send-callback'],
+    ['VAD after the manual commit send callback', 'vad-after-send-callback']
+  ] as const)('attributes the final manual commit explicitly when %s', async (_label, order) => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    socket.autoCompleteSends = false;
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    while (messageTypes(socket).at(-1) !== 'input_audio_buffer.append') {
+      socket.completeNextSend();
+    }
+    while (socket.pendingSendCallbacks.length > 0) socket.completeNextSend();
+    socket.message(speechStopped());
+
+    session.finalize(UTTERANCE_ID);
+    while (messageTypes(socket).at(-1) !== 'input_audio_buffer.commit') {
+      socket.completeNextSend();
+    }
+    expect(socket.pendingSendCallbacks).toHaveLength(1);
+
+    if (order === 'vad-before-send-callback') {
+      socket.message(committed('item-vad-race', null));
+      socket.completeNextSend();
+      socket.message(committed('item-manual-race', 'item-vad-race'));
+    } else {
+      socket.completeNextSend();
+      socket.message(committed('item-vad-race', null));
+      socket.message(committed('item-manual-race', 'item-vad-race'));
+    }
+    socket.message(completed('item-vad-race', 'prefix'));
+    socket.message(completed('item-manual-race', 'tail'));
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'prefix tail'
+    });
+  });
+
+  it('does not consume a VAD commit as the final manual acknowledgement before an empty error', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    socket.autoCompleteSends = false;
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    socket.message(speechStarted());
+    socket.message(speechStopped());
+    while (socket.pendingSendCallbacks.length > 0) socket.completeNextSend();
+    session.finalize(UTTERANCE_ID);
+    while (messageTypes(socket).at(-1) !== 'input_audio_buffer.commit') {
+      socket.completeNextSend();
+    }
+    socket.completeNextSend();
+    socket.message(committed('item-vad-before-empty-error', null));
+    socket.message(completed('item-vad-before-empty-error', 'prefix'));
+
+    expect(events.some((event) => event.type === 'transcript.final')).toBe(false);
+    socket.message(emptyCommitError());
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: 'transcript.final', text: 'prefix' });
+  });
+
+  it('retains the final manual commit for the resampler tail after VAD', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_601 * 2)
+    });
+    socket.message(committed('item-vad-final-1', null));
+    socket.message(completed('item-vad-final-1', 'vad final'));
+
+    session.finalize(UTTERANCE_ID);
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(1);
+    socket.message(committed('item-vad-final-tail-1', 'item-vad-final-1'));
+    socket.message(completed('item-vad-final-tail-1', 'vad final'));
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: 'transcript.final', text: 'vad final' });
+  });
+
+  it('treats Azure’s too-small final residual commit error as benign', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    socket.message(committed('item-vad-error-1', null));
+    socket.message(completed('item-vad-error-1', 'vad prefix'));
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 9_600,
+      pcm: new Uint8Array(2)
+    });
+
+    session.finalize(UTTERANCE_ID);
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(1);
+    socket.message(emptyCommitError());
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: 'transcript.final', text: 'vad prefix' });
+  });
+
+  it('settles a benign final residual error even when it precedes the commit send callback', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    socket.autoCompleteSends = false;
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    while (socket.pendingSendCallbacks.length > 0) socket.completeNextSend();
+    socket.message(speechStopped());
+    socket.message(committed('item-vad-send-race', null));
+    socket.message(delta('item-vad-send-race', 'complete sentence'));
+    socket.message(completed('item-vad-send-race', 'complete sentence'));
+
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 9_600,
+      pcm: new Uint8Array(2)
+    });
+    session.finalize(UTTERANCE_ID);
+    while (messageTypes(socket).at(-1) !== 'input_audio_buffer.commit') {
+      socket.completeNextSend();
+    }
+    expect(socket.pendingSendCallbacks).toHaveLength(1);
+
+    socket.message(emptyCommitError());
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'complete sentence'
+    });
+    socket.completeNextSend();
+    expect(failures).toEqual([]);
+  });
+
+  it('settles a skipped final commit when VAD already completed the full transcript', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(
+      socket,
+      events,
+      failures,
+      {},
+      { serverVadMode: 'enabled', languageMode: 'automatic', manualCommitCadenceMs: 600 }
+    );
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    socket.message(speechStopped());
+    socket.message(committed('item-vad-zero-residual', null));
+    socket.message(delta('item-vad-zero-residual', 'complete sentence'));
+    socket.message(completed('item-vad-zero-residual', 'complete sentence'));
+
+    const commitsBeforeFinalize = messageTypes(socket)
+      .filter((type) => type === 'input_audio_buffer.commit').length;
+    const flush = vi.spyOn(LinearPcm16To24AudioResampler.prototype, 'flush')
+      .mockReturnValueOnce(new Uint8Array(0));
+    try {
+      session.finalize(UTTERANCE_ID);
+    } finally {
+      flush.mockRestore();
+    }
+
+    expect(messageTypes(socket).filter((type) => type === 'input_audio_buffer.commit'))
+      .toHaveLength(commitsBeforeFinalize);
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'complete sentence'
+    });
   });
 
   it.each([
@@ -1706,6 +2279,31 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     socket.message(sessionUpdated());
     await expect(resultPromise).resolves.toEqual({
       ready: true,
+      provider: 'azure-realtime',
+      model: 'transcribe-prod'
+    });
+    expect(socket.readyState).toBe(3);
+  });
+
+  it('fails readiness closed when the disabled probe echoes server VAD', async () => {
+    const socket = new FakeSocket();
+    const adapter = new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'transcribe-prod',
+      tokenProvider: async () => ({
+        token: 'readiness-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => socket
+    });
+    const resultPromise = adapter.checkReadiness();
+    await Promise.resolve();
+    socket.open();
+    socket.message(sessionCreated());
+    socket.message(sessionUpdated('azure-session-1', undefined, 'enabled'));
+
+    await expect(resultPromise).resolves.toEqual({
+      ready: false,
       provider: 'azure-realtime',
       model: 'transcribe-prod'
     });

@@ -317,7 +317,7 @@ function snapshotConfiguredTranscriptionCapabilities(
 const SESSION_EPOCH = 1;
 const RECENTLY_RESOLVED_UTTERANCE_CAPACITY = 8;
 const MANUAL_COMMIT_CADENCE_MS = 600;
-const CONFIGURED_SERVER_VAD = 'disabled' as const;
+const CONFIGURED_SERVER_VAD = 'enabled' as const;
 const CONFIGURED_LANGUAGE_MODE = 'selected-target' as const;
 const LANGUAGE_BOUNDARY_CONFIGURATION_ERROR =
   'Invalid relay language boundary mode.';

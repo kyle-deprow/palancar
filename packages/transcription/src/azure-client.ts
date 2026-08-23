@@ -2,13 +2,16 @@ import {
   isIso6391LanguageCode,
   snapshotOwnDataProperties
 } from './types.js';
-import type { TranscriptionLanguageConfiguration } from './types.js';
+import type { ServerVadMode, TranscriptionLanguageConfiguration } from './types.js';
 import { AZURE_REALTIME_DEPLOYMENT_PATTERN } from './azure-deployment.js';
 
 export const AZURE_REALTIME_INPUT_AUDIO_FORMAT = 'audio/pcm' as const;
 /** One 100 ms 16 kHz relay frame after 16->24 kHz conversion. */
 export const DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES = 4_800 as const;
 export const MAX_AZURE_REALTIME_APPEND_BYTES = 4_800 as const;
+export const DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD = 0.5 as const;
+export const DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS = 300 as const;
+export const DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS = 500 as const;
 
 export type AzureRealtimeClientMessageErrorReason =
   | 'invalid-deployment'
@@ -35,6 +38,13 @@ export class AzureRealtimeClientMessageError extends TypeError {
 
 export { AzureRealtimeClientMessageError as AzureRealtimeClientError };
 
+export interface AzureRealtimeServerVadTurnDetection {
+  readonly type: 'server_vad';
+  readonly threshold: typeof DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD;
+  readonly prefix_padding_ms: typeof DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS;
+  readonly silence_duration_ms: typeof DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS;
+}
+
 export interface AzureRealtimeSessionUpdateMessage {
   readonly type: 'session.update';
   readonly session: Readonly<{
@@ -45,7 +55,7 @@ export interface AzureRealtimeSessionUpdateMessage {
           readonly type: typeof AZURE_REALTIME_INPUT_AUDIO_FORMAT;
           readonly rate: 24000;
         }>;
-        readonly turn_detection: null;
+        readonly turn_detection: null | Readonly<AzureRealtimeServerVadTurnDetection>;
         readonly transcription: Readonly<{
           readonly model: string;
           readonly language?: string;
@@ -55,7 +65,9 @@ export interface AzureRealtimeSessionUpdateMessage {
   }>;
 }
 
-export type AzureRealtimeSessionUpdateOptions = TranscriptionLanguageConfiguration;
+export type AzureRealtimeSessionUpdateOptions = TranscriptionLanguageConfiguration & Readonly<{
+  readonly serverVadMode?: ServerVadMode;
+}>;
 
 export interface AzureRealtimeInputAudioAppendMessage {
   readonly type: 'input_audio_buffer.append';
@@ -98,27 +110,51 @@ function validateDeployment(deployment: unknown): asserts deployment is string {
   }
 }
 
+type ValidatedAzureRealtimeSessionUpdateOptions = TranscriptionLanguageConfiguration & Readonly<{
+  readonly serverVadMode: ServerVadMode;
+}>;
+
 function validateSessionUpdateOptions(
   options: unknown
-): TranscriptionLanguageConfiguration {
+): ValidatedAzureRealtimeSessionUpdateOptions {
   if (options === undefined) {
-    return Object.freeze({ languageMode: 'automatic' });
+    return Object.freeze({ languageMode: 'automatic', serverVadMode: 'disabled' });
   }
   const snapshot = snapshotOwnDataProperties(options);
   if (snapshot === undefined) {
     fail('invalid-options');
   }
   const languageMode = snapshot.languageMode;
+  const serverVadMode = snapshot.serverVadMode;
+  if (serverVadMode !== undefined && serverVadMode !== 'enabled' && serverVadMode !== 'disabled') {
+    fail('invalid-options');
+  }
   const keys = Object.keys(snapshot);
+  const expectedKeys = (languageMode === 'selected-target'
+    ? ['languageMode', 'languageHint']
+    : ['languageMode']);
+  if (
+    serverVadMode !== undefined
+      ? keys.length !== expectedKeys.length + 1
+      : keys.length !== expectedKeys.length ||
+        keys.some((key) => key === 'serverVadMode')
+  ) {
+    fail('invalid-options');
+  }
+  if (keys.some((key) => !expectedKeys.includes(key) && key !== 'serverVadMode')) {
+    fail('invalid-options');
+  }
   if (languageMode === 'automatic') {
-    if (keys.length !== 1 || keys[0] !== 'languageMode') {
+    if (!keys.includes('languageMode') || Object.hasOwn(snapshot, 'languageHint')) {
       fail('invalid-options');
     }
-    return Object.freeze({ languageMode: 'automatic' });
+    return Object.freeze({
+      languageMode: 'automatic',
+      serverVadMode: serverVadMode ?? 'disabled'
+    });
   }
   if (
     languageMode !== 'selected-target' ||
-    keys.length !== 2 ||
     !keys.includes('languageMode') ||
     !keys.includes('languageHint') ||
     !isIso6391LanguageCode(snapshot.languageHint)
@@ -127,7 +163,8 @@ function validateSessionUpdateOptions(
   }
   return Object.freeze({
     languageMode: 'selected-target',
-    languageHint: snapshot.languageHint
+    languageHint: snapshot.languageHint,
+    serverVadMode: serverVadMode ?? 'disabled'
   });
 }
 
@@ -186,7 +223,14 @@ export function buildAzureRealtimeSessionUpdateMessage(
             type: AZURE_REALTIME_INPUT_AUDIO_FORMAT,
             rate: 24000
           }),
-          turn_detection: null,
+          turn_detection: languageConfiguration.serverVadMode === 'enabled'
+            ? Object.freeze({
+                type: 'server_vad',
+                threshold: DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD,
+                prefix_padding_ms: DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS,
+                silence_duration_ms: DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS
+              })
+            : null,
           transcription: Object.freeze(transcription)
         })
       })

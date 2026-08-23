@@ -48,12 +48,21 @@ import type {
 
 export const AZURE_REALTIME_TRANSCRIPTION_READY_TIMEOUT_MS = 5_000 as const;
 export const AZURE_REALTIME_TRANSCRIPTION_FINALIZATION_TIMEOUT_MS = 10_000 as const;
-export const AZURE_REALTIME_TRANSCRIPTION_QUEUE_BYTES = 128 * 1024;
+// Audio may arrive while the websocket is authenticating and waiting for
+// session.updated. Keep enough serialized append data for the full readiness
+// window without changing the explicit queueBytes override contract.
+export const AZURE_REALTIME_TRANSCRIPTION_QUEUE_BYTES = 384 * 1024;
 export const AZURE_REALTIME_TRANSCRIPTION_BUFFERED_HIGH_WATER_MARK_BYTES = 64 * 1024;
 export const AZURE_REALTIME_TRANSCRIPTION_APPEND_MAX_BYTES = 4_800 as const;
 export const AZURE_REALTIME_TRANSCRIPTION_COMMIT_CADENCE_MS = 600 as const;
 export const AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES = 9_600 as const;
 export const AZURE_REALTIME_TRANSCRIPTION_COMMIT_PROVIDER_SAMPLES = 14_400 as const;
+
+// Appends are limited to one 100 ms provider frame. Use that same frame as
+// the smallest plausible amount of provider progress for one VAD item when
+// bounding unsolicited chained commit events.
+const AZURE_REALTIME_TRANSCRIPTION_MIN_VAD_ITEM_PROVIDER_SAMPLES =
+  AZURE_REALTIME_TRANSCRIPTION_APPEND_MAX_BYTES / 2;
 
 const SOCKET_OPEN = 1 as const;
 const AZURE_OPENAI_HOST_PATTERN =
@@ -131,7 +140,10 @@ const AZURE_CAPABILITIES: Readonly<TranscriptionCapabilities> = Object.freeze({
   acceptedInput: Object.freeze({ sampleRateHz: 16_000, sampleFormat: 's16le', channels: 1 }),
   providerInput: Object.freeze({ sampleRateHz: 24_000, sampleFormat: 's16le', channels: 1 }),
   resampling: Object.freeze({ mode: 'required', stateful: true }),
-  serverVad: Object.freeze({ supported: true, modes: Object.freeze(['disabled'] as const) }),
+  serverVad: Object.freeze({
+    supported: true,
+    modes: Object.freeze(['enabled', 'disabled'] as const)
+  }),
   manualCommit: Object.freeze({
     supported: true,
     cadencesMs: Object.freeze([AZURE_REALTIME_TRANSCRIPTION_COMMIT_CADENCE_MS])
@@ -153,8 +165,8 @@ const AZURE_SERVER_EVENT_ALLOWED_STATES = Object.freeze({
   'rate_limits.updated': ACTIVE_CONFIGURED_STATES,
   'input_audio_buffer.committed': ACTIVE_CONFIGURED_STATES,
   'input_audio_buffer.cleared': Object.freeze([] as const),
-  'input_audio_buffer.speech_started': Object.freeze([] as const),
-  'input_audio_buffer.speech_stopped': Object.freeze([] as const),
+  'input_audio_buffer.speech_started': ACTIVE_CONFIGURED_STATES,
+  'input_audio_buffer.speech_stopped': ACTIVE_CONFIGURED_STATES,
   'input_audio_buffer.timeout_triggered': Object.freeze([] as const),
   'conversation.item.created': ACTIVE_CONFIGURED_STATES,
   'conversation.item.added': ACTIVE_CONFIGURED_STATES,
@@ -173,7 +185,19 @@ interface QueueEntry {
   readonly payload: string;
   readonly bytes: number;
   readonly kind: 'session.update' | 'append' | 'commit' | 'clear';
-  readonly commitOriginalOffset?: number;
+  readonly appendProviderSamples?: number;
+  readonly manualCommit?: ManualCommit;
+}
+
+type ManualCommitStatus = 'queued' | 'sending' | 'sent' | 'settled';
+
+type FinalManualCommitSettlement = 'not-required' | 'outstanding' | 'settled';
+
+interface ManualCommit {
+  readonly originalOffset: number;
+  readonly providerSamples: number;
+  previousItemId: string | null;
+  status: ManualCommitStatus;
 }
 
 interface CommittedItem {
@@ -550,7 +574,11 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
             return;
           }
           if (event.type === 'session.created') return;
-          if (event.type === 'session.updated' && event.session.configured) {
+          if (
+            event.type === 'session.updated' &&
+            event.session.configured &&
+            event.session.turnDetection === 'disabled'
+          ) {
             finish(true);
             return;
           }
@@ -644,9 +672,15 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
   #acceptedOriginalOffset = 0;
   #nextBoundaryOriginalOffset = AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES;
   #providerSamples = 0;
+  #providerSamplesSent = 0;
   #lastCommittedProviderSamples = 0;
+  #lastScheduledProviderSamples = 0;
   #scheduledCommitOffsets: number[] = [];
-  #ackEligibleCommitOffsets: number[] = [];
+  #manualCommits: ManualCommit[] = [];
+  #pendingVadCommitProviderSamples: number[] = [];
+  #vadItemCount = 0;
+  #finalManualCommit: ManualCommit | undefined;
+  #finalManualCommitSettlement: FinalManualCommitSettlement = 'not-required';
   #unacknowledgedCommitCount = 0;
   #lastEnqueuedCommitOffset = 0;
   #items: CommittedItem[] = [];
@@ -702,13 +736,13 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     const inputConfiguration = input.configuration;
     const configuration = validateTranscriptionSessionConfiguration(inputConfiguration);
     if (
-      configuration.serverVadMode !== 'disabled' ||
+      !AZURE_CAPABILITIES.serverVad.modes.includes(configuration.serverVadMode) ||
       !AZURE_CAPABILITIES.languageModes.includes(configuration.languageMode) ||
       !AZURE_CAPABILITIES.manualCommit.cadencesMs.includes(
         configuration.manualCommitCadenceMs
       )
     ) {
-      throw new RangeError('Azure Realtime requires disabled server VAD and 600 ms manual commits');
+      throw new RangeError('Azure Realtime requires supported server VAD mode and 600 ms manual commits');
     }
     this.#input = Object.freeze({
       sessionId: input.sessionId,
@@ -794,9 +828,11 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     }
     const owned = new Uint8Array(input.pcm);
     this.#acceptedOriginalOffset = nextOffset;
-    while (this.#acceptedOriginalOffset >= this.#nextBoundaryOriginalOffset) {
-      this.#scheduledCommitOffsets.push(this.#nextBoundaryOriginalOffset);
-      this.#nextBoundaryOriginalOffset += AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES;
+    if (this.configuration.serverVadMode === 'disabled') {
+      while (this.#acceptedOriginalOffset >= this.#nextBoundaryOriginalOffset) {
+        this.#scheduledCommitOffsets.push(this.#nextBoundaryOriginalOffset);
+        this.#nextBoundaryOriginalOffset += AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES;
+      }
     }
     let providerAudio: Uint8Array;
     try {
@@ -837,9 +873,15 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       throw new TranscriptionSessionError('invalid-audio', 'Audio resampling failed');
     }
     this.#enqueueProviderAudio(tail);
-    if (this.#providerSamples > this.#lastCommittedProviderSamples) {
-      this.#enqueueCommit(this.#acceptedOriginalOffset);
-      this.#lastCommittedProviderSamples = this.#providerSamples;
+    const providerSamplesCoveredByQueuedCommits = this.configuration.serverVadMode === 'disabled'
+      ? Math.max(this.#lastCommittedProviderSamples, this.#lastScheduledProviderSamples)
+      : this.#lastCommittedProviderSamples;
+    if (this.#providerSamples > providerSamplesCoveredByQueuedCommits) {
+      this.#finalManualCommitSettlement = 'outstanding';
+      this.#finalManualCommit = this.#enqueueCommit(this.#acceptedOriginalOffset);
+    } else {
+      this.#finalManualCommit = undefined;
+      this.#finalManualCommitSettlement = 'settled';
     }
     const timerEpoch = this.#operationEpoch;
     const timerSocketIdentity = this.#socketIdentity;
@@ -923,9 +965,15 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#acceptedOriginalOffset = 0;
     this.#nextBoundaryOriginalOffset = AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES;
     this.#providerSamples = 0;
+    this.#providerSamplesSent = 0;
     this.#lastCommittedProviderSamples = 0;
+    this.#lastScheduledProviderSamples = 0;
     this.#scheduledCommitOffsets = [];
-    this.#ackEligibleCommitOffsets = [];
+    this.#manualCommits = [];
+    this.#pendingVadCommitProviderSamples = [];
+    this.#vadItemCount = 0;
+    this.#finalManualCommit = undefined;
+    this.#finalManualCommitSettlement = 'not-required';
     this.#unacknowledgedCommitCount = 0;
     this.#lastEnqueuedCommitOffset = 0;
     this.#items = [];
@@ -1006,10 +1054,14 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         const update = buildAzureRealtimeSessionUpdateMessage(
           this.#adapter.deployment,
           this.configuration.languageMode === 'automatic'
-            ? { languageMode: 'automatic' }
+            ? {
+                languageMode: 'automatic',
+                serverVadMode: this.configuration.serverVadMode
+              }
             : {
                 languageMode: 'selected-target',
-                languageHint: this.configuration.languageHint
+                languageHint: this.configuration.languageHint,
+                serverVadMode: this.configuration.serverVadMode
               }
         );
         this.#enqueueMessage(update, 'session.update', true);
@@ -1052,9 +1104,10 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     if (pcm.byteLength === 0) return;
     for (let offset = 0; offset < pcm.byteLength;) {
       const remaining = pcm.byteLength - offset;
-      const providerSamplesUntilBoundary = this.#scheduledCommitOffsets.length > 0
+      const providerSamplesUntilBoundary = this.configuration.serverVadMode === 'disabled' &&
+        this.#scheduledCommitOffsets.length > 0
         ? AZURE_REALTIME_TRANSCRIPTION_COMMIT_PROVIDER_SAMPLES -
-          (this.#providerSamples - this.#lastCommittedProviderSamples)
+          (this.#providerSamples - this.#lastScheduledProviderSamples)
         : remaining / 2;
       const chunkBytes = Math.min(
         this.#adapter.options.appendMaxBytes,
@@ -1067,11 +1120,15 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         return;
       }
       const chunk = pcm.slice(offset, offset + evenChunkBytes);
-      this.#enqueueAppend(chunk);
+      const chunkProviderSamples = evenChunkBytes / 2;
+      // Count the complete append before enqueueing it because #pump may
+      // synchronously hand the message to the socket and receive a provider
+      // event re-entrantly.
+      this.#providerSamples += chunkProviderSamples;
+      this.#enqueueAppend(chunk, chunkProviderSamples);
       offset += evenChunkBytes;
-      this.#providerSamples += evenChunkBytes / 2;
       if (this.#scheduledCommitOffsets.length > 0 &&
-          this.#providerSamples - this.#lastCommittedProviderSamples ===
+          this.#providerSamples - this.#lastScheduledProviderSamples ===
             AZURE_REALTIME_TRANSCRIPTION_COMMIT_PROVIDER_SAMPLES) {
         const originalOffset = this.#scheduledCommitOffsets.shift();
         if (originalOffset === undefined) {
@@ -1079,38 +1136,52 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
           return;
         }
         this.#enqueueCommit(originalOffset);
-        this.#lastCommittedProviderSamples = this.#providerSamples;
+        this.#lastScheduledProviderSamples = this.#providerSamples;
       }
     }
   }
 
-  #enqueueAppend(pcm: Uint8Array): void {
+  #enqueueAppend(pcm: Uint8Array, providerSamples: number): void {
     const message = {
       type: 'input_audio_buffer.append' as const,
       audio: this.#base64(pcm)
     };
-    this.#enqueueMessage(message, 'append');
+    this.#enqueueMessage(message, 'append', false, providerSamples);
   }
 
-  #enqueueCommit(originalOffset: number): void {
+  #enqueueCommit(originalOffset: number): ManualCommit | undefined {
     if (!Number.isSafeInteger(originalOffset) || originalOffset < 1 ||
         originalOffset <= this.#lastEnqueuedCommitOffset) {
       this.#fail('protocol');
-      return;
+      return undefined;
     }
+    const manualCommit: ManualCommit = {
+      originalOffset,
+      providerSamples: this.#providerSamples,
+      previousItemId: this.#lastItemId,
+      status: 'queued'
+    };
+    this.#manualCommits.push(manualCommit);
     this.#enqueueMessage(
       buildAzureRealtimeInputAudioCommitMessage(),
       'commit',
       false,
-      originalOffset
+      undefined,
+      manualCommit
     );
+    this.#lastScheduledProviderSamples = Math.max(
+      this.#lastScheduledProviderSamples,
+      manualCommit.providerSamples
+    );
+    return manualCommit;
   }
 
   #enqueueMessage(
     message: AzureRealtimeClientMessage,
     kind: QueueEntry['kind'],
     prepend = false,
-    commitOriginalOffset?: number
+    appendProviderSamples?: number,
+    manualCommit?: ManualCommit
   ): void {
     const eventId = this.#nextEventId();
     const payload = jsonMessage(message, eventId);
@@ -1123,7 +1194,8 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       payload,
       bytes,
       kind,
-      ...(commitOriginalOffset === undefined ? {} : { commitOriginalOffset })
+      ...(appendProviderSamples === undefined ? {} : { appendProviderSamples }),
+      ...(manualCommit === undefined ? {} : { manualCommit })
     });
     if (prepend) {
       this.#queued.unshift(entry);
@@ -1132,11 +1204,11 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     }
     this.#queuedBytes += bytes;
     if (kind === 'commit') {
-      if (commitOriginalOffset === undefined) {
+      if (manualCommit === undefined) {
         this.#fail('protocol');
         return;
       }
-      this.#lastEnqueuedCommitOffset = commitOriginalOffset;
+      this.#lastEnqueuedCommitOffset = manualCommit.originalOffset;
       this.#unacknowledgedCommitCount += 1;
     }
     this.#pump();
@@ -1175,6 +1247,27 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#queuedBytes -= next.bytes;
     this.#sending = true;
     if (next.kind === 'session.update') this.#sessionUpdateSent = true;
+    if (next.kind === 'append') {
+      const providerSamples = next.appendProviderSamples;
+      if (providerSamples === undefined) {
+        this.#sending = false;
+        this.#fail('protocol');
+        return;
+      }
+      // This is the point at which the append is handed to the provider
+      // socket. VAD accounting deliberately uses this counter instead of the
+      // accepted-original cursor or merely queued resampler output.
+      this.#providerSamplesSent += providerSamples;
+    }
+    if (next.kind === 'commit') {
+      const manualCommit = next.manualCommit;
+      if (manualCommit === undefined || manualCommit.status !== 'queued') {
+        this.#sending = false;
+        this.#fail('protocol');
+        return;
+      }
+      manualCommit.status = 'sending';
+    }
     try {
       socket.send(next.payload, (error?: Error | null) => {
         if (!this.#isCurrent(epoch, socketIdentity) || this.#socket !== socket) return;
@@ -1184,14 +1277,13 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
           return;
         }
         if (next.kind === 'commit') {
-          const originalOffset = next.commitOriginalOffset;
-          const previousOffset = this.#ackEligibleCommitOffsets.at(-1) ??
-            this.#items.at(-1)?.originalOffset ?? 0;
-          if (originalOffset === undefined || originalOffset <= previousOffset) {
+          const manualCommit = next.manualCommit;
+          if (manualCommit === undefined ||
+              (manualCommit.status !== 'sending' && manualCommit.status !== 'settled')) {
             this.#fail('protocol');
             return;
           }
-          this.#ackEligibleCommitOffsets.push(originalOffset);
+          if (manualCommit.status === 'sending') manualCommit.status = 'sent';
         }
         this.#pump();
       });
@@ -1230,7 +1322,11 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         this.#providerSessionId = event.session.id;
         return;
       case 'session.updated':
-        if (!event.session.configured || this.#configured || !this.#socketOpen ||
+        if (
+          event.session.turnDetection !== (
+            this.configuration.serverVadMode === 'enabled' ? 'server_vad' : 'disabled'
+          ) ||
+          !event.session.configured || this.#configured || !this.#socketOpen ||
             !this.#sessionUpdateSent || !this.#sessionCreatedReceived ||
             event.session.phase !== 'configured' || event.session.id !== this.#providerSessionId) {
           this.#fail('configuration');
@@ -1254,10 +1350,16 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         this.#handleCommitted(event.item_id, event.previous_item_id);
         return;
       case 'input_audio_buffer.cleared':
-      case 'input_audio_buffer.speech_started':
-      case 'input_audio_buffer.speech_stopped':
       case 'input_audio_buffer.timeout_triggered':
         this.#fail('protocol');
+        return;
+      case 'input_audio_buffer.speech_started':
+      case 'input_audio_buffer.speech_stopped':
+        if (this.configuration.serverVadMode !== 'enabled') {
+          this.#fail('protocol');
+        } else if (event.type === 'input_audio_buffer.speech_stopped') {
+          this.#pendingVadCommitProviderSamples.push(this.#providerSamplesSent);
+        }
         return;
       case 'conversation.item.created':
       case 'conversation.item.added':
@@ -1283,6 +1385,10 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
         this.#fail('provider');
         return;
       case 'error':
+        if (event.code === 'input_audio_buffer_commit_empty' &&
+            this.#handleBenignFinalCommitError()) {
+          return;
+        }
         this.#fail('protocol');
         return;
     }
@@ -1295,16 +1401,127 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
   }
 
   #handleCommitted(itemId: string, previousItemId: string | null): void {
-    const originalOffset = this.#ackEligibleCommitOffsets.shift();
-    if (originalOffset === undefined || this.#itemsById.has(itemId) || previousItemId !== this.#lastItemId) {
+    if (this.#itemsById.has(itemId) || previousItemId !== this.#lastItemId) {
       this.#fail('protocol');
       return;
     }
+
+    const manualCommit = this.#manualCommits[0];
+    const pendingVadProviderSamples = this.#pendingVadCommitProviderSamples.shift();
+    const manualCommitInFlight = manualCommit !== undefined &&
+      (manualCommit.status === 'sending' || manualCommit.status === 'sent');
+    const isVadCommit = this.configuration.serverVadMode === 'enabled' && (
+      pendingVadProviderSamples !== undefined ||
+      !manualCommitInFlight
+    );
+
+    if (isVadCommit) {
+      if (this.#providerSamplesSent < 1) {
+        this.#fail('protocol');
+        return;
+      }
+      const observedProviderSamples = pendingVadProviderSamples ?? this.#providerSamplesSent;
+      const progressBound = Math.max(
+        1,
+        Math.ceil(observedProviderSamples / AZURE_REALTIME_TRANSCRIPTION_MIN_VAD_ITEM_PROVIDER_SAMPLES)
+      );
+      const utteranceBound = Math.max(
+        1,
+        Math.ceil(
+          this.#adapter.options.maxUtteranceSamples * 3 / 2 /
+            AZURE_REALTIME_TRANSCRIPTION_MIN_VAD_ITEM_PROVIDER_SAMPLES
+        )
+      );
+      if (this.#vadItemCount >= Math.min(progressBound, utteranceBound)) {
+        this.#fail('protocol');
+        return;
+      }
+      const committedProviderSamples = Math.min(
+        this.#providerSamples,
+        observedProviderSamples
+      );
+      if (committedProviderSamples < 1) {
+        this.#fail('protocol');
+        return;
+      }
+      this.#vadItemCount += 1;
+      this.#lastCommittedProviderSamples = Math.max(
+        this.#lastCommittedProviderSamples,
+        committedProviderSamples
+      );
+      const originalOffset = Math.max(
+        this.#items.at(-1)?.originalOffset ?? 0,
+        this.#originalOffsetForProviderSamples(this.#lastCommittedProviderSamples)
+      );
+      this.#appendCommittedItem(itemId, originalOffset);
+      // If the provider observed the VAD boundary before the explicit manual
+      // commit was acknowledged, its committed item precedes that manual
+      // result. The provider's previous_item_id on the manual result therefore
+      // becomes this VAD item, even though the command was already in flight.
+      for (const pendingManualCommit of this.#manualCommits) {
+        pendingManualCommit.previousItemId = itemId;
+      }
+      this.#maybeFinish();
+      return;
+    }
+    if (
+      manualCommit === undefined ||
+      (manualCommit.status !== 'sent' && !(
+        this.configuration.serverVadMode === 'enabled' &&
+        manualCommit.status === 'sending'
+      )) ||
+      manualCommit.previousItemId !== previousItemId
+    ) {
+      this.#fail('protocol');
+      return;
+    }
+    this.#manualCommits.shift();
     this.#unacknowledgedCommitCount -= 1;
     if (this.#unacknowledgedCommitCount < 0) {
       this.#fail('protocol');
       return;
     }
+    this.#lastCommittedProviderSamples = Math.max(
+      this.#lastCommittedProviderSamples,
+      Math.min(this.#providerSamples, manualCommit.providerSamples)
+    );
+    manualCommit.status = 'settled';
+    if (manualCommit === this.#finalManualCommit) {
+      this.#finalManualCommitSettlement = 'settled';
+    }
+    this.#appendCommittedItem(itemId, manualCommit.originalOffset);
+    this.#maybeFinish();
+  }
+
+  #handleBenignFinalCommitError(): boolean {
+    if (
+      this.configuration.serverVadMode !== 'enabled' ||
+      !this.#finalizationRequested
+    ) {
+      return false;
+    }
+    const manualCommit = this.#manualCommits[0];
+    if (
+      manualCommit === undefined ||
+      manualCommit !== this.#finalManualCommit ||
+      (manualCommit.status !== 'sending' && manualCommit.status !== 'sent') ||
+      this.#unacknowledgedCommitCount !== 1
+    ) {
+      return false;
+    }
+    manualCommit.status = 'settled';
+    this.#manualCommits.shift();
+    this.#unacknowledgedCommitCount = 0;
+    this.#lastCommittedProviderSamples = Math.max(
+      this.#lastCommittedProviderSamples,
+      Math.min(this.#providerSamples, manualCommit.providerSamples)
+    );
+    this.#finalManualCommitSettlement = 'settled';
+    this.#maybeFinish();
+    return true;
+  }
+
+  #appendCommittedItem(itemId: string, originalOffset: number): void {
     const item: CommittedItem = {
       itemId,
       originalOffset,
@@ -1317,6 +1534,19 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#items.push(item);
     this.#itemsById.set(itemId, item);
     this.#lastItemId = itemId;
+    for (const pendingManualCommit of this.#manualCommits) {
+      pendingManualCommit.previousItemId = itemId;
+    }
+  }
+
+  #originalOffsetForProviderSamples(providerSamples: number): number {
+    // 24 kHz output is 3/2 of the 16 kHz source. Floor keeps an item offset
+    // from claiming a source sample represented only by a future resampler
+    // output. The accepted cursor is only an upper bound.
+    return Math.min(
+      this.#acceptedOriginalOffset,
+      Math.floor(providerSamples * 2 / 3)
+    );
   }
 
   #handleItemCreated(itemId: string, previousItemId: string | null): void {
@@ -1441,7 +1671,10 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
 
   #maybeFinish(): void {
     if (!this.#finalizationRequested || this.#finalEvent !== undefined || this.#activeUtteranceId === undefined) return;
-    if (this.#scheduledCommitOffsets.length > 0 || this.#unacknowledgedCommitCount > 0 ||
+    if (this.#scheduledCommitOffsets.length > 0 ||
+        this.#pendingVadCommitProviderSamples.length > 0 ||
+        this.#finalManualCommitSettlement !== 'settled' ||
+        this.#unacknowledgedCommitCount > 0 ||
         this.#items.some((item) => !item.completed) ||
         this.#providerSamples !== this.#lastCommittedProviderSamples) return;
     this.#finish(this.#activeUtteranceId);
@@ -1549,9 +1782,15 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#acceptedOriginalOffset = 0;
     this.#nextBoundaryOriginalOffset = AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES;
     this.#providerSamples = 0;
+    this.#providerSamplesSent = 0;
     this.#lastCommittedProviderSamples = 0;
+    this.#lastScheduledProviderSamples = 0;
     this.#scheduledCommitOffsets = [];
-    this.#ackEligibleCommitOffsets = [];
+    this.#manualCommits = [];
+    this.#pendingVadCommitProviderSamples = [];
+    this.#vadItemCount = 0;
+    this.#finalManualCommit = undefined;
+    this.#finalManualCommitSettlement = 'not-required';
     this.#unacknowledgedCommitCount = 0;
     this.#lastEnqueuedCommitOffset = 0;
     this.#items = [];

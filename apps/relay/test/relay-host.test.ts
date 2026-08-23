@@ -3963,6 +3963,10 @@ describe('relay HTTP/WebSocket host', () => {
       sessionEpoch,
       utteranceId: UTTERANCE_ID
     }));
+    const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
+    const language = nextMessage(socket, (message) => message.type === 'language.decision');
+    const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
+    const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
 
     for (let sequence = 0; sequence < 18; sequence += 1) {
       const ack = nextMessage(
@@ -3972,18 +3976,6 @@ describe('relay HTTP/WebSocket host', () => {
       socket.send(frame(sequence, sequence * 1_600), { binary: true });
       await ack;
     }
-
-    const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
-    const language = nextMessage(socket, (message) => message.type === 'language.decision');
-    const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
-    const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
-    socket.send(JSON.stringify({
-      type: 'utterance.commit',
-      sessionId,
-      sessionEpoch,
-      utteranceId: UTTERANCE_ID,
-      finalOriginalSampleOffset: 28_800
-    }));
     await expect(Promise.all([transcript, language, translation, suggestions])).resolves.toHaveLength(4);
     const closed = waitForClose(socket);
     socket.close(1000, 'test_done');
@@ -4134,6 +4126,10 @@ describe('relay HTTP/WebSocket host', () => {
       sessionEpoch,
       utteranceId: UTTERANCE_ID
     }));
+    const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
+    const language = nextMessage(socket, (message) => message.type === 'language.decision');
+    const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
+    const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
     for (let sequence = 0; sequence < 18; sequence += 1) {
       const ack = nextMessage(
         socket,
@@ -4142,19 +4138,6 @@ describe('relay HTTP/WebSocket host', () => {
       socket.send(frame(sequence, sequence * 1_600), { binary: true });
       await ack;
     }
-
-    const transcript = nextMessage(socket, (message) => message.type === 'transcript.final');
-    const language = nextMessage(socket, (message) => message.type === 'language.decision');
-    const translation = nextMessage(socket, (message) => message.type === 'translation.ready');
-    const suggestions = nextMessage(socket, (message) => message.type === 'suggestions.ready');
-    socket.send(JSON.stringify({
-      type: 'utterance.commit',
-      sessionId,
-      sessionEpoch,
-      utteranceId: UTTERANCE_ID,
-      finalOriginalSampleOffset: 28_800
-    }));
-
     await Promise.all([transcript, language]);
     expect(seenTypes).toContain('transcript.final');
     expect(seenTypes).toContain('language.decision');
@@ -4232,6 +4215,7 @@ describe('relay HTTP/WebSocket host', () => {
     const sessionId = String(ready.sessionId);
     const sessionEpoch = Number(ready.sessionEpoch);
     socket.send(JSON.stringify({ type: 'utterance.start', sessionId, sessionEpoch, utteranceId: UTTERANCE_ID }));
+    const failure = nextMessage(socket, (message) => message.type === 'error');
     for (let sequence = 0; sequence < 18; sequence += 1) {
       const ack = nextMessage(
         socket,
@@ -4240,14 +4224,6 @@ describe('relay HTTP/WebSocket host', () => {
       socket.send(frame(sequence, sequence * 1_600), { binary: true });
       await ack;
     }
-    const failure = nextMessage(socket, (message) => message.type === 'error');
-    socket.send(JSON.stringify({
-      type: 'utterance.commit',
-      sessionId,
-      sessionEpoch,
-      utteranceId: UTTERANCE_ID,
-      finalOriginalSampleOffset: 28_800
-    }));
     const errorMessage = await failure;
     expect(JSON.stringify(errorMessage)).not.toContain(CANARY);
     const closed = waitForClose(socket);

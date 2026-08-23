@@ -2370,7 +2370,7 @@ describe('relay session core', () => {
   it('rejects unsupported transcription capabilities generically', () => {
     const unsupported = {
       ...DETERMINISTIC_MOCK_CAPABILITIES,
-      serverVad: { ...DETERMINISTIC_MOCK_CAPABILITIES.serverVad, modes: ['enabled'] as const }
+      serverVad: { ...DETERMINISTIC_MOCK_CAPABILITIES.serverVad, modes: ['disabled'] as const }
     };
     const { core, adapter } = openNew(recordingAdapter(unsupported));
     const result = core.handleText(utteranceStartText());
@@ -2949,7 +2949,7 @@ describe('relay session core', () => {
       });
       expect(adapter.sessions).toHaveLength(2);
       const expectedConfiguration = {
-        serverVadMode: 'disabled',
+        serverVadMode: 'enabled',
         languageMode: 'selected-target',
         languageHint: targetLanguage,
         manualCommitCadenceMs: 600

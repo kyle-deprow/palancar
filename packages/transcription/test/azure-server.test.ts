@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { MAX_CONTROL_MESSAGE_BYTES } from '@palancar/contracts';
 
+import { buildAzureRealtimeSessionUpdateMessage } from '../src/azure-client.js';
 import {
   AzureRealtimeServerEventError,
   parseAzureRealtimeServerEvent as parseServerEventInternal,
@@ -247,7 +248,8 @@ describe('Azure Realtime GA server event parser', () => {
         type: 'transcription',
         id: session.id,
         phase: 'configured',
-        configured: true
+        configured: true,
+        turnDetection: 'disabled'
       }
     });
     expect(parseServerEvent(providerEvent({
@@ -428,7 +430,7 @@ describe('Azure Realtime GA server event parser', () => {
     );
   });
 
-  it('validates realistic session configuration without exposing it', () => {
+  it('validates realistic session configuration and exposes its turn-detection variant', () => {
     expectReason(() => parseServerEvent(providerEvent({
       type: 'session.created',
       event_id: 'event_1'
@@ -467,7 +469,8 @@ describe('Azure Realtime GA server event parser', () => {
         type: 'transcription',
         id: session.id,
         phase: 'basic',
-        configured: false
+        configured: false,
+        turnDetection: 'disabled'
       }
     });
     expect(JSON.stringify(result)).not.toContain('Customer support terminology');
@@ -527,6 +530,25 @@ describe('Azure Realtime GA server event parser', () => {
     expect(configured).toMatchObject({
       session: { phase: 'configured', configured: true }
     });
+    const serverVadUpdate = buildAzureRealtimeSessionUpdateMessage(EXPECTED_DEPLOYMENT, {
+      languageMode: 'automatic',
+      serverVadMode: 'enabled'
+    });
+    const serverVadConfigured = parseServerEvent(providerEvent({
+      type: 'session.updated',
+      event_id: 'event_server_vad_configured',
+      session: {
+        ...createdSession,
+        audio: serverVadUpdate.session.audio
+      }
+    }));
+    expect(serverVadConfigured).toMatchObject({
+      session: {
+        phase: 'configured',
+        configured: true,
+        turnDetection: 'server_vad'
+      }
+    });
 
     const baseInput = session.audio.input;
     const unconfiguredInputs = [
@@ -541,15 +563,6 @@ describe('Azure Realtime GA server event parser', () => {
       {
         format: baseInput.format,
         transcription: baseInput.transcription
-      },
-      {
-        ...baseInput,
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        }
       },
       {
         format: baseInput.format,
@@ -1699,6 +1712,19 @@ describe('Azure Realtime GA server event parser', () => {
         event_id: 'not an identifier / but valid Unicode ✅'
       }
     }))).toEqual({ type: 'error', category: 'protocol-failure' });
+    expect(parseServerEvent(providerEvent({
+      type: 'error',
+      event_id: 'event_empty_commit',
+      error: {
+        type: 'invalid_request_error',
+        code: 'input_audio_buffer_commit_empty',
+        message: 'buffer too small'
+      }
+    }))).toEqual({
+      type: 'error',
+      category: 'protocol-failure',
+      code: 'input_audio_buffer_commit_empty'
+    });
     for (const event_id of ['', null]) {
       expect(parseServerEvent(providerEvent({
         type: 'error',

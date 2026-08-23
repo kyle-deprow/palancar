@@ -3,6 +3,11 @@ import {
   isIso6391LanguageCode,
   snapshotOwnDataProperties
 } from './types.js';
+import {
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS,
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS,
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD
+} from './azure-client.js';
 import { AZURE_REALTIME_DEPLOYMENT_PATTERN } from './azure-deployment.js';
 
 export const MAX_AZURE_REALTIME_SERVER_EVENT_JSON_BYTES = MAX_CONTROL_MESSAGE_BYTES;
@@ -98,6 +103,11 @@ export type AzureRealtimeServerFailureCategory =
   | 'provider-failure'
   | 'protocol-failure';
 
+export type AzureRealtimeTurnDetectionVariant =
+  | 'disabled'
+  | 'server_vad'
+  | 'semantic_vad';
+
 export interface AzureRealtimeLogprobsSummary {
   readonly count: number;
   readonly present: boolean;
@@ -108,6 +118,7 @@ export interface AzureRealtimeSessionSummary {
   readonly id: string;
   readonly phase: 'basic' | 'configured';
   readonly configured: boolean;
+  readonly turnDetection?: AzureRealtimeTurnDetectionVariant;
   readonly language?: string;
 }
 
@@ -230,6 +241,7 @@ export interface AzureRealtimeInputAudioTranscriptionFailedEvent {
 export interface AzureRealtimeErrorEvent {
   readonly type: 'error';
   readonly category: 'protocol-failure';
+  readonly code?: 'input_audio_buffer_commit_empty';
 }
 
 export type AzureRealtimeServerEvent =
@@ -725,7 +737,12 @@ function validateSessionNoiseReduction(value: unknown): void {
   }
 }
 
-function validateSessionTurnDetection(value: unknown): void {
+interface SessionTurnDetectionValidation {
+  readonly variant: Exclude<AzureRealtimeTurnDetectionVariant, 'disabled'>;
+  readonly exact: boolean;
+}
+
+function validateSessionTurnDetection(value: unknown): SessionTurnDetectionValidation {
   if (!isPlainObject(value)) {
     fail('invalid-field');
   }
@@ -761,7 +778,20 @@ function validateSessionTurnDetection(value: unknown): void {
     ) {
       fail('invalid-field');
     }
-    return;
+    return Object.freeze({
+      variant: 'server_vad',
+      exact: (
+        hasExactKeys(value, [
+          'type',
+          'threshold',
+          'prefix_padding_ms',
+          'silence_duration_ms'
+        ]) &&
+        valueOf(value, 'threshold') === DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD &&
+        valueOf(value, 'prefix_padding_ms') === DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS &&
+        valueOf(value, 'silence_duration_ms') === DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS
+      )
+    });
   }
   if (type === 'semantic_vad') {
     if (!hasExactKeys(value, ['type'], [
@@ -783,7 +813,7 @@ function validateSessionTurnDetection(value: unknown): void {
     ) {
       fail('invalid-field');
     }
-    return;
+    return Object.freeze({ variant: 'semantic_vad', exact: false });
   }
   fail('invalid-field');
 }
@@ -817,6 +847,7 @@ function isBoundedSegmentSecond(value: unknown): value is number {
 
 interface SessionAudioValidation {
   readonly configured: boolean;
+  readonly turnDetection?: AzureRealtimeTurnDetectionVariant;
   readonly language?: string;
 }
 
@@ -845,6 +876,8 @@ function validateSessionAudio(
   const hasTurnDetection = Object.hasOwn(input, 'turn_detection');
   let expectedFormat = false;
   let expectedModel = false;
+  let configuredTurnDetection = false;
+  let turnDetection: AzureRealtimeTurnDetectionVariant | undefined;
   let language: string | undefined;
   if (hasFormat) {
     expectedFormat = validateSessionFormat(valueOf(input, 'format'));
@@ -868,9 +901,14 @@ function validateSessionAudio(
     }
   }
   if (Object.hasOwn(input, 'turn_detection')) {
-    const turnDetection = valueOf(input, 'turn_detection');
-    if (turnDetection !== null) {
-      validateSessionTurnDetection(turnDetection);
+    const rawTurnDetection = valueOf(input, 'turn_detection');
+    if (rawTurnDetection !== null) {
+      const validation = validateSessionTurnDetection(rawTurnDetection);
+      configuredTurnDetection = validation.exact;
+      turnDetection = validation.variant;
+    } else {
+      configuredTurnDetection = true;
+      turnDetection = 'disabled';
     }
   }
   return Object.freeze({
@@ -880,8 +918,9 @@ function validateSessionAudio(
       hasTurnDetection &&
       expectedFormat &&
       expectedModel &&
-      valueOf(input, 'turn_detection') === null
+      configuredTurnDetection
     ),
+    ...(turnDetection === undefined ? {} : { turnDetection }),
     ...(language === undefined ? {} : { language })
   });
 }
@@ -948,6 +987,7 @@ function parseSession(
   const hasAudio = Object.hasOwn(value, 'audio');
   let hasConfiguredAudio = false;
   let sessionLanguage: string | undefined;
+  let turnDetection: AzureRealtimeTurnDetectionVariant | undefined;
   if (hasAudio) {
     const audioValidation = validateSessionAudio(
       valueOf(value, 'audio'),
@@ -955,6 +995,7 @@ function parseSession(
     );
     hasConfiguredAudio = audioValidation.configured;
     sessionLanguage = audioValidation.language;
+    turnDetection = audioValidation.turnDetection;
   }
   if (Object.hasOwn(value, 'include')) {
     validateSessionInclude(valueOf(value, 'include'));
@@ -965,6 +1006,7 @@ function parseSession(
     id,
     phase: configured ? 'configured' : 'basic',
     configured,
+    ...(turnDetection === undefined ? {} : { turnDetection }),
     ...(sessionLanguage === undefined ? {} : { language: sessionLanguage })
   });
 }
@@ -1437,8 +1479,18 @@ function parseObjectEvent(
       if (!hasExactKeys(value, ['type', 'event_id', 'error'])) {
         fail('invalid-event');
       }
-      validateGeneralErrorDetails(valueOf(value, 'error'));
-      return Object.freeze({ type, category: 'protocol-failure' });
+      const errorDetails = valueOf(value, 'error');
+      validateGeneralErrorDetails(errorDetails);
+      const errorCode = isPlainObject(errorDetails)
+        ? valueOf(errorDetails, 'code')
+        : undefined;
+      return Object.freeze({
+        type,
+        category: 'protocol-failure',
+        ...(errorCode === 'input_audio_buffer_commit_empty'
+          ? { code: errorCode }
+          : {})
+      });
     default:
       fail('invalid-event');
   }

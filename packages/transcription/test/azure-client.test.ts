@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES,
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS,
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS,
+  DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD,
   MAX_AZURE_REALTIME_APPEND_BYTES,
   AzureRealtimeClientMessageError,
   buildAzureRealtimeInputAudioAppendMessage,
@@ -68,6 +71,21 @@ describe('Azure Realtime client message builders', () => {
     expect(Object.isFrozen(message.session.audio.input.transcription)).toBe(true);
   });
 
+  it('builds the exact server-VAD transcription session variant', () => {
+    const message = buildAzureRealtimeSessionUpdateMessage('transcribe-prod', {
+      languageMode: 'automatic',
+      serverVadMode: 'enabled'
+    });
+
+    expect(message.session.audio.input.turn_detection).toEqual({
+      type: 'server_vad',
+      threshold: DEFAULT_AZURE_REALTIME_SERVER_VAD_THRESHOLD,
+      prefix_padding_ms: DEFAULT_AZURE_REALTIME_SERVER_VAD_PREFIX_PADDING_MS,
+      silence_duration_ms: DEFAULT_AZURE_REALTIME_SERVER_VAD_SILENCE_DURATION_MS
+    });
+    expect(Object.isFrozen(message.session.audio.input.turn_detection)).toBe(true);
+  });
+
   it('rejects malformed or non-exact language options', () => {
     for (const options of [
       { languageMode: 'automatic', languageHint: 'es' },
@@ -76,6 +94,8 @@ describe('Azure Realtime client message builders', () => {
       { languageMode: 'selected-target', languageHint: 'spa' },
       { languageMode: 'selected-target', languageHint: ' es' },
       { languageMode: 'selected-target', languageHint: 'es', extra: true },
+      { languageMode: 'automatic', serverVadMode: 'unknown' },
+      { languageMode: 'automatic', serverVadMode: 'enabled', extra: true },
       { languageMode: 'unknown' },
       null,
       'automatic'
