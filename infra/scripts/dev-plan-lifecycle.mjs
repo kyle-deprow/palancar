@@ -7345,11 +7345,16 @@ function normalizeLiveCommand(value, code) {
 
 function normalizeLiveContainer(container, code, source) {
   assertKnownKeys(container, ["name", "image", "imageType", "env", "resources", "probes", "command", "args"], code);
-  assertRequiredKeys(container, ["name", "image", "env", "resources", "probes", ...(source === "app" ? ["imageType"] : [])], code);
+  assertRequiredKeys(container, ["name", "image", "env", "resources", ...(source === "app" ? ["imageType"] : [])], code);
   failIf(typeof container.name !== "string" || typeof container.image !== "string", code);
   const env = assertEnvironmentEntries(container.env, code).map((entry) => ({ ...entry }));
-  failIf(!Array.isArray(container.probes) || container.probes.length === 0, code);
-  const probes = container.probes.map((probe) => normalizeLiveProbe(probe, code));
+  // Older Container Apps API responses synthesized a default probe for
+  // containers with none configured; newer responses omit the key. The
+  // Terraform template configures no probes, so absent/null is the
+  // expected live shape.
+  const rawProbes = container.probes ?? [];
+  failIf(!Array.isArray(rawProbes), code);
+  const probes = rawProbes.map((probe) => normalizeLiveProbe(probe, code));
   const command = normalizeLiveCommand(container.command, code);
   const args = normalizeLiveCommand(container.args, code);
   if (source === "app") {
