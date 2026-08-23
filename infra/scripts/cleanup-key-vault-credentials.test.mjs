@@ -29,6 +29,7 @@ import {
   CUMULATIVE_ELAPSED_LIMIT_MS,
   createCleanupForTests,
   DESCRIPTOR_FILENAME,
+  EVIDENCE_ROOT,
   HTTP_TIMEOUT_MS,
   INVOCATION_DEADLINE_MS,
   JOURNAL_COMMITMENT_DIRECTORY_NAME,
@@ -96,6 +97,89 @@ const temporaryRoots = new Set();
 after(() => {
   for (const root of temporaryRoots) rmSync(root, { recursive: true, force: true });
 });
+
+function productionKernelLockPath() {
+  return path.join(path.dirname(EVIDENCE_ROOT), `${path.basename(EVIDENCE_ROOT)}.kernel.lock`);
+}
+
+function runCleanupLockProbe(composition, descriptorPath = productionKernelLockPath()) {
+  const lockPath = productionKernelLockPath();
+  const cleanupScript = new URL("./cleanup-key-vault-credentials.mjs", import.meta.url).pathname;
+  const lifecycleScript = new URL("./dev-plan-lifecycle.mjs", import.meta.url).pathname;
+  const cleanupMarker = "--__palancar-cleanup-locked-b1b";
+  const lifecycleMarker = "--__palancar-internal-locked-b1b";
+  const token = readFileSync(lockPath, "utf8").trim();
+  const descriptorFd = openSync(descriptorPath, "r");
+  try {
+    const env = {
+      PATH: "/usr/bin:/bin",
+      LANG: "C",
+      LC_ALL: "C",
+      PALANCAR_CLEANUP_LOCK_FD: "3",
+      PALANCAR_CLEANUP_LOCK_TOKEN: token,
+    };
+    if (composition === "parent-neither") {
+      return spawnSync(process.execPath, [cleanupScript, cleanupMarker, "not-an-operation"], {
+        cwd: "/",
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe", descriptorFd],
+      });
+    }
+    if (composition === "direct") {
+      return spawnSync("/usr/bin/flock", ["-n", "-x", lockPath, process.execPath, cleanupScript, cleanupMarker, "not-an-operation"], {
+        cwd: "/",
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe", descriptorFd],
+      });
+    }
+
+    const nestedCode = `
+      import { spawnSync } from "node:child_process";
+      const result = spawnSync(${JSON.stringify(process.execPath)}, [
+        ${JSON.stringify(cleanupScript)},
+        ${JSON.stringify(cleanupMarker)},
+        "not-an-operation",
+      ], {
+        cwd: "/",
+        env: {
+          ...process.env,
+          PALANCAR_CLEANUP_LOCK_FD: "3",
+          PALANCAR_CLEANUP_LOCK_TOKEN: ${JSON.stringify(token)},
+        },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe", 3],
+      });
+      process.stdout.write(JSON.stringify({
+        status: result.status,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      }));
+    `;
+    const parentArgs = [
+      "--input-type=module",
+      "-e",
+      nestedCode,
+      lifecycleScript,
+      lifecycleMarker,
+    ];
+    const result = composition === "lifecycle"
+      ? spawnSync("/usr/bin/flock", ["-n", lockPath, process.execPath, ...parentArgs], {
+          cwd: "/",
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe", descriptorFd],
+        })
+      : spawnSync(process.execPath, parentArgs, {
+          cwd: "/",
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe", descriptorFd],
+        });
+    return { ...result, probe: result.stdout === "" ? undefined : JSON.parse(result.stdout) };
+  } finally {
+    closeSync(descriptorFd);
+  }
+}
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1899,6 +1983,41 @@ test("production lock path is a protected kernel-lock protocol and CLI never acc
   assert.equal(source.includes("renameSync(temporary, filePath)"), true);
   assert.equal(parseCli(["start", VAULT_URI]), undefined);
   assert.equal(await runCli(["--__palancar-cleanup-locked-b1b", "start", "run-1"]), 1);
+});
+
+test("inherited lock validation accepts direct flock and lifecycle nesting, and rejects forged ancestry", () => {
+  const direct = runCleanupLockProbe("direct");
+  assert.equal(direct.status, 2);
+  assert.equal(direct.stdout, "");
+  assert.equal(direct.stderr, "");
+
+  const lifecycle = runCleanupLockProbe("lifecycle");
+  assert.equal(lifecycle.status, 0);
+  assert.deepEqual(lifecycle.probe, { status: 2, stdout: "", stderr: "" });
+
+  const parentNeither = runCleanupLockProbe("parent-neither");
+  assert.equal(parentNeither.status, 1);
+  assert.equal(parentNeither.stdout, "");
+  assert.equal(parentNeither.stderr, "cleanup-key-vault-credentials: rejected lock-failed\n");
+
+  const wrongGrandparent = runCleanupLockProbe("wrong-grandparent");
+  assert.equal(wrongGrandparent.status, 0);
+  assert.deepEqual(wrongGrandparent.probe, {
+    status: 1,
+    stdout: "",
+    stderr: "cleanup-key-vault-credentials: rejected lock-failed\n",
+  });
+
+  const mismatchedPath = path.join(mkdtempSync(path.join(tmpdir(), "palancar-lock-inode-")), "other.lock");
+  temporaryRoots.add(path.dirname(mismatchedPath));
+  writeExclusive(mismatchedPath, "not-the-kernel-lock\n");
+  const mismatchedInode = runCleanupLockProbe("lifecycle", mismatchedPath);
+  assert.equal(mismatchedInode.status, 0);
+  assert.deepEqual(mismatchedInode.probe, {
+    status: 1,
+    stdout: "",
+    stderr: "cleanup-key-vault-credentials: rejected lock-failed\n",
+  });
 });
 
 test("production CLI preserves stdout/stderr and exit status through the real flock subprocess", () => {

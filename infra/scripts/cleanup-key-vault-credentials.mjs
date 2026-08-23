@@ -122,6 +122,8 @@ const MAX_INVENTORY_PAGES = 64;
 const MAX_INVENTORY_ITEMS = 4096;
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
 const INTERNAL_LOCKED_MARKER = "--__palancar-cleanup-locked-b1b";
+const LIFECYCLE_INTERNAL_LOCKED_MARKER = "--__palancar-internal-locked-b1b";
+const LIFECYCLE_SCRIPT_PATH = path.join(SCRIPT_DIR, "dev-plan-lifecycle.mjs");
 const TEST_LOCKS = new Set();
 const PRODUCTION_ENV = Object.freeze({
   PATH: "/usr/bin:/bin",
@@ -3516,12 +3518,36 @@ function inheritedLockIsValid() {
   let parentStat;
   let fileToken;
   try {
-    if (process.ppid <= 1 || readlinkSync(`/proc/${process.ppid}/exe`) !== "/usr/bin/flock") return false;
-    const parentArgv = readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").split("\0").filter(Boolean);
-    if (parentArgv[0] !== "/usr/bin/flock" || !parentArgv.includes("-n") || !parentArgv.includes("-x") || parentArgv.indexOf(lockPath) < 0) return false;
+    if (process.ppid <= 1) return false;
+    const parentPid = process.ppid;
+    const parentExe = readlinkSync(`/proc/${parentPid}/exe`);
+    const parentArgv = readFileSync(`/proc/${parentPid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    const parentIsFlock = parentExe === "/usr/bin/flock" &&
+      parentArgv[0] === "/usr/bin/flock" &&
+      parentArgv.includes("-n") && parentArgv.includes("-x") && parentArgv.includes(lockPath);
+    const parentIsLifecycle = parentExe === process.execPath &&
+      parentArgv.includes(LIFECYCLE_SCRIPT_PATH) && parentArgv.includes(LIFECYCLE_INTERNAL_LOCKED_MARKER);
+    if (!parentIsFlock && !parentIsLifecycle) return false;
+    if (parentIsLifecycle) {
+      let grandparentPid;
+      try {
+        const stat = readFileSync(`/proc/${parentPid}/stat`, "utf8");
+        const closingParen = stat.lastIndexOf(") ");
+        if (closingParen < 0) throw new Error("proc-stat");
+        grandparentPid = Number(stat.slice(closingParen + 2).trim().split(/\s+/u)[1]);
+      } catch {
+        const status = readFileSync(`/proc/${parentPid}/status`, "utf8");
+        const match = /^PPid:\s+(\d+)$/mu.exec(status);
+        grandparentPid = Number(match?.[1]);
+      }
+      if (!Number.isInteger(grandparentPid) || grandparentPid <= 1) return false;
+      if (readlinkSync(`/proc/${grandparentPid}/exe`) !== "/usr/bin/flock") return false;
+      const grandparentArgv = readFileSync(`/proc/${grandparentPid}/cmdline`, "utf8").split("\0").filter(Boolean);
+      if (grandparentArgv[0] !== "/usr/bin/flock" || !grandparentArgv.includes("-n") || grandparentArgv.indexOf(lockPath) < 0) return false;
+    }
     descriptorStat = fstatSync(fd);
     const selfLink = readlinkSync(`/proc/self/fd/${fd}`);
-    const parentFdPath = `/proc/${process.ppid}/fd/${fd}`;
+    const parentFdPath = `/proc/${parentPid}/fd/${fd}`;
     const parentLink = readlinkSync(parentFdPath);
     if (selfLink !== lockPath || parentLink !== lockPath) return false;
     parentStat = statSync(parentFdPath);
