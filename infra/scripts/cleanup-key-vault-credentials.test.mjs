@@ -1794,7 +1794,7 @@ test("production subprocesses use the exact approved cwd for git and Terraform",
     { root: contextHarness.root, processRunner: contextProcessRunner },
   );
   const dependencyPaths = [
-    "infra/scripts/dev-plan-lifecycle.mjs",
+    "infra/scripts/verify-acr-image-platform.mjs",
     "infra/scripts/assert-dev-plan.mjs",
     "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
     "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",

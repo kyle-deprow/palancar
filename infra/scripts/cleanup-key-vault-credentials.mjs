@@ -39,8 +39,11 @@ export const TERRAFORM_PATH = "/home/dev/.local/bin/terraform-1.15.8";
 export const TERRAFORM_SHA256 =
   "00f55981f5215594c418cd6b20f44fa4c99f9126650602e65d533d131005ea81";
 const GIT_PATH = "/usr/bin/git";
+// Must equal dev-plan-lifecycle.mjs REVIEWED_DEPENDENCIES["credential-cleanup"]
+// minus its leading dev-plan-lifecycle.mjs entry (bound via lifecycleSha256):
+// the lifecycle manifest's dependencyBlobs is that slice, in order.
 const LIVE_DEPENDENCY_PATHS = Object.freeze([
-  "infra/scripts/dev-plan-lifecycle.mjs",
+  "infra/scripts/verify-acr-image-platform.mjs",
   "infra/scripts/assert-dev-plan.mjs",
   "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
   "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
