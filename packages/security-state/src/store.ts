@@ -722,7 +722,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     const expiresAt = checkedAdd(now, PAIRING_TTL_MS);
     const rate = this.#window(this.#operatorIssueRates, operatorHash);
     return this.#commit(now, () => {
-      if (rate.count(now, DAY_MS) >= PAIR_ISSUES_PER_DAY) fail('rate-limited');
+      if (rate.count(now, DAY_MS) >= PAIR_ISSUES_PER_DAY) fail('quota-exceeded');
       if (this.#pairings.has(hash)) fail('state-unavailable');
       rate.add(now, DAY_MS);
       this.#installWindow(this.#operatorIssueRates, operatorHash, rate);
@@ -770,7 +770,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       if (
         shortRate.count(now, 15 * MINUTE_MS) >= PAIR_ATTEMPTS_PER_FIFTEEN_MINUTES ||
         dayRate.count(now, DAY_MS) >= PAIR_ATTEMPTS_PER_DAY
-      ) return { kind: 'rate' as const };
+      ) return { kind: 'quota' as const };
       const pair = pairHash === undefined ? undefined : this.#pairings.get(pairHash);
       const valid = pair !== undefined && pair.status === 'issued' && now < pair.expiresAt;
       if (valid && (installationId === undefined || credential === undefined || credentialHash === undefined)) {
@@ -819,7 +819,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         idleExpiresAt: idleExpiresAt as number
       };
     });
-    if (outcome.kind === 'rate') fail('rate-limited');
+    if (outcome.kind === 'quota') fail('quota-exceeded');
     if (outcome.kind === 'state') fail('state-unavailable');
     if (outcome.kind === 'invalid') fail('invalid-pairing');
     return freeze({
@@ -1152,7 +1152,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       const minute = this.#window(this.#ticketMinuteRates, authentication.installation.id);
       const hour = this.#window(this.#ticketHourRates, authentication.installation.id);
       if (minute.count(now, MINUTE_MS) >= TICKETS_PER_MINUTE || hour.count(now, HOUR_MS) >= TICKETS_PER_HOUR) {
-        return undefined;
+        fail('quota-exceeded');
       }
       if (this.#tickets.has(ticketHash)) fail('state-unavailable');
       const expiresAt = checkedAdd(now, TICKET_TTL_MS);
@@ -1218,13 +1218,14 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       const oldExpired = oldSession !== undefined &&
         (oldSession.status === 'ended' || oldSession.status === 'expired' || oldSession.status === 'revoked' || now >= oldSession.leaseExpiresAt);
       if (oldSession !== undefined && !oldExpired) return undefined;
-      const reconnect = installation.sessionEpoch > 0;
+      const reconnect = oldSession !== undefined &&
+        ['opening', 'active', 'expired'].includes(oldSession.status) && now >= oldSession.leaseExpiresAt;
       const reconnectMinute = this.#window(this.#reconnectMinuteRates, installation.id);
       const reconnectTen = this.#window(this.#reconnectTenMinuteRates, installation.id);
       if (reconnect && (
         reconnectMinute.count(now, MINUTE_MS) >= RECONNECTS_PER_MINUTE ||
         reconnectTen.count(now, TEN_MINUTES_MS) >= RECONNECTS_PER_TEN_MINUTES
-      )) return undefined;
+      )) fail('quota-exceeded');
       if (this.#sessions.has(sessionId)) fail('state-unavailable');
       const epoch = checkedIncrement(installation.sessionEpoch, 'invalid-ticket');
       const leaseExpiresAt = checkedAdd(now, OPENING_LEASE_MS);
@@ -1430,6 +1431,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
 
   #parseGeneration(value: AuthorizeGenerationInput): {
     readonly lease: SessionLease;
+    readonly decision: 'target';
     readonly utteranceId: CanonicalUuid;
     readonly acceptedFinalRevision: number;
     readonly selectedTargetLanguage: string;
@@ -1447,6 +1449,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     ) fail('invalid-input');
     return {
       lease: parseLease(input.lease),
+      decision: input.decision,
       utteranceId: assertCanonicalUuid(input.utteranceId),
       acceptedFinalRevision: input.acceptedFinalRevision,
       selectedTargetLanguage: input.selectedTargetLanguage,
@@ -1460,6 +1463,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
     const input = this.#parseGeneration(value);
     const authorizationId = hashCorrelationKey(JSON.stringify([
       input.lease.installationId, input.lease.sessionId, input.lease.sessionEpoch,
+      input.lease.credentialVersion, input.decision,
       input.utteranceId, input.acceptedFinalRevision, input.selectedTargetLanguage,
       input.gatePolicyVersion, input.transcriptHash
     ]));
@@ -1497,7 +1501,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         if (
           session.generatedWindow.count(now, MINUTE_MS) >= GENERATIONS_PER_MINUTE ||
           session.generatedCount >= GENERATIONS_PER_SESSION
-        ) fail(session.generatedCount >= GENERATIONS_PER_SESSION ? 'quota-exceeded' : 'rate-limited');
+        ) fail('quota-exceeded');
         const generatedCount = checkedIncrement(session.generatedCount, 'quota-exceeded');
         const row: GenerationRow = {
           authorizationId,
@@ -1555,7 +1559,7 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       const installation = this.#installations.get(row.installationId);
       if (session === undefined || installation === undefined || !this.#sessionActive(session, installation, now)) return undefined;
       if (session.attemptWindow.count(now, MINUTE_MS) >= ATTEMPTS_PER_MINUTE || session.attemptCount >= ATTEMPTS_PER_SESSION) {
-        fail(session.attemptCount >= ATTEMPTS_PER_SESSION ? 'quota-exceeded' : 'rate-limited');
+        fail('quota-exceeded');
       }
       const attemptCount = checkedIncrement(session.attemptCount, 'quota-exceeded');
       const leaseVersion = checkedIncrement(row.leaseVersion, 'generation-rejected');

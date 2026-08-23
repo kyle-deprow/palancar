@@ -383,7 +383,7 @@ describe('pairing, source rates, and factory isolation', () => {
     })));
     expect(results.filter((item) => item.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter((item) => item.status === 'rejected')).toHaveLength(99);
-    expect(results.some((item) => item.status === 'rejected' && expectCategory(item.reason, 'rate-limited'))).toBe(true);
+    expect(results.some((item) => item.status === 'rejected' && expectCategory(item.reason, 'quota-exceeded'))).toBe(true);
     expect(store.snapshot().installations).toHaveLength(1);
   });
 
@@ -395,7 +395,7 @@ describe('pairing, source rates, and factory isolation', () => {
         .rejects.toMatchObject({ category: 'invalid-pairing' });
     }
     await expect(store.redeemPairing({ pairingCode: valid.pairingCode, trustedSource: trusted('trusted-a') }))
-      .rejects.toMatchObject({ category: 'rate-limited' });
+      .rejects.toMatchObject({ category: 'quota-exceeded' });
     await expect(store.redeemPairing({ pairingCode: valid.pairingCode, trustedSource: trusted('trusted-b') }))
       .resolves.toMatchObject({ credentialVersion: 1 });
     await expect(store.redeemPairing({ pairingCode: valid.pairingCode } as never))
@@ -423,7 +423,7 @@ describe('pairing, source rates, and factory isolation', () => {
     const valid = await attemptFixture.store.issuePairing({ operatorScope: 'operator' });
     await expect(attemptFixture.store.redeemPairing({
       pairingCode: valid.pairingCode, trustedSource: trusted('same-source')
-    })).rejects.toMatchObject({ category: 'rate-limited' });
+    })).rejects.toMatchObject({ category: 'quota-exceeded' });
   });
 
   it('revokes pairing hashes in O(1) and rejects redemption generically', async () => {
@@ -1007,7 +1007,7 @@ describe('credential rotation, tickets, and session leases', () => {
     expect(active.leaseExpiresAt - ticket.issuedAt).toBe(ACTIVE_LEASE_MS);
   });
 
-  it('enforces rolling ticket limits and reports them only as invalid-ticket', async () => {
+  it('enforces rolling ticket limits as quota-exceeded', async () => {
     const { store, fake } = fixture();
     const { redeemed } = await enroll(store);
     for (let batch = 0; batch < 5; batch += 1) {
@@ -1016,33 +1016,32 @@ describe('credential rotation, tickets, and session leases', () => {
       fake.advance(60_000);
     }
     await expect(store.issueSessionTicket(ticketRequest(redeemed.credential)))
-      .rejects.toMatchObject({ category: 'invalid-ticket' });
+      .rejects.toMatchObject({ category: 'quota-exceeded' });
     expect(store.snapshot().tickets).toHaveLength(30);
   });
 
   it('enforces reconnect limits at 5/60s and 12/10m', async () => {
     const { store, fake } = fixture();
     const { redeemed } = await enroll(store);
-    const initial = await open(store, redeemed.credential);
-    await store.endSession({ lease: initial.active });
+    const initialTicket = await store.issueSessionTicket(ticketRequest(redeemed.credential));
+    await store.consumeSessionTicket(ticketConsume(initialTicket.ticket));
 
     let elapsedReconnects = 0;
     for (let batch = 0; batch < 3; batch += 1) {
-      fake.advance(60_000);
-      const tickets = await Promise.all(Array.from({ length: 5 }, () =>
-        store.issueSessionTicket(ticketRequest(redeemed.credential))));
       const allowed = batch < 2 ? 5 : 2;
       for (let index = 0; index < allowed; index += 1) {
-        const opening = await store.consumeSessionTicket(ticketConsume(tickets[index]?.ticket as string));
-        const active = await store.activateSession({
-          lease: opening, message: { type: 'session.start', protocolVersion: 1 }
-        });
-        await store.endSession({ lease: active });
+        fake.advance(OPENING_LEASE_MS);
+        const ticket = await store.issueSessionTicket(ticketRequest(redeemed.credential));
+        await store.consumeSessionTicket(ticketConsume(ticket.ticket));
         elapsedReconnects += 1;
       }
-      if (batch === 2) {
-        await expect(store.consumeSessionTicket(ticketConsume(tickets[allowed]?.ticket as string)))
-          .rejects.toMatchObject({ category: 'invalid-ticket' });
+      if (batch < 2) {
+        fake.advance(60_000);
+      } else {
+        fake.advance(OPENING_LEASE_MS);
+        const ticket = await store.issueSessionTicket(ticketRequest(redeemed.credential));
+        await expect(store.consumeSessionTicket(ticketConsume(ticket.ticket)))
+          .rejects.toMatchObject({ category: 'quota-exceeded' });
       }
     }
     expect(elapsedReconnects).toBe(12);
@@ -1443,6 +1442,8 @@ describe('audio grants and generation claims', () => {
       active.installationId,
       active.sessionId,
       active.sessionEpoch,
+      active.credentialVersion,
+      'target',
       request.utteranceId,
       request.acceptedFinalRevision,
       request.selectedTargetLanguage,
@@ -1463,7 +1464,7 @@ describe('audio grants and generation claims', () => {
       await minute.store.authorizeGeneration(correlation(minute.active, revision));
     }
     await expect(minute.store.authorizeGeneration(correlation(minute.active, 7)))
-      .rejects.toMatchObject({ category: 'rate-limited' });
+      .rejects.toMatchObject({ category: 'quota-exceeded' });
 
     const session = await activeFixture();
     let lease = session.active;

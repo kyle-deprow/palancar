@@ -51,6 +51,11 @@ const OTHER_AUDIENCE: SecurityAudience = Object.freeze({
   path: '/v1/stream',
   protocol: 'palancar.v1'
 });
+const LOCAL_AUDIENCE: SecurityAudience = Object.freeze({
+  origin: 'wss://localhost:7443',
+  path: '/v1/stream',
+  protocol: 'palancar.v1'
+});
 
 const AZURE_CLI_OPTIONS = Object.freeze({
   endpoint: 'https://palancarunit.table.core.windows.net',
@@ -387,6 +392,58 @@ async function activeFixture(initialNow = 1_000) {
   const { redeemed } = await enroll(base);
   const opened = await open(base, redeemed.credential);
   return { ...base, redeemed, ...opened };
+}
+
+function localFixture(initialNow = 1_000) {
+  const fake = createFakeClock(initialNow);
+  const store = createTestSecurityStateStore({
+    audience: LOCAL_AUDIENCE,
+    generationProvider: 'mock',
+    transcriptionProvider: 'mock',
+    clock: fake.clock,
+    ids: ids(),
+    tokens: tokens()
+  });
+  return { store, fake };
+}
+
+async function localEnroll(base: ReturnType<typeof localFixture>) {
+  const issued = await base.store.issuePairing({ operatorScope: 'operator-1' });
+  const redeemed = await base.store.redeemPairing({
+    pairingCode: issued.pairingCode,
+    trustedSource: trusted('source-1')
+  });
+  return { issued, redeemed };
+}
+
+async function localOpen(base: ReturnType<typeof localFixture>, credential: string) {
+  const ticket = await base.store.issueSessionTicket({
+    credential,
+    environment: LOCAL_MOCK_ENVIRONMENT,
+    audience: LOCAL_AUDIENCE,
+    intent: 'new'
+  });
+  const opening = await base.store.consumeSessionTicket({
+    ticket: ticket.ticket,
+    environment: LOCAL_MOCK_ENVIRONMENT,
+    audience: LOCAL_AUDIENCE,
+    intent: 'new'
+  });
+  const active = await base.store.activateSession({
+    lease: opening,
+    message: { type: 'session.start', protocolVersion: 1 }
+  });
+  return { ticket, opening, active };
+}
+
+async function rejectionCategory(operation: () => Promise<unknown>) {
+  try {
+    await operation();
+    return undefined;
+  } catch (error) {
+    if (!(error instanceof SecurityStateError)) throw error;
+    return error.category;
+  }
 }
 
 function audioRows(base: ReturnType<typeof fixture>): readonly AzureStoredEntity[] {
@@ -1954,6 +2011,295 @@ describe('Azure Table durable adapter', () => {
     expect(durableResult.exhausted).toBe(localResult.exhausted);
     expect(local.snapshot().pairings).toHaveLength(1);
     expect(durable.security.snapshot().some((row) => row.properties.kind === 'pairing')).toBe(true);
+  });
+
+  it('keeps local and durable authorization identities and quota categories aligned', async () => {
+    const localIdentity = localFixture();
+    const durableIdentity = fixture();
+    const localEnrollment = await localEnroll(localIdentity);
+    const durableEnrollment = await enroll(durableIdentity);
+    const localOpened = await localOpen(localIdentity, localEnrollment.redeemed.credential);
+    const durableOpened = await open(durableIdentity, durableEnrollment.redeemed.credential);
+    const localRequest = correlation(localOpened.active);
+    const durableRequest = correlation(durableOpened.active);
+    const localAuthorization = await localIdentity.store.authorizeGeneration(localRequest);
+    const durableAuthorization = await durableIdentity.runtime.authorizeGeneration(durableRequest);
+    const localDuplicateAuthorization = await localIdentity.store.authorizeGeneration(localRequest);
+    const durableDuplicateAuthorization = await durableIdentity.runtime.authorizeGeneration(durableRequest);
+
+    expect(localAuthorization.status).toBe('acquired');
+    expect(durableAuthorization.status).toBe(localAuthorization.status);
+    expect(localDuplicateAuthorization.status).toBe('duplicate-in-flight');
+    expect(durableDuplicateAuthorization.status).toBe(localDuplicateAuthorization.status);
+    expect(localDuplicateAuthorization.claim).toEqual(localAuthorization.claim);
+    expect(durableDuplicateAuthorization.claim).toEqual(durableAuthorization.claim);
+    expect(localAuthorization.status).toBe(durableAuthorization.status);
+    expect(localAuthorization.claim.authorizationId).toBe(hashCorrelationKey(JSON.stringify([
+      localOpened.active.installationId,
+      localOpened.active.sessionId,
+      localOpened.active.sessionEpoch,
+      localOpened.active.credentialVersion,
+      localRequest.decision,
+      localRequest.utteranceId,
+      localRequest.acceptedFinalRevision,
+      localRequest.selectedTargetLanguage,
+      localRequest.gatePolicyVersion,
+      localRequest.transcriptHash
+    ])));
+    expect(durableAuthorization.claim.authorizationId).toBe(localAuthorization.claim.authorizationId);
+
+    const localChangedCredentialVersion = await rejectionCategory(() =>
+      localIdentity.store.authorizeGeneration({
+        ...localRequest,
+        lease: { ...localOpened.active, credentialVersion: localOpened.active.credentialVersion + 1 }
+      })
+    );
+    const durableChangedCredentialVersion = await rejectionCategory(() =>
+      durableIdentity.runtime.authorizeGeneration({
+        ...durableRequest,
+        lease: { ...durableOpened.active, credentialVersion: durableOpened.active.credentialVersion + 1 }
+      })
+    );
+    expect(localChangedCredentialVersion).toBe('generation-rejected');
+    expect(durableChangedCredentialVersion).toBe(localChangedCredentialVersion);
+
+    const localChangedDecision = await rejectionCategory(() =>
+      localIdentity.store.authorizeGeneration({ ...localRequest, decision: 'english' } as never)
+    );
+    const durableChangedDecision = await rejectionCategory(() =>
+      durableIdentity.runtime.authorizeGeneration({ ...durableRequest, decision: 'english' } as never)
+    );
+    expect(localChangedDecision).toBe('invalid-input');
+    expect(durableChangedDecision).toBe(localChangedDecision);
+
+    for (let revision = 2; revision <= 6; revision += 1) {
+      await localIdentity.store.authorizeGeneration(correlation(localOpened.active, revision));
+      await durableIdentity.runtime.authorizeGeneration(correlation(durableOpened.active, revision));
+    }
+    const localGenerationQuota = await rejectionCategory(() =>
+      localIdentity.store.authorizeGeneration(correlation(localOpened.active, 7))
+    );
+    const durableGenerationQuota = await rejectionCategory(() =>
+      durableIdentity.runtime.authorizeGeneration(correlation(durableOpened.active, 7))
+    );
+    expect(localGenerationQuota).toBe('quota-exceeded');
+    expect(durableGenerationQuota).toBe(localGenerationQuota);
+
+    const localTicketRate = localFixture();
+    const durableTicketRate = fixture();
+    const localTicketEnrollment = await localEnroll(localTicketRate);
+    const durableTicketEnrollment = await enroll(durableTicketRate);
+    for (let batch = 0; batch < 5; batch += 1) {
+      for (let index = 0; index < 6; index += 1) {
+        await localTicketRate.store.issueSessionTicket({
+          credential: localTicketEnrollment.redeemed.credential,
+          environment: LOCAL_MOCK_ENVIRONMENT,
+          audience: LOCAL_AUDIENCE,
+          intent: 'new'
+        });
+        await durableTicketRate.runtime.issueSessionTicket(ticketRequest(durableTicketEnrollment.redeemed.credential));
+      }
+      localTicketRate.fake.advance(60_000);
+      durableTicketRate.fake.advance(60_000);
+    }
+    const localTicketQuota = await rejectionCategory(() => localTicketRate.store.issueSessionTicket({
+      credential: localTicketEnrollment.redeemed.credential,
+      environment: LOCAL_MOCK_ENVIRONMENT,
+      audience: LOCAL_AUDIENCE,
+      intent: 'new'
+    }));
+    const durableTicketQuota = await rejectionCategory(() =>
+      durableTicketRate.runtime.issueSessionTicket(ticketRequest(durableTicketEnrollment.redeemed.credential))
+    );
+    expect(localTicketQuota).toBe('quota-exceeded');
+    expect(durableTicketQuota).toBe(localTicketQuota);
+
+    const localReconnect = localFixture();
+    const durableReconnect = fixture();
+    const localReconnectEnrollment = await localEnroll(localReconnect);
+    const durableReconnectEnrollment = await enroll(durableReconnect);
+    const localFirstTicket = await localReconnect.store.issueSessionTicket({
+      credential: localReconnectEnrollment.redeemed.credential,
+      environment: LOCAL_MOCK_ENVIRONMENT,
+      audience: LOCAL_AUDIENCE,
+      intent: 'new'
+    });
+    const durableFirstTicket = await durableReconnect.runtime.issueSessionTicket(
+      ticketRequest(durableReconnectEnrollment.redeemed.credential)
+    );
+    await localReconnect.store.consumeSessionTicket({
+      ticket: localFirstTicket.ticket,
+      environment: LOCAL_MOCK_ENVIRONMENT,
+      audience: LOCAL_AUDIENCE,
+      intent: 'new'
+    });
+    await durableReconnect.runtime.consumeSessionTicket(ticketConsume(durableFirstTicket.ticket));
+    let localReconnectQuota: string | undefined;
+    let durableReconnectQuota: string | undefined;
+    for (let batch = 0; batch < 3; batch += 1) {
+      const allowed = batch < 2 ? 5 : 2;
+      for (let index = 0; index < allowed; index += 1) {
+        localReconnect.fake.advance(OPENING_LEASE_MS);
+        durableReconnect.fake.advance(OPENING_LEASE_MS);
+        const localTicket = await localReconnect.store.issueSessionTicket({
+          credential: localReconnectEnrollment.redeemed.credential,
+          environment: LOCAL_MOCK_ENVIRONMENT,
+          audience: LOCAL_AUDIENCE,
+          intent: 'new'
+        });
+        const durableTicket = await durableReconnect.runtime.issueSessionTicket(
+          ticketRequest(durableReconnectEnrollment.redeemed.credential)
+        );
+        const localOpening = await localReconnect.store.consumeSessionTicket({
+          ticket: localTicket.ticket,
+          environment: LOCAL_MOCK_ENVIRONMENT,
+          audience: LOCAL_AUDIENCE,
+          intent: 'new'
+        });
+        const durableOpening = await durableReconnect.runtime.consumeSessionTicket(
+          ticketConsume(durableTicket.ticket)
+        );
+        expect(localOpening.sessionEpoch).toBe(batch * 5 + index + 2);
+        expect(durableOpening.sessionEpoch).toBe(localOpening.sessionEpoch);
+      }
+      if (batch < 2) {
+        localReconnect.fake.advance(60_000);
+        durableReconnect.fake.advance(60_000);
+      } else {
+        localReconnect.fake.advance(OPENING_LEASE_MS);
+        durableReconnect.fake.advance(OPENING_LEASE_MS);
+        const localReconnectTicket = await localReconnect.store.issueSessionTicket({
+          credential: localReconnectEnrollment.redeemed.credential,
+          environment: LOCAL_MOCK_ENVIRONMENT,
+          audience: LOCAL_AUDIENCE,
+          intent: 'new'
+        });
+        const durableReconnectTicket = await durableReconnect.runtime.issueSessionTicket(
+          ticketRequest(durableReconnectEnrollment.redeemed.credential)
+        );
+        localReconnectQuota = await rejectionCategory(() => localReconnect.store.consumeSessionTicket({
+          ticket: localReconnectTicket.ticket,
+          environment: LOCAL_MOCK_ENVIRONMENT,
+          audience: LOCAL_AUDIENCE,
+          intent: 'new'
+        }));
+        durableReconnectQuota = await rejectionCategory(() =>
+          durableReconnect.runtime.consumeSessionTicket(ticketConsume(durableReconnectTicket.ticket))
+        );
+      }
+    }
+    expect(localReconnectQuota).toBe('quota-exceeded');
+    expect(durableReconnectQuota).toBe(localReconnectQuota);
+
+    const localEndedReconnect = localFixture();
+    const durableEndedReconnect = fixture();
+    const localEndedReconnectEnrollment = await localEnroll(localEndedReconnect);
+    const durableEndedReconnectEnrollment = await enroll(durableEndedReconnect);
+    const localEndedInitial = await localOpen(
+      localEndedReconnect,
+      localEndedReconnectEnrollment.redeemed.credential
+    );
+    const durableEndedInitial = await open(
+      durableEndedReconnect,
+      durableEndedReconnectEnrollment.redeemed.credential
+    );
+    await localEndedReconnect.store.endSession({ lease: localEndedInitial.active });
+    await durableEndedReconnect.runtime.endSession({ lease: durableEndedInitial.active });
+    const localHeldTickets = [];
+    const durableHeldTickets = [];
+    for (let index = 0; index < 5; index += 1) {
+      localHeldTickets.push(await localEndedReconnect.store.issueSessionTicket({
+        credential: localEndedReconnectEnrollment.redeemed.credential,
+        environment: LOCAL_MOCK_ENVIRONMENT,
+        audience: LOCAL_AUDIENCE,
+        intent: 'new'
+      }));
+      durableHeldTickets.push(await durableEndedReconnect.runtime.issueSessionTicket(
+        ticketRequest(durableEndedReconnectEnrollment.redeemed.credential)
+      ));
+    }
+    localEndedReconnect.fake.advance(59_000);
+    durableEndedReconnect.fake.advance(59_000);
+    for (let index = 0; index < localHeldTickets.length; index += 1) {
+      const localHeldTicket = localHeldTickets[index];
+      const durableHeldTicket = durableHeldTickets[index];
+      if (localHeldTicket === undefined || durableHeldTicket === undefined) {
+        throw new Error('missing held reconnect ticket');
+      }
+      const localOpening = await localEndedReconnect.store.consumeSessionTicket({
+        ticket: localHeldTicket.ticket,
+        environment: LOCAL_MOCK_ENVIRONMENT,
+        audience: LOCAL_AUDIENCE,
+        intent: 'new'
+      });
+      const durableOpening = await durableEndedReconnect.runtime.consumeSessionTicket(
+        ticketConsume(durableHeldTicket.ticket)
+      );
+      const localEnded = await localEndedReconnect.store.activateSession({
+        lease: localOpening,
+        message: { type: 'session.start', protocolVersion: 1 }
+      });
+      const durableEnded = await durableEndedReconnect.runtime.activateSession({
+        lease: durableOpening,
+        message: { type: 'session.start', protocolVersion: 1 }
+      });
+      expect(durableEnded.sessionEpoch).toBe(localEnded.sessionEpoch);
+      await localEndedReconnect.store.endSession({ lease: localEnded });
+      await durableEndedReconnect.runtime.endSession({ lease: durableEnded });
+    }
+    localEndedReconnect.fake.advance(1_000);
+    durableEndedReconnect.fake.advance(1_000);
+    const localFinalEnded = await localOpen(
+      localEndedReconnect,
+      localEndedReconnectEnrollment.redeemed.credential
+    );
+    const durableFinalEnded = await open(
+      durableEndedReconnect,
+      durableEndedReconnectEnrollment.redeemed.credential
+    );
+    expect(durableFinalEnded.active.sessionEpoch).toBe(localFinalEnded.active.sessionEpoch);
+    await localEndedReconnect.store.endSession({ lease: localFinalEnded.active });
+    await durableEndedReconnect.runtime.endSession({ lease: durableFinalEnded.active });
+
+    const localPairQuota = localFixture();
+    const durablePairQuota = fixture();
+    for (let index = 0; index < 20; index += 1) {
+      await localPairQuota.store.issuePairing({ operatorScope: 'same-operator' });
+      await durablePairQuota.operator.issuePairing({ operatorScope: 'same-operator' });
+    }
+    const localPairIssueQuota = await rejectionCategory(() =>
+      localPairQuota.store.issuePairing({ operatorScope: 'same-operator' })
+    );
+    const durablePairIssueQuota = await rejectionCategory(() =>
+      durablePairQuota.operator.issuePairing({ operatorScope: 'same-operator' })
+    );
+    expect(localPairIssueQuota).toBe('quota-exceeded');
+    expect(durablePairIssueQuota).toBe(localPairIssueQuota);
+
+    const localPairAttempt = localFixture();
+    const durablePairAttempt = fixture();
+    const localPair = await localPairAttempt.store.issuePairing({ operatorScope: 'operator' });
+    const durablePair = await durablePairAttempt.operator.issuePairing({ operatorScope: 'operator' });
+    for (let index = 0; index < 5; index += 1) {
+      await expect(localPairAttempt.store.redeemPairing({
+        pairingCode: pairing(50 + index),
+        trustedSource: trusted('same-source')
+      })).rejects.toMatchObject({ category: 'invalid-pairing' });
+      await expect(durablePairAttempt.runtime.redeemPairing({
+        pairingCode: pairing(50 + index),
+        trustedSource: trusted('same-source')
+      })).rejects.toMatchObject({ category: 'invalid-pairing' });
+    }
+    const localPairAttemptQuota = await rejectionCategory(() => localPairAttempt.store.redeemPairing({
+      pairingCode: localPair.pairingCode,
+      trustedSource: trusted('same-source')
+    }));
+    const durablePairAttemptQuota = await rejectionCategory(() => durablePairAttempt.runtime.redeemPairing({
+      pairingCode: durablePair.pairingCode,
+      trustedSource: trusted('same-source')
+    }));
+    expect(localPairAttemptQuota).toBe('quota-exceeded');
+    expect(durablePairAttemptQuota).toBe(localPairAttemptQuota);
   });
 
   it('rejects malformed schema and never includes row or secret content in errors', async () => {
