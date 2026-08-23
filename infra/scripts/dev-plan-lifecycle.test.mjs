@@ -68,6 +68,7 @@ const {
   createLifecycle,
   createLifecycleForTests,
   LIFECYCLE_CACHE_ROOT,
+  JOURNAL_COMMITMENT_DIRECTORY_NAME,
   parseCanonicalBackendConfig,
   parseTerraformStateCache,
   parseCli,
@@ -2444,6 +2445,28 @@ function writeRevocationEvidence(harness) {
     recorded_at: new Date().toISOString(),
   });
   writeExclusive(path.join(root, "openrouter-revocation.lock"), "");
+}
+
+function writeCleanupJournalEvidence(harness, journalRunId = "cleanup-journal-run") {
+  const parent = path.join(harness.root, JOURNAL_COMMITMENT_DIRECTORY_NAME);
+  mkdirSync(parent, { mode: 0o700 });
+  chmodSync(parent, 0o700);
+  const runDirectory = path.join(parent, journalRunId);
+  mkdirSync(runDirectory, { mode: 0o700 });
+  chmodSync(runDirectory, 0o700);
+  writeExclusive(path.join(runDirectory, "cleanup-operation-head-000000.json"), {
+    version: 1,
+    type: "key-vault-cleanup-operation-head",
+    runId: journalRunId,
+    phase: "credential-cleanup",
+  });
+  writeExclusive(path.join(runDirectory, "cleanup-operation-head-intent-000000.json"), {
+    version: 1,
+    type: "key-vault-cleanup-operation-head-intent",
+    runId: journalRunId,
+    phase: "credential-cleanup",
+  });
+  return { parent, runDirectory };
 }
 
 function guardPreflight(harness, phase) {
@@ -7196,6 +7219,54 @@ test("Sol probe: terminal inventory closes over every predecessor journal and au
     assert.equal(labels.has("openrouter-revocation.lock"), true);
   } finally {
     harness.cleanup();
+  }
+});
+
+test("cleanup journal directory is accepted for creates and inventoried recursively", () => {
+  const createHarness = makeHarness();
+  try {
+    writeCleanupJournalEvidence(createHarness);
+    initialize(createHarness);
+    assert.equal(createHarness.lifecycle.create("model-bootstrap").status, "created");
+  } finally {
+    createHarness.cleanup();
+  }
+
+  const inventoryHarness = makeHarness();
+  try {
+    writeCleanupJournalEvidence(inventoryHarness, "seed-cleanup-journal");
+    const runId = prepareTerminalFromSeed(inventoryHarness);
+    inventoryHarness.lifecycle.finalize("terminal", runId);
+    const inventory = JSON.parse(readFileSync(inventoryHarness.paths(runId).terminal, "utf8")).receiptInventory;
+    const labels = new Set(inventory.map((entry) => entry.label));
+    assert.equal(labels.has(`${JOURNAL_COMMITMENT_DIRECTORY_NAME}/seed-cleanup-journal/cleanup-operation-head-000000.json`), true);
+    assert.equal(labels.has(`${JOURNAL_COMMITMENT_DIRECTORY_NAME}/seed-cleanup-journal/cleanup-operation-head-intent-000000.json`), true);
+  } finally {
+    inventoryHarness.cleanup();
+  }
+});
+
+test("cleanup journal directory rejects symlinks and wrong modes", () => {
+  for (const kind of ["symlink", "mode"]) {
+    const harness = makeHarness();
+    try {
+      const journalPath = path.join(harness.root, JOURNAL_COMMITMENT_DIRECTORY_NAME);
+      if (kind === "symlink") {
+        const target = path.join(harness.root, "journal-target");
+        mkdirSync(target, { mode: 0o700 });
+        chmodSync(target, 0o700);
+        symlinkSync(target, journalPath, "dir");
+      } else {
+        mkdirSync(journalPath, { mode: 0o755 });
+        chmodSync(journalPath, 0o755);
+      }
+      expectCode(
+        () => initialize(harness),
+        kind === "symlink" ? "cleanup-journal-directory-symlink" : "cleanup-journal-directory-mode",
+      );
+    } finally {
+      harness.cleanup();
+    }
   }
 });
 

@@ -406,6 +406,10 @@ const REVOCATION_FIXED_FILES = Object.freeze([
 const REVOCATION_STATE_RE = /^openrouter-revocation-state\.json(?:\.seq-(\d{8}))?$/;
 const REVOCATION_TEMP_RE = /^(openrouter-revocation-state\.json(?:\.seq-\d{8})?|openrouter-revocation-raw-response\.json|openrouter-revocation-receipt\.json|openrouter-revocation\.lock)\.tmp-(\d+)-([a-f0-9]{24})$/;
 const REVOCATION_MANIFEST_RE = /^openrouter-revocation-owned-temp-(\d+)-([a-f0-9]{24})\.json$/;
+// Shared evidence contract with cleanup-key-vault-credentials.mjs:
+// JOURNAL_COMMITMENT_DIRECTORY_NAME must remain identical in both scripts.
+export const JOURNAL_COMMITMENT_DIRECTORY_NAME = ".cleanup-journal-commitments";
+const CLEANUP_JOURNAL_ARTIFACT_RE = /^cleanup-(?:operation-head(?:-intent)?|journal-commitment|mutation-(?:intent|commitment))-\d{6}\.json$/u;
 const CLOSURE_STATE_RE = /^closure-state-(\d{6})\.json$/;
 const CLOSURE_TOMBSTONE_FILENAME = "closure-tombstone.json";
 const CLOSURE_INVENTORY_FILENAME = "closure-inventory.json";
@@ -3330,8 +3334,45 @@ function withLock(config, callback, allowClosure = false) {
 }
 
 function auxiliaryEvidenceName(name) {
-  return REVOCATION_FIXED_FILES.includes(name) || REVOCATION_STATE_RE.test(name) ||
+  return name === JOURNAL_COMMITMENT_DIRECTORY_NAME ||
+    REVOCATION_FIXED_FILES.includes(name) || REVOCATION_STATE_RE.test(name) ||
     REVOCATION_TEMP_RE.test(name) || REVOCATION_MANIFEST_RE.test(name);
+}
+
+function validateCleanupJournalEvidence(config) {
+  const parent = path.join(config.root, JOURNAL_COMMITMENT_DIRECTORY_NAME);
+  let parentStat;
+  try {
+    parentStat = lstatSync(parent);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    reject("cleanup-journal-directory");
+  }
+  failIf(parentStat.isSymbolicLink(), "cleanup-journal-directory-symlink");
+  assertDirectory(parent, "cleanup-journal-directory");
+
+  const entries = [];
+  for (const runEntry of readdirSync(parent, { withFileTypes: true })) {
+    failIf(
+      runEntry.isSymbolicLink() || !runEntry.isDirectory() || !RUN_ID_RE.test(runEntry.name),
+      "cleanup-journal-run-directory",
+    );
+    const runDirectory = path.join(parent, runEntry.name);
+    assertDirectory(runDirectory, "cleanup-journal-run-directory");
+    for (const fileEntry of readdirSync(runDirectory, { withFileTypes: true })) {
+      failIf(
+        fileEntry.isSymbolicLink() || !fileEntry.isFile() ||
+          !CLEANUP_JOURNAL_ARTIFACT_RE.test(fileEntry.name),
+        "cleanup-journal-file",
+      );
+      const filePath = path.join(runDirectory, fileEntry.name);
+      assertRegular(filePath, ARTIFACT_MODE, "cleanup-journal-file");
+      const label = path.relative(config.root, filePath);
+      failIf(label === "" || label.startsWith("..") || path.isAbsolute(label), "cleanup-journal-path");
+      entries.push({ label, sha256: sha256EvidenceFile(filePath, label) });
+    }
+  }
+  return entries.sort((left, right) => left.label.localeCompare(right.label));
 }
 
 function validateRevocationFile(filePath, code) {
@@ -3553,11 +3594,13 @@ function validateRevocationEvidence(config, { requireComplete = false } = {}) {
   }
   if (requireComplete) failIf(states.at(-1)?.value.state !== "local-removed" || !existsSync(receiptPath), "revocation-incomplete");
   for (const entry of names) {
+    if (entry.name === JOURNAL_COMMITMENT_DIRECTORY_NAME) continue;
     if (auxiliaryEvidenceName(entry.name)) entries.push({
       label: entry.name,
       sha256: sha256EvidenceFile(path.join(config.root, entry.name), entry.name),
     });
   }
+  entries.push(...validateCleanupJournalEvidence(config));
   return entries.sort((a, b) => a.label.localeCompare(b.label));
 }
 
