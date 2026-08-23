@@ -1565,6 +1565,52 @@ describe("G2 relay transport", () => {
     });
   });
 
+  it("sends one post-commit cancel and retires the turn before the relay abort arrives", async () => {
+    const events: RelayTransportCallbackEvent[] = [];
+    const { transport } = createTransport(undefined, undefined, (event) => events.push(event));
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    transport.commitUtterance();
+    transport.cancelUtterance();
+
+    expect(sentControlTypes(socket).filter((type) =>
+      type === "utterance.cancel" || type === "utterance.commit",
+    )).toEqual(["utterance.commit", "utterance.cancel"]);
+    expect(transport.snapshot.activeUtteranceId).toBeUndefined();
+
+    transport.startUtterance(SECOND_UTTERANCE_ID);
+    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
+      type: "utterance.start",
+      utteranceId: SECOND_UTTERANCE_ID,
+    });
+
+    socket.message(JSON.stringify(utteranceAborted(UTTERANCE_ID, "cancellation")));
+    expect(events.filter((event) => event.type === "utterance.aborted")).toHaveLength(0);
+    expect(transport.snapshot.activeUtteranceId).toBe(SECOND_UTTERANCE_ID);
+  });
+
+  it("retires a pause-deferred commit when the watchdog cancels the turn", async () => {
+    const { transport } = createTransport();
+    const socket = await openReady(transport);
+
+    transport.startUtterance(UTTERANCE_ID);
+    socket.message(JSON.stringify(audioAck(UTTERANCE_ID, 0, "pause")));
+    transport.commitUtterance();
+    transport.cancelUtterance({ retireImmediately: true });
+
+    expect(sentControlTypes(socket).filter((type) =>
+      type === "utterance.cancel" || type === "utterance.commit",
+    )).toEqual(["utterance.cancel"]);
+    expect(transport.snapshot.activeUtteranceId).toBeUndefined();
+
+    transport.startUtterance(SECOND_UTTERANCE_ID);
+    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
+      type: "utterance.start",
+      utteranceId: SECOND_UTTERANCE_ID,
+    });
+  });
+
   it("retains a cancelled queue for delayed ACKs and clears it before utterance.aborted callbacks", async () => {
     const errors: RelayTransportError[] = [];
     let activeInCallback: string | undefined;

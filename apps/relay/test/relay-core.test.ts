@@ -1045,6 +1045,7 @@ describe('relay session core', () => {
     const cancel = core.handleText(utteranceCancelText());
     expect(cancel.outgoing).toMatchObject([{ type: 'utterance.aborted', category: 'cancellation' }]);
     expect(cancel.close).toBeUndefined();
+    expect(cancel.terminatedUtteranceId).toBe(TEST_UTTERANCE_ID);
     expect(core.handleText(utteranceCancelText())).toEqual({ outgoing: [] });
     expect(adapter.sessions[0]?.cancelCalls).toEqual([TEST_UTTERANCE_ID]);
 
@@ -1054,6 +1055,25 @@ describe('relay session core', () => {
     expect(endResult).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
     expect(endedAdapter.sessions[0]?.closeCalls).toBe(1);
     expect(endedCore.close()).toEqual({ outgoing: [], close: { code: 1000, reason: 'closed' } });
+  });
+
+  it('treats a cancel arriving after the relay resolved the result as a no-op', async () => {
+    const { core } = openNew();
+    core.handleText(utteranceStartText());
+    await core.handleTranscriptionEvent(finalEvent());
+    await flushAsyncEvents();
+    await core.drainAsyncEvents();
+
+    expect(core.handleText(utteranceCancelText())).toEqual({ outgoing: [] });
+  });
+
+  it('keeps a cancel for a never-existent utterance as a protocol violation', () => {
+    const { core } = openNew();
+
+    expect(core.handleText(utteranceCancelText(TEST_SECOND_UTTERANCE_ID))).toMatchObject({
+      outgoing: [{ type: 'error', code: 'malformed_message' }],
+      close: { code: 1002, reason: 'protocol_error' }
+    });
   });
 
   it('cancels pending generation when the utterance is cancelled', async () => {

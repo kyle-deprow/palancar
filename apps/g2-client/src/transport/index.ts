@@ -778,11 +778,11 @@ export class RelayTransport {
     this.#commitActive(active);
   }
 
-  cancelUtterance(): void {
+  cancelUtterance(options: Readonly<{ readonly retireImmediately?: boolean }> = {}): void {
     const active = this.#active;
     const session = this.#session;
     if (active === undefined || session === undefined) return;
-    this.#sendUtteranceCancel();
+    this.#sendUtteranceCancel(options.retireImmediately === true);
   }
 
   endSession(reason: "user_requested" | "app_shutdown" | "transport_error" = "user_requested"): void {
@@ -1324,12 +1324,14 @@ export class RelayTransport {
     );
   }
 
-  #sendUtteranceCancel(): boolean {
+  #sendUtteranceCancel(retireImmediately = false): boolean {
     const active = this.#active;
     const session = this.#session;
     if (active === undefined || session === undefined) return true;
-    if (this.#isTerminalUtterance(active)) return true;
-    if (active.phase !== "streaming" && active.phase !== "committing") return true;
+    if (active.phase === "cancelling") return true;
+    const committed = active.phase === "committing" && !active.commitRequested;
+    const commitDeferred = active.phase === "committing" && active.commitRequested;
+    if (!committed && !commitDeferred && active.phase !== "streaming") return true;
     const message = assertUtteranceCancel({
       type: "utterance.cancel",
       sessionId: session.sessionId,
@@ -1339,7 +1341,17 @@ export class RelayTransport {
     });
     if (!this.#sendControl(message)) return false;
     active.commitRequested = false;
-    active.phase = "cancelling";
+    if (committed || (retireImmediately && commitDeferred)) {
+      // `utterance.commit` is the normal terminal control for a turn, but it
+      // either marks the relay's active turn committed or is still deferred
+      // behind a legal audio pause. Relay accepts the follow-up
+      // `utterance.cancel` in both cases. Retire the identity locally after
+      // sending that terminal control so the next turn can start without
+      // waiting for relay's delayed aborted event.
+      this.#retireActiveAfterLocalCancel(active, session);
+    } else {
+      active.phase = "cancelling";
+    }
     return true;
   }
 
@@ -1348,6 +1360,14 @@ export class RelayTransport {
       active.phase === "cancelling" ||
       (active.phase === "committing" && !active.commitRequested)
     );
+  }
+
+  #retireActiveAfterLocalCancel(active: ActiveUtterance, session: SessionIdentity): void {
+    if (this.#active !== active) return;
+    this.#rememberRetiredUtterance(
+      utteranceIdentityKey(session.sessionId, session.sessionEpoch, active.utteranceId),
+    );
+    this.#active = undefined;
   }
 
   #abortActive(lockPhase = false): void {

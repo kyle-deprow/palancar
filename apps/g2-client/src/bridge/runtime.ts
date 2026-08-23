@@ -53,6 +53,7 @@ export const RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW = 12;
 export const RECOVERY_BACKOFF_BASE_MS = 500;
 export const RECOVERY_BACKOFF_MAX_MS = 8_000;
 export const RECOVERY_READY_DEADLINE_MS = 10_000;
+export const RESULT_PIPELINE_DEADLINE_MS = 15_000;
 
 const CLEANUP_PREEMPTED = Symbol("cleanup-preempted");
 const AUTH_OPERATION_PREEMPTED = Symbol("auth-operation-preempted");
@@ -117,7 +118,7 @@ export interface G2Transport {
   startUtterance(utteranceId: string): void;
   pushPcm(pcm: Uint8Array): void;
   commitUtterance(): void;
-  cancelUtterance(): void;
+  cancelUtterance(options?: Readonly<{ readonly retireImmediately?: boolean }>): void;
   endSession(reason?: "user_requested" | "app_shutdown" | "transport_error"): void;
   close(): void;
 }
@@ -284,6 +285,38 @@ function transportErrorEvent(error: RelayTransportError, state: ClientState): Cl
     case "Ready":
     case "Error":
       return { type: "fatal" };
+  }
+}
+
+type ResultPipelineState = Extract<ClientState, { state: "Finalizing" | "Translating" }>;
+type ResultPipelineTimeoutEvent = Extract<ClientEvent, { type: "utterance.aborted" }>;
+
+function isResultPipelineState(state: ClientState): state is ResultPipelineState {
+  return state.state === "Finalizing" || state.state === "Translating";
+}
+
+function isResultPipelineProgress(
+  previousState: ClientState,
+  event: ClientEvent,
+  nextState: ClientState,
+): boolean {
+  if (!isResultPipelineState(previousState) || !isResultPipelineState(nextState)) return false;
+
+  switch (event.type) {
+    case "transcript.partial":
+    case "transcript.final":
+      return previousState.state === "Finalizing" && nextState.state === "Finalizing" &&
+        nextState.utteranceId === event.utteranceId &&
+        nextState.segmentRevisions[event.segmentId] === event.revision &&
+        previousState.segmentRevisions[event.segmentId] !== event.revision;
+    case "language.decision":
+      return previousState.state === "Finalizing" && nextState.state === "Translating";
+    case "translation.ready":
+      return previousState.state === "Translating" && nextState.state === "Translating" &&
+        previousState.englishTranslation === undefined &&
+        nextState.englishTranslation !== undefined;
+    default:
+      return false;
   }
 }
 
@@ -672,6 +705,9 @@ export class G2BridgeRuntime {
   #pendingAudioClose: Promise<boolean> | undefined;
   #audioCloseRequired = false;
   #audioPcmFaultTransport: G2Transport | undefined;
+  #resultPipelineWatchdogCancel: (() => void) | undefined;
+  #resultPipelineWatchdogArmed = false;
+  #resultPipelineWatchdogGeneration = 0;
   #displayTimer: ReturnType<typeof setTimeout> | undefined;
   #displayTimerPromise: Promise<void> | undefined;
   #displayTimerResolve: (() => void) | undefined;
@@ -1145,6 +1181,7 @@ export class G2BridgeRuntime {
     this.#invalidateAuthOperations();
     const authFailure = this.#disposeAuthController();
     this.#cancelRecoveryTimers();
+    this.#cancelResultPipelineWatchdog();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
     this.#pendingRecoveryLoss = false;
@@ -1278,6 +1315,7 @@ export class G2BridgeRuntime {
     let controllerFailure = this.#disposeAuthController();
     this.#phoneAuthListeners.clear();
     this.#cancelRecoveryTimers();
+    this.#cancelResultPipelineWatchdog();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
     this.#pendingRecoveryLoss = false;
@@ -1534,6 +1572,7 @@ export class G2BridgeRuntime {
       systemEventType === OsEventTypeList.ABNORMAL_EXIT_EVENT
     ) {
       this.#cancelRecoveryTimers();
+      this.#cancelResultPipelineWatchdog();
       queueMicrotask(() => this.#requestCleanup());
       return;
     }
@@ -1582,6 +1621,7 @@ export class G2BridgeRuntime {
         systemEvent.eventType === OsEventTypeList.ABNORMAL_EXIT_EVENT
       ) {
         this.#cancelRecoveryTimers();
+        this.#cancelResultPipelineWatchdog();
         this.#requestCleanup();
         return;
       }
@@ -1692,13 +1732,90 @@ export class G2BridgeRuntime {
     scheduleDisplay = true,
   ): ReturnType<typeof reduceClientState> {
     if (this.#isRuntimeInactive()) {
+      this.#cancelResultPipelineWatchdog();
       return { state: this.#state, effects: [] };
     }
+    const previousState = this.#state;
     const reduction = reduceClientState(this.#state, event);
     this.#state = reduction.state;
+    this.#syncResultPipelineWatchdog(previousState, event, this.#state);
     this.#publishPhoneAuthState();
     if (scheduleDisplay) this.#scheduleDisplay(this.#state);
     return reduction;
+  }
+
+  #syncResultPipelineWatchdog(
+    previousState: ClientState,
+    event: ClientEvent,
+    nextState: ClientState,
+  ): void {
+    if (!isResultPipelineState(nextState)) {
+      this.#cancelResultPipelineWatchdog();
+      return;
+    }
+    if (
+      isResultPipelineProgress(previousState, event, nextState) &&
+      this.#resultPipelineWatchdogArmed
+    ) {
+      this.#armResultPipelineWatchdog(nextState);
+    }
+  }
+
+  #cancelResultPipelineWatchdog(): void {
+    this.#resultPipelineWatchdogGeneration += 1;
+    this.#resultPipelineWatchdogArmed = false;
+    const cancel = this.#resultPipelineWatchdogCancel;
+    this.#resultPipelineWatchdogCancel = undefined;
+    if (cancel === undefined) return;
+    try {
+      cancel();
+    } catch {
+      // A custom scheduler's cancellation is best effort.
+    }
+  }
+
+  #armResultPipelineWatchdog(state: ResultPipelineState): void {
+    this.#cancelResultPipelineWatchdog();
+    const generation = this.#resultPipelineWatchdogGeneration;
+    this.#resultPipelineWatchdogArmed = true;
+    const timeoutEvent: ResultPipelineTimeoutEvent = {
+      type: "utterance.aborted",
+      sessionId: state.sessionId,
+      sessionEpoch: state.sessionEpoch,
+      utteranceId: state.utteranceId,
+      category: "provider_loss",
+    };
+    try {
+      this.#resultPipelineWatchdogCancel = this.#recoveryTiming.schedule(() => {
+        if (this.#resultPipelineWatchdogGeneration !== generation) return;
+        this.#resultPipelineWatchdogCancel = undefined;
+        this.#queueResultPipelineTimeout(timeoutEvent, generation);
+      }, RESULT_PIPELINE_DEADLINE_MS);
+    } catch {
+      this.#resultPipelineWatchdogCancel = undefined;
+      this.#queueResultPipelineTimeout(timeoutEvent, generation);
+    }
+  }
+
+  #queueResultPipelineTimeout(event: ResultPipelineTimeoutEvent, generation: number): void {
+    void this.#queueSerializedEvent(() => {
+      if (
+        this.#isRuntimeInactive() ||
+        this.#resultPipelineWatchdogGeneration !== generation ||
+        !isResultPipelineState(this.#state) ||
+        this.#state.sessionId !== event.sessionId ||
+        this.#state.sessionEpoch !== event.sessionEpoch ||
+        this.#state.utteranceId !== event.utteranceId
+      ) return;
+      this.#resultPipelineWatchdogArmed = false;
+      try {
+        this.#transport?.cancelUtterance({ retireImmediately: true });
+      } catch {
+        this.#handleEffectFailure();
+        return;
+      }
+      return this.#dispatchAndRunEffects(event);
+    });
   }
 
   async #runEffects(
@@ -1761,7 +1878,20 @@ export class G2BridgeRuntime {
             await this.#stopAudio();
             break;
           case "commit-utterance":
-            this.#transport?.commitUtterance();
+            {
+              const transport = this.#transport;
+              if (transport === undefined) break;
+              transport.commitUtterance();
+              const state = this.#state;
+              if (
+                isResultPipelineState(state) &&
+                state.sessionId === effect.sessionId &&
+                state.sessionEpoch === effect.sessionEpoch &&
+                state.utteranceId === effect.utteranceId
+              ) {
+                this.#armResultPipelineWatchdog(state);
+              }
+            }
             break;
           case "end-session":
             this.#transport?.endSession("user_requested");
@@ -1785,6 +1915,7 @@ export class G2BridgeRuntime {
     this.#audioPcmEnabled = false;
     this.#invalidateAuthOperations();
     this.#cancelRecoveryTimers();
+    this.#cancelResultPipelineWatchdog();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
     this.#pendingRecoveryLoss = false;
@@ -2011,6 +2142,7 @@ export class G2BridgeRuntime {
     this.#audioPcmEnabled = false;
     this.#pendingRecoveryLoss = true;
     this.#cancelRecoveryTimers();
+    this.#cancelResultPipelineWatchdog();
     this.#retireCurrentTransport(transport, generation, false);
 
     // The transport is detached before this callback enters the serialized
@@ -2313,6 +2445,7 @@ export class G2BridgeRuntime {
       ? this.#state
       : undefined;
     this.#cancelRecoveryTimers();
+    this.#cancelResultPipelineWatchdog();
     this.#recoveryCycle += 1;
     this.#recoveryContext = undefined;
     this.#pendingRecoveryLoss = false;
@@ -2699,6 +2832,7 @@ export class G2BridgeRuntime {
     if (this.#cleanupRequested) return;
     this.#displayAvailable = false;
     this.#pendingDisplayState = undefined;
+    this.#cancelResultPipelineWatchdog();
     if (this.#state.state !== "Error") {
       this.#state = reduceClientState(this.#state, { type: "fatal" }).state;
     }

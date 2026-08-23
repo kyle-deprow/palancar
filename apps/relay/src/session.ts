@@ -315,6 +315,7 @@ function snapshotConfiguredTranscriptionCapabilities(
 }
 
 const SESSION_EPOCH = 1;
+const RECENTLY_RESOLVED_UTTERANCE_CAPACITY = 8;
 const MANUAL_COMMIT_CADENCE_MS = 600;
 const CONFIGURED_SERVER_VAD = 'disabled' as const;
 const CONFIGURED_LANGUAGE_MODE = 'selected-target' as const;
@@ -729,7 +730,7 @@ export class RelaySessionCore {
   #finalController: AbortController | undefined;
   #generationOperation: GenerationSecurityOperation | undefined;
   #generationStarted = false;
-  #lastCancelled: UtteranceIdentity | undefined;
+  #recentlyResolvedUtteranceIds = new Set<string>();
   #sessionStartMetricRecorded = false;
   #sessionRejectMetricRecorded = false;
   #sessionEndMetricRecorded = false;
@@ -1508,6 +1509,7 @@ export class RelaySessionCore {
 
     this.#sessionId = this.#sessionLease.sessionId;
     this.#sessionEpoch = this.#sessionLease.sessionEpoch;
+    this.#recentlyResolvedUtteranceIds.clear();
     this.#selectedTargetLanguage = message.targetLanguage;
     this.#selectedTranscriptionLanguageHint = languageHint;
     this.#effectiveLimits = negotiateLimits(message.requestedLimits, this.#serverLimits);
@@ -1799,24 +1801,19 @@ export class RelaySessionCore {
       return boundaryFailure;
     }
     const active = this.#active;
-    const identity = {
-      sessionId: message.sessionId,
-      sessionEpoch: message.sessionEpoch,
-      utteranceId: message.utteranceId
-    };
     if (active === undefined) {
-      if (this.#lastCancelled !== undefined && sameIdentity(this.#lastCancelled, identity)) {
-        return this.#result([]);
-      }
-      return this.#protocolBoundaryFailure();
+      return this.#recentlyResolvedUtteranceIds.has(message.utteranceId)
+        ? this.#result([])
+        : this.#protocolBoundaryFailure();
     }
     if (active.utteranceId !== message.utteranceId) {
-      return this.#protocolBoundaryFailure();
+      return this.#recentlyResolvedUtteranceIds.has(message.utteranceId)
+        ? this.#result([])
+        : this.#protocolBoundaryFailure();
     }
     const aborted = this.#aborted(this.#identity(active), 'cancellation');
-    this.#lastCancelled = identity;
     this.#finishActive(true);
-    return this.#result([aborted]);
+    return this.#result([aborted], undefined, active.utteranceId);
   }
 
   #handleSessionEnd(message: ReturnType<typeof assertSessionEnd>): RelayStepResult {
@@ -2519,6 +2516,9 @@ export class RelaySessionCore {
     const operation = this.#generationOperation;
     const claim = operation?.claim;
     const generationStarted = this.#generationStarted;
+    if (active !== undefined) {
+      this.#rememberRecentlyResolvedUtterance(active.utteranceId);
+    }
     this.#active = undefined;
     this.#finalToken = undefined;
     this.#finalController = undefined;
@@ -2549,6 +2549,15 @@ export class RelaySessionCore {
           (current) => this.#releaseClaim(current)
         );
       }
+    }
+  }
+
+  #rememberRecentlyResolvedUtterance(utteranceId: string): void {
+    this.#recentlyResolvedUtteranceIds.delete(utteranceId);
+    this.#recentlyResolvedUtteranceIds.add(utteranceId);
+    if (this.#recentlyResolvedUtteranceIds.size > RECENTLY_RESOLVED_UTTERANCE_CAPACITY) {
+      const oldest = this.#recentlyResolvedUtteranceIds.values().next().value as string | undefined;
+      if (oldest !== undefined) this.#recentlyResolvedUtteranceIds.delete(oldest);
     }
   }
 
@@ -2619,13 +2628,17 @@ export class RelaySessionCore {
 
   #result(
     outgoing: readonly ServerControlMessage[],
-    close?: Readonly<{ readonly code: RelayCloseCode; readonly reason: string }>
+    close?: Readonly<{ readonly code: RelayCloseCode; readonly reason: string }>,
+    terminatedUtteranceId?: string
   ): RelayStepResult {
     const validated = Object.freeze(outgoing.map((message) => assertServerControlMessage(message)));
-    if (close === undefined) {
-      return { outgoing: validated };
+    const result: RelayStepResult = close === undefined
+      ? { outgoing: validated }
+      : { outgoing: validated, close };
+    if (terminatedUtteranceId === undefined) {
+      return result;
     }
-    return { outgoing: validated, close };
+    return { ...result, terminatedUtteranceId };
   }
 
   #terminalResult(): RelayStepResult {

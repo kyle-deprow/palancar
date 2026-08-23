@@ -29,6 +29,7 @@ import {
   RECOVERY_MAX_ATTEMPTS_PER_LONG_WINDOW,
   RECOVERY_MAX_CONSECUTIVE_ATTEMPTS,
   RECOVERY_READY_DEADLINE_MS,
+  RESULT_PIPELINE_DEADLINE_MS,
   type RecoveryTiming,
   isPairedTurnEffects,
   type G2BridgePort,
@@ -151,20 +152,26 @@ class FakeTransport implements G2Transport {
   readonly calls: string[];
   readonly pcm: Uint8Array[] = [];
   targetLanguage: string | undefined;
+  activeUtteranceId: string | undefined;
+  committed = false;
+  startUtteranceRejected = false;
   closed = false;
   pushPcmImplementation: (() => void) | undefined;
   commitImplementation: (() => void) | undefined;
   closeImplementation: (() => void) | undefined;
   readonly startSessionImplementation: ((targetLanguage: "es" | "tr") => Promise<void>) | undefined;
+  readonly statefulUtteranceLifecycle: boolean;
 
   constructor(
     options: RelayTransportOptions,
     calls: string[],
     startSessionImplementation?: (targetLanguage: "es" | "tr") => Promise<void>,
+    statefulUtteranceLifecycle = false,
   ) {
     this.options = options;
     this.calls = calls;
     this.startSessionImplementation = startSessionImplementation;
+    this.statefulUtteranceLifecycle = statefulUtteranceLifecycle;
   }
 
   async startSession(targetLanguage: "es" | "tr"): Promise<void> {
@@ -174,7 +181,13 @@ class FakeTransport implements G2Transport {
   }
 
   startUtterance(utteranceId: string): void {
+    if (this.statefulUtteranceLifecycle && this.activeUtteranceId !== undefined) {
+      this.startUtteranceRejected = true;
+      return;
+    }
     this.calls.push(`start-utterance:${utteranceId}`);
+    this.activeUtteranceId = utteranceId;
+    this.committed = false;
   }
 
   pushPcm(pcm: Uint8Array): void {
@@ -185,11 +198,16 @@ class FakeTransport implements G2Transport {
 
   commitUtterance(): void {
     this.calls.push("commit");
+    if (this.statefulUtteranceLifecycle) this.committed = true;
     this.commitImplementation?.();
   }
 
   cancelUtterance(): void {
     this.calls.push("cancel");
+    if (this.statefulUtteranceLifecycle) {
+      this.activeUtteranceId = undefined;
+      this.committed = false;
+    }
   }
 
   endSession(): void {
@@ -400,6 +418,7 @@ interface HarnessOptions {
   readonly utteranceIds?: readonly string[];
   readonly displayDebounceMs?: number;
   readonly recoveryTiming?: RecoveryTiming;
+  readonly statefulTransport?: boolean;
 }
 
 function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
@@ -420,7 +439,12 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
     waitForBridge: harnessOptions.waitForBridge ?? (async () => bridge),
     readyLogger: (marker) => bridge.calls.push(`ready:${marker}`),
     createTransport: (options) => {
-      const transport = new FakeTransport(options, operations, harnessOptions.startSession);
+      const transport = new FakeTransport(
+        options,
+        operations,
+        harnessOptions.startSession,
+        harnessOptions.statefulTransport,
+      );
       transports.push(transport);
       return transport;
     },
@@ -2146,12 +2170,166 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.bridge.calls.indexOf("audio:close")).toBeGreaterThan(-1);
   });
 
+  it("returns a stalled Finalizing turn to Ready without losing the session", async () => {
+    const clock = manualRecoveryClock();
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Finalizing");
+
+    clock.fireNext(RESULT_PIPELINE_DEADLINE_MS);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+    expect(transport.closed).toBe(false);
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toContain("utterance was aborted");
+    await harness.runtime.cleanup();
+  });
+
+  it("retires a committed turn before the watchdog permits the next utterance", async () => {
+    const clock = manualRecoveryClock();
+    const harness = createHarness({
+      idGenerator: (() => {
+        const ids = [UTTERANCE_ID, NEXT_UTTERANCE_ID];
+        let index = 0;
+        return () => ids[index++] ?? NEXT_UTTERANCE_ID;
+      })(),
+      recoveryTiming: clock.timing,
+      statefulTransport: true,
+    });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(transport.committed).toBe(true);
+
+    clock.fireNext(RESULT_PIPELINE_DEADLINE_MS);
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(transport.activeUtteranceId).toBeUndefined();
+    expect(transport.calls.filter((call) => call === "cancel")).toHaveLength(1);
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(transport.startUtteranceRejected).toBe(false);
+    expect(transport.activeUtteranceId).toBe(NEXT_UTTERANCE_ID);
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+    await harness.runtime.cleanup();
+  });
+
+  it("returns a stalled Translating turn to Ready without losing the session", async () => {
+    const clock = manualRecoveryClock();
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    transport.emit(utteranceEvent());
+    transport.emit(languageDecision());
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Translating");
+
+    clock.fireNext(RESULT_PIPELINE_DEADLINE_MS);
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+    expect(transport.closed).toBe(false);
+    await harness.runtime.cleanup();
+  });
+
+  it("re-arms the watchdog for legitimate pipeline progress and clears it at Results", async () => {
+    const clock = manualRecoveryClock();
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    const finalizingTimer = clock.timers.find((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS);
+    expect(finalizingTimer).toBeDefined();
+
+    transport.emit(utteranceEvent("transcript.partial", "hola parcial"));
+    await harness.runtime.whenEventsIdle();
+    expect(finalizingTimer?.cancelled).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Finalizing");
+
+    const partialTimer = clock.timers.find((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS);
+    expect(partialTimer).toBeDefined();
+    transport.emit(utteranceEvent());
+    transport.emit(languageDecision());
+    await harness.runtime.whenEventsIdle();
+    expect(partialTimer?.cancelled).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Translating");
+
+    const translatingTimer = clock.timers.find((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS);
+    expect(translatingTimer).toBeDefined();
+    transport.emit(translationReady());
+    await harness.runtime.whenEventsIdle();
+    expect(translatingTimer?.cancelled).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Translating");
+
+    const translatedTimer = clock.timers.find((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS);
+    expect(translatedTimer).toBeDefined();
+    transport.emit(suggestionsReady());
+    await harness.runtime.whenEventsIdle();
+    expect(translatedTimer?.cancelled).toBe(true);
+    expect(harness.runtime.snapshot.state).toBe("Results");
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+    await harness.runtime.cleanup();
+  });
+
+  it("cancels the result-pipeline watchdog during shutdown", async () => {
+    const clock = manualRecoveryClock();
+    const harness = createHarness({ recoveryTiming: clock.timing });
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(textEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Finalizing");
+    const watchdog = clock.timers.find((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS);
+    expect(watchdog).toBeDefined();
+
+    await harness.runtime.cleanup();
+    expect(watchdog?.cancelled).toBe(true);
+    expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+  });
+
   it("waits for microphone shutdown before committing", async () => {
     let resolveClose: ((closed: boolean) => void) | undefined;
     const pendingClose = new Promise<boolean>((resolve) => {
       resolveClose = resolve;
     });
-    const harness = createHarness();
+    const clock = manualRecoveryClock();
+    const harness = createHarness({ recoveryTiming: clock.timing });
     const transport = await selectSpanishAndStart(harness);
     transport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
@@ -2170,13 +2348,20 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(settled).toBe(false);
     expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
     expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(0);
+    expect(clock.timers.filter((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS,
+    )).toHaveLength(0);
 
     resolveClose?.(true);
     await idle;
     expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
     expect(harness.runtime.snapshot.audioOpen).toBe(false);
     expect(harness.operations.filter((operation) => operation === "commit")).toHaveLength(1);
+    expect(clock.timers.filter((timer) =>
+      !timer.cancelled && !timer.fired && timer.delayMs === RESULT_PIPELINE_DEADLINE_MS,
+    )).toHaveLength(1);
     expect(transport.closed).toBe(false);
+    await harness.runtime.cleanup();
   });
 
   it("closes a late microphone-open success after transport loss and never enables PCM", async () => {

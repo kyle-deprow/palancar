@@ -71,6 +71,7 @@ const ORIGIN = 'wss://127.0.0.1';
 const ENVIRONMENT = 'relay-host-test';
 const GATE_POLICY_VERSION = '1.0.0';
 const UTTERANCE_ID = '22222222-2222-4222-8222-222222222222';
+const SECOND_UTTERANCE_ID = '33333333-3333-4333-8333-333333333333';
 const CANARY = 'relay-host-canary-ticket-body-provider-error';
 const CONFIG_CANARY = 'relay-host-config-canary-invalid-origin';
 const PENDING_CREDENTIAL = 'C'.repeat(42) + 'E';
@@ -488,6 +489,15 @@ function frame(sequence: number, offset: number, payload = new Uint8Array(3_200)
     offset,
     payload
   });
+}
+
+function frameFor(
+  utteranceId: string,
+  sequence: number,
+  offset: number,
+  payload = new Uint8Array(3_200)
+): Uint8Array {
+  return encodeAudioFrame({ utteranceId, sequence, offset, payload });
 }
 
 async function issueTicket(host: RelayHost, body: unknown = { protocolVersion: 1, intent: 'new' }): Promise<JsonObject> {
@@ -3973,6 +3983,102 @@ describe('relay HTTP/WebSocket host', () => {
     const closed = waitForClose(socket);
     socket.close(1000, 'test_done');
     await closed;
+  });
+
+  it('keeps B audio flowing after a late no-op cancel for resolved utterance A', async () => {
+    await host.stop();
+    const security = testSecurityWith();
+    const reserve = vi.spyOn(security.runtime, 'reserveAudio');
+    host = createRelayHostProduction({
+      environment: ENVIRONMENT,
+      origin: ORIGIN,
+      port: 0,
+      gatePolicyVersion: GATE_POLICY_VERSION,
+      metricSink: productionTestMetricSink(),
+      security
+    });
+    await host.start();
+
+    const issued = await issueTicket(host);
+    const socket = await openSocket(host, String(issued.ticket));
+    const readyPromise = nextMessage(socket, (message) => message.type === 'session.ready');
+    socket.send(sessionStartText());
+    const ready = await readyPromise;
+    const sessionId = String(ready.sessionId);
+    const sessionEpoch = Number(ready.sessionEpoch);
+    const start = (utteranceId: string): void => {
+      socket.send(JSON.stringify({
+        type: 'utterance.start',
+        sessionId,
+        sessionEpoch,
+        utteranceId
+      }));
+    };
+
+    start(UTTERANCE_ID);
+    const resolvedA = nextMessage(
+      socket,
+      (message) => message.type === 'language.decision' && message.utteranceId === UTTERANCE_ID
+    );
+    socket.send(JSON.stringify({
+      type: 'utterance.commit',
+      sessionId,
+      sessionEpoch,
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 0
+    }));
+    await expect(resolvedA).resolves.toMatchObject({
+      type: 'language.decision',
+      utteranceId: UTTERANCE_ID,
+      decision: 'uncertain'
+    });
+
+    start(SECOND_UTTERANCE_ID);
+    const bInitialAck = nextMessage(
+      socket,
+      (message) => message.type === 'audio.ack' &&
+        message.utteranceId === SECOND_UTTERANCE_ID &&
+        message.highestContiguousExclusiveOffset === 8_000
+    );
+    for (let sequence = 0; sequence < 5; sequence += 1) {
+      socket.send(frameFor(SECOND_UTTERANCE_ID, sequence, sequence * 1_600), { binary: true });
+    }
+    await bInitialAck;
+
+    socket.send(JSON.stringify({
+      type: 'utterance.cancel',
+      sessionId,
+      sessionEpoch,
+      utteranceId: UTTERANCE_ID,
+      finalOriginalSampleOffset: 0
+    }));
+    const bSubsequentAck = nextMessage(
+      socket,
+      (message) => message.type === 'audio.ack' &&
+        message.utteranceId === SECOND_UTTERANCE_ID &&
+        message.highestContiguousExclusiveOffset === 16_000
+    );
+    for (let sequence = 5; sequence < 10; sequence += 1) {
+      socket.send(frameFor(SECOND_UTTERANCE_ID, sequence, sequence * 1_600), { binary: true });
+    }
+
+    await expect(bSubsequentAck).resolves.toMatchObject({
+      type: 'audio.ack',
+      utteranceId: SECOND_UTTERANCE_ID,
+      highestContiguousExclusiveOffset: 16_000
+    });
+    expect(reserve).toHaveBeenCalledTimes(3);
+    expect(reserve.mock.calls.map(([input]) => ({
+      from: input.fromOriginalSampleOffset,
+      samples: input.originalSamples
+    }))).toEqual([
+      { from: 0, samples: 8_000 },
+      { from: 0, samples: 8_000 },
+      { from: 8_000, samples: 8_000 }
+    ]);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    socket.close(1000, 'test_done');
+    await waitForClose(socket);
   });
 
   it('delivers final transcript and language before deferred generation output', async () => {

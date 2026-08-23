@@ -2838,11 +2838,15 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
             return;
           }
           result = core.handleText(text);
-          if (
-            typeof parsed === 'object' && parsed !== null &&
-            ['utterance.commit', 'utterance.cancel'].includes(
-              String((parsed as { readonly type?: unknown }).type)
-            )
+          const controlMessageType = typeof parsed === 'object' && parsed !== null
+            ? String((parsed as { readonly type?: unknown }).type)
+            : undefined;
+          if (controlMessageType === 'utterance.commit') {
+            connection.audio = undefined;
+          } else if (
+            controlMessageType === 'utterance.cancel' &&
+            result.terminatedUtteranceId !== undefined &&
+            connection.audio?.utteranceId === result.terminatedUtteranceId
           ) {
             connection.audio = undefined;
           }

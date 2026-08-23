@@ -291,6 +291,8 @@ export type RelayCloseCode =
 export interface RelayStepResult {
   readonly outgoing: readonly ServerControlMessage[];
   readonly close?: Readonly<{ readonly code: RelayCloseCode; readonly reason: string }>;
+  /** Internal host signal; this is not serialized onto the wire. */
+  readonly terminatedUtteranceId?: string;
 }
 
 export type { NegotiatedLimits, NormalizedTranscriptionEvent, ServerControlMessage };
