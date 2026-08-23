@@ -34,6 +34,14 @@ const REAL_SOURCE_TEXT = Object.freeze({
   trQuestion: 'Merhaba, tren istasyonu nerede?',
   catalan: "Podria ajudar-me a localitzar l'estació de tren, si us plau?"
 });
+const REAL_GENERATED_TEXT = Object.freeze({
+  translationEnglish: 'Excuse me, where is the train station?',
+  suggestionZeroEnglish: 'Excuse me, could you tell me where the train station is?',
+  suggestionZeroSpanish: 'Disculpe, ¿podría decirme dónde está la estación de tren?',
+  suggestionOneEnglish: 'Could you please show me how to get to the train station?',
+  suggestionOneSpanish: '¿Podría mostrarme cómo llegar a la estación de tren, por favor?',
+  mixed: 'Excuse me, ¿dónde está la estación?'
+});
 const MEASURED_MINIMUM_MARGIN_CORPUS = Object.freeze([
   ['es', REAL_SOURCE_TEXT.esTrainDeparture],
   ['es', REAL_SOURCE_TEXT.esStationTwoBlocks],
@@ -190,6 +198,20 @@ function generatedInput(
           ? override.text
           : TEXT[expectedLanguage],
       expectedLanguage
+    }))) as GeneratedLanguageValidationInput['checks']
+  });
+}
+
+function generatedInputWithTexts(
+  target: 'es' | 'tr',
+  count: 5 | 7,
+  overrides: Readonly<Record<number, string>>
+): GeneratedLanguageValidationInput {
+  const baseline = generatedInput(target, count);
+  return Object.freeze({
+    checks: Object.freeze(baseline.checks.map((check, index) => Object.freeze({
+      ...check,
+      text: overrides[index] ?? check.text
     }))) as GeneratedLanguageValidationInput['checks']
   });
 }
@@ -465,7 +487,7 @@ describe('development provisional ELD-small boundary', () => {
     ['es', 0.8462327011788826],
     ['tr', 0.726775956284153]
   ] as const)(
-    'accepts pinned real-ELD %s source evidence with an isolated canonical-empty numeric window',
+    'accepts pinned real-ELD %s source evidence without querying a sub-threshold numeric window',
     async (target, expectedScore) => {
       const eld = (await import('eld/small')).default;
       const detector = eld.newInstance();
@@ -502,7 +524,7 @@ describe('development provisional ELD-small boundary', () => {
         throw new Error('expected provisional source evidence');
       }
       expect(result.provisionalScore).toBeCloseTo(expectedScore, 12);
-      expect(canonicalEmptyWindows).toBeGreaterThan(0);
+      expect(canonicalEmptyWindows).toBe(0);
     }
   );
 
@@ -605,7 +627,7 @@ describe('development provisional ELD-small boundary', () => {
     ['tr', 5],
     ['tr', 7]
   ] as const)(
-    'accepts pinned real-ELD %s %i-check output with canonical-empty numeric subwindows',
+    'accepts pinned real-ELD %s %i-check output without querying sub-threshold numeric windows',
     async (target, count) => {
       const eld = (await import('eld/small')).default;
       const detector = eld.newInstance();
@@ -642,7 +664,7 @@ describe('development provisional ELD-small boundary', () => {
         evidence,
         'development-provisional'
       )).toBe(true);
-      expect(canonicalEmptyWindows).toBeGreaterThanOrEqual(count);
+      expect(canonicalEmptyWindows).toBe(0);
     }
   );
 
@@ -690,6 +712,93 @@ describe('development provisional ELD-small boundary', () => {
     expect(isAcceptedGeneratedLanguageEvidence(evidence)).toBe(false);
   });
 
+  it('accepts the live Luna English translation and suggestions, plus their Spanish pairs', async () => {
+    const { generatedLanguageValidator } =
+      createDevelopmentProvisionalLanguageBoundary();
+    const evidence = await generatedLanguageValidator.validate(
+      generatedInputWithTexts('es', 5, {
+        0: REAL_GENERATED_TEXT.translationEnglish,
+        1: REAL_GENERATED_TEXT.suggestionZeroEnglish,
+        2: REAL_GENERATED_TEXT.suggestionZeroSpanish,
+        3: REAL_GENERATED_TEXT.suggestionOneEnglish,
+        4: REAL_GENERATED_TEXT.suggestionOneSpanish
+      }),
+      { signal: new AbortController().signal }
+    );
+
+    expect(evidence.checks).toMatchObject([
+      { expectedLanguage: 'en', detectedLanguage: 'en', verdict: 'match' },
+      { expectedLanguage: 'en', detectedLanguage: 'en', verdict: 'match' },
+      { expectedLanguage: 'es', detectedLanguage: 'es', verdict: 'match' },
+      { expectedLanguage: 'en', detectedLanguage: 'en', verdict: 'match' },
+      { expectedLanguage: 'es', detectedLanguage: 'es', verdict: 'match' }
+    ]);
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(true);
+  });
+
+  it('ignores a short English source filler but rejects a real English clause as mixed', async () => {
+    const boundary = createDevelopmentProvisionalLanguageBoundary();
+
+    await expect(boundary.classifier.classify(
+      'Buenos días. ¿Dónde está la estación? please',
+      'es'
+    )).resolves.toMatchObject({
+      detectedLanguage: 'es',
+      decision: 'accept',
+      reason: 'MATCH'
+    });
+
+    await expect(boundary.classifier.classify(
+      'Buenos días. ¿Dónde está la estación? Where is the train station?',
+      'es'
+    )).resolves.toMatchObject({
+      detectedLanguage: 'mixed',
+      decision: 'reject',
+      reason: 'MIXED'
+    });
+
+    const generated = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, {
+        index: 2,
+        text: '¿Dónde está la estación? please'
+      }),
+      { signal: new AbortController().signal }
+    );
+    expect(generated.checks[2]).toMatchObject({
+      expectedLanguage: 'es',
+      detectedLanguage: 'es',
+      verdict: 'match'
+    });
+  });
+
+  it.each(['en', 'es'] as const)(
+    'rejects the live mixed sentence as mixed when %s is expected',
+    async (expectedLanguage) => {
+      const { generatedLanguageValidator } =
+        createDevelopmentProvisionalLanguageBoundary();
+      const index = expectedLanguage === 'en' ? 0 : 2;
+      const evidence = await generatedLanguageValidator.validate(
+        generatedInputWithTexts('es', 5, {
+          [index]: REAL_GENERATED_TEXT.mixed
+        }),
+        { signal: new AbortController().signal }
+      );
+
+      expect(evidence.checks[index]).toMatchObject({
+        expectedLanguage,
+        detectedLanguage: 'mixed',
+        verdict: 'mismatch'
+      });
+      expect(isAcceptedGeneratedLanguageEvidence(
+        evidence,
+        'development-provisional'
+      )).toBe(false);
+    }
+  );
+
   it.each([
     ['Turkish', TEXT.tr],
     ['English', TEXT.en],
@@ -722,15 +831,19 @@ describe('development provisional ELD-small boundary', () => {
   ) => {
     const text = `reliable ${topLanguage} generated calibration text`;
     const boundary = createDevelopmentProvisionalLanguageBoundary({
-      loadDetector: () => detectorFor((candidate) => candidate === text
-        ? {
+      loadDetector: () => detectorFor((candidate) => {
+        if (candidate === text) {
+          return {
             language: topLanguage,
             score: 0.7,
             secondLanguage: topLanguage === 'en' ? 'es' : 'en',
             secondScore: 0.64,
             reliable: true
-          }
-        : tokenLanguage(candidate))
+          };
+        }
+        const detected = tokenLanguage(candidate);
+        return detected === 'zz' ? topLanguage : detected;
+      })
     });
     const evidence = await boundary.generatedLanguageValidator.validate(
       generatedInput(target, 5, { index, text }),
@@ -995,9 +1108,9 @@ describe('development provisional ELD-small boundary', () => {
           text.startsWith(targetToken)
             ? {
                 status: 'provisional',
-                detectedLanguage: target,
-                decision: 'accept',
-                reason: 'MATCH_IGNORED_SINGLETON'
+                detectedLanguage: 'mixed',
+                decision: 'reject',
+                reason: 'MIXED'
               }
             : {
                 status: 'provisional',
@@ -1033,7 +1146,7 @@ describe('development provisional ELD-small boundary', () => {
             'alpha beta gamma': 'fr',
             beta: 'fr'
           },
-          expected: 'MATCH_IGNORED_SINGLETON'
+          expected: 'MIXED'
         },
         {
           text: `${selectedMarker(target)}. left right middle.`,
@@ -1041,7 +1154,7 @@ describe('development provisional ELD-small boundary', () => {
             'left right': 'fr',
             'right middle': 'fr'
           },
-          expected: 'MIXED'
+          expected: 'MATCH'
         },
         {
           text: `${selectedMarker(target)}. alpha,beta.`,
@@ -1049,17 +1162,17 @@ describe('development provisional ELD-small boundary', () => {
             'alpha,beta': 'fr',
             'alpha beta': 'de'
           },
-          expected: 'MIXED'
+          expected: 'MATCH'
         },
         {
           text: `${selectedMarker(target)}. repeat. gap. repeat.`,
           overrides: { repeat: 'fr' },
-          expected: 'MIXED'
+          expected: 'MATCH'
         },
         {
           text: `${selectedMarker(target)}. café. 東京.`,
           overrides: { café: 'fr', 東京: 'de' },
-          expected: 'MIXED'
+          expected: 'MATCH'
         },
         {
           text: `${selectedMarker(target)}. one two three four five six seven eight nine.`,
@@ -1168,14 +1281,14 @@ describe('development provisional ELD-small boundary', () => {
   );
 
   it.each(['es', 'tr'] as const)(
-    'applies minimal source conflict cores symmetrically for %s',
+    'ignores sub-threshold source conflict cores and rejects substantive cores for %s',
     async (target) => {
       const singletonCalls: string[] = [];
       const boundary = createDevelopmentProvisionalLanguageBoundary({
         loadDetector: () => detectorFor((text) => {
           const known = tokenLanguage(text);
           if (known !== 'zz') return known;
-          if (text === 'isolatedword') {
+          if (text === 'isolated') {
             singletonCalls.push(text);
             return 'fr';
           }
@@ -1186,22 +1299,22 @@ describe('development provisional ELD-small boundary', () => {
       });
 
       await expect(boundary.classifier.classify(
-        `${selectedMarker(target)}. isolatedword.`,
+        `${selectedMarker(target)}. isolated.`,
         target
       )).resolves.toMatchObject({
         detectedLanguage: target,
         decision: 'accept',
-        reason: 'MATCH_IGNORED_SINGLETON'
+        reason: 'MATCH'
       });
-      expect(singletonCalls).toHaveLength(1);
+      expect(singletonCalls).toHaveLength(0);
 
       await expect(boundary.classifier.classify(
         `${selectedMarker(target)}. isolatedone. isolatedtwo.`,
         target
       )).resolves.toMatchObject({
-        detectedLanguage: 'mixed',
-        decision: 'reject',
-        reason: 'MIXED'
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH'
       });
 
       await expect(boundary.classifier.classify(
@@ -1400,16 +1513,7 @@ describe('development provisional ELD-small boundary', () => {
     'preserves generated clause-then-canonical detector order for %s',
     async (target) => {
       const text = 'alpha,beta gamma delta epsilon zeta eta theta';
-      const canonical = [
-        'alpha',
-        'beta',
-        'gamma',
-        'delta',
-        'epsilon',
-        'zeta',
-        'eta',
-        'theta'
-      ];
+      const words = text.match(/[\p{L}\p{N}]+/gu) ?? [];
       const seen: string[] = [];
       const boundary = createDevelopmentProvisionalLanguageBoundary({
         loadDetector: () => detectorFor((candidate) => {
@@ -1424,15 +1528,24 @@ describe('development provisional ELD-small boundary', () => {
       );
       const fullIndex = seen.indexOf(text);
       expect(fullIndex).toBeGreaterThanOrEqual(0);
-      expect(seen.slice(fullIndex, fullIndex + 10)).toEqual([
+      const qualifyingWindows: string[] = [];
+      for (let windowWords = 1; windowWords <= 8; windowWords += 1) {
+        for (let start = 0; start + windowWords <= words.length; start += 1) {
+          const candidate = words.slice(start, start + windowWords).join(' ');
+          if (countSubstantiveCharacters(candidate) >= 12) {
+            qualifyingWindows.push(candidate);
+          }
+        }
+      }
+      expect(seen.slice(fullIndex, fullIndex + qualifyingWindows.length + 2)).toEqual([
         text,
         text,
-        ...canonical
+        ...qualifyingWindows
       ]);
     }
   );
 
-  it('inspects every overlapping profile window from one through eight words', async () => {
+  it('inspects every overlapping profile window with enough substantive characters', async () => {
     const seen: string[] = [];
     const boundary = createDevelopmentProvisionalLanguageBoundary({
       loadDetector: () => detectorFor((text) => {
@@ -1458,7 +1571,12 @@ describe('development provisional ELD-small boundary', () => {
     await boundary.classifier.classify(words.join(' '), 'es');
     for (let length = 1; length <= 8; length += 1) {
       for (let start = 0; start + length <= words.length; start += 1) {
-        expect(seen).toContain(words.slice(start, start + length).join(' '));
+        const window = words.slice(start, start + length).join(' ');
+        if (countSubstantiveCharacters(window) >= 12) {
+          expect(seen).toContain(window);
+        } else {
+          expect(seen).not.toContain(window);
+        }
       }
     }
   });

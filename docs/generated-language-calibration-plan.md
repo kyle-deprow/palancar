@@ -18,7 +18,7 @@ This plan is read-only to the worker. Generation prompting, `GenerationService`,
 
 ## Required behavior
 
-1. Add an exact, deeply frozen generated-output target margin map to the development provisional profile: Spanish `0.05`, Turkish `0.08`.
+1. Keep an exact, deeply frozen generated-output target margin map in the development provisional profile: Spanish `0.01`, Turkish `0.04`.
 2. Validate exactly the `es` and `tr` keys and threshold values in `[0,1]`; include the map in profile equality and symmetry.
 3. Bump the provisional profile version and language-registry version for the exported calibration change.
 4. Use the target-specific margin only for generated target-language full-text acceptance. Generated English, source/input classification, mixed/subwindow detection, score/reliability/length checks, and all production-calibrated paths retain their current behavior.

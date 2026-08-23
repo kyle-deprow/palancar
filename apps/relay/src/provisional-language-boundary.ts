@@ -336,8 +336,13 @@ function analysisWindows(
   const candidates: string[] = [];
   const addCandidate = (candidate: string): void => {
     const trimmed = candidate.trim();
+    // Windows below minimumTextCharacters are statistically meaningless for
+    // n-gram detection (real eld/small reliably calls "excuse me" Albanian),
+    // so they never count as conflicts. Accepted tradeoff: a sub-minimum
+    // non-expected clause can ride along undetected; the source gate, not
+    // this validator, is the security boundary.
     if (
-      countSubstantiveCharacters(trimmed) >= settings.minimumWindowCharacters
+      countSubstantiveCharacters(trimmed) >= settings.minimumTextCharacters
     ) {
       candidates.push(trimmed);
     }
@@ -375,7 +380,7 @@ function analysisIntervals(
   ): void => {
     const trimmed = candidate.trim();
     if (wordLength < 1) return;
-    if (countSubstantiveCharacters(trimmed) < settings.minimumWindowCharacters) {
+    if (countSubstantiveCharacters(trimmed) < settings.minimumTextCharacters) {
       return;
     }
     const key = JSON.stringify([lexicalStart, wordLength, trimmed]);
@@ -427,24 +432,78 @@ function hasSubstantiveMix(
   detector: EldDetector,
   text: string,
   settings: DevelopmentProvisionalProfile,
+  expectedLanguage: GeneratedLanguage,
   fullDetection: Detection
 ): boolean {
   const strongLanguages = new Set<string>();
   if (
-    fullDetection.reliable &&
-    fullDetection.score >= settings.provisionalScoreThreshold &&
-    fullDetection.margin >= settings.provisionalMarginThreshold
+    isStrongDetection(
+      fullDetection,
+      settings,
+      generatedConflictMarginThreshold(
+        expectedLanguage,
+        fullDetection.language,
+        settings
+      )
+    )
   ) {
     strongLanguages.add(fullDetection.language);
   }
   for (const window of analysisWindows(text, settings)) {
     const windowDetection = detect(detector, window);
     if (
-      windowDetection.reliable &&
-      windowDetection.score >= settings.provisionalScoreThreshold &&
-      windowDetection.margin >= settings.provisionalMarginThreshold
+      isStrongDetection(
+        windowDetection,
+        settings,
+        generatedConflictMarginThreshold(
+          expectedLanguage,
+          windowDetection.language,
+          settings
+        )
+      )
     ) {
-      strongLanguages.add(windowDetection.language);
+      // A matching window confirms the expected language but is not an
+      // independent conflict when the full result already matches. Only a
+      // reliably strong window can add a second language to the result.
+      if (windowDetection.language !== expectedLanguage) {
+        strongLanguages.add(windowDetection.language);
+      } else if (
+        fullDetection.language !== expectedLanguage &&
+        isStrongDetection(windowDetection, settings)
+      ) {
+        // When the full result is another language, a generic-margin match
+        // window can provide the second side of a genuinely mixed result.
+        strongLanguages.add(windowDetection.language);
+      }
+    }
+  }
+  const invertedQuestion = text.indexOf('¿');
+  if (invertedQuestion > 0) {
+    const prefix = text
+      .slice(0, invertedQuestion)
+      .replace(/[\s,;:]+$/u, '')
+      .trim();
+    if (
+      countSubstantiveCharacters(prefix) > 0 &&
+      countSubstantiveCharacters(prefix) < settings.minimumTextCharacters
+    ) {
+      const prefixDetection = detect(detector, prefix);
+      if (
+        isStrongDetection(
+          prefixDetection,
+          settings,
+          generatedConflictMarginThreshold(
+            expectedLanguage,
+            prefixDetection.language,
+            settings
+          )
+        ) &&
+        prefixDetection.language !== fullDetection.language
+      ) {
+        // The short prefix is only a boundary hint. It is deliberately not
+        // an analysis interval and cannot create a conflict by itself.
+        strongLanguages.add(prefixDetection.language);
+      }
     }
   }
   return strongLanguages.size > 1;
@@ -482,6 +541,16 @@ function generatedFullTextMarginThreshold(
     : settings.generatedOutputTargetMarginThresholds[expectedLanguage];
 }
 
+function generatedConflictMarginThreshold(
+  expectedLanguage: GeneratedLanguage,
+  detectedLanguage: string,
+  settings: DevelopmentProvisionalProfile
+): number {
+  return detectedLanguage === expectedLanguage
+    ? generatedFullTextMarginThreshold(expectedLanguage, detectedLanguage, settings)
+    : settings.provisionalMarginThreshold;
+}
+
 function strictlyContains(
   outer: AnalysisInterval,
   inner: AnalysisInterval
@@ -499,7 +568,7 @@ function sourceConflictReason(
   detector: EldDetector,
   text: string,
   settings: DevelopmentProvisionalProfile,
-  selectedLanguage: TargetLanguage,
+  expectedLanguage: TargetLanguage,
   fullDetection: Detection
 ): 'MIXED' | 'MATCH_IGNORED_SINGLETON' | undefined {
   const detections = new Map<string, Detection>([[text, fullDetection]]);
@@ -514,9 +583,9 @@ function sourceConflictReason(
       isStrongDetection(
         detection,
         settings,
-        sourceMarginThreshold(selectedLanguage, detection.language, settings)
+        sourceMarginThreshold(expectedLanguage, detection.language, settings)
       ) &&
-      detection.language !== selectedLanguage
+      detection.language !== expectedLanguage
     ) {
       const key = `${interval.lexicalStart}:${interval.wordLength}:${detection.language}`;
       if (!conflicts.has(key)) {
@@ -686,7 +755,7 @@ function classifyGenerated(
       full.language,
       settings
     );
-    if (hasSubstantiveMix(detector, text, settings, full)) {
+    if (hasSubstantiveMix(detector, text, settings, expectedLanguage, full)) {
       return evidence(settings, {
         detectedLanguage: MIXED_LANGUAGE,
         provisionalScore: full.score,
