@@ -7469,14 +7469,16 @@ function normalizeLiveConfiguration(configuration, outputs, reviewed, expectedFq
   failIf(settingMap.get(identityKey(outputs.imagePullIdentityId)) !== "None" || settingMap.get(identityKey(outputs.runtimeIdentityId)) !== "Main", code);
   failIf(settings[0].identity !== identityKey(outputs.imagePullIdentityId) || settings[0].lifecycle !== "None" ||
     settings[1].identity !== identityKey(outputs.runtimeIdentityId) || settings[1].lifecycle !== "Main", code);
-  failIf(!Array.isArray(configuration.secrets), code);
+  // Newer Container Apps API responses serialize the empty secrets
+  // collection as null instead of [].
+  failIf(configuration.secrets !== null && !Array.isArray(configuration.secrets), code);
   return {
     activeRevisionsMode: configuration.activeRevisionsMode,
     ingress,
     maxInactiveRevisions: configuration.maxInactiveRevisions,
     registries: [{ server: registry.server, identity: identityKey(registry.identity) }],
     identitySettings: settings,
-    secrets: configuration.secrets.map((secret) => ({ ...secret })),
+    secrets: (configuration.secrets ?? []).map((secret) => ({ ...secret })),
   };
 }
 
@@ -7556,7 +7558,11 @@ function assertContainerAppResponse(value, outputs, reviewed, code) {
 }
 
 function assertSecretConfiguration(configuration, outputs, mode, code) {
-  failIf(!Array.isArray(configuration.secrets), code);
+  // Newer Container Apps API responses serialize the empty secrets
+  // collection as null instead of [].
+  const secrets = configuration.secrets ?? [];
+  failIf(!Array.isArray(secrets), code);
+  configuration = { ...configuration, secrets };
   if (mode === "pre") {
     failIf(configuration.secrets.length !== RETIRED_SECRET_NAMES.length, code);
     const names = new Set();
