@@ -102,6 +102,11 @@ const ARTIFACT_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const ACR_LOGIN_SERVER_RE = /^[a-z0-9]{5,50}\.azurecr\.io$/u;
+const ACCOUNT_ID_RE = /^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)\/providers\/Microsoft\.CognitiveServices\/accounts\/([^/?#]+)$/u;
+const RUNTIME_IDENTITY_ID_RE = /^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/]+$/u;
+const IMAGE_REFERENCE_RE = /^([a-z0-9]{5,50}\.azurecr\.io)\/(palancar-relay|palancar-expiry-cleanup)@(sha256:[a-f0-9]{64})$/u;
 const SECRET_NAME_RE = /^[A-Za-z0-9-]{1,127}$/u;
 const COMMIT_RE = /^[0-9a-f]{40}$/u;
 const STATES = Object.freeze(["start-inventory-validated", "attempting", "unknown", "complete"]);
@@ -138,8 +143,18 @@ const BINDING_KEYS = Object.freeze([
   "planSha256", "terraformSha256", "lifecycleSha256", "guardSha256",
   "dependencyBlobs", "repositoryCommit", "cwd", "phase", "argv", "backend",
   "backendSha256", "backendConfigurationSha256", "workspace", "stateLineage",
-  "stateSerial", "liveRevision", "azureContextHash", "callerHash", "guard",
+  "stateSerial", "liveRevision", "runtimeIdentityId", "runtimeIdentityClientId",
+  "runtimeIdentityPrincipalId", "accountId", "runtimeOpenAiRoleAssignmentId",
+  "azureContextHash", "callerHash", "guard", "acrLoginServer", "imagePlatforms",
 ]);
+const IMAGE_DESCRIPTOR_KEYS = Object.freeze([
+  "version", "reference", "repository", "manifestDigest", "manifestMediaType",
+  "configDigest", "configMediaType", "os", "architecture", "variant",
+]);
+const IMAGE_MANIFEST_MEDIA_TYPES = Object.freeze({
+  "application/vnd.oci.image.manifest.v1+json": "application/vnd.oci.image.config.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json": "application/vnd.docker.container.image.v1+json",
+});
 const DEPENDENCY_KEYS = Object.freeze(["path", "blob", "sha256"]);
 const BACKEND_KEYS = Object.freeze([
   "container_name", "key", "resource_group_name", "storage_account_name",
@@ -624,6 +639,74 @@ function validateBackend(backend, descriptor) {
   );
 }
 
+function validateImagePlatformBinding(value, acrLoginServer) {
+  exactKeys(value, ["version", "verifierSha256", "images"], "context-image-platform-schema");
+  failIf(
+    value.version !== 1 || !isSha256(value.verifierSha256) || !Array.isArray(value.images) ||
+      value.images.length !== 2,
+    "context-image-platform",
+  );
+  const seen = new Set();
+  for (const descriptor of value.images) {
+    exactKeys(descriptor, IMAGE_DESCRIPTOR_KEYS, "context-image-descriptor-schema");
+    const match = typeof descriptor.reference === "string" ? IMAGE_REFERENCE_RE.exec(descriptor.reference) : null;
+    failIf(match === null, "context-image-descriptor");
+    const [, host, repository, digest] = match;
+    failIf(
+      seen.has(repository) ||
+        descriptor.version !== 1 ||
+        host !== acrLoginServer ||
+        descriptor.repository !== repository ||
+        descriptor.manifestDigest !== digest ||
+        typeof descriptor.configDigest !== "string" ||
+        !/^sha256:[a-f0-9]{64}$/u.test(descriptor.configDigest) ||
+        typeof descriptor.manifestMediaType !== "string" ||
+        !Object.hasOwn(IMAGE_MANIFEST_MEDIA_TYPES, descriptor.manifestMediaType) ||
+        descriptor.configMediaType !== IMAGE_MANIFEST_MEDIA_TYPES[descriptor.manifestMediaType] ||
+        descriptor.os !== "linux" ||
+        descriptor.architecture !== "amd64" ||
+        descriptor.variant !== null,
+      "context-image-descriptor",
+    );
+    seen.add(repository);
+  }
+  failIf(
+    value.images[0].repository !== "palancar-expiry-cleanup" ||
+      value.images[1].repository !== "palancar-relay",
+    "context-image-platform",
+  );
+}
+
+function validateLifecycleBindings(bindings, descriptor) {
+  failIf(
+    typeof bindings.runtimeIdentityId !== "string" || !RUNTIME_IDENTITY_ID_RE.test(bindings.runtimeIdentityId) ||
+      typeof bindings.runtimeIdentityClientId !== "string" ||
+      !UUID_RE.test(bindings.runtimeIdentityClientId) ||
+      typeof bindings.runtimeIdentityPrincipalId !== "string" ||
+      !UUID_RE.test(bindings.runtimeIdentityPrincipalId),
+    "context-runtime-identity",
+  );
+  const accountMatch = typeof bindings.accountId === "string" ? ACCOUNT_ID_RE.exec(bindings.accountId) : null;
+  failIf(
+    accountMatch === null ||
+      !UUID_RE.test(accountMatch[1]) ||
+      accountMatch[1] !== descriptor.subscription,
+    "context-account",
+  );
+  const roleAssignmentPrefix = `${bindings.accountId}/providers/Microsoft.Authorization/roleAssignments/`;
+  failIf(
+    typeof bindings.runtimeOpenAiRoleAssignmentId !== "string" ||
+      !bindings.runtimeOpenAiRoleAssignmentId.startsWith(roleAssignmentPrefix) ||
+      !UUID_RE.test(bindings.runtimeOpenAiRoleAssignmentId.slice(roleAssignmentPrefix.length)),
+    "context-runtime-openai-role",
+  );
+  failIf(
+    typeof bindings.acrLoginServer !== "string" || !ACR_LOGIN_SERVER_RE.test(bindings.acrLoginServer),
+    "context-acr-login-server",
+  );
+  validateImagePlatformBinding(bindings.imagePlatforms, bindings.acrLoginServer);
+}
+
 function validateBindings(bindings, descriptor, manifest) {
   exactKeys(bindings, BINDING_KEYS, "context-schema");
   failIf(bindings.planSha256 !== manifest.planSha256 || bindings.phase !== "credential-cleanup", "context-binding");
@@ -652,6 +735,7 @@ function validateBindings(bindings, descriptor, manifest) {
     exactKeys(dependency, DEPENDENCY_KEYS, "context-dependency-schema");
     failIf(typeof dependency.path !== "string" || !/^[^/].*[^/]$/u.test(dependency.path) || !/^[0-9a-f]{40}$/u.test(dependency.blob) || !isSha256(dependency.sha256), "context-dependency");
   }
+  validateLifecycleBindings(bindings, descriptor);
   failIf(manifest.bindingSha256 !== sha256Json(bindings), "context-binding-hash");
 }
 

@@ -61,6 +61,36 @@ const PLAN_SHA256 = createHash("sha256").update(PLAN).digest("hex");
 const CREATE_TIME = "2026-08-21T00:00:00.000Z";
 const PREFLIGHT_TIME = "2026-08-21T00:00:30.000Z";
 const COMMIT = "c".repeat(40);
+const ACR_LOGIN_SERVER = "palancardev.azurecr.io";
+const ACCOUNT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.CognitiveServices/accounts/palancar-dev`;
+const RUNTIME_IDENTITY_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/palancar-runtime`;
+const RUNTIME_IDENTITY_CLIENT_ID = "44444444-4444-4444-8444-444444444444";
+const RUNTIME_IDENTITY_PRINCIPAL_ID = "55555555-5555-4555-8555-555555555555";
+const RUNTIME_OPENAI_ROLE_ASSIGNMENT_ID = `${ACCOUNT_ID}/providers/Microsoft.Authorization/roleAssignments/66666666-6666-4666-8666-666666666666`;
+
+function imageDescriptor(repository, manifestDigest, configDigest) {
+  return {
+    version: 1,
+    reference: `${ACR_LOGIN_SERVER}/${repository}@${manifestDigest}`,
+    repository,
+    manifestDigest,
+    manifestMediaType: "application/vnd.oci.image.manifest.v1+json",
+    configDigest,
+    configMediaType: "application/vnd.oci.image.config.v1+json",
+    os: "linux",
+    architecture: "amd64",
+    variant: null,
+  };
+}
+
+const IMAGE_PLATFORMS = {
+  version: 1,
+  verifierSha256: "4".repeat(64),
+  images: [
+    imageDescriptor("palancar-expiry-cleanup", `sha256:${"5".repeat(64)}`, `sha256:${"6".repeat(64)}`),
+    imageDescriptor("palancar-relay", `sha256:${"7".repeat(64)}`, `sha256:${"8".repeat(64)}`),
+  ],
+};
 
 const temporaryRoots = new Set();
 after(() => {
@@ -156,9 +186,16 @@ function makeBindings(planPath) {
     stateLineage: "lineage-test",
     stateSerial: 7,
     liveRevision: "revision-test",
+    runtimeIdentityId: RUNTIME_IDENTITY_ID,
+    runtimeIdentityClientId: RUNTIME_IDENTITY_CLIENT_ID,
+    runtimeIdentityPrincipalId: RUNTIME_IDENTITY_PRINCIPAL_ID,
+    accountId: ACCOUNT_ID,
+    runtimeOpenAiRoleAssignmentId: RUNTIME_OPENAI_ROLE_ASSIGNMENT_ID,
     azureContextHash,
     callerHash,
     guard: "azure-credential-cleanup",
+    acrLoginServer: ACR_LOGIN_SERVER,
+    imagePlatforms: IMAGE_PLATFORMS,
   };
   return { bindings, bindingSha256: hashJson(bindings) };
 }
@@ -530,6 +567,50 @@ test("start is single-use and a token/network crash leaves a resumable manifest"
   await expectCode(harness.cleanup.start(harness.runId), "already-started");
   assert.equal(harness.azCalls[0].command, AZ_PATH);
   assert.deepEqual(harness.azCalls[0].argv, ["account", "get-access-token", "--resource", AZURE_MANAGEMENT_RESOURCE, "--output", "json"]);
+});
+
+test("lifecycle 26-key bindings are accepted and new fields are closed and validated", async () => {
+  const accepted = makeHarness({ autoPreflight: false });
+  await accepted.cleanup.start(accepted.runId);
+
+  const newKeys = [
+    "accountId", "acrLoginServer", "imagePlatforms", "runtimeIdentityClientId",
+    "runtimeIdentityId", "runtimeIdentityPrincipalId", "runtimeOpenAiRoleAssignmentId",
+  ];
+  for (const key of newKeys) {
+    const missing = makeHarness({ autoPreflight: false });
+    rewriteJson(missing.path("create-manifest.json"), (value) => { delete value.bindings[key]; });
+    await expectCode(missing.cleanup.start(missing.runId), "context-schema");
+  }
+
+  const malformed = [
+    ["runtime identity resource ID", (bindings) => { bindings.runtimeIdentityId = "not-an-arm-resource-id"; }, "context-runtime-identity"],
+    ["runtime identity client UUID", (bindings) => { bindings.runtimeIdentityClientId = "not-a-uuid"; }, "context-runtime-identity"],
+    ["runtime identity principal UUID", (bindings) => { bindings.runtimeIdentityPrincipalId = "not-a-uuid"; }, "context-runtime-identity"],
+    ["account subscription", (bindings) => { bindings.accountId = bindings.accountId.replace(SUBSCRIPTION, "not-a-uuid"); }, "context-account"],
+    ["OpenAI role assignment resource ID", (bindings) => { bindings.runtimeOpenAiRoleAssignmentId = `${bindings.accountId}/providers/Microsoft.Authorization/roleAssignments/not-a-uuid`; }, "context-runtime-openai-role"],
+    ["ACR login server", (bindings) => { bindings.acrLoginServer = "not-a-registry"; }, "context-acr-login-server"],
+    ["image verifier digest", (bindings) => { bindings.imagePlatforms.verifierSha256 = "not-a-sha256"; }, "context-image-platform"],
+    ["image descriptor digest", (bindings) => { bindings.imagePlatforms.images[0].configDigest = "sha256:not-a-sha256"; }, "context-image-descriptor"],
+  ];
+  for (const [, mutate, code] of malformed) {
+    const harness = makeHarness({ autoPreflight: false });
+    const manifest = rewriteJson(harness.path("create-manifest.json"), (value) => {
+      mutate(value.bindings);
+      value.bindingSha256 = hashJson(value.bindings);
+    });
+    rewriteJson(harness.path(DESCRIPTOR_FILENAME), (value) => {
+      value.bindingSha256 = manifest.bindingSha256;
+      value.contextSha256 = manifest.bindingSha256;
+    });
+    await expectCode(harness.cleanup.start(harness.runId), code);
+  }
+
+  const legacy = makeHarness({ autoPreflight: false });
+  rewriteJson(legacy.path("create-manifest.json"), (value) => {
+    for (const key of newKeys) delete value.bindings[key];
+  });
+  await expectCode(legacy.cleanup.start(legacy.runId), "context-schema");
 });
 
 test("descriptor, create, guard, preflight, operation, and state schemas are closed", async () => {
