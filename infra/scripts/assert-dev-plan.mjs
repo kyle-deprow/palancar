@@ -14,6 +14,8 @@ const FINAL_ROLLOUT_MODE = "final-rollout";
 const LUNA_MODEL_BOOTSTRAP_MODE = "luna-model-bootstrap";
 const AZURE_GENERATION_CUTOVER_MODE = "azure-generation-cutover";
 const AZURE_CREDENTIAL_CLEANUP_MODE = "azure-credential-cleanup";
+const POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE =
+  "post-cutover-relay-image-rollout";
 const FINAL_ROLLOUT_COMPLETE_MODE = "final-rollout-complete";
 const SUPPORTED_PLAN_FORMAT_VERSION = "1.2";
 const PINNED_DEPLOYMENT_NAME = "gpt-4o-mini-transcribe";
@@ -7296,7 +7298,8 @@ function cutoverHasExactRelevantAttributes(plan, mode) {
       ? CUTOVER_GENERATION_REFERENCE_PLAN.relevant_attributes
       : mode === AZURE_CREDENTIAL_CLEANUP_MODE
         ? CUTOVER_CREDENTIAL_CLEANUP_REFERENCE_PLAN.relevant_attributes
-        : mode === FINAL_ROLLOUT_COMPLETE_MODE
+        : mode === POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE ||
+            mode === FINAL_ROLLOUT_COMPLETE_MODE
           ? TERMINAL_REFERENCE_PLAN.relevant_attributes
           : undefined;
   if (
@@ -7557,6 +7560,8 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
   const plannedExtra = new Set(
     mode === AZURE_GENERATION_CUTOVER_MODE
       ? [CUTOVER_RUNTIME_SECRETS_USER]
+      : mode === POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE
+        ? [CUTOVER_RUNTIME_SECRETS_USER]
       : [],
   );
   const priorExtra = new Set(
@@ -7564,6 +7569,8 @@ function cutoverHasExactStateInventories(plan, changes, mode, planned, prior) {
       ? [CUTOVER_RUNTIME_SECRETS_USER]
       : mode === AZURE_CREDENTIAL_CLEANUP_MODE
         ? [CUTOVER_RUNTIME_SECRETS_USER]
+        : mode === POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE
+          ? [CUTOVER_RUNTIME_SECRETS_USER]
         : [],
   );
   if (
@@ -8136,7 +8143,7 @@ function cutoverExactDirectApp(
   after,
   expectedImage,
   context,
-  { update = false } = {},
+  { update = false, omitProbes = false } = {},
 ) {
   const properties = after?.body?.properties;
   const configuration = properties?.configuration;
@@ -8218,6 +8225,7 @@ function cutoverExactDirectApp(
   ]);
   const probesMatch =
     update ||
+    (omitProbes && !Object.hasOwn(container ?? {}, "probes")) ||
     (Array.isArray(container?.probes) &&
       container.probes.length === 2 &&
       hasExactFinalTcpProbe(container.probes[0], {
@@ -8299,7 +8307,7 @@ function cutoverExactDirectApp(
     hasExactKeys(template, ["containers", "scale"]) &&
     hasExactKeys(
       container,
-      update
+      update || omitProbes
         ? ["env", "image", "name", "resources"]
         : ["env", "image", "name", "probes", "resources"],
     ) &&
@@ -9368,7 +9376,12 @@ function cutoverTerminalNoOp(plan, changes) {
   return cutoverExactFoundryModels(byAddress, bindings) && cutoverExactOutputs(plan, true, bindings);
 }
 
-function cutoverExactOutputs(plan, terminal, bindings = []) {
+function cutoverExactOutputs(
+  plan,
+  terminal,
+  bindings = [],
+  relayRevisionUpdate = false,
+) {
   const expectedNames = Object.keys(TERMINAL_REFERENCE_PLAN.output_changes);
   if (
     !hasExactKeys(plan.output_changes, expectedNames) ||
@@ -9380,7 +9393,7 @@ function cutoverExactOutputs(plan, terminal, bindings = []) {
     const planned = plan.planned_values.outputs[name];
     const prior = plan.prior_state.values.outputs[name];
     const referencePlan =
-      !terminal && name === "relay_latest_revision_name"
+      (relayRevisionUpdate || !terminal) && name === "relay_latest_revision_name"
         ? CUTOVER_GENERATION_REFERENCE_PLAN
         : TERMINAL_REFERENCE_PLAN;
     const reference = referencePlan.output_changes[name];
@@ -9643,6 +9656,179 @@ function acceptsAzureCredentialCleanup(plan, changes) {
   return models && outputs;
 }
 
+function cutoverHasExactRelayImageChangeEnvelope(entry, bindings) {
+  const terminalChange = TERMINAL_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+  )?.change;
+  const generationChange = CUTOVER_GENERATION_REFERENCE_PLAN.resource_changes.find(
+    (candidate) => candidate.address === CUTOVER_CONTAINER_APP,
+  )?.change;
+  if (!terminalChange || !generationChange) return false;
+  const expectedBeforeSensitive = structuredClone(terminalChange.before_sensitive);
+  delete expectedBeforeSensitive.body?.properties?.template?.containers?.[0]
+    ?.probes;
+  const afterSensitiveMatches = cutoverSensitiveMaskMatches(
+    entry.change.after,
+    generationChange.after,
+    entry.change.after_sensitive,
+    generationChange.after_sensitive,
+    bindings,
+  );
+  if (
+    !isDeepStrictEqual(
+      entry.change.before_sensitive,
+      cutoverRebindReference(expectedBeforeSensitive, bindings),
+    ) ||
+    !isDeepStrictEqual(
+      entry.change.after_unknown,
+      generationChange.after_unknown,
+    ) ||
+    !afterSensitiveMatches
+  ) {
+    return false;
+  }
+  for (const side of ["before", "after"]) {
+    const identityKey = `${side}_identity`;
+    if (!Object.hasOwn(entry.change, identityKey)) return false;
+    if (
+      !isDeepStrictEqual(entry.change[identityKey], {
+        id: entry.change[side]?.id,
+        type: null,
+      })
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function acceptsPostCutoverRelayImageRollout(plan, changes) {
+  if (
+    !cutoverStateSections(
+      plan,
+      POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE,
+      true,
+      true,
+    ) ||
+    !cutoverExactAddressSet(
+      changes,
+      new Set(
+        CUTOVER_CREDENTIAL_CLEANUP_REFERENCE_PLAN.resource_changes.map(
+          (entry) => entry.address,
+        ),
+      ),
+    )
+  ) {
+    return false;
+  }
+  const byAddress = new Map(changes.map((entry) => [entry.address, entry]));
+  const planned = cutoverCollectValueResources(plan.planned_values.root_module);
+  const prior = cutoverCollectValueResources(plan.prior_state.values.root_module);
+  const context = cutoverIdentityContext(
+    byAddress,
+    prior,
+    plan.planned_values.outputs,
+    plan.prior_state.values.outputs,
+    plan.output_changes,
+    plan.variables.operator_principal_id?.value,
+    plan.variables.tenant_id?.value,
+  );
+  const appEntry = byAddress.get(CUTOVER_CONTAINER_APP);
+  const beforeImage =
+    appEntry?.change?.before?.body?.properties?.template?.containers?.[0]?.image;
+  const relayImage = plan.variables.relay_image_digest?.value;
+  if (
+    !planned ||
+    !prior ||
+    !context ||
+    !isImmutableAcrImage(beforeImage) ||
+    !isImmutableAcrImage(relayImage) ||
+    beforeImage === relayImage ||
+    !relayImage.startsWith(`${context.acrLoginServer}/palancar-relay@sha256:`)
+  ) {
+    return false;
+  }
+  if (
+    !cutoverHasExactStateInventories(
+      plan,
+      changes,
+      POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE,
+      planned,
+      prior,
+    )) {
+    return false;
+  }
+  const bindings = cutoverBindings(plan, byAddress);
+  if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
+  const referenceChanges = new Map(
+    TERMINAL_REFERENCE_PLAN.resource_changes.map((entry) => [entry.address, entry]),
+  );
+  for (const entry of changes) {
+    const isApp = entry.address === CUTOVER_CONTAINER_APP;
+    if (
+      !cutoverExactResourceEntry(entry) ||
+      !cutoverExactEntryMetadata(entry) ||
+      !cutoverResourceChangeStateCoherent(plan, entry, planned, prior) ||
+      !isDeepStrictEqual(entry.change.actions, [isApp ? "update" : "no-op"])
+    ) {
+      return false;
+    }
+    if (isApp) {
+      if (
+        !cutoverHasExactRelayImageChangeEnvelope(entry, bindings) ||
+        !cutoverExactDirectApp(entry.change.before, beforeImage, context, {
+          omitProbes: true,
+        }) ||
+        !cutoverExactDirectApp(entry.change.after, relayImage, context, {
+          update: true,
+        })
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (
+      !cutoverExactNoOp(entry.change, entry.address) ||
+      !cutoverHasExactChangeEnvelope(entry, bindings)
+    ) {
+      return false;
+    }
+    const reference = referenceChanges.get(entry.address);
+    if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === CUTOVER_TRANSCRIPTION_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, PINNED_DEPLOYMENT_NAME, bindings)) {
+        return false;
+      }
+    } else if (entry.address === CUTOVER_LUNA_DEPLOYMENT) {
+      if (!cutoverExactModelChange(entry.change, LUNA_DEPLOYMENT_NAME, bindings)) {
+        return false;
+      }
+    } else if (CUTOVER_IDENTITY_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactIdentityChange(entry, context)) return false;
+    } else if (CUTOVER_RBAC_ADDRESSES.has(entry.address)) {
+      if (!cutoverExactRoleChange(entry, context, "no-op")) return false;
+    } else if (entry.address === EXPIRY_CLEANUP_JOB) {
+      if (
+        !cutoverReferenceAfterMatches(entry.change.after, reference, bindings, entry.address) ||
+        !cutoverExactCleanupImage(
+          entry.change.after,
+          plan.variables.expiry_cleanup_image_digest?.value,
+          context.acrLoginServer,
+        )
+      ) {
+        return false;
+      }
+    } else if (!cutoverReferenceAfterMatches(entry.change.after, reference, bindings, entry.address)) {
+      return false;
+    }
+  }
+  return (
+    cutoverExactFoundryModels(byAddress, bindings) &&
+    cutoverExactOutputs(plan, false, bindings, true)
+  );
+}
+
 function acceptsFinalRolloutComplete(plan, changes) {
   return (
     cutoverStateSections(
@@ -9668,6 +9854,7 @@ export function acceptsPlan(plan, mode) {
       LUNA_MODEL_BOOTSTRAP_MODE,
       AZURE_GENERATION_CUTOVER_MODE,
       AZURE_CREDENTIAL_CLEANUP_MODE,
+      POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE,
       FINAL_ROLLOUT_COMPLETE_MODE,
     ].includes(mode)
   ) {
@@ -9684,6 +9871,7 @@ export function acceptsPlan(plan, mode) {
     mode === FINAL_ROLLOUT_MODE ||
     mode === AZURE_GENERATION_CUTOVER_MODE ||
     mode === AZURE_CREDENTIAL_CLEANUP_MODE ||
+    mode === POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE ||
     mode === FINAL_ROLLOUT_COMPLETE_MODE;
   if (
     hasInvalidChecks ||
@@ -9720,6 +9908,10 @@ export function acceptsPlan(plan, mode) {
 
   if (mode === AZURE_CREDENTIAL_CLEANUP_MODE) {
     return acceptsAzureCredentialCleanup(plan, changes);
+  }
+
+  if (mode === POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE) {
+    return acceptsPostCutoverRelayImageRollout(plan, changes);
   }
 
   if (mode === FINAL_ROLLOUT_COMPLETE_MODE) {
@@ -9783,6 +9975,7 @@ function getMode(argv) {
     LUNA_MODEL_BOOTSTRAP_MODE,
     AZURE_GENERATION_CUTOVER_MODE,
     AZURE_CREDENTIAL_CLEANUP_MODE,
+    POST_CUTOVER_RELAY_IMAGE_ROLLOUT_MODE,
     FINAL_ROLLOUT_COMPLETE_MODE,
   ].includes(mode)
     ? mode

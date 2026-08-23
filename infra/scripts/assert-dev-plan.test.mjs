@@ -48,6 +48,8 @@ const credentialCleanupFixture = JSON.parse(
     "utf8",
   ),
 );
+const postCutoverRelayImage =
+  "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:" + "b".repeat(64);
 const lunaDeploymentAddress =
   'module.foundry.azurerm_cognitive_deployment.this["gpt-5.6-luna"]';
 const lunaTranscriptionAddress =
@@ -71,6 +73,88 @@ const FIXTURE_APP_INSIGHTS_FULL_CONNECTION =
   "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com/;" +
   "LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;" +
   `ApplicationId=${FIXTURE_APP_INSIGHTS_APPLICATION_ID}`;
+
+function postCutoverRelayImageRolloutFixture() {
+  const candidate = clone(credentialCleanupFixture);
+  const terminalApp = cutoverChange(candidate, lunaContainerAppAddress);
+  const generationApp = cutoverChange(
+    runtimeCutoverFixture,
+    lunaContainerAppAddress,
+  );
+  const before = clone(terminalApp.change.after);
+  const after = clone(before);
+  delete before.body.properties.template.containers[0].probes;
+  delete after.body.properties.template.containers[0].probes;
+  after.body.properties.template.containers[0].image = postCutoverRelayImage;
+  delete after.output;
+  const beforeSensitive = clone(terminalApp.change.before_sensitive);
+  delete beforeSensitive.body.properties.template.containers[0].probes;
+  terminalApp.change = {
+    ...clone(generationApp.change),
+    before,
+    after,
+    before_sensitive: beforeSensitive,
+    after_sensitive: clone(generationApp.change.after_sensitive),
+    before_identity: clone(generationApp.change.before_identity),
+    after_identity: clone(generationApp.change.after_identity),
+  };
+  const planned = finalValueResource(
+    candidate.planned_values.root_module,
+    lunaContainerAppAddress,
+  );
+  const prior = finalValueResource(
+    candidate.prior_state.values.root_module,
+    lunaContainerAppAddress,
+  );
+  planned.values = clone(after);
+  planned.sensitive_values = clone(generationApp.change.after_sensitive);
+  prior.values = clone(before);
+  prior.sensitive_values = clone(beforeSensitive);
+  const secretsRole = cutoverChange(
+    candidate,
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]",
+  );
+  secretsRole.change = {
+    ...clone(secretsRole.change),
+    actions: ["no-op"],
+    after: clone(secretsRole.change.before),
+    after_unknown: {},
+    after_sensitive: clone(secretsRole.change.before_sensitive),
+  };
+  const priorSecretsRole = finalValueResource(
+    candidate.prior_state.values.root_module,
+    secretsRole.address,
+  );
+  const plannedKeyVault = candidate.planned_values.root_module.child_modules.find(
+    (module) => module.address === "module.workload_key_vault",
+  );
+  assert.ok(priorSecretsRole);
+  assert.ok(plannedKeyVault);
+  plannedKeyVault.resources.push({
+    address: priorSecretsRole.address,
+    index: priorSecretsRole.index,
+    mode: priorSecretsRole.mode,
+    name: priorSecretsRole.name,
+    provider_name: priorSecretsRole.provider_name,
+    schema_version: priorSecretsRole.schema_version,
+    type: priorSecretsRole.type,
+    values: clone(secretsRole.change.after),
+    sensitive_values: clone(secretsRole.change.after_sensitive),
+  });
+  candidate.variables.relay_image_digest.value = postCutoverRelayImage;
+  candidate.variables.enable_runtime_secrets_user_assignment.value = true;
+  candidate.output_changes.relay_latest_revision_name = clone(
+    runtimeCutoverFixture.output_changes.relay_latest_revision_name,
+  );
+  candidate.planned_values.outputs.relay_latest_revision_name = clone(
+    runtimeCutoverFixture.planned_values.outputs.relay_latest_revision_name,
+  );
+  candidate.prior_state.values.outputs.relay_latest_revision_name = clone(
+    runtimeCutoverFixture.prior_state.values.outputs.relay_latest_revision_name,
+  );
+  candidate.applyable = true;
+  return candidate;
+}
 const FIXTURE_APP_INSIGHTS_RELAY_CONNECTION =
   `InstrumentationKey=${FIXTURE_APP_INSIGHTS_INSTRUMENTATION_KEY};` +
   "IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com";
@@ -6233,6 +6317,13 @@ test("new guard modes have closed content-free CLI entry points", () => {
     0,
   );
   assert.equal(
+    runCli(
+      ["--mode=post-cutover-relay-image-rollout"],
+      JSON.stringify(postCutoverRelayImageRolloutFixture()),
+    ),
+    0,
+  );
+  assert.equal(
     runCli(["--mode=azure-generation-cutover", "extra"], "{}"),
     2,
   );
@@ -6643,4 +6734,146 @@ test("final-rollout-complete is the post-cleanup direct-Entra terminal state", (
     value.primary_access_key = 123;
   }
   assert.equal(acceptsPlan(invalidType, "final-rollout-complete"), false);
+});
+
+test("post-cutover relay image rollout accepts the observed provider-shaped update", () => {
+  const candidate = postCutoverRelayImageRolloutFixture();
+  assert.equal(candidate.applyable, true);
+  assert.equal(
+    candidate.resource_changes.filter((entry) =>
+      entry.change.actions.includes("update"),
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    cutoverChange(candidate, lunaContainerAppAddress).change.actions,
+    ["update"],
+  );
+  assert.deepEqual(
+    candidate.output_changes.relay_latest_revision_name.actions,
+    ["update"],
+  );
+  assert.equal(
+    candidate.output_changes.relay_latest_revision_name.after_unknown,
+    true,
+  );
+  assert.equal(
+    Object.values(candidate.output_changes).filter((change) =>
+      change.actions.includes("update"),
+    ).length,
+    1,
+  );
+  assert.equal(
+    Object.entries(candidate.output_changes).every(([name, change]) =>
+      name === "relay_latest_revision_name"
+        ? change.actions[0] === "update"
+        : change.actions[0] === "no-op",
+    ),
+    true,
+  );
+  assert.equal(
+    acceptsPlan(candidate, "post-cutover-relay-image-rollout"),
+    true,
+  );
+});
+
+test("post-cutover relay image rollout rejects every non-image or incomplete delta", () => {
+  const mode = "post-cutover-relay-image-rollout";
+  const mutations = [
+    ["same relay digest", (candidate) => {
+      candidate.variables.relay_image_digest.value =
+        cutoverChange(candidate, lunaContainerAppAddress).change.before.body
+          .properties.template.containers[0].image;
+    }],
+    ["mutable tag", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8c.azurecr.io/palancar-relay:latest";
+    }],
+    ["wrong image host", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].image =
+        "other.azurecr.io/palancar-relay@sha256:" + "c".repeat(64);
+    }],
+    ["wrong image repository", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8c.azurecr.io/other@sha256:" + "c".repeat(64);
+    }],
+    ["second resource action", (candidate) => {
+      candidate.resource_changes.push(clone(candidate.resource_changes[0]));
+    }],
+    ["second app action", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.actions.push("update");
+    }],
+    ["environment drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].env[0].value =
+        "staging";
+    }],
+    ["identity drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.identity[0].identity_ids[0] += "/drift";
+    }],
+    ["scale drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.scale.minReplicas = 2;
+    }],
+    ["traffic drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.configuration.ingress.traffic[0].weight = 99;
+    }],
+    ["probe drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].probes = [];
+    }],
+    ["resource drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers[0].resources.cpu = 0.5;
+    }],
+    ["mutable sidecar", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.template.containers.push({});
+    }],
+    ["secret drift", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after.body.properties.configuration.secrets.push({});
+    }],
+    ["model drift", (candidate) => {
+      cutoverChange(candidate, lunaDeploymentAddress).change.after.model[0].version = "2099-01-01";
+    }],
+    ["RBAC drift", (candidate) => {
+      cutoverChange(candidate, operatorRateRoleAddress).change.after.role_definition_name = "Owner";
+    }],
+    ["cleanup image drift", (candidate) => {
+      cutoverChange(candidate, finalCleanupJobAddress).change.after.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8c.azurecr.io/palancar-expiry-cleanup@sha256:" + "d".repeat(64);
+    }],
+    ["hidden sensitive value", (candidate) => {
+      cutoverChange(candidate, lunaContainerAppAddress).change.after_sensitive.extra = true;
+    }],
+    ["latest revision output not computed", (candidate) => {
+      candidate.output_changes.relay_latest_revision_name.after_unknown = false;
+    }],
+    ["prior state drift", (candidate) => {
+      finalValueResource(candidate.prior_state.values.root_module, lunaContainerAppAddress).values.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:" + "e".repeat(64);
+    }],
+    ["planned state drift", (candidate) => {
+      finalValueResource(candidate.planned_values.root_module, lunaContainerAppAddress).values.body.properties.template.containers[0].image =
+        "palancardevacraeeacd8c.azurecr.io/palancar-relay@sha256:" + "f".repeat(64);
+    }],
+    ["configuration drift", (candidate) => {
+      candidate.configuration.extra = true;
+    }],
+    ["failed check", (candidate) => {
+      candidate.checks[0].status = "fail";
+    }],
+    ["deferred change", (candidate) => {
+      candidate.deferred_changes = [];
+    }],
+    ["unknown resource drift", (candidate) => {
+      candidate.resource_drift = [{ address: "fixture" }];
+    }],
+    ["missing inventory entry", (candidate) => {
+      candidate.resource_changes.pop();
+    }],
+    ["duplicate inventory entry", (candidate) => {
+      candidate.resource_changes.push(clone(candidate.resource_changes[0]));
+    }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const candidate = postCutoverRelayImageRolloutFixture();
+    mutate(candidate);
+    assert.equal(acceptsPlan(candidate, mode), false, label);
+  }
 });
