@@ -62,11 +62,30 @@ interface ServiceOptionsSnapshot {
   readonly evidence?: unknown;
 }
 
+interface CompletionCaller {
+  readonly signal: AbortSignal;
+  readonly promise: Promise<GenerationCompletion>;
+  readonly resolve: (value: GenerationCompletion) => void;
+  readonly reject: (reason?: unknown) => void;
+  readonly listener: () => void;
+  aborted: boolean;
+  internalAbort: boolean;
+  settled: boolean;
+}
+
 interface CompletionEntry {
+  readonly key: string;
   readonly promise: Promise<GenerationCompletion>;
   readonly controller: AbortController;
-  readonly listeners: Map<AbortSignal, () => void>;
+  readonly callers: Map<AbortSignal, CompletionCaller>;
+  nonAbortingCallerCount: number;
+  internalAbort: boolean;
+  settled: boolean;
 }
+
+type CompletionOutcome =
+  | { readonly kind: 'success'; readonly result: GenerationCompletion }
+  | { readonly kind: 'failure'; readonly error: unknown };
 
 function invalid(category: 'forged-value' | 'invalid-provider'): never {
   throw new GenerationError(category);
@@ -108,6 +127,29 @@ function descriptorFor(value: object, key: string): PropertyDescriptor | undefin
     }
   }
   return undefined;
+}
+
+function completionSignalSnapshot(value: unknown): AbortSignal | undefined {
+  if (typeof value !== 'object' || value === null) {
+    throw new GenerationError('forged-value');
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = descriptorFor(value, 'signal');
+  } catch {
+    throw new GenerationError('forged-value');
+  }
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (!Object.hasOwn(descriptor, 'value')) {
+    throw new GenerationError('forged-value');
+  }
+  const signal = descriptor.value;
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new GenerationError('forged-value');
+  }
+  return signal;
 }
 
 function providerSnapshot(value: unknown): ProviderSnapshot {
@@ -587,20 +629,13 @@ export class GenerationService {
     if (!isAcceptedTargetTurn(turn)) {
       throw new GenerationError('forged-value');
     }
-    if (
-      typeof options !== 'object' ||
-      options === null ||
-      (options.signal !== undefined && !(options.signal instanceof AbortSignal))
-    ) {
-      throw new GenerationError('forged-value');
-    }
+    const signal = completionSignalSnapshot(options);
 
     const correlation = correlationFromTurn(turn);
     const key = keyFor(correlation, turn.targetTranscript);
     const existing = this.#completionPromises.get(key);
     if (existing !== undefined) {
-      this.#attachSignal(existing, options.signal);
-      return existing.promise;
+      return this.#joinCompletion(existing, signal);
     }
 
     const controller = new AbortController();
@@ -611,51 +646,162 @@ export class GenerationService {
       rejectPromise = reject;
     });
     const entry: CompletionEntry = {
+      key,
       promise,
       controller,
-      listeners: new Map()
+      callers: new Map(),
+      nonAbortingCallerCount: 0,
+      internalAbort: false,
+      settled: false
     };
     this.#completionPromises.set(key, entry);
-    this.#attachSignal(entry, options.signal);
 
-    void this.#executeComplete(turn, correlation, controller).then(resolvePromise, rejectPromise);
     void promise.then(
-      () => this.#settle(key, entry),
-      () => this.#settle(key, entry)
+      (result) => this.#finish(key, entry, { kind: 'success', result }),
+      (error: unknown) => this.#finish(key, entry, { kind: 'failure', error })
     );
+
+    let callerPromise: Promise<GenerationCompletion>;
+    try {
+      callerPromise = this.#joinCompletion(entry, signal);
+    } catch (error) {
+      rejectPromise(error);
+      this.#settle(key, entry);
+      throw error;
+    }
+
+    void this.#executeComplete(turn, correlation, controller, entry).then(resolvePromise, rejectPromise);
+    return callerPromise;
+  }
+
+  #joinCompletion(
+    entry: CompletionEntry,
+    signal: AbortSignal | undefined
+  ): Promise<GenerationCompletion> {
+    if (signal === undefined) {
+      entry.nonAbortingCallerCount += 1;
+      return entry.promise;
+    }
+
+    const existing = entry.callers.get(signal);
+    if (existing !== undefined) {
+      return existing.promise;
+    }
+
+    let resolvePromise!: (value: GenerationCompletion) => void;
+    let rejectPromise!: (reason?: unknown) => void;
+    const promise = new Promise<GenerationCompletion>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    void promise.catch(() => undefined);
+    const caller: CompletionCaller = {
+      signal,
+      promise,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      listener: () => this.#cancelCaller(entry, caller),
+      aborted: false,
+      internalAbort: false,
+      settled: false
+    };
+    entry.callers.set(signal, caller);
+    try {
+      signal.addEventListener('abort', caller.listener, { once: true });
+      if (signal.aborted) {
+        caller.listener();
+      }
+    } catch (error) {
+      entry.callers.delete(signal);
+      try {
+        signal.removeEventListener('abort', caller.listener);
+      } catch {
+        // Listener cleanup is best effort at a hostile boundary.
+      }
+      rejectPromise(error);
+      void promise.catch(() => undefined);
+      throw error;
+    }
     return promise;
   }
 
-  #attachSignal(entry: CompletionEntry, signal: AbortSignal | undefined): void {
-    if (signal === undefined || entry.listeners.has(signal)) {
+  #cancelCaller(entry: CompletionEntry, caller: CompletionCaller): void {
+    if (caller.aborted || caller.settled) {
       return;
     }
-    const onAbort = (): void => {
-      if (!entry.controller.signal.aborted) {
-        entry.controller.abort();
-      }
-    };
-    entry.listeners.set(signal, onAbort);
-    signal.addEventListener('abort', onAbort, { once: true });
-    if (signal.aborted) {
-      onAbort();
+    caller.aborted = true;
+    if (entry.internalAbort) {
+      caller.internalAbort = true;
+      return;
+    }
+    caller.settled = true;
+    caller.reject(new GenerationError('provider-failure'));
+    if (
+      entry.nonAbortingCallerCount === 0 &&
+      !entry.controller.signal.aborted &&
+      [...entry.callers.values()].every((item) => item.aborted)
+    ) {
+      this.#settle(entry.key, entry);
+      entry.controller.abort();
     }
   }
 
+  #finish(
+    key: string,
+    entry: CompletionEntry,
+    outcome: CompletionOutcome
+  ): void {
+    if (entry.settled) {
+      return;
+    }
+    for (const caller of entry.callers.values()) {
+      if (caller.aborted) {
+        caller.settled = true;
+        if (
+          caller.internalAbort &&
+          outcome.kind === 'failure' &&
+          outcome.error instanceof GenerationError &&
+          outcome.error.category === 'language-validation-failure'
+        ) {
+          caller.reject(outcome.error);
+        } else {
+          caller.reject(new GenerationError('provider-failure'));
+        }
+        continue;
+      }
+      caller.settled = true;
+      if (outcome.kind === 'failure') {
+        caller.reject(outcome.error);
+      } else {
+        caller.resolve(outcome.result);
+      }
+    }
+    this.#settle(key, entry);
+  }
+
   #settle(key: string, entry: CompletionEntry): void {
+    if (entry.settled) {
+      return;
+    }
+    entry.settled = true;
     if (this.#completionPromises.get(key) === entry) {
       this.#completionPromises.delete(key);
     }
-    for (const [signal, listener] of entry.listeners) {
-      signal.removeEventListener('abort', listener);
+    for (const caller of entry.callers.values()) {
+      try {
+        caller.signal.removeEventListener('abort', caller.listener);
+      } catch {
+        // Listener cleanup is best effort at a hostile boundary.
+      }
     }
-    entry.listeners.clear();
+    entry.callers.clear();
   }
 
   async #executeComplete(
     turn: AcceptedTargetTurn,
     correlation: GenerationCorrelation,
-    controller: AbortController
+    controller: AbortController,
+    entry: CompletionEntry
   ): Promise<GenerationCompletion> {
     const start = now();
     let status: GenerationEvidenceRecord['status'] = 'failure';
@@ -694,7 +840,8 @@ export class GenerationService {
       languageValidationCheckCount = validationInput.checks.length;
       const validationEvidence = await this.#validateGeneratedLanguage(
         validationInput,
-        controller.signal
+        controller.signal,
+        entry
       );
       languageValidationNonmatchCount = validationEvidence.checks.filter((item) =>
         item.verdict !== 'match' ||
@@ -787,7 +934,8 @@ export class GenerationService {
 
   async #validateGeneratedLanguage(
     input: GeneratedLanguageValidationInput,
-    operationSignal: AbortSignal
+    operationSignal: AbortSignal,
+    entry: CompletionEntry
   ): Promise<GeneratedLanguageValidationEvidence> {
     if (operationSignal.aborted) {
       throw new GenerationError('provider-failure');
@@ -804,7 +952,7 @@ export class GenerationService {
         terminal = 'caller-cancelled';
         reject(new GenerationError('provider-failure'));
         if (!validationController.signal.aborted) {
-          validationController.abort();
+          this.#abortValidationController(entry, validationController);
         }
       };
       operationSignal.addEventListener('abort', onOperationAbort, { once: true });
@@ -820,7 +968,7 @@ export class GenerationService {
           terminal = 'timed-out';
           reject(new GenerationError('language-validation-failure'));
           if (!validationController.signal.aborted) {
-            validationController.abort();
+            this.#abortValidationController(entry, validationController);
           }
         }, this.#languageValidationTimeoutMs);
       } catch {
@@ -865,8 +1013,20 @@ export class GenerationService {
         operationSignal.removeEventListener('abort', onOperationAbort);
       }
       if (!validationController.signal.aborted) {
-        validationController.abort();
+        this.#abortValidationController(entry, validationController);
       }
+    }
+  }
+
+  #abortValidationController(
+    entry: CompletionEntry,
+    controller: AbortController
+  ): void {
+    entry.internalAbort = true;
+    try {
+      controller.abort();
+    } finally {
+      entry.internalAbort = false;
     }
   }
 

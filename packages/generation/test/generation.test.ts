@@ -669,7 +669,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     expect(provider.completeCalls).toBe(5);
   });
 
-  it('shares one promise, aborts once for any caller, and records cancellation', async () => {
+  it('gives deduped callers independent cancellation while preserving the shared result', async () => {
     const provider = new DeterministicMockProvider({
       complete: { result: completion(), delayMs: 50 }
     });
@@ -679,7 +679,7 @@ describe('provider failures, validation, retry, and deduplication', () => {
     const firstPromise = service.complete(turn(), { signal: firstController.signal });
     const secondPromise = service.complete(turn(), { signal: secondController.signal });
 
-    expect(secondPromise).toBe(firstPromise);
+    expect(secondPromise).not.toBe(firstPromise);
     await Promise.resolve();
     expect(provider.completeCalls).toBe(1);
     firstController.abort();
@@ -687,9 +687,115 @@ describe('provider failures, validation, retry, and deduplication', () => {
       category: 'provider-failure',
       providerFailureStage: undefined
     });
+    await expect(secondPromise).resolves.toMatchObject({
+      englishTranslation: 'English'
+    });
+    expect(provider.signals[0]?.aborted).toBe(false);
+    expect(service.evidence).toMatchObject([{ operation: 'complete', status: 'success' }]);
+  });
+
+  it('aborts the shared operation only after every signal-bearing caller aborts', async () => {
+    const provider = new DeterministicMockProvider({
+      complete: { result: completion(), delayMs: 50 }
+    });
+    const service = serviceWithValidator(provider);
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const firstPromise = service.complete(turn(), { signal: firstController.signal });
+    const secondPromise = service.complete(turn(), { signal: secondController.signal });
+
+    firstController.abort();
+    await expect(firstPromise).rejects.toMatchObject({ category: 'provider-failure' });
+    expect(provider.signals[0]?.aborted).toBe(false);
+
+    secondController.abort();
+    await expect(secondPromise).rejects.toMatchObject({ category: 'provider-failure' });
     expect(provider.signals[0]?.aborted).toBe(true);
     expect(service.evidence).toMatchObject([{ operation: 'complete', status: 'cancelled' }]);
     expect(service.evidence[0]).not.toHaveProperty('providerFailureStage');
+  });
+
+  it('detaches an abandoned operation so a later caller can complete and late settlement is harmless', async () => {
+    let firstResolve: ((value: GenerationProviderCompletion) => void) | undefined;
+    let calls = 0;
+    const provider: GenerationProvider = {
+      id: 'noncooperative-provider',
+      version: '1.0.0',
+      complete: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise<GenerationProviderCompletion>((resolve) => {
+            firstResolve = resolve;
+          });
+        }
+        return completion('Fresh English');
+      }
+    };
+    const service = serviceWithValidator(provider);
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = service.complete(turn(), { signal: firstController.signal });
+    const second = service.complete(turn(), { signal: secondController.signal });
+    await vi.waitFor(() => expect(calls).toBe(1));
+
+    firstController.abort();
+    secondController.abort();
+    await Promise.all([
+      expect(first).rejects.toMatchObject({ category: 'provider-failure' }),
+      expect(second).rejects.toMatchObject({ category: 'provider-failure' })
+    ]);
+
+    await expect(service.complete(turn())).resolves.toMatchObject({
+      englishTranslation: 'Fresh English'
+    });
+    expect(calls).toBe(2);
+
+    firstResolve?.(completion('Stale English'));
+    await vi.waitFor(() => expect(service.evidence).toHaveLength(2));
+    expect(service.evidence.map((item) => item.status)).toEqual(['success', 'cancelled']);
+  });
+
+  it('does not wedge the deduplication map when signal is an accessor', async () => {
+    const provider = new DeterministicMockProvider({
+      complete: { result: completion() }
+    });
+    const service = serviceWithValidator(provider);
+    let reads = 0;
+    const hostileOptions = {};
+    Object.defineProperty(hostileOptions, 'signal', {
+      get: () => {
+        reads += 1;
+        return reads === 1 ? new AbortController().signal : {};
+      }
+    });
+
+    expect(() => service.complete(turn(), hostileOptions as never)).toThrow(
+      expect.objectContaining({ category: 'forged-value' })
+    );
+    expect(reads).toBe(0);
+    await expect(service.complete(turn())).resolves.toMatchObject({
+      englishTranslation: 'English'
+    });
+    expect(provider.completeCalls).toBe(1);
+  });
+
+  it('settles the deduplication entry when listener attachment throws', async () => {
+    const provider = new DeterministicMockProvider({
+      complete: { result: completion() }
+    });
+    const service = serviceWithValidator(provider);
+    const signal = new AbortController().signal;
+    Object.defineProperty(signal, 'addEventListener', {
+      value: () => {
+        throw new Error('listener attachment failed');
+      }
+    });
+
+    expect(() => service.complete(turn(), { signal })).toThrow('listener attachment failed');
+    await expect(service.complete(turn())).resolves.toMatchObject({
+      englishTranslation: 'English'
+    });
+    expect(provider.completeCalls).toBe(1);
   });
 
   it('deduplicates a repeated signal listener, cleans it up, and aborts once', async () => {
