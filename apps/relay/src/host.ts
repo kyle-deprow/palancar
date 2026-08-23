@@ -80,6 +80,10 @@ import {
   isDurableSecurityRuntime,
   type RelaySecurityComposition
 } from './security.js';
+import {
+  RelaySecurityCache,
+  RELAY_SECURITY_CACHE_CAPACITY
+} from './security-cache.js';
 import type {
   RelayClock,
   RelayIdGenerator,
@@ -2184,8 +2188,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   const leases = new WeakMap<WebSocket, SessionLease>();
   const pendingUpgrades = new Set<PendingUpgrade>();
   const pendingUpgradesByInstallation = new Map<string, Set<PendingUpgrade>>();
-  const revokedInstallations = new Set<string>();
-  const minimumCredentialVersions = new Map<string, number>();
+  const securityCache = new RelaySecurityCache(RELAY_SECURITY_CACHE_CAPACITY);
   const hostAbortController = new AbortController();
   const trackedWork = new Set<Promise<unknown>>();
   let lifecycleState: RelayHostLifecycleState = 'created';
@@ -2510,9 +2513,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   };
 
   const leaseAllowed = (lease: SessionLease): boolean => {
-    if (revokedInstallations.has(lease.installationId)) return false;
-    const minimumVersion = minimumCredentialVersions.get(lease.installationId);
-    return minimumVersion === undefined || lease.credentialVersion >= minimumVersion;
+    return securityCache.leaseAllowed(lease);
   };
 
   const removePendingUpgrade = (pendingUpgrade: PendingUpgrade): void => {
@@ -2580,10 +2581,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   };
 
   const applyPromotionResult = async (result: CredentialPromotionResult): Promise<void> => {
-    const currentMinimum = minimumCredentialVersions.get(result.installationId) ?? 0;
-    if (result.credentialVersion > currentMinimum) {
-      minimumCredentialVersions.set(result.installationId, result.credentialVersion);
-    }
+    securityCache.applyPromotionResult(result);
     cancelPendingForInstallation(
       result.installationId,
       (lease) => lease.credentialVersion < result.credentialVersion
@@ -2595,7 +2593,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
   };
 
   const applyRevocationResult = async (result: InstallationRevocationResult): Promise<void> => {
-    revokedInstallations.add(result.installationId);
+    securityCache.applyRevocationResult(result);
     cancelPendingForInstallation(result.installationId, () => true);
     await waitForClosedConnections(result.installationId, () => true);
   };
@@ -3087,8 +3085,7 @@ export function createRelayHost(config: RelayHostConfig): RelayHost {
       pendingUpgrades.clear();
       pendingUpgradesByInstallation.clear();
       connectionsByInstallation.clear();
-      revokedInstallations.clear();
-      minimumCredentialVersions.clear();
+      securityCache.clear();
       readinessCache = undefined;
     })().catch(() => undefined).finally(() => {
       lifecycleState = 'stopped';
