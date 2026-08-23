@@ -2,7 +2,7 @@ import { assertCanonicalUuid } from './crypto.js';
 import { createSystemClock } from './clock.js';
 import { SecurityStateError } from './errors.js';
 import { exactDataObject, nonNegativeSafeInteger, positiveSafeInteger } from './schema.js';
-import type { AudioGrant, SecurityClock } from './types.js';
+import { CLOCK_BACKWARDS_TOLERANCE_MS, type AudioGrant, type SecurityClock } from './types.js';
 
 export interface AudioGrantMeterRangeInput {
   readonly fromOriginalSampleOffset: number;
@@ -98,10 +98,19 @@ export class AudioGrantMeter {
     this.#externalActive = true;
     this.#reentryDetected = false;
     try {
-      const now = this.#clock.now();
-      if (this.#reentryDetected || !nonNegativeSafeInteger(now) || now < this.#lastNow) {
+      const observedNow = this.#clock.now();
+      if (this.#reentryDetected || !nonNegativeSafeInteger(observedNow)) {
         fail('state-unavailable');
       }
+      if (
+        observedNow < this.#lastNow &&
+        this.#lastNow - observedNow > CLOCK_BACKWARDS_TOLERANCE_MS
+      ) {
+        fail('state-unavailable');
+      }
+      // Keep the meter's high-water mark as effective time so rollback cannot
+      // extend the grant's lifetime or move its permitted window backwards.
+      const now = observedNow < this.#lastNow ? this.#lastNow : observedNow;
       this.#lastNow = now;
       return now;
     } catch (error) {

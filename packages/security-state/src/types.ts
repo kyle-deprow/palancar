@@ -32,6 +32,13 @@ export const ATTEMPTS_PER_SESSION = 120;
 export const RECONNECTS_PER_MINUTE = 5;
 export const RECONNECTS_PER_TEN_MINUTES = 12;
 export const COLLISION_RETRY_LIMIT = 8;
+/**
+ * Backwards wall-clock corrections within this window use the recorded
+ * high-water mark as effective "now" for expiry/TTL, replay-window, and
+ * rate-limit comparisons and new timestamps, so state cannot un-expire or
+ * move a window backwards. Larger corrections fail closed.
+ */
+export const CLOCK_BACKWARDS_TOLERANCE_MS = 5 * 60_000;
 
 export interface SecurityClock {
   readonly now: () => number;

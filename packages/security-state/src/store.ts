@@ -22,6 +22,7 @@ import {
   ATTEMPTS_PER_MINUTE,
   ATTEMPTS_PER_SESSION,
   COLLISION_RETRY_LIMIT,
+  CLOCK_BACKWARDS_TOLERANCE_MS,
   CREDENTIAL_ABSOLUTE_TTL_MS,
   CREDENTIAL_IDLE_TTL_MS,
   GENERATIONS_PER_MINUTE,
@@ -529,10 +530,18 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
   #context(minimum = this.#latestAcceptedObservation): number {
     const available = this.#external(() => this.#availability.isAvailable());
     if (available !== true) fail('state-unavailable');
-    const now = this.#external(() => this.#clock.now());
-    if (!nonNegativeSafeInteger(now) || now < this.#latestAcceptedObservation || now < minimum) {
+    const observedNow = this.#external(() => this.#clock.now());
+    if (!nonNegativeSafeInteger(observedNow)) fail('state-unavailable');
+    if (
+      observedNow < this.#latestAcceptedObservation &&
+      this.#latestAcceptedObservation - observedNow > CLOCK_BACKWARDS_TOLERANCE_MS
+    ) {
       fail('state-unavailable');
     }
+    const now = observedNow < this.#latestAcceptedObservation
+      ? this.#latestAcceptedObservation
+      : observedNow;
+    if (now < minimum) fail('state-unavailable');
     this.#latestAcceptedObservation = now;
     return now;
   }
@@ -1697,8 +1706,8 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         Object.getPrototypeOf(signal) !== AbortSignal.prototype)
     ) fail('state-unavailable');
     if (aborted(signal)) fail('state-unavailable');
-    const available = this.#external(() => this.#availability.isAvailable());
-    if (aborted(signal) || available !== true) fail('state-unavailable');
+    this.#context();
+    if (aborted(signal)) fail('state-unavailable');
   }
 
   async cleanupExpired(value: CleanupInput): Promise<CleanupResult> {

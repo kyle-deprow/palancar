@@ -47,6 +47,7 @@ import {
   AUDIO_GRANT_TTL_MS,
   AUDIO_RESERVATION_WINDOW_MS,
   COLLISION_RETRY_LIMIT,
+  CLOCK_BACKWARDS_TOLERANCE_MS,
   CREDENTIAL_ABSOLUTE_TTL_MS,
   CREDENTIAL_IDLE_TTL_MS,
   DURABLE_SECURITY_STATE_STORE,
@@ -1287,6 +1288,8 @@ class AzureSecurityStateCore {
   readonly #clock: SecurityClock;
   readonly #ids: SecurityIdFactory;
   readonly #tokens: SecurityTokenFactory;
+  // Deliberately process-local: a restart starts a fresh observation window,
+  // so the rollback tolerance applies per process.
   #lastNow = 0;
   #externalActive = false;
   #cleanupSecurityToken: string | undefined;
@@ -1320,8 +1323,16 @@ class AzureSecurityStateCore {
   }
 
   #now(minimum = this.#lastNow): number {
-    const now = this.#external(() => this.#clock.now());
-    if (!nonNegativeSafeInteger(now) || now < minimum || now < this.#lastNow) fail('state-unavailable');
+    const observedNow = this.#external(() => this.#clock.now());
+    if (!nonNegativeSafeInteger(observedNow)) fail('state-unavailable');
+    if (
+      observedNow < this.#lastNow &&
+      this.#lastNow - observedNow > CLOCK_BACKWARDS_TOLERANCE_MS
+    ) {
+      fail('state-unavailable');
+    }
+    const now = observedNow < this.#lastNow ? this.#lastNow : observedNow;
+    if (now < minimum) fail('state-unavailable');
     this.#lastNow = now;
     return now;
   }

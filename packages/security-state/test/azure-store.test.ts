@@ -5,6 +5,7 @@ import {
   AUDIO_GRANT_TTL_MS,
   AUDIO_RESERVATION_WINDOW_MS,
   AZURE_SECURITY_SCHEMA_VERSION,
+  CLOCK_BACKWARDS_TOLERANCE_MS,
   CREDENTIAL_ABSOLUTE_TTL_MS,
   CREDENTIAL_IDLE_TTL_MS,
   LOCAL_MOCK_ENVIRONMENT,
@@ -381,8 +382,8 @@ async function open(base: ReturnType<typeof fixture>, credential: string) {
   return { ticket, opening, active };
 }
 
-async function activeFixture() {
-  const base = fixture();
+async function activeFixture(initialNow = 1_000) {
+  const base = fixture(initialNow);
   const { redeemed } = await enroll(base);
   const opened = await open(base, redeemed.credential);
   return { ...base, redeemed, ...opened };
@@ -426,6 +427,30 @@ function correlation(lease: SessionLease, revision = 1) {
 }
 
 describe('Azure Table durable adapter', () => {
+  it('clamps small clock rollback without un-expiring state and fails closed beyond the tolerance', async () => {
+    const base = await activeFixture(CLOCK_BACKWARDS_TOLERANCE_MS + 1_000);
+    base.fake.advance(ACTIVE_LEASE_MS);
+    const highWater = base.fake.now();
+    await base.runtime.cleanupExpired({ limit: 100 });
+    expect(requiredRow(base.security.snapshot(), 'session').properties).toMatchObject({ status: 'expired' });
+
+    base.fake.set(highWater - CLOCK_BACKWARDS_TOLERANCE_MS + 1);
+    await expect(base.runtime.cleanupExpired({ limit: 100 })).resolves.toBeDefined();
+    expect(requiredRow(base.security.snapshot(), 'session').properties).toMatchObject({ status: 'expired' });
+    const clamped = await base.operator.issuePairing({ operatorScope: 'operator' });
+    expect(clamped.issuedAt).toBe(highWater);
+
+    base.fake.set(highWater - CLOCK_BACKWARDS_TOLERANCE_MS - 1);
+    await expect(base.runtime.cleanupExpired({ limit: 100 }))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+
+    base.fake.set(highWater);
+    expect(requiredRow(base.security.snapshot(), 'session').properties).toMatchObject({ status: 'expired' });
+    base.fake.advance(1);
+    const advanced = await base.operator.issuePairing({ operatorScope: 'operator' });
+    expect(advanced.issuedAt).toBe(highWater + 1);
+  });
+
   it('readiness conditionally probes both tables and fails closed on either outage', async () => {
     const base = fixture();
     await expect(base.runtime.checkReadiness())

@@ -8,6 +8,7 @@ import {
   CREDENTIAL_IDLE_TTL_MS,
   DURABLE_SECURITY_STATE_STORE,
   AUDIO_RESERVATION_WINDOW_MS,
+  CLOCK_BACKWARDS_TOLERANCE_MS,
   LOCAL_MOCK_ONLY,
   LOCAL_MOCK_ENVIRONMENT,
   MAX_AUDIO_GRANT_SAMPLES,
@@ -148,8 +149,8 @@ async function open(store: InMemorySecurityStateStore, credential: string) {
   return { ticket, opening, active };
 }
 
-async function activeFixture() {
-  const base = fixture();
+async function activeFixture(initialNow = 1_000) {
+  const base = fixture(initialNow);
   const { redeemed } = await enroll(base.store);
   const opened = await open(base.store, redeemed.credential);
   return { ...base, ...opened, redeemed };
@@ -273,7 +274,7 @@ describe('deployment boundary and exact schemas', () => {
   });
 
   it('exposes readiness only through maintenance and fails closed on outage or cancellation', async () => {
-    const { store, availability } = fixture();
+    const { store, availability, fake } = fixture(CLOCK_BACKWARDS_TOLERANCE_MS + 1_000);
     await expect(store.checkReadiness()).resolves.toBeUndefined();
     availability.set(false);
     await expect(store.checkReadiness()).rejects.toMatchObject({ category: 'state-unavailable' });
@@ -284,6 +285,8 @@ describe('deployment boundary and exact schemas', () => {
       .rejects.toMatchObject({ category: 'state-unavailable' });
     await expect(store.checkReadiness(new Proxy(new AbortController().signal, {})))
       .rejects.toMatchObject({ category: 'state-unavailable' });
+    fake.set(999);
+    await expect(store.checkReadiness()).rejects.toMatchObject({ category: 'state-unavailable' });
   });
 
   it('rejects extras, symbols, accessors, inheritance, custom/null prototypes, and proxies without getters', async () => {
@@ -1117,44 +1120,54 @@ describe('credential rotation, tickets, and session leases', () => {
 });
 
 describe('audio grants and generation claims', () => {
-  it('retains a successful 500ms handoff observation before a rolled-back next operation', async () => {
+  it('clamps a small rollback after a successful 500ms handoff observation', async () => {
     const base = await audioHandoffFixture(MIN_AUDIO_GRANT_HANDOFF_MS);
     await expect(base.store.reserveAudio(audioRequest(base.active, 100)))
       .resolves.toMatchObject({ issuedAt: 1_000, expiresAt: 2_000 });
 
     base.fake.set(1_000);
     await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_500, 100)))
-      .rejects.toMatchObject({ category: 'state-unavailable' });
+      .resolves.toMatchObject({ issuedAt: 1_500, expiresAt: 2_500 });
 
     base.fake.set(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS);
     const snapshot = base.store.snapshot();
-    expect(snapshot.grants).toHaveLength(1);
+    expect(snapshot.grants).toHaveLength(2);
     expect(snapshot.grants[0]).toMatchObject({
       fromOriginalSampleOffset: 0,
       throughOriginalSampleOffset: 100,
       reservedOriginalSamples: 100
     });
-    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(100);
+    expect(snapshot.grants[1]).toMatchObject({
+      fromOriginalSampleOffset: 100,
+      throughOriginalSampleOffset: 200,
+      reservedOriginalSamples: 100
+    });
+    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(200);
   });
 
-  it('retains a failed 501ms handoff observation before a rolled-back next operation', async () => {
+  it('clamps a small rollback after a failed 501ms handoff observation', async () => {
     const base = await audioHandoffFixture(MIN_AUDIO_GRANT_HANDOFF_MS + 1);
     await expect(base.store.reserveAudio(audioRequest(base.active, 100)))
       .rejects.toMatchObject({ category: 'state-unavailable' });
 
     base.fake.set(1_000);
     await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_500, 100)))
-      .rejects.toMatchObject({ category: 'state-unavailable' });
+      .resolves.toMatchObject({ issuedAt: 1_501, expiresAt: 2_501 });
 
     base.fake.set(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
     const snapshot = base.store.snapshot();
-    expect(snapshot.grants).toHaveLength(1);
+    expect(snapshot.grants).toHaveLength(2);
     expect(snapshot.grants[0]).toMatchObject({
       fromOriginalSampleOffset: 0,
       throughOriginalSampleOffset: 100,
       reservedOriginalSamples: 100
     });
-    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(100);
+    expect(snapshot.grants[1]).toMatchObject({
+      fromOriginalSampleOffset: 100,
+      throughOriginalSampleOffset: 200,
+      reservedOriginalSamples: 100
+    });
+    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(200);
   });
 
   it('accepts exactly 500ms of in-memory post-commit handoff and retains a committed reservation at 501ms', async () => {
@@ -1342,6 +1355,39 @@ describe('audio grants and generation claims', () => {
       fromOriginalSampleOffset: 5,
       throughOriginalSampleOffset: 10
     })).toThrowError(SecurityStateError);
+  });
+
+  it('clamps meter rollback within tolerance without extending the grant lifetime', async () => {
+    const base = await activeFixture(CLOCK_BACKWARDS_TOLERANCE_MS + 1_000);
+    await base.store.reserveAudio(audioRequest(base.active, 10, 9_500));
+    base.fake.advance(500);
+    expect(base.store.snapshot()).toBeDefined();
+    const highWater = base.fake.now();
+
+    base.fake.set(highWater - 500);
+    const grant = await base.store.reserveAudio(audioRequest(base.active, 10, 9_501, 10));
+    expect(grant).toMatchObject({ issuedAt: highWater, expiresAt: highWater + AUDIO_GRANT_TTL_MS });
+
+    const meter = createAudioGrantMeter({ grant, clock: base.fake.clock });
+    expect(meter.accept({ fromOriginalSampleOffset: 10, throughOriginalSampleOffset: 15 }))
+      .toMatchObject({ acceptedThroughOriginalSampleOffset: 15, complete: false });
+
+    base.fake.set(grant.expiresAt);
+    expect(() => meter.accept({ fromOriginalSampleOffset: 15, throughOriginalSampleOffset: 20 }))
+      .toThrowError(SecurityStateError);
+  });
+
+  it('rejects meter rollback beyond the shared tolerance', async () => {
+    const base = await activeFixture(CLOCK_BACKWARDS_TOLERANCE_MS + 1_000);
+    const grant = await base.store.reserveAudio(audioRequest(base.active, 10));
+    const meter = createAudioGrantMeter({ grant, clock: base.fake.clock });
+    base.fake.advance(1);
+    expect(() => meter.accept({ fromOriginalSampleOffset: 0, throughOriginalSampleOffset: 5 }))
+      .not.toThrow();
+
+    base.fake.set(999);
+    expect(() => meter.accept({ fromOriginalSampleOffset: 5, throughOriginalSampleOffset: 10 }))
+      .toThrowError(new SecurityStateError('state-unavailable'));
   });
 
   it('supports a 30-second utterance as the durable audio window refills', async () => {
@@ -1576,14 +1622,30 @@ describe('expiry, cleanup, snapshots, and safe time', () => {
     expect(store.snapshot().pairings).toHaveLength(0);
   });
 
-  it('detects clock rollback and timestamp overflow without partial mutation', async () => {
+  it('clamps small clock rollback without un-expiring state and fails closed beyond the tolerance', async () => {
     const { store, fake } = fixture(1_000);
     await store.issuePairing({ operatorScope: 'operator' });
-    const before = store.snapshot();
-    fake.set(999);
-    expect(() => store.snapshot()).toThrowError(SecurityStateError);
-    fake.set(1_000);
-    expect(store.snapshot()).toEqual(before);
+    fake.advance(PAIRING_TTL_MS);
+    const highWater = fake.now();
+    expect(store.snapshot().pairings[0]?.status).toBe('expired');
+
+    fake.set(highWater - CLOCK_BACKWARDS_TOLERANCE_MS + 1);
+    expect(() => store.snapshot()).not.toThrow();
+    expect(store.snapshot().pairings[0]?.status).toBe('expired');
+    const clamped = await store.issuePairing({ operatorScope: 'operator' });
+    expect(clamped.issuedAt).toBe(highWater);
+
+    fake.set(highWater - CLOCK_BACKWARDS_TOLERANCE_MS - 1);
+    expect(() => store.snapshot()).toThrow(new SecurityStateError('state-unavailable'));
+
+    fake.set(highWater);
+    expect(store.snapshot().pairings[0]?.status).toBe('expired');
+    fake.advance(1);
+    const advanced = await store.issuePairing({ operatorScope: 'operator' });
+    expect(advanced.issuedAt).toBe(highWater + 1);
+  });
+
+  it('detects timestamp overflow without partial mutation', async () => {
 
     const nearMax = fixture(Number.MAX_SAFE_INTEGER - 599_999);
     await expect(nearMax.store.issuePairing({ operatorScope: 'operator' }))
