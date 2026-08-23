@@ -4238,35 +4238,36 @@ test("revision responses reject every phase and mode mismatch", () => {
   }
 });
 
-test("runtime, credential, and terminal predecessor proofs remain strict for both live limits", () => {
+test("post-cutover predecessor proofs allow purged predecessors but remain strict for both live limits", () => {
   const mutations = [
-    ["missing", (active) => [active]],
-    ["extra", (active) => [active, retainedRuntimePredecessorRevision(), retainedRuntimePredecessorRevision()]],
+    ["missing", (active) => [active], false],
+    ["bound", (active) => [active, retainedRuntimePredecessorRevision()], false],
     ["wrong name", (active) => {
       const predecessor = retainedRuntimePredecessorRevision();
       predecessor.name = "revision-other";
       predecessor.id = predecessor.id.replace(/\/revisions\/[^/]+$/, "/revisions/revision-other");
       predecessor.properties.fqdn = `revision-other.${RELAY_ENVIRONMENT_SUFFIX}`;
       return [active, predecessor];
-    }],
+    }, true],
+    ["extra", (active) => [active, retainedRuntimePredecessorRevision(), retainedRuntimePredecessorRevision()], true],
     ["wrong template", (active) => {
       const predecessor = retainedRuntimePredecessorRevision();
       predecessor.properties.template.containers[0].image = `${predecessor.properties.template.containers[0].image.slice(0, -64)}${"0".repeat(64)}`;
       return [active, predecessor];
-    }],
+    }, true],
     ["serving", (active) => {
       const predecessor = retainedRuntimePredecessorRevision();
       predecessor.properties.trafficWeight = 1;
       return [active, predecessor];
-    }],
+    }, true],
     ["replicated", (active) => {
       const predecessor = retainedRuntimePredecessorRevision();
       predecessor.properties.replicaCount = 1;
       return [active, predecessor];
-    }],
+    }, true],
   ];
   for (const liveLimit of [null, 1]) {
-    for (const [label, revisions] of mutations) {
+    for (const [label, revisions, shouldReject] of mutations) {
       void label;
       const runtime = makeHarness();
       try {
@@ -4279,7 +4280,8 @@ test("runtime, credential, and terminal predecessor proofs remain strict for bot
           return next;
         });
         runtime.setLiveRevisionMutator((active) => revisions(active));
-        assert.throws(() => runtime.lifecycle.reconcile("runtime-cutover", runId));
+        if (shouldReject) assert.throws(() => runtime.lifecycle.reconcile("runtime-cutover", runId));
+        else assert.doesNotThrow(() => runtime.lifecycle.reconcile("runtime-cutover", runId));
       } finally {
         runtime.cleanup();
       }
@@ -4294,7 +4296,8 @@ test("runtime, credential, and terminal predecessor proofs remain strict for bot
           return next;
         });
         credential.setLiveRevisionMutator((active) => revisions(active));
-        assert.throws(() => credential.lifecycle.preflight("credential-cleanup", runId));
+        if (shouldReject) assert.throws(() => credential.lifecycle.preflight("credential-cleanup", runId));
+        else assert.doesNotThrow(() => credential.lifecycle.preflight("credential-cleanup", runId));
       } finally {
         credential.cleanup();
       }
@@ -4308,11 +4311,21 @@ test("runtime, credential, and terminal predecessor proofs remain strict for bot
           return next;
         });
         terminal.setLiveRevisionMutator((active) => revisions(active));
-        assert.throws(() => terminal.lifecycle.finalize("terminal", runId));
+        if (shouldReject) assert.throws(() => terminal.lifecycle.finalize("terminal", runId));
+        else assert.doesNotThrow(() => terminal.lifecycle.finalize("terminal", runId));
       } finally {
         terminal.cleanup();
       }
     }
+  }
+
+  const runtimePre = makeHarness();
+  try {
+    const runId = prepareRuntime(runtimePre);
+    runtimePre.setLiveRevisionMutator((active) => [active, retainedRuntimePredecessorRevision()]);
+    expectCode(() => runtimePre.lifecycle.preflight("runtime-cutover", runId), "runtime-revisions-set");
+  } finally {
+    runtimePre.cleanup();
   }
 });
 
@@ -5086,7 +5099,7 @@ test("credential cleanup binds the retained predecessor to the completed runtime
   }
 
   for (const [label, mutate, expected] of [
-    ["missing", (revisions) => revisions.slice(0, 1), "credential-revisions-set"],
+    ["missing", (revisions) => revisions.slice(0, 1), undefined],
     ["extra", (revisions) => [...revisions, structuredClone(revisions[1])], "credential-revisions-set"],
   ]) {
     void label;
@@ -5098,7 +5111,15 @@ test("credential cleanup binds the retained predecessor to the completed runtime
         const revisions = [active, retainedRuntimePredecessorRevision()];
         return mutate(revisions);
       });
-      expectCode(() => negative.lifecycle.preflight("credential-cleanup", runId), expected);
+      if (expected === undefined) {
+        assert.deepEqual(negative.lifecycle.preflight("credential-cleanup", runId), {
+          runId,
+          phase: "credential-cleanup",
+          status: "preflighted",
+        });
+      } else {
+        expectCode(() => negative.lifecycle.preflight("credential-cleanup", runId), expected);
+      }
     } finally {
       negative.cleanup();
     }

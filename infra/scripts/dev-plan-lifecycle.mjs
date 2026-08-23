@@ -7894,7 +7894,10 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
   if (runtimePre) {
     failIf(inactive.length !== 0, `${code}-set`);
   } else {
-    failIf(inactive.length !== 1, `${code}-set`);
+    // Azure retention eventually purges the retained predecessor entirely,
+    // so post-cutover phases may legitimately observe zero inactive
+    // revisions; more than one violates maxInactiveRevisions = 1.
+    failIf(inactive.length > 1, `${code}-set`);
   }
   const retainedPredecessor = options.inactiveRevisionContract;
   if (retainedPredecessor !== undefined) {
@@ -7908,15 +7911,19 @@ function assertRevisionResponse(value, app, reviewed, expectedRevision, expected
   if (runtimePre) {
     failIf(retainedPredecessor !== undefined || expectedInactiveRevision !== undefined, `${code}-inactive`);
   } else {
-    const boundInactiveRevision = retainedPredecessor?.revisionName ?? expectedInactiveRevision;
-    failIf(typeof boundInactiveRevision !== "string" || boundInactiveRevision.length === 0, `${code}-inactive`);
     failIf(
       retainedPredecessor !== undefined &&
         expectedInactiveRevision !== undefined &&
         retainedPredecessor.revisionName !== expectedInactiveRevision,
       `${code}-inactive`,
     );
-    failIf(inactive[0]?.revision.name !== boundInactiveRevision, `${code}-inactive`);
+    if (inactive.length === 1) {
+      const boundInactiveRevision = retainedPredecessor?.revisionName ?? expectedInactiveRevision;
+      if (boundInactiveRevision !== undefined) {
+        failIf(typeof boundInactiveRevision !== "string" || boundInactiveRevision.length === 0, `${code}-inactive`);
+        failIf(inactive[0]?.revision.name !== boundInactiveRevision, `${code}-inactive`);
+      }
+    }
   }
   const selected = active[0];
   const selectedName = selected.revision.name;
