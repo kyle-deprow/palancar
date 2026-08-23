@@ -336,6 +336,11 @@ export interface SecurityStateSnapshot {
 export interface CleanupResult {
   readonly visited: number;
   readonly removed: number;
+  readonly removedByTable: Readonly<{
+    readonly security: number;
+    readonly rate: number;
+  }>;
+  readonly exhausted: boolean;
 }
 
 export interface SecurityRuntimeStore {

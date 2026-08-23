@@ -1292,6 +1292,8 @@ class AzureSecurityStateCore {
   #cleanupSecurityToken: string | undefined;
   #cleanupRateToken: string | undefined;
   #cleanupTable: 'security' | 'rate' = 'security';
+  #cleanupSecurityExhausted = false;
+  #cleanupRateExhausted = false;
 
   constructor(options: CoreOptions) {
     this.environment = options.environment;
@@ -3934,18 +3936,42 @@ class AzureSecurityStateCore {
   async cleanupExpired(value: CleanupInput): Promise<CleanupResult> {
     const input = exactDataObject(value, ['limit']);
     if (!positiveSafeInteger(input.limit) || input.limit > 10_000) fail('invalid-input');
+    if (this.#cleanupSecurityExhausted && this.#cleanupRateExhausted) {
+      this.#cleanupSecurityToken = undefined;
+      this.#cleanupRateToken = undefined;
+      this.#cleanupTable = 'security';
+      this.#cleanupSecurityExhausted = false;
+      this.#cleanupRateExhausted = false;
+    }
     const now = this.#now();
     let visited = 0;
+    let pagesVisited = 0;
     let removed = 0;
-    while (visited < input.limit) {
+    let securityRemoved = 0;
+    let rateRemoved = 0;
+    let securityStoppedForRun = false;
+    let rateStoppedForRun = false;
+    while (visited < input.limit && pagesVisited < input.limit) {
+      const securityAvailable = !this.#cleanupSecurityExhausted && !securityStoppedForRun;
+      const rateAvailable = !this.#cleanupRateExhausted && !rateStoppedForRun;
+      if (!securityAvailable && !rateAvailable) break;
+      if (
+        (this.#cleanupTable === 'security' && !securityAvailable) ||
+        (this.#cleanupTable === 'rate' && !rateAvailable)
+      ) {
+        this.#cleanupTable = this.#cleanupTable === 'security' ? 'rate' : 'security';
+      }
       const tableName = this.#cleanupTable;
       const table = tableName === 'security' ? this.#security : this.#rate;
       const token = tableName === 'security' ? this.#cleanupSecurityToken : this.#cleanupRateToken;
+      const activeTables = Number(securityAvailable) + Number(rateAvailable);
+      const rowBudget = Math.max(1, Math.ceil((input.limit - visited) / activeTables));
       const page = await table.listPage({
-        limit: Math.min(100, input.limit - visited),
+        limit: Math.min(100, rowBudget),
         ...(tableName === 'security' ? { partitionKey: this.environment } : {}),
         ...(token === undefined ? {} : { continuationToken: token })
       }).catch((error: unknown) => mapBoundary(error));
+      pagesVisited += 1;
       if (tableName === 'security') this.#cleanupSecurityToken = page.continuationToken;
       else this.#cleanupRateToken = page.continuationToken;
       for (const entity of page.entities) {
@@ -3958,22 +3984,32 @@ class AzureSecurityStateCore {
         try {
           await table.delete(entity.partitionKey, entity.rowKey, entity.etag);
           removed += 1;
+          if (tableName === 'security') securityRemoved += 1;
+          else rateRemoved += 1;
         } catch (error) {
           if (!isBoundary(error, 'not-found', 'precondition-failed', 'ambiguous')) mapBoundary(error);
         }
       }
       const exhausted = page.continuationToken === undefined;
+      const stalled = !exhausted && page.entities.length === 0 && token !== undefined &&
+        page.continuationToken === token;
       if (exhausted) {
         if (tableName === 'security') this.#cleanupSecurityToken = undefined;
         else this.#cleanupRateToken = undefined;
-        this.#cleanupTable = tableName === 'security' ? 'rate' : 'security';
+        if (tableName === 'security') this.#cleanupSecurityExhausted = true;
+        else this.#cleanupRateExhausted = true;
+      } else if (stalled) {
+        if (tableName === 'security') securityStoppedForRun = true;
+        else rateStoppedForRun = true;
       }
-      if (page.entities.length === 0 && exhausted && this.#cleanupTable === 'security') break;
-      if (page.entities.length === 0 && !exhausted) continue;
-      if (visited >= input.limit) break;
-      if (!exhausted) continue;
+      this.#cleanupTable = tableName === 'security' ? 'rate' : 'security';
     }
-    return freeze({ visited, removed });
+    return freeze({
+      visited,
+      removed,
+      removedByTable: freeze({ security: securityRemoved, rate: rateRemoved }),
+      exhausted: this.#cleanupSecurityExhausted && this.#cleanupRateExhausted
+    });
   }
 }
 

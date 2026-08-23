@@ -28,6 +28,7 @@ import {
   createDeterministicIdFactory,
   createDeterministicTokenFactory,
   createFakeClock,
+  createTestSecurityStateStore,
   type AzureBoundaryErrorKind,
   type AzureNewEntity,
   type AzureStoredEntity,
@@ -1622,6 +1623,132 @@ describe('Azure Table durable adapter', () => {
     expiry.fake.advance(CREDENTIAL_ABSOLUTE_TTL_MS);
     await expect(expiry.runtime.authenticateCredential({ credential: enrollment.redeemed.credential }))
       .rejects.toMatchObject({ category: 'invalid-credential' });
+  });
+
+  it('continues past the first security page and then cleans the rate table', async () => {
+    const base = fixture();
+    for (let index = 0; index < 100; index += 1) {
+      base.security.insertRaw(Object.freeze({
+        partitionKey: ENVIRONMENT,
+        rowKey: `a-readiness:${String(index).padStart(3, '0')}`,
+        properties: Object.freeze({
+          schemaVersion: AZURE_SECURITY_SCHEMA_VERSION,
+          kind: 'readiness',
+          environment: ENVIRONMENT,
+          table: 'security',
+          probe: 0,
+          updatedAt: 0
+        })
+      }));
+    }
+    const pairingCode = pairing(1);
+    const pairingHash = hashPairingCode(pairingCode);
+    base.security.insertRaw(Object.freeze({
+      partitionKey: ENVIRONMENT,
+      rowKey: `pair:${pairingHash}`,
+      properties: Object.freeze({
+        schemaVersion: AZURE_SECURITY_SCHEMA_VERSION,
+        kind: 'pairing',
+        environment: ENVIRONMENT,
+        hash: pairingHash,
+        issueOperationId: hashCorrelationKey('cleanup-issue-operation'),
+        operatorHash: hashCorrelationKey('cleanup-operator'),
+        audienceOrigin: AUDIENCE.origin,
+        audiencePath: AUDIENCE.path,
+        audienceProtocol: AUDIENCE.protocol,
+        status: 'issued',
+        issuedAt: 0,
+        expiresAt: 1
+      })
+    }));
+    base.rate.insertRaw(Object.freeze({
+      partitionKey: 'rate:cleanup',
+      rowKey: 'expired-window',
+      properties: Object.freeze({
+        schemaVersion: AZURE_SECURITY_SCHEMA_VERSION,
+        kind: 'rate',
+        environment: ENVIRONMENT,
+        scope: 'cleanup',
+        window: 'test',
+        events: '[]',
+        retainUntil: 0
+      })
+    }));
+
+    await expect(base.runtime.cleanupExpired({ limit: 100 })).resolves.toMatchObject({
+      visited: 100,
+      removed: 1,
+      removedByTable: { security: 0, rate: 1 },
+      exhausted: false
+    });
+    await expect(base.runtime.cleanupExpired({ limit: 100 })).resolves.toMatchObject({
+      visited: 2,
+      removed: 1,
+      removedByTable: { security: 1, rate: 0 },
+      exhausted: true
+    });
+    expect(base.security.snapshot().some((entity) => entity.rowKey === `pair:${pairingHash}`)).toBe(false);
+    expect(base.rate.snapshot().some((entity) => entity.rowKey === 'expired-window')).toBe(false);
+  });
+
+  it('bounds a stalled empty continuation page and reports the traversal as unfinished', async () => {
+    const security = fakeTable();
+    const rate = fakeTable();
+    let securityListCalls = 0;
+    const stalledSecurity: AzureTableClientLike = Object.freeze({
+      ...security.client,
+      listPage: async (input: Parameters<AzureTableClientLike['listPage']>[0]) => {
+        securityListCalls += 1;
+        return Object.freeze({
+          entities: Object.freeze([]),
+          continuationToken: input.continuationToken ?? 'stale-token'
+        });
+      }
+    });
+    const stores = createAzureTableStoresForTesting({
+      environment: ENVIRONMENT,
+      audience: AUDIENCE,
+      securityTable: stalledSecurity,
+      rateTable: rate.client,
+      clock: createFakeClock(1_000).clock,
+      ids: ids(),
+      tokens: tokens()
+    });
+
+    await expect(stores.runtime.cleanupExpired({ limit: 3 })).resolves.toMatchObject({
+      visited: 0,
+      removed: 0,
+      exhausted: false
+    });
+    expect(securityListCalls).toBe(2);
+  });
+
+  it('aligns durable and in-memory exhaustion for equivalent live datasets', async () => {
+    const local = createTestSecurityStateStore({
+      audience: Object.freeze({
+        origin: 'wss://localhost:7443',
+        path: '/v1/stream',
+        protocol: 'palancar.v1'
+      }),
+      generationProvider: 'mock',
+      transcriptionProvider: 'mock',
+      clock: createFakeClock(1_000).clock,
+      ids: ids(),
+      tokens: tokens()
+    });
+    await local.issuePairing({ operatorScope: 'operator-1' });
+
+    const durable = fixture();
+    await durable.operator.issuePairing({ operatorScope: 'operator-1' });
+
+    const [localResult, durableResult] = await Promise.all([
+      local.cleanupExpired({ limit: 100 }),
+      durable.runtime.cleanupExpired({ limit: 100 })
+    ]);
+    expect(localResult.exhausted).toBe(true);
+    expect(durableResult.exhausted).toBe(localResult.exhausted);
+    expect(local.snapshot().pairings).toHaveLength(1);
+    expect(durable.security.snapshot().some((row) => row.properties.kind === 'pairing')).toBe(true);
   });
 
   it('rejects malformed schema and never includes row or secret content in errors', async () => {

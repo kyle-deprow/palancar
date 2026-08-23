@@ -2,6 +2,8 @@ import type { AzureTableRuntimeStoreOptions } from '@palancar/security-state';
 
 const FAILURE_OUTPUT = 'expiry-cleanup: failed\n';
 const CLEANUP_ENV_PREFIX = 'PALANCAR_EXPIRY_CLEANUP_';
+const CLEANUP_DEADLINE_MARGIN_MS = 5_000;
+export const EXPIRY_CLEANUP_MAX_ITERATIONS = 1_000;
 
 const REQUIRED_ENVIRONMENT_KEYS = Object.freeze([
   'AZURE_CLIENT_ID',
@@ -160,33 +162,80 @@ export function parseExpiryCleanupConfiguration(
   });
 }
 
-function parseCleanupResult(value: unknown, limit: number): Readonly<{ visited: number; removed: number }> {
+function parseCleanupResult(value: unknown, limit: number): Readonly<{
+  readonly visited: number;
+  readonly removed: number;
+  readonly securityRemoved: number;
+  readonly rateRemoved: number;
+  readonly exhausted: boolean;
+}> {
   if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new TypeError('Invalid cleanup result.');
   }
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 2 || !keys.includes('visited') || !keys.includes('removed')) {
+  if (
+    keys.length !== 4 || !keys.includes('visited') || !keys.includes('removed') ||
+    !keys.includes('removedByTable') || !keys.includes('exhausted')
+  ) {
     throw new TypeError('Invalid cleanup result.');
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const visitedDescriptor = descriptors.visited;
   const removedDescriptor = descriptors.removed;
+  const removedByTableDescriptor = descriptors.removedByTable;
+  const exhaustedDescriptor = descriptors.exhausted;
   if (
     visitedDescriptor === undefined || removedDescriptor === undefined ||
+    removedByTableDescriptor === undefined || exhaustedDescriptor === undefined ||
     !Object.hasOwn(visitedDescriptor, 'value') || !Object.hasOwn(removedDescriptor, 'value')
+    || !Object.hasOwn(removedByTableDescriptor, 'value') ||
+    !Object.hasOwn(exhaustedDescriptor, 'value')
   ) {
     throw new TypeError('Invalid cleanup result.');
   }
   const visited: unknown = visitedDescriptor.value;
   const removed: unknown = removedDescriptor.value;
+  const removedByTable: unknown = removedByTableDescriptor.value;
+  const exhausted: unknown = exhaustedDescriptor.value;
   if (
-    typeof visited !== 'number' || typeof removed !== 'number' ||
-    !Number.isSafeInteger(visited) || !Number.isSafeInteger(removed) ||
-    visited < 0 || removed < 0 || removed > visited || visited > limit
+    typeof removedByTable !== 'object' || removedByTable === null ||
+    Object.getPrototypeOf(removedByTable) !== Object.prototype
   ) {
     throw new TypeError('Invalid cleanup result.');
   }
-  return Object.freeze({ visited, removed });
+  const tableKeys = Reflect.ownKeys(removedByTable);
+  if (tableKeys.length !== 2 || !tableKeys.includes('security') || !tableKeys.includes('rate')) {
+    throw new TypeError('Invalid cleanup result.');
+  }
+  const tableDescriptors = Object.getOwnPropertyDescriptors(removedByTable);
+  const securityDescriptor = tableDescriptors.security;
+  const rateDescriptor = tableDescriptors.rate;
+  if (
+    securityDescriptor === undefined || rateDescriptor === undefined ||
+    !Object.hasOwn(securityDescriptor, 'value') || !Object.hasOwn(rateDescriptor, 'value')
+  ) {
+    throw new TypeError('Invalid cleanup result.');
+  }
+  const securityRemoved: unknown = securityDescriptor.value;
+  const rateRemoved: unknown = rateDescriptor.value;
+  if (
+    typeof visited !== 'number' || typeof removed !== 'number' ||
+    !Number.isSafeInteger(visited) || !Number.isSafeInteger(removed) ||
+    typeof securityRemoved !== 'number' || typeof rateRemoved !== 'number' ||
+    !Number.isSafeInteger(securityRemoved) || !Number.isSafeInteger(rateRemoved) ||
+    typeof exhausted !== 'boolean' || visited < 0 || removed < 0 ||
+    securityRemoved < 0 || rateRemoved < 0 || removed > visited || visited > limit ||
+    securityRemoved + rateRemoved !== removed
+  ) {
+    throw new TypeError('Invalid cleanup result.');
+  }
+  return Object.freeze({
+    visited,
+    removed,
+    securityRemoved,
+    rateRemoved,
+    exhausted
+  });
 }
 
 export function runExpiryCleanup<TimerHandle>(
@@ -243,7 +292,13 @@ export function runExpiryCleanup<TimerHandle>(
     }, 1);
   };
 
-  const emitSuccess = (visited: number, removed: number): void => {
+  const emitSuccess = (
+    visited: number,
+    removed: number,
+    securityRemoved: number,
+    rateRemoved: number,
+    exhausted: boolean
+  ): void => {
     if (terminal) return;
     try {
       clearWatchdog();
@@ -252,7 +307,10 @@ export function runExpiryCleanup<TimerHandle>(
       return;
     }
     settleTerminal(() => {
-      runtimeProcess.writeStdout(`expiry-cleanup: pass visited=${visited} removed=${removed}\n`);
+      runtimeProcess.writeStdout(
+        `expiry-cleanup: pass visited=${visited} removed=${removed} ` +
+        `securityRemoved=${securityRemoved} rateRemoved=${rateRemoved} exhausted=${exhausted}\n`
+      );
     }, 0);
   };
 
@@ -276,27 +334,35 @@ export function runExpiryCleanup<TimerHandle>(
     }
     if (terminal) return completion;
 
-    let cleanup: Promise<unknown>;
-    try {
-      cleanup = cleanupExpired(Object.freeze({ limit: configuration.limit }));
-    } catch {
-      emitFailure(true);
-      return completion;
-    }
-    void Promise.resolve(cleanup).then(
-      (value: unknown) => {
+    const cleanup = async (): Promise<void> => {
+      const deadline = Date.now() + Math.max(1, configuration.timeoutMs - CLEANUP_DEADLINE_MARGIN_MS);
+      let iterations = 0;
+      let visited = 0;
+      let removed = 0;
+      let securityRemoved = 0;
+      let rateRemoved = 0;
+      let exhausted = false;
+      while (
+        !exhausted && iterations < EXPIRY_CLEANUP_MAX_ITERATIONS &&
+        (iterations === 0 || Date.now() < deadline)
+      ) {
         if (terminal) return;
-        try {
-          const result = parseCleanupResult(value, configuration.limit);
-          emitSuccess(result.visited, result.removed);
-        } catch {
-          emitFailure(true);
-        }
-      },
-      () => {
-        emitFailure(true);
+        iterations += 1;
+        const value = await cleanupExpired(Object.freeze({ limit: configuration.limit }));
+        if (terminal) return;
+        const result = parseCleanupResult(value, configuration.limit);
+        visited += result.visited;
+        removed += result.removed;
+        securityRemoved += result.securityRemoved;
+        rateRemoved += result.rateRemoved;
+        exhausted = result.exhausted;
       }
-    );
+      if (terminal) return;
+      emitSuccess(visited, removed, securityRemoved, rateRemoved, exhausted);
+    };
+    void cleanup().catch(() => {
+      emitFailure(true);
+    });
   } catch {
     emitFailure(true);
   }

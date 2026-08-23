@@ -6,6 +6,7 @@ import {
   main,
   parseExpiryCleanupConfiguration,
   runExpiryCleanup,
+  EXPIRY_CLEANUP_MAX_ITERATIONS,
   type ExpiryCleanupProcess,
   type ExpiryCleanupRuntime,
   type ExpiryCleanupStore
@@ -80,8 +81,33 @@ function deferred<T>(): Readonly<{
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
+function cleanupResult(
+  visited: number,
+  removed: number,
+  options: Readonly<{
+    readonly securityRemoved?: number;
+    readonly rateRemoved?: number;
+    readonly exhausted?: boolean;
+  }> = {}
+): Readonly<{
+  readonly visited: number;
+  readonly removed: number;
+  readonly removedByTable: Readonly<{ readonly security: number; readonly rate: number }>;
+  readonly exhausted: boolean;
+}> {
+  return {
+    visited,
+    removed,
+    removedByTable: {
+      security: options.securityRemoved ?? removed,
+      rate: options.rateRemoved ?? 0
+    },
+    exhausted: options.exhausted ?? true
+  };
+}
+
 function harness(
-  cleanupExpired: ExpiryCleanupStore['cleanupExpired'] = async () => ({ visited: 4, removed: 2 })
+  cleanupExpired: ExpiryCleanupStore['cleanupExpired'] = async () => cleanupResult(4, 2)
 ): Readonly<{
   process: ProcessCapture;
   timers: FakeTimers;
@@ -344,8 +370,8 @@ describe('configuration', () => {
 });
 
 describe('one-shot runtime', () => {
-  it('constructs once, cleans once, passes only the limit, and emits exact success output', async () => {
-    const cleanupExpired = vi.fn(async () => ({ visited: 1000, removed: 17 }));
+  it('constructs once, cleans once, passes only the limit, and emits cleanup details', async () => {
+    const cleanupExpired = vi.fn(async () => cleanupResult(1000, 17));
     const testHarness = harness(cleanupExpired);
 
     await runExpiryCleanup(VALID_ENVIRONMENT, testHarness.process, testHarness.runtime);
@@ -367,8 +393,49 @@ describe('one-shot runtime', () => {
     expect(cleanupExpired).toHaveBeenCalledWith({ limit: 1000 });
     expect(testHarness.timers.records).toHaveLength(1);
     expect(testHarness.timers.records[0]).toMatchObject({ timeoutMs: 240000, cleared: true });
-    expect(testHarness.process.stdout).toEqual(['expiry-cleanup: pass visited=1000 removed=17\n']);
+    expect(testHarness.process.stdout).toEqual([
+      'expiry-cleanup: pass visited=1000 removed=17 securityRemoved=17 rateRemoved=0 exhausted=true\n'
+    ]);
     expect(testHarness.process.stderr).toEqual([]);
+    expect(testHarness.process.exitCodes).toEqual([0]);
+  });
+
+  it('loops until the store reports both tables exhausted and aggregates removals', async () => {
+    const results = [
+      cleanupResult(1000, 17, { securityRemoved: 17, rateRemoved: 0, exhausted: false }),
+      cleanupResult(23, 8, { securityRemoved: 3, rateRemoved: 5, exhausted: true })
+    ];
+    const cleanupExpired = vi.fn(async () => {
+      const result = results.shift();
+      if (result === undefined) throw new Error('cleanup called after exhaustion');
+      return result;
+    });
+    const testHarness = harness(cleanupExpired);
+
+    await runExpiryCleanup(VALID_ENVIRONMENT, testHarness.process, testHarness.runtime);
+
+    expect(cleanupExpired).toHaveBeenCalledTimes(2);
+    expect(testHarness.process.stdout).toEqual([
+      'expiry-cleanup: pass visited=1023 removed=25 securityRemoved=20 rateRemoved=5 exhausted=true\n'
+    ]);
+    expect(testHarness.process.exitCodes).toEqual([0]);
+  });
+
+  it('stops at the cleanup iteration safety bound when exhaustion is never reported', async () => {
+    const cleanupExpired = vi.fn(async () => cleanupResult(1, 0, {
+      securityRemoved: 0,
+      rateRemoved: 0,
+      exhausted: false
+    }));
+    const testHarness = harness(cleanupExpired);
+
+    await runExpiryCleanup(VALID_ENVIRONMENT, testHarness.process, testHarness.runtime);
+
+    expect(cleanupExpired).toHaveBeenCalledTimes(EXPIRY_CLEANUP_MAX_ITERATIONS);
+    expect(testHarness.process.stdout).toEqual([
+      `expiry-cleanup: pass visited=${EXPIRY_CLEANUP_MAX_ITERATIONS} removed=0 ` +
+      'securityRemoved=0 rateRemoved=0 exhausted=false\n'
+    ]);
     expect(testHarness.process.exitCodes).toEqual([0]);
   });
 
@@ -376,7 +443,7 @@ describe('one-shot runtime', () => {
     const propertyReads: PropertyKey[] = [];
     const timers = new FakeTimers();
     const runtimeProcess = processCapture();
-    const cleanupExpired = vi.fn(async () => ({ visited: 0, removed: 0 }));
+    const cleanupExpired = vi.fn(async () => cleanupResult(0, 0));
     const store = new Proxy(Object.create(null) as ExpiryCleanupStore, {
       get: (_target, property) => {
         propertyReads.push(property);
@@ -397,7 +464,7 @@ describe('one-shot runtime', () => {
   it('does not invoke cleanup when its getter reentrantly fires the watchdog', async () => {
     const timers = new FakeTimers();
     const runtimeProcess = processCapture();
-    const cleanupExpired = vi.fn(async () => ({ visited: 0, removed: 0 }));
+    const cleanupExpired = vi.fn(async () => cleanupResult(0, 0));
     const getter = vi.fn(() => {
       const timer = timers.records[0];
       if (timer === undefined) throw new Error('watchdog was not installed');
@@ -484,7 +551,7 @@ describe('one-shot runtime', () => {
   });
 
   it('attempts stdout before exit even when stdout throws', async () => {
-    const testHarness = harness(async () => ({ visited: 3, removed: 1 }));
+    const testHarness = harness(async () => cleanupResult(3, 1));
     const events: string[] = [];
     const completion = runExpiryCleanup(VALID_ENVIRONMENT, {
       writeStdout: (value) => {
@@ -497,7 +564,7 @@ describe('one-shot runtime', () => {
 
     await expect(completion).resolves.toBeUndefined();
     expect(events).toEqual([
-      'stdout:expiry-cleanup: pass visited=3 removed=1\n',
+      'stdout:expiry-cleanup: pass visited=3 removed=1 securityRemoved=1 rateRemoved=0 exhausted=true\n',
       'exit:0'
     ]);
   });
@@ -522,7 +589,7 @@ describe('one-shot runtime', () => {
   });
 
   it('normalizes a throwing success exit without rejecting terminal settlement', async () => {
-    const testHarness = harness(async () => ({ visited: 1, removed: 1 }));
+    const testHarness = harness(async () => cleanupResult(1, 1));
     const events: string[] = [];
     const completion = runExpiryCleanup(VALID_ENVIRONMENT, {
       writeStdout: (value) => events.push(`stdout:${value}`),
@@ -535,7 +602,7 @@ describe('one-shot runtime', () => {
 
     await expect(completion).resolves.toBeUndefined();
     expect(events).toEqual([
-      'stdout:expiry-cleanup: pass visited=1 removed=1\n',
+      'stdout:expiry-cleanup: pass visited=1 removed=1 securityRemoved=1 rateRemoved=0 exhausted=true\n',
       'exit:0'
     ]);
   });
@@ -560,7 +627,7 @@ describe('one-shot runtime', () => {
   });
 
   it('claims success before a reentrant stdout writer can fire the watchdog', async () => {
-    const testHarness = harness(async () => ({ visited: 2, removed: 0 }));
+    const testHarness = harness(async () => cleanupResult(2, 0));
     const events: string[] = [];
     await runExpiryCleanup(VALID_ENVIRONMENT, {
       writeStdout: (value) => {
@@ -574,7 +641,7 @@ describe('one-shot runtime', () => {
     }, testHarness.runtime);
 
     expect(events).toEqual([
-      'stdout:expiry-cleanup: pass visited=2 removed=0\n',
+      'stdout:expiry-cleanup: pass visited=2 removed=0 securityRemoved=0 rateRemoved=0 exhausted=true\n',
       'exit:0'
     ]);
   });
@@ -602,8 +669,11 @@ describe('one-shot runtime', () => {
   it.each([
     {
       name: 'success',
-      cleanup: async () => ({ visited: 5, removed: 4 }),
-      expected: ['stdout:expiry-cleanup: pass visited=5 removed=4\n', 'exit:0']
+      cleanup: async () => cleanupResult(5, 4),
+      expected: [
+        'stdout:expiry-cleanup: pass visited=5 removed=4 securityRemoved=4 rateRemoved=0 exhausted=true\n',
+        'exit:0'
+      ]
     },
     {
       name: 'failure',
@@ -628,7 +698,7 @@ describe('one-shot runtime', () => {
   });
 
   it('preserves cross-stream output-before-exit ordering for both outcomes', async () => {
-    const successHarness = harness(async () => ({ visited: 0, removed: 0 }));
+    const successHarness = harness(async () => cleanupResult(0, 0));
     const successEvents: string[] = [];
     await runExpiryCleanup(VALID_ENVIRONMENT, {
       writeStdout: (value) => successEvents.push(`stdout:${value}`),
@@ -645,7 +715,7 @@ describe('one-shot runtime', () => {
     }, failureHarness.runtime);
 
     expect(successEvents).toEqual([
-      'stdout:expiry-cleanup: pass visited=0 removed=0\n',
+      'stdout:expiry-cleanup: pass visited=0 removed=0 securityRemoved=0 rateRemoved=0 exhausted=true\n',
       'exit:0'
     ]);
     expect(failureEvents).toEqual([
@@ -695,7 +765,7 @@ describe('one-shot runtime', () => {
 
   it('converts a throwing timer clearer into one generic failure', async () => {
     const runtimeProcess = processCapture();
-    const cleanupExpired = vi.fn(async () => ({ visited: 1, removed: 0 }));
+    const cleanupExpired = vi.fn(async () => cleanupResult(1, 0));
     await runExpiryCleanup(VALID_ENVIRONMENT, runtimeProcess, {
       createStore: () => ({ cleanupExpired }),
       setTimeout: (callback, timeoutMs) => ({ callback, timeoutMs }),
@@ -714,7 +784,7 @@ describe('one-shot runtime', () => {
 
   it('settles once when the timer clearer reentrantly fires the watchdog', async () => {
     const runtimeProcess = processCapture();
-    const cleanupExpired = vi.fn(async () => ({ visited: 1, removed: 0 }));
+    const cleanupExpired = vi.fn(async () => cleanupResult(1, 0));
     await runExpiryCleanup(VALID_ENVIRONMENT, runtimeProcess, {
       createStore: () => ({ cleanupExpired }),
       setTimeout: (callback, timeoutMs) => ({ callback, timeoutMs }),
@@ -745,7 +815,7 @@ describe('one-shot runtime', () => {
       exitCodes: [1]
     });
 
-    pending.resolve({ visited: 1, removed: 1 });
+    pending.resolve(cleanupResult(1, 1));
     await Promise.resolve();
     expect(testHarness.process).toMatchObject({
       stdout: [],
@@ -775,12 +845,14 @@ describe('one-shot runtime', () => {
     const timer = testHarness.timers.records[0];
     if (timer === undefined) throw new Error('watchdog was not installed');
 
-    pending.resolve({ visited: 2, removed: 1 });
+    pending.resolve(cleanupResult(2, 1));
     await completion;
     expect(timer.cleared).toBe(true);
     testHarness.timers.fire(timer, true);
     expect(testHarness.process).toMatchObject({
-      stdout: ['expiry-cleanup: pass visited=2 removed=1\n'],
+      stdout: [
+        'expiry-cleanup: pass visited=2 removed=1 securityRemoved=1 rateRemoved=0 exhausted=true\n'
+      ],
       stderr: [],
       exitCodes: [0]
     });
@@ -793,7 +865,7 @@ describe('one-shot runtime', () => {
     const timer = testHarness.timers.records[0];
     if (timer === undefined) throw new Error('watchdog was not installed');
 
-    pending.resolve({ visited: 2, removed: 1 });
+    pending.resolve(cleanupResult(2, 1));
     testHarness.timers.fire(timer);
     await completion;
     await Promise.resolve();

@@ -219,6 +219,8 @@ interface RevokedSessionIdentity {
   readonly sessionEpoch: number;
 }
 
+type CleanupEntry = readonly [Map<unknown, unknown>, unknown];
+
 class RollingWindow {
   readonly timestamps: number[] = [];
   head = 0;
@@ -480,7 +482,13 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
   readonly #ticketHourRates = new Map<CanonicalUuid, RollingWindow>();
   readonly #reconnectMinuteRates = new Map<CanonicalUuid, RollingWindow>();
   readonly #reconnectTenMinuteRates = new Map<CanonicalUuid, RollingWindow>();
-  #cleanupTable = 0;
+  #cleanupTable: 'security' | 'rate' = 'security';
+  #cleanupSecurityEntries: readonly CleanupEntry[] | undefined;
+  #cleanupRateEntries: readonly CleanupEntry[] | undefined;
+  #cleanupSecurityIndex = 0;
+  #cleanupRateIndex = 0;
+  #cleanupSecurityExhausted = false;
+  #cleanupRateExhausted = false;
 
   constructor(options: LocalMockSecurityStateOptions) {
     const parsed = parseOptions(options);
@@ -1705,20 +1713,69 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
         this.#pairAttemptShortRates, this.#pairAttemptDayRates, this.#ticketMinuteRates,
         this.#ticketHourRates, this.#reconnectMinuteRates, this.#reconnectTenMinuteRates
       ];
+      const securityTables = tables.slice(0, 5);
+      const rateTables = tables.slice(5);
+      if (this.#cleanupSecurityExhausted && this.#cleanupRateExhausted) {
+        this.#cleanupTable = 'security';
+        this.#cleanupSecurityEntries = undefined;
+        this.#cleanupRateEntries = undefined;
+        this.#cleanupSecurityIndex = 0;
+        this.#cleanupRateIndex = 0;
+        this.#cleanupSecurityExhausted = false;
+        this.#cleanupRateExhausted = false;
+      }
+      this.#cleanupSecurityEntries ??= securityTables.flatMap((table) =>
+        [...table.keys()].map((key): CleanupEntry => [table, key])
+      );
+      this.#cleanupRateEntries ??= rateTables.flatMap((table) =>
+        [...table.keys()].map((key): CleanupEntry => [table, key])
+      );
       let visited = 0;
       let removed = 0;
-      while (visited < (input.limit as number)) {
-        const table = tables[this.#cleanupTable % tables.length];
-        this.#cleanupTable = (this.#cleanupTable + 1) % tables.length;
-        if (table === undefined) break;
-        const first = table.entries().next();
-        if (first.done) {
-          if (tables.every((item) => item.size === 0)) break;
-          visited += 1;
+      let securityRemoved = 0;
+      let rateRemoved = 0;
+      while (
+        visited < (input.limit as number) &&
+        (!this.#cleanupSecurityExhausted || !this.#cleanupRateExhausted)
+      ) {
+        const securityAvailable = !this.#cleanupSecurityExhausted;
+        const rateAvailable = !this.#cleanupRateExhausted;
+        if (
+          (this.#cleanupTable === 'security' && !securityAvailable) ||
+          (this.#cleanupTable === 'rate' && !rateAvailable)
+        ) {
+          this.#cleanupTable = this.#cleanupTable === 'security' ? 'rate' : 'security';
+        }
+        const securityEntries = this.#cleanupSecurityEntries;
+        const rateEntries = this.#cleanupRateEntries;
+        const entries = this.#cleanupTable === 'security' ? securityEntries : rateEntries;
+        if (entries === undefined) break;
+        const index = this.#cleanupTable === 'security'
+          ? this.#cleanupSecurityIndex
+          : this.#cleanupRateIndex;
+        if (index >= entries.length) {
+          if (this.#cleanupTable === 'security') this.#cleanupSecurityExhausted = true;
+          else this.#cleanupRateExhausted = true;
           continue;
         }
+        const entry = entries[index];
+        if (this.#cleanupTable === 'security') this.#cleanupSecurityIndex += 1;
+        else this.#cleanupRateIndex += 1;
+        if (entry === undefined) break;
+        const [table, key] = entry;
         visited += 1;
-        const [key, row] = first.value;
+        const row = table.get(key);
+        if (row === undefined) {
+          if (
+            (this.#cleanupTable === 'security' && this.#cleanupSecurityIndex >= (this.#cleanupSecurityEntries?.length ?? 0)) ||
+            (this.#cleanupTable === 'rate' && this.#cleanupRateIndex >= (this.#cleanupRateEntries?.length ?? 0))
+          ) {
+            if (this.#cleanupTable === 'security') this.#cleanupSecurityExhausted = true;
+            else this.#cleanupRateExhausted = true;
+          }
+          this.#cleanupTable = this.#cleanupTable === 'security' ? 'rate' : 'security';
+          continue;
+        }
         let removable = false;
         if (table === this.#pairings) {
           const pairing = row as PairingRow;
@@ -1804,13 +1861,32 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
           else if (table === this.#reconnectTenMinuteRates) period = TEN_MINUTES_MS;
           removable = window.count(now, period) === 0;
         }
-        if (removable && table.delete(key)) removed += 1;
-        else {
-          table.delete(key);
-          table.set(key, row);
+        if (removable && table.delete(key)) {
+          removed += 1;
+          if (
+            table === this.#grants || table === this.#generations ||
+            table === this.#operatorIssueRates || table === this.#pairAttemptShortRates ||
+            table === this.#pairAttemptDayRates || table === this.#ticketMinuteRates ||
+            table === this.#ticketHourRates || table === this.#reconnectMinuteRates ||
+            table === this.#reconnectTenMinuteRates
+          ) rateRemoved += 1;
+          else securityRemoved += 1;
         }
+        if (
+          (this.#cleanupTable === 'security' && this.#cleanupSecurityIndex >= (this.#cleanupSecurityEntries?.length ?? 0)) ||
+          (this.#cleanupTable === 'rate' && this.#cleanupRateIndex >= (this.#cleanupRateEntries?.length ?? 0))
+        ) {
+          if (this.#cleanupTable === 'security') this.#cleanupSecurityExhausted = true;
+          else this.#cleanupRateExhausted = true;
+        }
+        this.#cleanupTable = this.#cleanupTable === 'security' ? 'rate' : 'security';
       }
-      return freeze({ visited, removed });
+      return freeze({
+        visited,
+        removed,
+        removedByTable: freeze({ security: securityRemoved, rate: rateRemoved }),
+        exhausted: this.#cleanupSecurityExhausted && this.#cleanupRateExhausted
+      });
     });
   }
 
