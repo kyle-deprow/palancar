@@ -32,12 +32,14 @@ import {
 import {
   LANGUAGE_REGISTRY_VERSION,
   evaluateLanguageGate,
+  getLanguageDefinition,
   snapshotClassifiedLanguageEvidence,
   type ClassifiedLanguageEvidence,
   type LanguageGateResult,
   type TextLanguageClassifier,
   type TargetLanguage
 } from '@palancar/language-registry';
+import { isIso6391LanguageCode } from '@palancar/transcription';
 import type {
   NormalizedTranscriptionEvent,
   TranscriptionSession,
@@ -75,10 +77,247 @@ function snapshotRelayClassifierEvidence(
   return snapshotClassifiedLanguageEvidence(value);
 }
 
+type RelayDataSnapshot = Readonly<Record<string, unknown>>;
+
+function snapshotRelayDataObject(
+  value: unknown,
+  requireFrozen: boolean
+): RelayDataSnapshot | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      (requireFrozen && !Object.isFrozen(value))
+    ) {
+      return undefined;
+    }
+    const keys = Reflect.ownKeys(value);
+    if (keys.some((key) => typeof key !== 'string')) {
+      return undefined;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+      string,
+      PropertyDescriptor
+    >;
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of keys) {
+      const descriptor = descriptors[key as string];
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value')
+      ) {
+        return undefined;
+      }
+      Object.defineProperty(snapshot, key, {
+        configurable: false,
+        enumerable: true,
+        value: descriptor.value,
+        writable: false
+      });
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotRelayFrozenArray(value: unknown): readonly unknown[] | undefined {
+  try {
+    if (
+      !Array.isArray(value) ||
+      utilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      !Object.isFrozen(value)
+    ) {
+      return undefined;
+    }
+    const keys = Reflect.ownKeys(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+      string,
+      PropertyDescriptor
+    >;
+    const lengthDescriptor = descriptors.length;
+    if (
+      lengthDescriptor === undefined ||
+      !Object.hasOwn(lengthDescriptor, 'value') ||
+      typeof lengthDescriptor.value !== 'number' ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0 ||
+      keys.length !== lengthDescriptor.value + 1
+    ) {
+      return undefined;
+    }
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const key = String(index);
+      const descriptor = descriptors[key];
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value')
+      ) {
+        return undefined;
+      }
+      snapshot.push(descriptor.value);
+    }
+    for (const key of keys) {
+      if (key !== 'length' &&
+          (typeof key !== 'string' || !/^\d+$/.test(key) || Number(key) >= lengthDescriptor.value)) {
+        return undefined;
+      }
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    return undefined;
+  }
+}
+
+type OwnedTranscriptionProviderIdentity = Readonly<{
+  readonly id: string;
+  readonly version: string;
+}>;
+
+const APPROVED_TRANSCRIPTION_PROVIDER_VERSIONS = new Map([
+  ['deterministic-mock', '1.0.0'],
+  ['azure-realtime', 'ga-transcription-websocket']
+]);
+
+function boundedTranscriptionProviderIdentity(
+  value: unknown
+): OwnedTranscriptionProviderIdentity | undefined {
+  const snapshot = snapshotRelayDataObject(value, true);
+  if (
+    snapshot === undefined ||
+    Object.keys(snapshot).length !== 3 ||
+    !Object.hasOwn(snapshot, 'provider') ||
+    !Object.hasOwn(snapshot, 'model') ||
+    !Object.hasOwn(snapshot, 'version') ||
+    typeof snapshot.provider !== 'string' ||
+    typeof snapshot.model !== 'string' ||
+    typeof snapshot.version !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(snapshot.provider) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(snapshot.model) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(snapshot.version)
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ id: snapshot.provider, version: snapshot.version });
+}
+
+function approvedTranscriptionProviderIdentity(
+  identity: OwnedTranscriptionProviderIdentity
+): OwnedTranscriptionProviderIdentity | undefined {
+  if (
+    APPROVED_TRANSCRIPTION_PROVIDER_VERSIONS.get(identity.id) !== identity.version
+  ) {
+    return undefined;
+  }
+  return identity;
+}
+
+type ConfiguredTranscriptionCapabilitySnapshot = Readonly<{
+  readonly providerIdentity: OwnedTranscriptionProviderIdentity | undefined;
+  readonly supportsConfigured: boolean;
+}>;
+
+function rejectedConfiguredTranscriptionCapabilities(
+  providerIdentity: OwnedTranscriptionProviderIdentity | undefined
+): ConfiguredTranscriptionCapabilitySnapshot {
+  return Object.freeze({ providerIdentity, supportsConfigured: false });
+}
+
+/**
+ * Resolve a registry definition at the accepted-session boundary.  The
+ * definition is supplied as a value, rather than a lookup callback, so this
+ * pure check cannot be re-entered or observe a changing registry.
+ */
+export function resolveCanonicalTranscriptionHint(
+  targetLanguage: TargetLanguage,
+  definition: unknown
+): string | undefined {
+  const snapshot = snapshotRelayDataObject(definition, false);
+  if (snapshot === undefined) {
+    return undefined;
+  }
+  const code = snapshot.code;
+  const hint = snapshot.transcriptionHint;
+  return code === targetLanguage &&
+    isIso6391LanguageCode(hint) &&
+    hint === targetLanguage
+    ? hint
+    : undefined;
+}
+
+function snapshotConfiguredTranscriptionCapabilities(
+  value: unknown
+): ConfiguredTranscriptionCapabilitySnapshot | undefined {
+  const root = snapshotRelayDataObject(value, false);
+  if (root === undefined) {
+    return undefined;
+  }
+  const boundedIdentity = boundedTranscriptionProviderIdentity(root.identity);
+  if (boundedIdentity === undefined) {
+    return undefined;
+  }
+  const providerIdentity = approvedTranscriptionProviderIdentity(boundedIdentity);
+  if (!Object.isFrozen(value)) {
+    return rejectedConfiguredTranscriptionCapabilities(providerIdentity);
+  }
+  const serverVad = snapshotRelayDataObject(root.serverVad, false);
+  const manualCommit = snapshotRelayDataObject(root.manualCommit, false);
+  if (
+    serverVad === undefined ||
+    manualCommit === undefined ||
+    !Object.isFrozen(root.serverVad) ||
+    !Object.isFrozen(root.manualCommit)
+  ) {
+    return rejectedConfiguredTranscriptionCapabilities(providerIdentity);
+  }
+  const serverVadModes = snapshotRelayFrozenArray(serverVad?.modes);
+  const languageModes = snapshotRelayFrozenArray(root.languageModes);
+  const manualCommitCadencesMs = snapshotRelayFrozenArray(manualCommit?.cadencesMs);
+  if (
+    serverVadModes === undefined ||
+    languageModes === undefined ||
+    manualCommitCadencesMs === undefined ||
+    Object.keys(serverVad).length !== 2 ||
+    !Object.hasOwn(serverVad, 'supported') ||
+    !Object.hasOwn(serverVad, 'modes') ||
+    Object.keys(manualCommit).length !== 2 ||
+    !Object.hasOwn(manualCommit, 'supported') ||
+    !Object.hasOwn(manualCommit, 'cadencesMs') ||
+    typeof serverVad.supported !== 'boolean' ||
+    typeof manualCommit.supported !== 'boolean' ||
+    languageModes.some((mode) => mode !== 'automatic' && mode !== 'selected-target') ||
+    serverVadModes.some((mode) => mode !== 'enabled' && mode !== 'disabled') ||
+    manualCommitCadencesMs.some(
+      (cadence) => typeof cadence !== 'number' || !Number.isSafeInteger(cadence) || cadence <= 0
+    ) ||
+    new Set(languageModes).size !== languageModes.length ||
+    new Set(serverVadModes).size !== serverVadModes.length ||
+    new Set(manualCommitCadencesMs).size !== manualCommitCadencesMs.length
+  ) {
+    return rejectedConfiguredTranscriptionCapabilities(providerIdentity);
+  }
+  return Object.freeze({
+    providerIdentity,
+    supportsConfigured:
+      serverVad.supported &&
+      serverVadModes.includes(CONFIGURED_SERVER_VAD) &&
+      languageModes.includes(CONFIGURED_LANGUAGE_MODE) &&
+      manualCommit.supported &&
+      manualCommitCadencesMs.includes(MANUAL_COMMIT_CADENCE_MS)
+  });
+}
+
 const SESSION_EPOCH = 1;
 const MANUAL_COMMIT_CADENCE_MS = 600;
 const CONFIGURED_SERVER_VAD = 'disabled' as const;
-const CONFIGURED_LANGUAGE_MODE = 'automatic' as const;
+const CONFIGURED_LANGUAGE_MODE = 'selected-target' as const;
 const LANGUAGE_BOUNDARY_CONFIGURATION_ERROR =
   'Invalid relay language boundary mode.';
 
@@ -473,6 +712,13 @@ export class RelaySessionCore {
   #sessionId: string | undefined;
   #sessionEpoch: number | undefined;
   #selectedTargetLanguage: TargetLanguage | undefined;
+  #selectedTranscriptionLanguageHint: string | undefined;
+  #selectedTranscriptionProviderIdentity: OwnedTranscriptionProviderIdentity | undefined;
+  #transcriptionCapabilityAdmission:
+    | 'unresolved'
+    | 'admitting'
+    | 'accepted'
+    | 'rejected' = 'unresolved';
   #selectedTranscriptionAdapter: TranscriptionAdapter | undefined;
   #effectiveLimits: NegotiatedLimits | undefined;
   #active: ActiveUtterance | undefined;
@@ -1247,9 +1493,23 @@ export class RelaySessionCore {
       );
     }
 
+    this.#selectedTranscriptionLanguageHint = undefined;
+    const languageHint = resolveCanonicalTranscriptionHint(
+      message.targetLanguage,
+      getLanguageDefinition(message.targetLanguage)
+    );
+    if (languageHint === undefined) {
+      return this.#terminate(
+        [this.#sessionRejected('state_unavailable')],
+        4503,
+        'state_unavailable'
+      );
+    }
+
     this.#sessionId = this.#sessionLease.sessionId;
     this.#sessionEpoch = this.#sessionLease.sessionEpoch;
     this.#selectedTargetLanguage = message.targetLanguage;
+    this.#selectedTranscriptionLanguageHint = languageHint;
     this.#effectiveLimits = negotiateLimits(message.requestedLimits, this.#serverLimits);
     this.#ready = true;
     const ready = assertServerControlMessage({
@@ -1309,7 +1569,11 @@ export class RelaySessionCore {
       );
     }
 
-    if (!this.#supportsConfiguredTranscription()) {
+    const configuredTranscriptionSupported = this.#supportsConfiguredTranscription();
+    if (!configuredTranscriptionSupported || this.#terminal) {
+      if (this.#terminal) {
+        return this.#terminalResult();
+      }
       this.#recordProviderFailure(undefined, 'transcription');
       return this.#terminate(
         [this.#error('provider_unavailable', 'server', true)],
@@ -1331,6 +1595,15 @@ export class RelaySessionCore {
         [this.#error('state_unavailable', 'server', true)],
         4503,
         'state_unavailable'
+      );
+    }
+    const languageHint = this.#selectedTranscriptionLanguageHint;
+    if (languageHint === undefined) {
+      this.#recordProviderFailure(undefined, 'transcription');
+      return this.#terminate(
+        [this.#error('provider_unavailable', 'server', true)],
+        4503,
+        'provider_unavailable'
       );
     }
 
@@ -1393,6 +1666,7 @@ export class RelaySessionCore {
         configuration: {
           serverVadMode: CONFIGURED_SERVER_VAD,
           languageMode: CONFIGURED_LANGUAGE_MODE,
+          languageHint,
           manualCommitCadenceMs: MANUAL_COMMIT_CADENCE_MS
         },
         onEvent,
@@ -1577,16 +1851,38 @@ export class RelaySessionCore {
   }
 
   #supportsConfiguredTranscription(): boolean {
+    if (this.#transcriptionCapabilityAdmission === 'accepted') {
+      return true;
+    }
+    if (
+      this.#transcriptionCapabilityAdmission === 'rejected' ||
+      this.#transcriptionCapabilityAdmission === 'admitting'
+    ) {
+      return false;
+    }
+    this.#transcriptionCapabilityAdmission = 'admitting';
     try {
-      const capabilities = this.#adapterForSelectedTarget().capabilities;
-      return (
-        capabilities.serverVad.supported &&
-        capabilities.serverVad.modes.includes(CONFIGURED_SERVER_VAD) &&
-        capabilities.languageModes.includes(CONFIGURED_LANGUAGE_MODE) &&
-        capabilities.manualCommit.supported &&
-        capabilities.manualCommit.cadencesMs.includes(MANUAL_COMMIT_CADENCE_MS)
+      if (this.#selectedTranscriptionLanguageHint === undefined) {
+        this.#selectedTranscriptionProviderIdentity = undefined;
+        this.#transcriptionCapabilityAdmission = 'rejected';
+        return false;
+      }
+      const capabilities = snapshotConfiguredTranscriptionCapabilities(
+        this.#adapterForSelectedTarget().capabilities
       );
+      if (capabilities === undefined) {
+        this.#selectedTranscriptionProviderIdentity = undefined;
+        this.#transcriptionCapabilityAdmission = 'rejected';
+        return false;
+      }
+      this.#selectedTranscriptionProviderIdentity = capabilities.providerIdentity;
+      this.#transcriptionCapabilityAdmission = capabilities.supportsConfigured
+        ? 'accepted'
+        : 'rejected';
+      return capabilities.supportsConfigured;
     } catch {
+      this.#selectedTranscriptionProviderIdentity = undefined;
+      this.#transcriptionCapabilityAdmission = 'rejected';
       return false;
     }
   }
@@ -1842,27 +2138,19 @@ export class RelaySessionCore {
     if (active !== undefined) {
       active.providerFailureMetricRecorded = true;
     }
-    let provider: Readonly<{ readonly id: string; readonly version: string }> | undefined;
-    try {
-      if (operation === 'provider') {
-        provider = generationProvider;
-      } else {
-        const identity = this.#selectedTranscriptionAdapter?.capabilities.identity;
-        if (identity !== undefined) {
-          provider = { id: identity.provider, version: identity.version };
-        }
-      }
-    } catch {
-      return;
-    }
-    if (provider === undefined) return;
+    const provider = operation === 'provider'
+      ? generationProvider
+      : this.#selectedTranscriptionProviderIdentity;
+    if (operation === 'provider' && provider === undefined) return;
+    const providerFields = provider === undefined
+      ? {}
+      : { providerId: provider.id, providerVersion: provider.version };
     this.#recordMetric({
       name: 'provider.failure',
       count: 1,
       operation,
       outcome: 'failure',
-      providerId: provider.id,
-      providerVersion: provider.version
+      ...providerFields
     });
   }
 
@@ -2325,6 +2613,7 @@ export class RelaySessionCore {
     this.#terminal = true;
     this.#finishActive(true);
     this.#recordSessionEnd();
+    this.#selectedTranscriptionLanguageHint = undefined;
     return this.#result(outgoing, { code, reason });
   }
 

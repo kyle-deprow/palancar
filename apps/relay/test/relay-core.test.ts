@@ -10,6 +10,7 @@ import {
 import {
   CONTROLLED_FIXTURE_CALIBRATION_VERSION,
   CONTROLLED_FIXTURE_DETECTOR_VERSION,
+  getLanguageDefinition,
   LANGUAGE_REGISTRY_VERSION,
   type ClassifiedLanguageEvidence,
   type TextLanguageClassifier
@@ -48,6 +49,7 @@ import {
   negotiateLimits,
   prepareStreamUpgrade,
   selectStreamSubprotocols,
+  resolveCanonicalTranscriptionHint,
   type RelayClock,
   type RelayMetricSink,
   type RelayProductionMetricInput,
@@ -2357,6 +2359,214 @@ describe('relay session core', () => {
     expect(adapter.sessions).toHaveLength(0);
   });
 
+  it.each([
+    ['capability proxy', (): unknown => new Proxy(DETERMINISTIC_MOCK_CAPABILITIES, {})],
+    ['throwing root accessor', (): unknown => {
+      let reads = 0;
+      const value = { ...DETERMINISTIC_MOCK_CAPABILITIES } as Record<string, unknown>;
+      Object.defineProperty(value, 'languageModes', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          throw new Error(`capability getter read ${reads}`);
+        }
+      });
+      return Object.freeze(value);
+    }],
+    ['alternating root accessor', (): unknown => {
+      let reads = 0;
+      const value = { ...DETERMINISTIC_MOCK_CAPABILITIES } as Record<string, unknown>;
+      Object.defineProperty(value, 'languageModes', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          return reads % 2 === 0 ? ['automatic'] : ['selected-target'];
+        }
+      });
+      return Object.freeze(value);
+    }],
+    ['mutable root', (): unknown => ({ ...DETERMINISTIC_MOCK_CAPABILITIES })],
+    ['mutable nested capability', (): unknown => Object.freeze({
+      ...DETERMINISTIC_MOCK_CAPABILITIES,
+      serverVad: { ...DETERMINISTIC_MOCK_CAPABILITIES.serverVad }
+    })]
+  ] as const)('rejects %s capability structures without reading untrusted values', (_name, makeCapabilities) => {
+    const adapter = recordingAdapter(
+      makeCapabilities() as typeof DETERMINISTIC_MOCK_CAPABILITIES
+    );
+    const { core } = openNew(adapter, 'es');
+
+    const result = core.handleText(utteranceStartText());
+    expect(result).toMatchObject({
+      outgoing: [expect.objectContaining({ type: 'error', code: 'provider_unavailable' })],
+      close: { code: 4503, reason: 'provider_unavailable' }
+    });
+    expect(adapter.sessions).toHaveLength(0);
+  });
+
+  it('uses owned or fixed provider identity after hostile capability rejection', () => {
+    const metrics = recordingMetricSink();
+    let rootProxyTraps = 0;
+    const proxiedCapabilities = new Proxy(DETERMINISTIC_MOCK_CAPABILITIES, {
+      get: () => {
+        rootProxyTraps += 1;
+        throw new Error('capability proxy read');
+      },
+      ownKeys: () => {
+        rootProxyTraps += 1;
+        throw new Error('capability proxy keys');
+      },
+      getOwnPropertyDescriptor: () => {
+        rootProxyTraps += 1;
+        throw new Error('capability proxy descriptor');
+      }
+    });
+    const adapter = recordingAdapter(proxiedCapabilities);
+    const { core } = openNew(adapter, 'es', { metricSink: metrics.sink });
+
+    const result = core.handleText(utteranceStartText());
+    expect(result).toMatchObject({
+      outgoing: [expect.objectContaining({ type: 'error', code: 'provider_unavailable' })],
+      close: { code: 4503, reason: 'provider_unavailable' }
+    });
+    expect(adapter.sessions).toHaveLength(0);
+    expect(rootProxyTraps).toBe(0);
+    const providerFailure = metrics.records.find((record) => record.name === 'provider.failure');
+    expect(providerFailure).toEqual(expect.objectContaining({ operation: 'transcription' }));
+    expect(providerFailure).not.toHaveProperty('providerId');
+    expect(providerFailure).not.toHaveProperty('providerVersion');
+    const sanitizedUnknown = sanitizeTelemetryForExport(
+      { ...providerFailure, deploymentSlot: 'dev' },
+      'dev'
+    );
+    expect(sanitizedUnknown).not.toHaveProperty('providerId');
+    expect(sanitizedUnknown).not.toHaveProperty('providerVersion');
+    for (const [providerId, providerVersion] of [
+      ['deterministic-mock', '1.0.0'],
+      ['azure-realtime', 'ga-transcription-websocket']
+    ] as const) {
+      expect(sanitizeTelemetryForExport({
+        name: 'provider.failure',
+        timestamp: '2026-08-10T12:00:00.000Z',
+        deploymentSlot: 'dev',
+        count: 1,
+        operation: 'transcription',
+        outcome: 'failure',
+        providerId,
+        providerVersion
+      }, 'dev')).toEqual(expect.objectContaining({ providerId, providerVersion }));
+    }
+  });
+
+  it.each(['accessor', 'throwing', 'reentrant'] as const)(
+    'does not read hostile transcription identity accessors after %s rejection',
+    (kind) => {
+      const metrics = recordingMetricSink();
+      let identityReads = 0;
+      const coreHolder: { current?: RelaySessionCore } = {};
+      const identity = {
+        provider: 'identity-canary',
+        model: 'identity-model',
+        version: '1.0.0'
+      } as Record<string, unknown>;
+      Object.defineProperty(identity, 'provider', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          identityReads += 1;
+          if (kind === 'throwing') {
+            throw new Error('identity getter canary');
+          }
+          if (kind === 'reentrant') {
+            coreHolder.current?.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID));
+          }
+          return 'identity-canary';
+        }
+      });
+      const capabilities = Object.freeze({
+        ...DETERMINISTIC_MOCK_CAPABILITIES,
+        identity: Object.freeze(identity)
+      });
+      const adapter = recordingAdapter(
+        capabilities as unknown as typeof DETERMINISTIC_MOCK_CAPABILITIES
+      );
+      const opened = openNew(adapter, 'es', { metricSink: metrics.sink });
+      coreHolder.current = opened.core;
+
+      const result = opened.core.handleText(utteranceStartText());
+      expect(result).toMatchObject({
+        outgoing: [expect.objectContaining({ type: 'error', code: 'provider_unavailable' })],
+        close: { code: 4503, reason: 'provider_unavailable' }
+      });
+      expect(identityReads).toBe(0);
+      expect(adapter.sessions).toHaveLength(0);
+      const providerFailure = metrics.records.find((record) => record.name === 'provider.failure');
+      expect(providerFailure).toEqual(expect.objectContaining({ operation: 'transcription' }));
+      expect(providerFailure).not.toHaveProperty('providerId');
+      expect(providerFailure).not.toHaveProperty('providerVersion');
+    }
+  );
+
+  it('reads an adapter capabilities getter once and never rereads it for failure telemetry', () => {
+    const metrics = recordingMetricSink();
+    const adapter = recordingAdapter();
+    let capabilityReads = 0;
+    Object.defineProperty(adapter, 'capabilities', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        capabilityReads += 1;
+        return new Proxy(DETERMINISTIC_MOCK_CAPABILITIES, {
+          get: () => {
+            throw new Error('post-rejection capability read');
+          }
+        });
+      }
+    });
+    const { core } = openNew(adapter, 'es', { metricSink: metrics.sink });
+
+    const result = core.handleText(utteranceStartText());
+    expect(result).toMatchObject({
+      outgoing: [expect.objectContaining({ type: 'error', code: 'provider_unavailable' })],
+      close: { code: 4503, reason: 'provider_unavailable' }
+    });
+    expect(capabilityReads).toBe(1);
+    expect(adapter.sessions).toHaveLength(0);
+    const providerFailure = metrics.records.find((record) => record.name === 'provider.failure');
+    expect(providerFailure).toEqual(expect.objectContaining({ operation: 'transcription' }));
+    expect(providerFailure).not.toHaveProperty('providerId');
+    expect(providerFailure).not.toHaveProperty('providerVersion');
+  });
+
+  it('blocks a reentrant capabilities getter from a second read or session creation', () => {
+    const metrics = recordingMetricSink();
+    const adapter = recordingAdapter();
+    let capabilityReads = 0;
+    const coreHolder: { current?: RelaySessionCore } = {};
+    Object.defineProperty(adapter, 'capabilities', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        capabilityReads += 1;
+        coreHolder.current?.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID));
+        return DETERMINISTIC_MOCK_CAPABILITIES;
+      }
+    });
+    const opened = openNew(adapter, 'es', { metricSink: metrics.sink });
+    coreHolder.current = opened.core;
+
+    const result = opened.core.handleText(utteranceStartText());
+    expect(result).toEqual({
+      outgoing: [],
+      close: { code: 1000, reason: 'closed' }
+    });
+    expect(capabilityReads).toBe(1);
+    expect(adapter.sessions).toHaveLength(0);
+    expect(metrics.records.filter((record) => record.name === 'provider.failure')).toHaveLength(1);
+  });
+
   it('maps push failure and high-water mismatch to provider loss without ACK', () => {
     const throwing = openNew(recordingAdapter(DETERMINISTIC_MOCK_CAPABILITIES, undefined, new Error('raw provider secret')));
     throwing.core.handleText(utteranceStartText());
@@ -2702,6 +2912,85 @@ describe('relay session core', () => {
     expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
     expect(spanish.sessions).toHaveLength(0);
     expect(turkish.sessions).toHaveLength(1);
+  });
+
+  it.each(['es', 'tr'] as const)(
+    'passes the selected %s registry hint to every utterance session',
+    (targetLanguage) => {
+      const adapter = recordingAdapter();
+      const { core } = openNew(adapter, targetLanguage);
+
+      expect(core.handleText(utteranceStartText())).toEqual({ outgoing: [] });
+      expect(core.handleText(utteranceCancelText())).toMatchObject({
+        outgoing: [expect.objectContaining({ type: 'utterance.aborted' })]
+      });
+      expect(core.handleText(utteranceStartText(TEST_SECOND_UTTERANCE_ID))).toEqual({
+        outgoing: []
+      });
+      expect(adapter.sessions).toHaveLength(2);
+      const expectedConfiguration = {
+        serverVadMode: 'disabled',
+        languageMode: 'selected-target',
+        languageHint: targetLanguage,
+        manualCommitCadenceMs: 600
+      };
+      expect(adapter.sessions[0]?.configuration).toEqual(expectedConfiguration);
+      expect(adapter.sessions[1]?.configuration).toEqual(expectedConfiguration);
+    }
+  );
+
+  it('resolves only an exact canonical target definition at a pure boundary', () => {
+    const spanish = getLanguageDefinition('es');
+    expect(spanish).toBeDefined();
+    expect(resolveCanonicalTranscriptionHint('es', spanish)).toBe('es');
+
+    const hostileDefinitions: readonly unknown[] = [
+      undefined,
+      { ...spanish, transcriptionHint: 'zz' },
+      { ...spanish, code: 'tr', transcriptionHint: 'tr' },
+      new Proxy(spanish as object, {
+        get: () => {
+          throw new Error('registry proxy must not be read');
+        }
+      })
+    ];
+    for (const definition of hostileDefinitions) {
+      expect(resolveCanonicalTranscriptionHint('es', definition)).toBeUndefined();
+    }
+
+    let getterReads = 0;
+    const accessorDefinition = { ...spanish } as Record<string, unknown>;
+    Object.defineProperty(accessorDefinition, 'transcriptionHint', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return getterReads % 2 === 0 ? 'tr' : 'es';
+      }
+    });
+    expect(resolveCanonicalTranscriptionHint('es', accessorDefinition)).toBeUndefined();
+    expect(getterReads).toBe(0);
+  });
+
+  it('does not expose a production registry lookup override', () => {
+    expect(Object.hasOwn(createTestOptions(), 'languageDefinitionForTarget')).toBe(false);
+    expect(getLanguageDefinition('es')?.transcriptionHint).toBe('es');
+  });
+
+  it('rejects a capability set without selected-target support instead of using automatic mode', () => {
+    const unsupported = {
+      ...DETERMINISTIC_MOCK_CAPABILITIES,
+      languageModes: ['automatic'] as const
+    };
+    const adapter = recordingAdapter(unsupported);
+    const { core } = openNew(adapter, 'es');
+
+    const result = core.handleText(utteranceStartText());
+    expect(result).toMatchObject({
+      outgoing: [expect.objectContaining({ type: 'error', code: 'provider_unavailable' })],
+      close: { code: 4503, reason: 'provider_unavailable' }
+    });
+    expect(adapter.sessions).toHaveLength(0);
   });
 
   it('accepts exactly one callback adapter mechanism', () => {
