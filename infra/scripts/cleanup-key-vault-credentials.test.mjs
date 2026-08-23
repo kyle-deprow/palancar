@@ -1818,6 +1818,7 @@ test("production subprocesses use the exact approved cwd for git and Terraform",
     LANG: "C",
     LC_ALL: "C",
     AZURE_CONFIG_DIR: "/home/dev/.azure",
+    XDG_CACHE_HOME: "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache",
   });
   assert.equal(context.repositoryCommit, COMMIT);
   assert.equal(context.cwd, path.join(root, "infra/environments/dev"));
@@ -1837,7 +1838,7 @@ test("production subprocesses use the exact approved cwd for git and Terraform",
     }
   `], {
     cwd: "/",
-    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", AZURE_CONFIG_DIR: "/home/dev/.azure" },
+    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", AZURE_CONFIG_DIR: "/home/dev/.azure", XDG_CACHE_HOME: "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache" },
     encoding: "utf8",
   });
   assert.equal(audienceChild.status, 0);

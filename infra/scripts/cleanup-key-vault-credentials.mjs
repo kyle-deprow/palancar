@@ -123,6 +123,11 @@ const PRODUCTION_ENV = Object.freeze({
   LANG: "C",
   LC_ALL: "C",
   AZURE_CONFIG_DIR: "/home/dev/.azure",
+  // Shared with dev-plan-lifecycle.mjs LIFECYCLE_CACHE_ROOT: without
+  // XDG_CACHE_HOME the Azure CLI's deviceid cache resolves HOME to the
+  // literal string "None" and lands inside the Terraform workdir, which
+  // this utility then rejects as a dirty worktree.
+  XDG_CACHE_HOME: "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache",
 });
 
 const DESCRIPTOR_KEYS = Object.freeze([
