@@ -6338,6 +6338,88 @@ test("Credential cleanup permits exactly one indexed RBAC delete and no previous
   );
 });
 
+test("Credential cleanup permits only the benign count-index action reason", () => {
+  const target =
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
+  const benignReason = "delete_because_count_index";
+
+  const accepted = clone(credentialCleanupFixture);
+  cutoverChange(accepted, target).action_reason = benignReason;
+  assert.equal(acceptsPlan(accepted, "azure-credential-cleanup"), true);
+
+  for (const wrongReason of [
+    "delete_because_replace",
+    "read_because_config_unknown",
+  ]) {
+    rejectsCutoverMutation(
+      credentialCleanupFixture,
+      "azure-credential-cleanup",
+      (candidate) => {
+        cutoverChange(candidate, target).action_reason = wrongReason;
+      },
+    );
+  }
+
+  for (const otherAddress of [
+    lunaContainerAppAddress,
+    cliRoleAddress,
+  ]) {
+    rejectsCutoverMutation(
+      credentialCleanupFixture,
+      "azure-credential-cleanup",
+      (candidate) => {
+        cutoverChange(candidate, otherAddress).action_reason = benignReason;
+      },
+    );
+  }
+
+  rejectsCutoverMutation(
+    runtimeCutoverFixture,
+    "azure-generation-cutover",
+    (candidate) => {
+      cutoverChange(candidate, target).action_reason = benignReason;
+    },
+  );
+  rejectsCutoverMutation(
+    terminalFixture,
+    "final-rollout-complete",
+    (candidate) => {
+      candidate.resource_changes[0].action_reason = benignReason;
+    },
+  );
+});
+
+test("Credential cleanup action-reason allowance is structural", () => {
+  const target =
+    "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
+  const candidate = clone(credentialCleanupFixture);
+  cutoverChange(candidate, target).action_reason =
+    "delete_because_count_index";
+
+  for (const expected of [
+    { resource: "azurerm_resource_group.foundation", attribute: ["id"] },
+    {
+      resource:
+        "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+      attribute: [],
+    },
+  ]) {
+    const index = candidate.relevant_attributes.findIndex(
+      (entry) =>
+        entry.resource === expected.resource &&
+        isDeepStrictEqual(entry.attribute, expected.attribute),
+    );
+    assert.notEqual(index, -1);
+    candidate.relevant_attributes.splice(index, 1);
+  }
+
+  candidate["resource_changes[999]"] = {
+    address: target,
+    action_reason: "delete_because_count_index",
+  };
+  assert.equal(acceptsPlan(candidate, "azure-credential-cleanup"), false);
+});
+
 test("Final rollout complete is a terminal exact no-op contract", () => {
   const terminal = clone(terminalFixture);
   assert.equal(acceptsPlan(terminal, "final-rollout-complete"), true);

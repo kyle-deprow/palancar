@@ -102,6 +102,8 @@ const CUTOVER_RUNTIME_SECRETS_USER =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
 const CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+const CUTOVER_CREDENTIAL_CLEANUP_BENIGN_ACTION_REASON =
+  "delete_because_count_index";
 const CUTOVER_CREDENTIAL_CLEANUP_BENIGN_MISSING_RELEVANT_ATTRIBUTE_KEYS =
   new Set([
     JSON.stringify(["azurerm_resource_group.foundation", ["id"]]),
@@ -6746,11 +6748,9 @@ const CUTOVER_BENIGN_DRIFT_CHANGE_KEYS = Object.freeze([
   "after_sensitive",
 ]);
 
-function cutoverHasForbiddenMetadata(value, path = "") {
+function cutoverHasForbiddenMetadata(value, atRoot = true) {
   if (Array.isArray(value)) {
-    return value.some((entry, index) =>
-      cutoverHasForbiddenMetadata(entry, `${path}[${index}]`),
-    );
+    return value.some((entry) => cutoverHasForbiddenMetadata(entry, false));
   }
   if (!isObject(value)) return false;
   for (const [key, child] of Object.entries(value)) {
@@ -6762,11 +6762,11 @@ function cutoverHasForbiddenMetadata(value, path = "") {
       return true;
     }
     if (key === "resource_drift") {
-      if (path !== "") return true;
+      if (!atRoot) return true;
       continue;
     }
     if (key === "deferred_changes") return true;
-    if (cutoverHasForbiddenMetadata(child, path ? `${path}.${key}` : key)) {
+    if (cutoverHasForbiddenMetadata(child, false)) {
       return true;
     }
   }
@@ -6845,7 +6845,11 @@ function cutoverHasSensitiveEnvelope(value) {
   );
 }
 
-function cutoverExactResourceEntry(entry, requirePrevious = false) {
+function cutoverExactResourceEntry(
+  entry,
+  requirePrevious = false,
+  allowCredentialCleanupActionReason = false,
+) {
   const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
     (candidate) => candidate.address === entry?.address,
   );
@@ -6861,6 +6865,11 @@ function cutoverExactResourceEntry(entry, requirePrevious = false) {
         "change",
         "index",
         ...(requirePrevious ? ["previous_address"] : []),
+        ...(allowCredentialCleanupActionReason &&
+        entry?.address === CUTOVER_RUNTIME_SECRETS_USER &&
+        Object.hasOwn(entry, "action_reason")
+          ? ["action_reason"]
+          : []),
       ];
   const expectedChangeKeys = reference
     ? [
@@ -8689,9 +8698,40 @@ function cutoverVariablesMatchReference(plan) {
   );
 }
 
-function cutoverStateSections(plan, mode, expectedEnable, expectedApplyable) {
+function cutoverPlanForForbiddenMetadata(plan, mode) {
+  if (mode !== AZURE_CREDENTIAL_CLEANUP_MODE) return plan;
+
+  const resourceChanges = plan?.resource_changes;
+  if (!Array.isArray(resourceChanges)) return plan;
+  const targetIndex = resourceChanges.findIndex(
+    (entry) =>
+      isObject(entry) && entry.address === CUTOVER_RUNTIME_SECRETS_USER,
+  );
+  if (targetIndex === -1) return plan;
+
+  const target = resourceChanges[targetIndex];
+  if (!Object.hasOwn(target, "action_reason")) return plan;
   if (
-    !cutoverExactPlanEnvelope(plan, expectedApplyable) ||
+    target.action_reason !==
+    CUTOVER_CREDENTIAL_CLEANUP_BENIGN_ACTION_REASON
+  ) {
+    return undefined;
+  }
+
+  const targetWithoutActionReason = { ...target };
+  delete targetWithoutActionReason.action_reason;
+  const resourceChangesWithoutActionReason = resourceChanges.slice();
+  resourceChangesWithoutActionReason[targetIndex] = targetWithoutActionReason;
+  return {
+    ...plan,
+    resource_changes: resourceChangesWithoutActionReason,
+  };
+}
+
+function cutoverStateSections(plan, mode, expectedEnable, expectedApplyable) {
+  const planForMetadata = cutoverPlanForForbiddenMetadata(plan, mode);
+  if (
+    !cutoverExactPlanEnvelope(planForMetadata, expectedApplyable) ||
     !cutoverHasExactStateEnvelopes(plan) ||
     !hasExactKeys(
       plan.variables,
@@ -9159,7 +9199,11 @@ function cutoverExpectedSensitive(entry, bindings) {
   };
 }
 
-function cutoverHasExactChangeEnvelope(entry, bindings) {
+function cutoverHasExactChangeEnvelope(
+  entry,
+  bindings,
+  allowOmittedContainerAppProbes = false,
+) {
   const expected = cutoverExpectedSensitive(entry, bindings);
   const reference = TERMINAL_REFERENCE_PLAN.resource_changes.find(
     (candidate) => candidate.address === entry.address,
@@ -9167,7 +9211,19 @@ function cutoverHasExactChangeEnvelope(entry, bindings) {
   const appUpdate =
     entry.address === CUTOVER_CONTAINER_APP &&
     isUpdate(entry.change.actions);
-  const afterSensitiveMatches = appUpdate
+  const noOpAppWithOmittedProbes =
+    allowOmittedContainerAppProbes &&
+    entry.address === CUTOVER_CONTAINER_APP &&
+    isNoOp(entry.change.actions) &&
+    !Object.hasOwn(
+      entry.change.after?.body?.properties?.template?.containers?.[0] ?? {},
+      "probes",
+    ) &&
+    !Object.hasOwn(
+      entry.change.before?.body?.properties?.template?.containers?.[0] ?? {},
+      "probes",
+    );
+  const afterSensitiveMatches = appUpdate || noOpAppWithOmittedProbes
     ? cutoverSensitiveMaskMatches(
         entry.change.after,
         reference?.change?.after,
@@ -9184,10 +9240,15 @@ function cutoverHasExactChangeEnvelope(entry, bindings) {
         )?.change.after_unknown
       : {},
   );
-  const beforeSensitiveMatches = isDeepStrictEqual(
-    entry.change.before_sensitive,
-    expected.before,
-  );
+  const beforeSensitiveMatches = noOpAppWithOmittedProbes
+    ? cutoverSensitiveMaskMatches(
+        entry.change.before,
+        reference?.change?.before,
+        entry.change.before_sensitive,
+        expected.before,
+        bindings,
+      )
+    : isDeepStrictEqual(entry.change.before_sensitive, expected.before);
   if (
     !unknownMatches ||
     !beforeSensitiveMatches ||
@@ -9643,20 +9704,38 @@ function acceptsAzureCredentialCleanup(plan, changes) {
   const bindings = cutoverBindings(plan, byAddress);
   if (!cutoverExactSecuritySchema(plan, byAddress, context)) return false;
   for (const entry of changes) {
+    // The live cleanup plan omits provider-computed probes from this no-op
+    // Container App entry; keep that compatibility local to this mode.
+    const omitContainerAppProbes =
+      entry.address === CUTOVER_CONTAINER_APP &&
+      !Object.hasOwn(
+        entry.change.after?.body?.properties?.template?.containers?.[0] ?? {},
+        "probes",
+      ) &&
+      !Object.hasOwn(
+        entry.change.before?.body?.properties?.template?.containers?.[0] ?? {},
+        "probes",
+      );
     if (
-      !cutoverExactResourceEntry(entry) ||
+      !cutoverExactResourceEntry(entry, false, true) ||
       !isDeepStrictEqual(
         entry.change.actions,
         [entry.address === CUTOVER_RUNTIME_SECRETS_USER ? "delete" : "no-op"],
       ) ||
-      !cutoverHasExactChangeEnvelope(entry, bindings)
+      !cutoverHasExactChangeEnvelope(
+        entry,
+        bindings,
+        omitContainerAppProbes,
+      )
     ) return false;
     if (!cutoverExactEntryMetadata(entry)) return false;
     if (!cutoverResourceChangeStateCoherent(plan, entry, planned, prior)) return false;
     if (entry.address === CUTOVER_CONTAINER_APP) {
       if (
         !cutoverExactNoOp(entry.change, entry.address) ||
-        !cutoverExactDirectApp(entry.change.after, relayImage, context)
+        !cutoverExactDirectApp(entry.change.after, relayImage, context, {
+          omitProbes: omitContainerAppProbes,
+        })
       ) return false;
     } else if (entry.address === CUTOVER_RUNTIME_SECRETS_USER) {
       if (!cutoverExactRoleChange(entry, context, "delete")) return false;
