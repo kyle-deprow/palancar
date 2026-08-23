@@ -1364,7 +1364,7 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
       this.#fail('protocol');
       return;
     }
-    item.text = normalizeText(`${item.text} ${delta}`);
+    item.text = `${item.text}${delta}`;
     this.#emitPartial();
   }
 
@@ -1380,14 +1380,22 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
     this.#maybeFinish();
   }
 
-  #currentText(): string {
+  #currentText(includeTrailingDelta = false): string {
     const segments: string[] = [];
+    let trailingDelta: string | undefined;
     for (const item of this.#items) {
-      if (!item.completed) break;
+      if (!item.completed) {
+        if (includeTrailingDelta) trailingDelta = item.text;
+        break;
+      }
       if (item.text.length === 0) continue;
       segments.push(item.text);
     }
-    return joinSegments(segments);
+    const completedText = joinSegments(segments);
+    if (!includeTrailingDelta || trailingDelta === undefined) return completedText;
+    const separator = completedText.length > 0 && trailingDelta.length > 0 &&
+      !/^\s/u.test(trailingDelta) ? ' ' : '';
+    return `${completedText}${separator}${trailingDelta}`.trimEnd();
   }
 
   #acceptedOffsetForPrefix(): number {
@@ -1401,7 +1409,7 @@ export class AzureRealtimeTranscriptionSession implements TranscriptionSession {
 
   #emitPartial(): void {
     if (this.#activeUtteranceId === undefined) return;
-    const text = this.#currentText();
+    const text = this.#currentText(true);
     if (text.length === 0) return;
     this.#revision += 1;
     const providerEventTime = this.#providerEventTime();

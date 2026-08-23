@@ -782,7 +782,12 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
     socket.message(committed('item-2', 'item-1'));
     socket.message(delta('item-1', 'hola mundo'));
     socket.message(completed('item-2', 'mundo final extra'));
-    expect(events).toEqual([]);
+    expect(events.filter((event) => event.type === 'transcript.partial').map((event) => event.text))
+      .toEqual(['hola mundo', 'hola mundo']);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      acceptedThroughOriginalSampleOffset: 0
+    });
     socket.message(completed('item-1', 'hola mundo final'));
     expect(events.at(-1)).toMatchObject({ type: 'transcript.final', text: 'hola mundo final extra' });
     expect(new Set(events.map((event) => event.segmentId)).size).toBe(1);
@@ -790,6 +795,163 @@ describe('AzureRealtimeTranscriptionAdapter', () => {
       [...events].map((event) => event.revision).sort((left, right) => left - right)
     );
   });
+
+  it('emits each accumulated delta while keeping the completed-prefix offset', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(socket, events, failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_601 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+
+    socket.message(committed('item-1', null));
+    socket.message(committed('item-2', 'item-1'));
+
+    const partialTexts = (): string[] => events
+      .filter((event): event is Extract<NormalizedTranscriptionEvent, { type: 'transcript.partial' }> =>
+        event.type === 'transcript.partial')
+      .map((event) => event.text);
+
+    socket.message(delta('item-1', 'trans'));
+    expect(partialTexts()).toEqual(['trans']);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      acceptedThroughOriginalSampleOffset: 0
+    });
+
+    socket.message(delta('item-1', 'lation'));
+    expect(partialTexts()).toEqual(['trans', 'translation']);
+
+    socket.message(completed('item-1', 'translation'));
+    expect(partialTexts()).toEqual(['trans', 'translation', 'translation']);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      text: 'translation',
+      acceptedThroughOriginalSampleOffset: 9_600
+    });
+
+    socket.message(delta('item-2', 'hello'));
+    expect(partialTexts()).toEqual([
+      'trans',
+      'translation',
+      'translation',
+      'translation hello'
+    ]);
+
+    socket.message(delta('item-2', ' '));
+    expect(partialTexts()).toEqual([
+      'trans',
+      'translation',
+      'translation',
+      'translation hello',
+      'translation hello'
+    ]);
+
+    socket.message(delta('item-2', 'world'));
+    expect(partialTexts()).toEqual([
+      'trans',
+      'translation',
+      'translation',
+      'translation hello',
+      'translation hello',
+      'translation hello world'
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.partial',
+      acceptedThroughOriginalSampleOffset: 9_600
+    });
+
+    socket.message(completed('item-2', 'hello world'));
+
+    expect(failures).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'translation hello world'
+    });
+  });
+
+  it('end-trims emitted deltas and replaces them with authoritative completion text', async () => {
+    const socket = new FakeSocket();
+    const events: NormalizedTranscriptionEvent[] = [];
+    const failures: unknown[] = [];
+    const session = makeSession(socket, events, failures);
+    await openSession(session, socket);
+    session.pushAudio({
+      utteranceId: UTTERANCE_ID,
+      originalSampleOffset: 0,
+      pcm: new Uint8Array(9_600 * 2)
+    });
+    session.finalize(UTTERANCE_ID);
+    socket.message(committed('item-1', null));
+
+    const partialTexts = (): string[] => events
+      .filter((event): event is Extract<NormalizedTranscriptionEvent, { type: 'transcript.partial' }> =>
+        event.type === 'transcript.partial')
+      .map((event) => event.text);
+
+    socket.message(delta('item-1', ' '));
+    expect(partialTexts()).toEqual([]);
+
+    socket.message(delta('item-1', 'hello '));
+    expect(partialTexts()).toEqual([' hello']);
+
+    socket.message(delta('item-1', 'world'));
+    expect(partialTexts()).toEqual([' hello', ' hello world']);
+
+    socket.message(completed('item-1', '  authoritative transcript \t'));
+
+    expect(failures).toEqual([]);
+    expect(partialTexts()).toEqual([' hello', ' hello world', 'authoritative transcript']);
+    expect(events.at(-1)).toMatchObject({
+      type: 'transcript.final',
+      text: 'authoritative transcript'
+    });
+    expect(events.every((event) => !/\s$/u.test(event.text))).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'adds a separator before a non-whitespace delta',
+      trailingDelta: 'ready set  go',
+      expected: 'ready set ready set  go'
+    },
+    {
+      label: 'keeps leading whitespace as the separator',
+      trailingDelta: '  ready set  go',
+      expected: 'ready set  ready set  go'
+    }
+  ])('preserves completed-prefix whitespace and repeated-token boundaries ($label)',
+    async ({ trailingDelta, expected }) => {
+      const socket = new FakeSocket();
+      const events: NormalizedTranscriptionEvent[] = [];
+      const failures: unknown[] = [];
+      const session = makeSession(socket, events, failures);
+      await openSession(session, socket);
+      session.pushAudio({
+        utteranceId: UTTERANCE_ID,
+        originalSampleOffset: 0,
+        pcm: new Uint8Array(9_601 * 2)
+      });
+      session.finalize(UTTERANCE_ID);
+
+      socket.message(committed('item-1', null));
+      socket.message(committed('item-2', 'item-1'));
+      socket.message(completed('item-1', 'ready set'));
+      socket.message(delta('item-2', trailingDelta));
+
+      expect(failures).toEqual([]);
+      expect(events.at(-1)).toMatchObject({
+        type: 'transcript.partial',
+        text: expected,
+        acceptedThroughOriginalSampleOffset: 9_600
+      });
+    }
+  );
 
   it.each([
     ['null', null],
