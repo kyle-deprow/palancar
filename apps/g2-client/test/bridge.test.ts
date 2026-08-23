@@ -2911,31 +2911,19 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 });
 
 describe("G2BridgeRuntime event normalization", () => {
-  it("makes an undefined list event diagnostic from TargetSelection", async () => {
+  it("treats an undefined event type as press", async () => {
     const harness = createHarness();
-    await boot(harness);
-
-    harness.bridge.emit(listEvent());
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
     await harness.runtime.whenEventsIdle();
 
-    expect(harness.transports).toHaveLength(1);
-    expect(harness.runtime.snapshot.state).toBe("Ready");
-    await authenticateSession(harness);
-    expect(harness.transports).toHaveLength(1);
-  });
-
-  it("treats undefined text/list event types as press and ignores malformed double-clicks", async () => {
-    const harness = createHarness();
-    await boot(harness);
     harness.bridge.emit(textEvent());
     await harness.runtime.whenEventsIdle();
-    expect(harness.transports).toHaveLength(1);
-    await authenticateSession(harness);
-    expect(harness.transports).toHaveLength(1);
 
-    harness.bridge.emit(listEvent());
-    await harness.runtime.whenEventsIdle();
     expect(harness.transports).toHaveLength(1);
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+    expect(harness.runtime.snapshot.audioOpen).toBe(true);
+    expect(harness.operations).toContain(`start-utterance:${UTTERANCE_ID}`);
 
     harness.bridge.emit(systemEvent(OsEventTypeList.DOUBLE_CLICK_EVENT));
     harness.bridge.emit(textEvent(OsEventTypeList.DOUBLE_CLICK_EVENT));

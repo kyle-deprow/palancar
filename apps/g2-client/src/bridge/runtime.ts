@@ -1687,6 +1687,7 @@ export class G2BridgeRuntime {
     if (isEventType(eventType, OsEventTypeList.SCROLL_BOTTOM_EVENT)) {
       return { type: "swipe.next" };
     }
+    // Keep undefined on the press path: SDK CLICK_EVENT === 0 can be lost by optional-field host normalization; docs/implementation-plan.md requires CLICK_EVENT/undefined routing.
     if (eventType === undefined || isEventType(eventType, OsEventTypeList.CLICK_EVENT)) {
       let press: ClientEvent = { type: "press" };
       if (

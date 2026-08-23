@@ -468,6 +468,20 @@ function copyLimits(limits: NegotiatedLimits): Readonly<NegotiatedLimits> {
   return Object.freeze({ ...limits });
 }
 
+function limitsEqual(
+  left: Readonly<NegotiatedLimits>,
+  right: Readonly<NegotiatedLimits>,
+): boolean {
+  const leftKeys = Object.keys(left) as Array<keyof NegotiatedLimits>;
+  const rightKeys = Object.keys(right) as Array<keyof NegotiatedLimits>;
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) =>
+      Object.prototype.hasOwnProperty.call(right, key) && left[key] === right[key],
+    )
+  );
+}
+
 function copyQueueState(queue: ClientRetainedAudioQueue): Readonly<ClientAudioQueueState> {
   const state = queue.state;
   return Object.freeze({
@@ -1146,7 +1160,7 @@ export class RelayTransport {
         return;
       }
       if (message.type === "session.ready") {
-        this.#assertExpectedSessionReady(message);
+        if (!this.#assertExpectedSessionReady(message)) return;
         this.#clearReadyTimeout(source);
         this.#expectedSessionNegotiation = undefined;
         this.#session = Object.freeze({
@@ -1499,7 +1513,23 @@ export class RelayTransport {
 
   #assertExpectedSessionReady(
     message: Extract<ServerControlMessage, { readonly type: "session.ready" }>,
-  ): void {
+  ): boolean {
+    const session = this.#session;
+    if (session !== undefined) {
+      const sameIdentity =
+        message.sessionId === session.sessionId &&
+        message.sessionEpoch === session.sessionEpoch;
+      if (
+        sameIdentity &&
+        this.#negotiatedLimits !== undefined &&
+        limitsEqual(message.effectiveLimits, this.#negotiatedLimits)
+      ) return false;
+      if (sameIdentity) {
+        throw new Error("Server session.ready does not match this session limits");
+      }
+      throw new Error("Server session.ready does not match this session identity");
+    }
+
     const expected = this.#expectedSessionNegotiation;
     if (
       expected === undefined ||
@@ -1511,6 +1541,7 @@ export class RelayTransport {
     ) {
       throw new Error("Server session.ready does not match this session negotiation");
     }
+    return true;
   }
 
   #retireActiveForEvent(event: RelayTransportEvent): void {

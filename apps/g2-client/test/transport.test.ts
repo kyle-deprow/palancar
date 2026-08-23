@@ -2430,22 +2430,35 @@ describe("G2 relay transport", () => {
     }, canary);
   });
 
-  it("rejects a duplicate session.ready and synchronously clears negotiated state", async () => {
+  it("ignores an exact duplicate session.ready but rejects changed limits", async () => {
+    const events: RelayTransportEvent[] = [];
     const errors: RelayTransportError[] = [];
-    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const { transport } = createTransport((event) => events.push(event), (error) => errors.push(error));
     const socket = await openSocket(transport);
     socket.message(JSON.stringify(readyMessage()));
     transport.startUtterance(UTTERANCE_ID);
     transport.pushPcm(Uint8Array.of(1, 2));
-    const duplicateLimits = {
+
+    socket.message(JSON.stringify(readyMessage(DEFAULT_NEGOTIATED_LIMITS)));
+
+    expect(errors).toHaveLength(0);
+    expect(socket.readyState).toBe(1);
+    expect(events.filter((event) => event.type === "session.ready")).toHaveLength(1);
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      sessionId: SESSION_ID,
+      sessionEpoch: 1,
+      negotiatedLimits: DEFAULT_NEGOTIATED_LIMITS,
+      activeUtteranceId: UTTERANCE_ID,
+    });
+
+    const changedLimits = {
       ...DEFAULT_NEGOTIATED_LIMITS,
       maxAudioPayloadBytes: 2,
     };
 
-    socket.message(JSON.stringify(readyMessage(duplicateLimits, {
-      sessionId: "55555555-5555-4555-8555-555555555555",
-      sessionEpoch: 2,
-    })));
+    socket.message(JSON.stringify(readyMessage(changedLimits)));
 
     expect(errors.at(-1)?.kind).toBe("protocol");
     expect(socket.readyState).toBe(3);
