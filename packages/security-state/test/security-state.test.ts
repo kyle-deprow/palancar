@@ -1144,32 +1144,27 @@ describe('audio grants and generation claims', () => {
     expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(200);
   });
 
-  it('clamps a small rollback after a failed 501ms handoff observation', async () => {
+  it('clamps a small rollback after a failed 501ms handoff observation and releases the failed grant', async () => {
     const base = await audioHandoffFixture(MIN_AUDIO_GRANT_HANDOFF_MS + 1);
     await expect(base.store.reserveAudio(audioRequest(base.active, 100)))
       .rejects.toMatchObject({ category: 'state-unavailable' });
 
     base.fake.set(1_000);
-    await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_500, 100)))
+    await expect(base.store.reserveAudio(audioRequest(base.active, 100, 9_501)))
       .resolves.toMatchObject({ issuedAt: 1_501, expiresAt: 2_501 });
 
     base.fake.set(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
     const snapshot = base.store.snapshot();
-    expect(snapshot.grants).toHaveLength(2);
+    expect(snapshot.grants).toHaveLength(1);
     expect(snapshot.grants[0]).toMatchObject({
       fromOriginalSampleOffset: 0,
       throughOriginalSampleOffset: 100,
       reservedOriginalSamples: 100
     });
-    expect(snapshot.grants[1]).toMatchObject({
-      fromOriginalSampleOffset: 100,
-      throughOriginalSampleOffset: 200,
-      reservedOriginalSamples: 100
-    });
-    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(200);
+    expect(snapshot.sessions[0]?.audioReservedOriginalSamples).toBe(100);
   });
 
-  it('accepts exactly 500ms of in-memory post-commit handoff and retains a committed reservation at 501ms', async () => {
+  it('accepts exactly 500ms of in-memory post-commit handoff and releases a failed reservation at 501ms', async () => {
     expect(AUDIO_GRANT_TTL_MS).toBe(1_000);
     expect(MIN_AUDIO_GRANT_HANDOFF_MS).toBe(500);
 
@@ -1218,13 +1213,10 @@ describe('audio grants and generation claims', () => {
     lateNow.enabled = true;
     await expect(lateStore.reserveAudio(audioRequest(lateSession.active, 100)))
       .rejects.toMatchObject({ category: 'state-unavailable' });
-    expect(lateStore.snapshot().grants).toHaveLength(1);
-    expect(lateStore.snapshot().grants[0]).toMatchObject({
-      fromOriginalSampleOffset: 0,
-      throughOriginalSampleOffset: 100,
-      reservedOriginalSamples: 100
-    });
-    expect(lateStore.snapshot().sessions[0]?.audioReservedOriginalSamples).toBe(100);
+    expect(lateStore.snapshot().grants).toHaveLength(0);
+    expect(lateStore.snapshot().sessions[0]?.audioReservedOriginalSamples).toBe(0);
+    await expect(lateStore.reserveAudio(audioRequest(lateSession.active, 100, 9_501)))
+      .resolves.toMatchObject({ throughOriginalSampleOffset: 100 });
   });
 
   it('enforces utterance-bound 1..8000 grants and exact 16000/1000ms rolling boundaries', async () => {

@@ -246,6 +246,14 @@ class RollingWindow {
     }
     this.timestamps.push(now);
   }
+
+  latestMatches(now: number): boolean {
+    return this.timestamps.length > this.head && this.timestamps[this.timestamps.length - 1] === now;
+  }
+
+  removeLatest(): void {
+    this.timestamps.pop();
+  }
 }
 
 class RollingAmountWindow {
@@ -276,6 +284,16 @@ class RollingAmountWindow {
     }
     this.entries.push({ at: now, amount });
     this.total += amount;
+  }
+
+  latestMatches(now: number, amount: number): boolean {
+    const latest = this.entries[this.entries.length - 1];
+    return this.entries.length > this.head && latest?.at === now && latest.amount === amount;
+  }
+
+  removeLatest(amount: number): void {
+    this.entries.pop();
+    this.total -= amount;
   }
 }
 
@@ -641,6 +659,36 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
   #deleteGrant(row: GrantRow): void {
     this.#grants.delete(row.id);
     this.#sessions.get(row.sessionId)?.grantIds.delete(row.id);
+  }
+
+  #releaseAudioGrant(grantId: CanonicalUuid): void {
+    const grant = this.#grants.get(grantId);
+    if (grant === undefined) return;
+    const session = this.#sessions.get(grant.sessionId);
+    const installation = this.#installations.get(grant.installationId);
+    if (session === undefined || installation === undefined) return;
+    if (
+      !session.audioWindow.latestMatches(grant.issuedAt, grant.reservedOriginalSamples) ||
+      !installation.audioWindow.latestMatches(grant.issuedAt, grant.reservedOriginalSamples) ||
+      !session.grantWindow.latestMatches(grant.issuedAt) ||
+      !installation.grantWindow.latestMatches(grant.issuedAt) ||
+      session.audioReservedOriginalSamples < grant.reservedOriginalSamples
+    ) return;
+    session.audioWindow.removeLatest(grant.reservedOriginalSamples);
+    installation.audioWindow.removeLatest(grant.reservedOriginalSamples);
+    session.grantWindow.removeLatest();
+    installation.grantWindow.removeLatest();
+    session.audioReservedOriginalSamples -= grant.reservedOriginalSamples;
+    this.#deleteGrant(grant);
+  }
+
+  #releaseAudioGrantBestEffort(grantId: CanonicalUuid, minimum: number): void {
+    try {
+      const now = this.#context(minimum);
+      this.#commit(now, () => this.#releaseAudioGrant(grantId));
+    } catch {
+      // Leave the committed reservation for normal TTL expiry if rollback is unavailable.
+    }
   }
 
   #cleanupSessionGrants(session: SessionRow, now: number): void {
@@ -1417,16 +1465,22 @@ export class InMemorySecurityStateStore implements LocalMockSecurityStateStore {
       return this.#grant(grant);
     });
     if (result === undefined) fail('stale-lease');
-    const handoffNow = this.#context(issuedAt);
-    const row = this.#sessions.get(lease.sessionId);
-    const installation = this.#installations.get(lease.installationId);
-    if (
-      row === undefined || installation === undefined ||
-      !this.#sessionActive(row, installation, handoffNow) ||
-      !this.#leaseMatches(lease, row)
-    ) fail('stale-lease');
-    if (result.expiresAt - handoffNow < MIN_AUDIO_GRANT_HANDOFF_MS) fail('state-unavailable');
-    return result;
+    let handoffNow = issuedAt;
+    try {
+      handoffNow = this.#context(issuedAt);
+      const row = this.#sessions.get(lease.sessionId);
+      const installation = this.#installations.get(lease.installationId);
+      if (
+        row === undefined || installation === undefined ||
+        !this.#sessionActive(row, installation, handoffNow) ||
+        !this.#leaseMatches(lease, row)
+      ) fail('stale-lease');
+      if (result.expiresAt - handoffNow < MIN_AUDIO_GRANT_HANDOFF_MS) fail('state-unavailable');
+      return result;
+    } catch (error) {
+      this.#releaseAudioGrantBestEffort(grantId, handoffNow);
+      throw error;
+    }
   }
 
   #parseGeneration(value: AuthorizeGenerationInput): {

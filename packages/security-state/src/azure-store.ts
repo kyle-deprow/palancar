@@ -1047,6 +1047,29 @@ function audioWindowEntity(
   });
 }
 
+function audioWindowStateMatches(
+  actual: AudioWindowRow,
+  expected: Omit<AudioWindowRow, 'entity'>
+): boolean {
+  return actual.scope === expected.scope &&
+    actual.window === expected.window &&
+    actual.retainUntil === expected.retainUntil &&
+    actual.installationId === expected.installationId &&
+    actual.sessionId === expected.sessionId &&
+    actual.sessionEpoch === expected.sessionEpoch &&
+    actual.activeUtteranceId === expected.activeUtteranceId &&
+    actual.nextOriginalSampleOffset === expected.nextOriginalSampleOffset &&
+    actual.activeGrantExpiresAt === expected.activeGrantExpiresAt &&
+    actual.events.length === expected.events.length &&
+    actual.events.every((event, index) => {
+      const expectedEvent = expected.events[index];
+      return expectedEvent !== undefined &&
+        event.at === expectedEvent.at &&
+        event.amount === expectedEvent.amount &&
+        event.operationId === expectedEvent.operationId;
+    });
+}
+
 function parseAudioGrant(
   entity: AzureStoredEntity,
   environment: string,
@@ -3039,6 +3062,79 @@ class AzureSecurityStateCore {
     if (expiresAt - handoffNow < MIN_AUDIO_GRANT_HANDOFF_MS) fail('state-unavailable');
   }
 
+  async #releaseCommittedAudioGrant(
+    partitionKey: string,
+    grant: Omit<AudioGrantRow, 'entity'>,
+    expectedInstallWindow: Omit<AudioWindowRow, 'entity'>,
+    expectedSessionWindow: Omit<AudioWindowRow, 'entity'>,
+    restoreInstallWindow: Omit<AudioWindowRow, 'entity'>,
+    restoreSessionWindow: Omit<AudioWindowRow, 'entity'>
+  ): Promise<void> {
+    try {
+      const [grantEntity, installWindowEntity, sessionWindowEntity] = await Promise.all([
+        this.#point(this.#rate, partitionKey, audioGrantKey(grant.grantId)),
+        this.#point(this.#rate, partitionKey, 'audio-window:installation'),
+        this.#point(this.#rate, partitionKey, `audio-window:session:${grant.sessionId}:${grant.sessionEpoch}`)
+      ]);
+      if (grantEntity === undefined || installWindowEntity === undefined || sessionWindowEntity === undefined) return;
+      const committedGrant = parseAudioGrant(grantEntity, this.environment, partitionKey, grant.grantId);
+      const committedInstallWindow = parseAudioWindow(
+        installWindowEntity,
+        this.environment,
+        partitionKey,
+        'audio-window:installation',
+        expectedInstallWindow.scope,
+        expectedInstallWindow.window,
+        grant.installationId,
+        undefined,
+        0
+      );
+      const committedSessionWindow = parseAudioWindow(
+        sessionWindowEntity,
+        this.environment,
+        partitionKey,
+        `audio-window:session:${grant.sessionId}:${grant.sessionEpoch}`,
+        expectedSessionWindow.scope,
+        expectedSessionWindow.window,
+        grant.installationId,
+        grant.sessionId,
+        grant.sessionEpoch
+      );
+      if (
+        !this.#audioGrantOperationMatches(grant, committedGrant) ||
+        !audioWindowStateMatches(committedInstallWindow, expectedInstallWindow) ||
+        !audioWindowStateMatches(committedSessionWindow, expectedSessionWindow)
+      ) return;
+
+      // Delete first so a failed window CAS leaves the active cursor charged.
+      await this.#rate.delete(partitionKey, audioGrantKey(grant.grantId), committedGrant.entity.etag);
+      await this.#rate.transaction([
+        {
+          type: 'replace',
+          entity: audioWindowEntity(
+            this.environment,
+            partitionKey,
+            'audio-window:installation',
+            restoreInstallWindow
+          ),
+          etag: installWindowEntity.etag
+        },
+        {
+          type: 'replace',
+          entity: audioWindowEntity(
+            this.environment,
+            partitionKey,
+            `audio-window:session:${grant.sessionId}:${grant.sessionEpoch}`,
+            restoreSessionWindow
+          ),
+          etag: sessionWindowEntity.etag
+        }
+      ]);
+    } catch {
+      // Preserve the original handoff failure; an uncertain rollback stays fail-closed until TTL expiry.
+    }
+  }
+
   #audioGrantOperationMatches(
     expected: Omit<AudioGrantRow, 'entity'>,
     actual: AudioGrantRow
@@ -3150,39 +3246,54 @@ class AzureSecurityStateCore {
         throughOriginalSampleOffset,
         reservedOriginalSamples: input.originalSamples as number
       };
-      const installNext = audioWindowEntity(
-        this.environment,
-        partitionKey,
-        installWindowKey,
-        {
-          scope: installWindow.scope,
-          window: installWindow.window,
-          events: Object.freeze([...installEvents, event]),
-          retainUntil: expiresAt,
-          installationId: lease.installationId,
-          sessionEpoch: 0,
-          activeUtteranceId: utteranceId,
-          nextOriginalSampleOffset: throughOriginalSampleOffset,
-          activeGrantExpiresAt: expiresAt
-        }
-      );
-      const sessionNext = audioWindowEntity(
-        this.environment,
-        partitionKey,
-        sessionWindowKey,
-        {
-          scope: sessionWindow.scope,
-          window: sessionWindow.window,
-          events: Object.freeze([...sessionEvents, event]),
-          retainUntil: expiresAt,
-          installationId: lease.installationId,
-          sessionId: lease.sessionId,
-          sessionEpoch: lease.sessionEpoch,
-          activeUtteranceId: utteranceId,
-          nextOriginalSampleOffset: throughOriginalSampleOffset,
-          activeGrantExpiresAt: expiresAt
-        }
-      );
+      const installNextState: Omit<AudioWindowRow, 'entity'> = {
+        scope: installWindow.scope,
+        window: installWindow.window,
+        events: Object.freeze([...installEvents, event]),
+        retainUntil: expiresAt,
+        installationId: lease.installationId,
+        sessionEpoch: 0,
+        activeUtteranceId: utteranceId,
+        nextOriginalSampleOffset: throughOriginalSampleOffset,
+        activeGrantExpiresAt: expiresAt
+      };
+      const sessionNextState: Omit<AudioWindowRow, 'entity'> = {
+        scope: sessionWindow.scope,
+        window: sessionWindow.window,
+        events: Object.freeze([...sessionEvents, event]),
+        retainUntil: expiresAt,
+        installationId: lease.installationId,
+        sessionId: lease.sessionId,
+        sessionEpoch: lease.sessionEpoch,
+        activeUtteranceId: utteranceId,
+        nextOriginalSampleOffset: throughOriginalSampleOffset,
+        activeGrantExpiresAt: expiresAt
+      };
+      const restoreInstallWindow: Omit<AudioWindowRow, 'entity'> = {
+        scope: installWindow.scope,
+        window: installWindow.window,
+        events: Object.freeze([...installEvents]),
+        retainUntil: installWindow.retainUntil,
+        installationId: installWindow.installationId,
+        sessionEpoch: installWindow.sessionEpoch,
+        ...(installWindow.activeUtteranceId === undefined ? {} : { activeUtteranceId: installWindow.activeUtteranceId }),
+        nextOriginalSampleOffset: installWindow.nextOriginalSampleOffset,
+        activeGrantExpiresAt: installWindow.activeGrantExpiresAt
+      };
+      const restoreSessionWindow: Omit<AudioWindowRow, 'entity'> = {
+        scope: sessionWindow.scope,
+        window: sessionWindow.window,
+        events: Object.freeze([...sessionEvents]),
+        retainUntil: sessionWindow.retainUntil,
+        installationId: sessionWindow.installationId,
+        sessionId: sessionWindow.sessionId,
+        sessionEpoch: sessionWindow.sessionEpoch,
+        ...(sessionWindow.activeUtteranceId === undefined ? {} : { activeUtteranceId: sessionWindow.activeUtteranceId }),
+        nextOriginalSampleOffset: sessionWindow.nextOriginalSampleOffset,
+        activeGrantExpiresAt: sessionWindow.activeGrantExpiresAt
+      };
+      const installNext = audioWindowEntity(this.environment, partitionKey, installWindowKey, installNextState);
+      const sessionNext = audioWindowEntity(this.environment, partitionKey, sessionWindowKey, sessionNextState);
       const mutations: AzureTableMutation[] = [
         installWindowEntity === undefined
           ? { type: 'create', entity: installNext }
@@ -3194,7 +3305,19 @@ class AzureSecurityStateCore {
       ];
       try {
         await this.#rate.transaction(mutations);
-        await this.#validateAudioGrantHandoff(lease, expiresAt);
+        try {
+          await this.#validateAudioGrantHandoff(lease, expiresAt);
+        } catch (error) {
+          await this.#releaseCommittedAudioGrant(
+            partitionKey,
+            grant,
+            installNextState,
+            sessionNextState,
+            restoreInstallWindow,
+            restoreSessionWindow
+          );
+          throw error;
+        }
         return this.#audioGrant(grant);
       } catch (error) {
         if (error instanceof SecurityStateError) throw error;
@@ -3204,7 +3327,19 @@ class AzureSecurityStateCore {
           if (reconciled !== undefined) {
             const parsed = parseAudioGrant(reconciled, this.environment, partitionKey, grantId);
             if (!this.#audioGrantOperationMatches(grant, parsed)) fail('state-unavailable');
-            await this.#validateAudioGrantHandoff(lease, parsed.expiresAt);
+            try {
+              await this.#validateAudioGrantHandoff(lease, parsed.expiresAt);
+            } catch (error) {
+              await this.#releaseCommittedAudioGrant(
+                partitionKey,
+                grant,
+                installNextState,
+                sessionNextState,
+                restoreInstallWindow,
+                restoreSessionWindow
+              );
+              throw error;
+            }
             return this.#audioGrant(parsed);
           }
           continue;

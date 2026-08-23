@@ -9,6 +9,7 @@ import {
   CREDENTIAL_ABSOLUTE_TTL_MS,
   CREDENTIAL_IDLE_TTL_MS,
   LOCAL_MOCK_ENVIRONMENT,
+  MAX_AUDIO_SAMPLES_PER_WINDOW,
   MAX_AUDIO_GRANTS_PER_WINDOW,
   MIN_AUDIO_GRANT_HANDOFF_MS,
   OPENING_LEASE_MS,
@@ -1444,36 +1445,155 @@ describe('Azure Table durable adapter', () => {
     expect(windows.every((row) => JSON.parse(String(row.properties.events))[0].at === 1_600)).toBe(true);
   });
 
-  it('retains the committed Azure reservation and cursor when handoff has only 499ms left', async () => {
+  it('compensates a committed Azure reservation while preserving pre-existing quota and cursor state', async () => {
     const base = await activeFixture();
-    base.security.afterNextPointRead(async () => { base.fake.advance(300); });
-    base.rate.afterNextPointRead(async () => { base.fake.advance(300); });
-    base.rate.afterNextTransaction(async () => { base.fake.advance(501); });
+    const utteranceId = uuid(9_501) as never;
+    const prior = await base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 8_000
+    });
+    base.rate.afterNextTransaction(async () => { base.fake.advance(MIN_AUDIO_GRANT_HANDOFF_MS + 1); });
 
     await expect(base.runtime.reserveAudio({
       lease: base.active,
-      utteranceId: uuid(9_501) as never,
-      fromOriginalSampleOffset: 0,
+      utteranceId,
+      fromOriginalSampleOffset: prior.throughOriginalSampleOffset,
       originalSamples: 100
     })).rejects.toMatchObject({ category: 'state-unavailable' });
-    expect(base.fake.now()).toBe(2_101);
-    expect(base.rate.transactions()).toHaveLength(1);
+    expect(base.fake.now()).toBe(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+
     const rows = audioRows(base);
-    expect(rows.filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    const grants = rows.filter((row) => row.properties.kind === 'audio-grant');
+    expect(grants).toHaveLength(1);
+    expect(grants[0]?.properties.grantId).toBe(prior.grantId);
     const windows = rows.filter((row) => row.properties.kind === 'audio-window');
     expect(windows).toHaveLength(2);
     expect(windows.every((row) =>
-      row.properties.retainUntil === 2_600 &&
-      row.properties.activeGrantExpiresAt === 2_600 &&
-      row.properties.nextOriginalSampleOffset === 100
+      row.properties.retainUntil === prior.expiresAt &&
+      row.properties.activeGrantExpiresAt === prior.expiresAt &&
+      row.properties.nextOriginalSampleOffset === prior.throughOriginalSampleOffset &&
+      row.properties.activeUtteranceId === utteranceId
     )).toBe(true);
     expect(windows.every((row) => {
-      const events = JSON.parse(String(row.properties.events));
-      return events.length === 1 && events[0].at === 1_600 && events[0].amount === 100;
+      const events = JSON.parse(String(row.properties.events)) as readonly {
+        readonly at: number;
+        readonly amount: number;
+        readonly operationId: string;
+      }[];
+      return events.length === 1 &&
+        events[0]?.at === prior.issuedAt &&
+        events[0]?.amount === prior.reservedOriginalSamples &&
+        events[0]?.operationId === prior.grantId;
+    })).toBe(true);
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId,
+      fromOriginalSampleOffset: prior.throughOriginalSampleOffset,
+      originalSamples: MAX_AUDIO_SAMPLES_PER_WINDOW - prior.reservedOriginalSamples
+    })).resolves.toMatchObject({ throughOriginalSampleOffset: MAX_AUDIO_SAMPLES_PER_WINDOW });
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId,
+      fromOriginalSampleOffset: MAX_AUDIO_SAMPLES_PER_WINDOW,
+      originalSamples: 1
+    })).rejects.toMatchObject({ category: 'quota-exceeded' });
+  });
+
+  it('does not compensate a newer Azure grant that races during compensation', async () => {
+    const base = await activeFixture();
+    const utteranceId = uuid(9_508) as never;
+    let newerGrantId: string | undefined;
+    base.rate.afterNextTransaction(async () => {
+      base.fake.advance(MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+      base.rate.afterNextPointRead(async () => {
+        newerGrantId = (await base.runtime.reserveAudio({
+          lease: base.active,
+          utteranceId,
+          fromOriginalSampleOffset: 100,
+          originalSamples: 100
+        })).grantId;
+      });
+    });
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'state-unavailable' });
+    expect(newerGrantId).toBeDefined();
+    expect(base.fake.now()).toBe(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+
+    const rows = audioRows(base);
+    const grants = rows.filter((row) => row.properties.kind === 'audio-grant');
+    expect(grants).toHaveLength(1);
+    expect(grants[0]?.properties.grantId).toBe(newerGrantId);
+    expect(grants[0]?.properties.issuedAt).toBe(1_501);
+    expect(grants[0]?.properties.fromOriginalSampleOffset).toBe(100);
+    expect(grants[0]?.properties.throughOriginalSampleOffset).toBe(200);
+    const windows = rows.filter((row) => row.properties.kind === 'audio-window');
+    expect(windows).toHaveLength(2);
+    expect(windows.every((row) =>
+      row.properties.retainUntil === 2_501 &&
+      row.properties.activeGrantExpiresAt === 2_501 &&
+      row.properties.nextOriginalSampleOffset === 200 &&
+      row.properties.activeUtteranceId === utteranceId
+    )).toBe(true);
+    expect(windows.every((row) => {
+      const events = JSON.parse(String(row.properties.events)) as readonly {
+        readonly at: number;
+        readonly amount: number;
+        readonly operationId: string;
+      }[];
+      return events.length === 2 &&
+        events[0]?.amount === 100 &&
+        events[1]?.amount === 100 &&
+        events[1]?.operationId === newerGrantId;
     })).toBe(true);
   });
 
-  it('leaves one ambiguous committed Azure reservation when handoff has only 499ms left', async () => {
+  it('reports the original handoff error when a window CAS conflicts after grant deletion', async () => {
+    const base = await activeFixture();
+    base.rate.afterNextTransaction(async () => {
+      base.fake.advance(MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+      base.rate.beforeNextTransaction(async () => {
+        const window = base.rate.snapshot().find((row) =>
+          row.properties.kind === 'audio-window' && row.rowKey.startsWith('audio-window:session:'));
+        if (window === undefined) throw new Error('audio session window missing');
+        base.rate.insertRaw({
+          partitionKey: window.partitionKey,
+          rowKey: window.rowKey,
+          properties: window.properties
+        });
+      });
+    });
+
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_509) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).rejects.toMatchObject({ category: 'state-unavailable' });
+    expect(base.fake.now()).toBe(1_000 + MIN_AUDIO_GRANT_HANDOFF_MS + 1);
+    expect(base.rate.transactions()).toHaveLength(1);
+    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(0);
+    const windows = audioRows(base).filter((row) => row.properties.kind === 'audio-window');
+    expect(windows).toHaveLength(2);
+    expect(windows.every((row) =>
+      row.properties.retainUntil === 2_000 &&
+      row.properties.activeGrantExpiresAt === 2_000 &&
+      row.properties.nextOriginalSampleOffset === 100
+    )).toBe(true);
+    expect(windows.every((row) => {
+      const events = JSON.parse(String(row.properties.events)) as readonly { readonly amount: number }[];
+      return events.length === 1 && events[0]?.amount === 100;
+    })).toBe(true);
+  });
+
+  it('compensates an ambiguous committed Azure reservation when handoff has only 499ms left', async () => {
     const base = await activeFixture();
     base.security.afterNextPointRead(async () => { base.fake.advance(300); });
     base.rate.afterNextPointRead(async () => { base.fake.advance(300); });
@@ -1487,24 +1607,25 @@ describe('Azure Table durable adapter', () => {
       originalSamples: 100
     })).rejects.toMatchObject({ category: 'state-unavailable' });
     expect(base.fake.now()).toBe(2_101);
-    expect(base.rate.transactions()).toHaveLength(1);
+    expect(base.rate.transactions()).toHaveLength(2);
     const rows = audioRows(base);
     const grants = rows.filter((row) => row.properties.kind === 'audio-grant');
-    expect(grants).toHaveLength(1);
+    expect(grants).toHaveLength(0);
     const windows = rows.filter((row) => row.properties.kind === 'audio-window');
     expect(windows).toHaveLength(2);
     expect(windows.every((row) =>
-      row.properties.retainUntil === 2_600 &&
-      row.properties.activeGrantExpiresAt === 2_600 &&
-      row.properties.nextOriginalSampleOffset === 100
+      row.properties.retainUntil === 0 &&
+      row.properties.activeGrantExpiresAt === 0 &&
+      row.properties.nextOriginalSampleOffset === 0 &&
+      row.properties.activeUtteranceId === undefined
     )).toBe(true);
-    expect(windows.every((row) => {
-      const events = JSON.parse(String(row.properties.events));
-      return events.length === 1 &&
-        events[0].at === 1_600 &&
-        events[0].amount === 100 &&
-        events[0].operationId === grants[0]?.properties.grantId;
-    })).toBe(true);
+    expect(windows.every((row) => JSON.parse(String(row.properties.events)).length === 0)).toBe(true);
+    await expect(base.runtime.reserveAudio({
+      lease: base.active,
+      utteranceId: uuid(9_507) as never,
+      fromOriginalSampleOffset: 0,
+      originalSamples: 100
+    })).resolves.toMatchObject({ throughOriginalSampleOffset: 100 });
   });
 
   it('retries an ambiguous Azure audio transaction only when no grant row committed', async () => {
@@ -1539,7 +1660,7 @@ describe('Azure Table durable adapter', () => {
       .every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
   });
 
-  it('fails an ambiguous committed Azure audio grant with a stale final lease without compensation', async () => {
+  it('compensates an ambiguous committed Azure audio grant with a stale final lease', async () => {
     const base = await activeFixture();
     base.rate.beforeNextTransaction(async () => {
       await base.runtime.revokeInstallation({ installationId: base.redeemed.installationId });
@@ -1551,11 +1672,11 @@ describe('Azure Table durable adapter', () => {
       fromOriginalSampleOffset: 0,
       originalSamples: 100
     })).rejects.toMatchObject({ category: 'stale-lease' });
-    expect(base.rate.transactions()).toHaveLength(1);
-    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(1);
+    expect(base.rate.transactions()).toHaveLength(2);
+    expect(audioRows(base).filter((row) => row.properties.kind === 'audio-grant')).toHaveLength(0);
     expect(audioRows(base)
       .filter((row) => row.properties.kind === 'audio-window')
-      .every((row) => JSON.parse(String(row.properties.events)).length === 1)).toBe(true);
+      .every((row) => JSON.parse(String(row.properties.events)).length === 0)).toBe(true);
   });
 
   it.each([
