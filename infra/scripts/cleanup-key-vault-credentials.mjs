@@ -62,7 +62,7 @@ export const OPERATION_MANIFEST_VERSION_FILENAME_RE = /^cleanup-manifest-(\d{6})
 export const ABSENCE_RECEIPT_FILENAME = "cleanup-absence-receipt.json";
 export const STATE_ANCHOR_FILENAME = "cleanup-state-anchor.json";
 export const STATE_FILENAME_RE = /^cleanup-state-(\d{6})\.json$/u;
-const STATE_ANCHOR_SEQUENCE_RE = /^cleanup-state-anchor-(\d{6})\.json$/u;
+const STATE_ANCHOR_SEQUENCE_RE = /^cleanup-state-anchor-((?!000000)\d{6})\.json$/u;
 const JOURNAL_HEAD_SEQUENCE_RE = /^cleanup-journal-head-(\d{6})\.json$/u;
 const OPERATION_HEAD_ANCHOR_SEQUENCE_RE = /^cleanup-operation-head-(\d{6})\.json$/u;
 const OPERATION_HEAD_INTENT_SEQUENCE_RE = /^cleanup-operation-head-intent-(\d{6})\.json$/u;
@@ -854,7 +854,10 @@ function validateOperationManifest(raw, context) {
   const expectedSupersession = descriptor.supersession;
   assertOwnedRegular(SCRIPT_PATH, "utility");
   failIf(
-      raw.version !== 3 || raw.type !== "cleanup" || !["prepared", "completed"].includes(raw.status) || raw.operation !== "credential-cleanup" ||
+      raw.version !== 3 || raw.type !== "cleanup" || !["prepared", "completed"].includes(raw.status) ||
+      !Number.isSafeInteger(raw.sequence) || raw.sequence < 0 || raw.sequence > 1 ||
+      (raw.sequence === 0 ? raw.status !== "prepared" : raw.status !== "completed") ||
+      raw.operation !== "credential-cleanup" ||
       raw.runId !== descriptor.runId ||
       raw.phase !== "credential-cleanup" || raw.planSha256 !== descriptor.planSha256 ||
       raw.bindingSha256 !== descriptor.bindingSha256 || raw.contextSha256 !== descriptor.contextSha256 ||
@@ -864,7 +867,6 @@ function validateOperationManifest(raw, context) {
       !isSha256(raw.utilitySha256) || raw.utilitySha256 !== sha256File(SCRIPT_PATH) ||
       raw.vaultResourceId !== descriptor.vaultResourceId ||
       raw.journalCommitmentPath !== journalCommitmentRelativePath(descriptor.runId) ||
-      !Number.isSafeInteger(raw.sequence) || raw.sequence < 0 ||
       (raw.sequence === 0 ? raw.previousManifestSha256 !== null : !isSha256(raw.previousManifestSha256)) ||
       canonicalJson(raw.supersession) !== canonicalJson(expectedSupersession) ||
       !isSha256(raw.sha256) || raw.sha256 !== sha256Json(Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "sha256"))),
@@ -1824,6 +1826,15 @@ function readMutationIntents(config, context) {
         canonicalJson(commitments[index].value.intent) !== canonicalJson(intents[index].value),
       "mutation-intent-journal",
     );
+    const referencedStatePath = statePath(context.directory, intents[index].value.stateSequence);
+    const referencedState = readJson(referencedStatePath, "mutation-intent-state");
+    failIf(
+      referencedState.sequence !== intents[index].value.stateSequence ||
+        intents[index].value.preflightReceiptSha256 !== referencedState.preflightReceiptSha256 ||
+        intents[index].value.preflightVerifierId !== referencedState.preflightVerifierId ||
+        intents[index].value.preflightVerifierSha256 !== referencedState.preflightVerifierSha256,
+      "mutation-intent-state-preflight",
+    );
   }
   return intents;
 }
@@ -1953,7 +1964,10 @@ function validateStateShape(value, context, filePath, previousFilePath) {
     const receipt = validateAbsenceReceipt(readJson(receiptPath, "absence-receipt"), context);
     failIf(
       receipt.mutationTailSequence !== value.mutationTailSequence ||
-        receipt.mutationTailSha256 !== value.mutationTailSha256,
+        receipt.mutationTailSha256 !== value.mutationTailSha256 ||
+        receipt.preflightReceiptSha256 !== value.preflightReceiptSha256 ||
+        receipt.preflightVerifierId !== value.preflightVerifierId ||
+        receipt.preflightVerifierSha256 !== value.preflightVerifierSha256,
       "absence-receipt-linkage",
     );
   }
@@ -1961,9 +1975,18 @@ function validateStateShape(value, context, filePath, previousFilePath) {
   failIf(value.inventorySha256 !== sha256Json(value.inventory), "state-inventory-hash");
   failIf(value.manifestSha256 !== sha256File(context.operationPath), "state-manifest-hash");
   validateMutationTailShape(value, "state-mutation-tail");
-  failIf(value.preflightReceiptSha256 === null
-    ? value.preflightVerifierId !== null || value.preflightVerifierSha256 !== null
-    : !isSha256(value.preflightReceiptSha256) || value.preflightVerifierId !== PREFLIGHT_VERIFIER_ID || value.preflightVerifierSha256 !== context.operation.utilitySha256, "state-preflight-verifier");
+  if (value.status === "start-inventory-validated") {
+    failIf(
+      value.preflightReceiptSha256 !== null || value.preflightVerifierId !== null || value.preflightVerifierSha256 !== null,
+      "state-preflight-verifier",
+    );
+  } else {
+    failIf(
+      !isSha256(value.preflightReceiptSha256) || value.preflightVerifierId !== PREFLIGHT_VERIFIER_ID ||
+        value.preflightVerifierSha256 !== context.operation.utilitySha256,
+      "state-preflight-verifier",
+    );
+  }
   if (previousFilePath === undefined) failIf(value.previousStateSha256 !== null, "state-history");
   else failIf(value.previousStateSha256 !== sha256File(previousFilePath), "state-history");
   failIf(!isSha256(value.stateSha256) || value.stateSha256 !== stateHash(value), "state-integrity");
@@ -3106,7 +3129,8 @@ async function startOperation(config, runId) {
   for (const entry of readdirSync(context.directory, { withFileTypes: true })) {
     failIf(
       STATE_FILENAME_RE.test(entry.name) || entry.name === STATE_ANCHOR_FILENAME ||
-      STATE_ANCHOR_SEQUENCE_RE.test(entry.name) || JOURNAL_HEAD_SEQUENCE_RE.test(entry.name),
+      /^cleanup-state-anchor-\d{6}\.json$/u.test(entry.name) ||
+      JOURNAL_HEAD_SEQUENCE_RE.test(entry.name),
       "state-before-start",
     );
   }
