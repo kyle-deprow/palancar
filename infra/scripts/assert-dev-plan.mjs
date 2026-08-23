@@ -102,6 +102,14 @@ const CUTOVER_RUNTIME_SECRETS_USER =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user[0]";
 const CUTOVER_RUNTIME_SECRETS_USER_PREVIOUS =
   "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user";
+const CUTOVER_CREDENTIAL_CLEANUP_BENIGN_MISSING_RELEVANT_ATTRIBUTE_KEYS =
+  new Set([
+    JSON.stringify(["azurerm_resource_group.foundation", ["id"]]),
+    JSON.stringify([
+      "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+      [],
+    ]),
+  ]);
 const CUTOVER_RETIRED_WORKLOAD_DEPENDENCIES = Object.freeze([
   "key_vault_uri",
   "runtime_secrets_user_role_assignment_id",
@@ -7305,7 +7313,13 @@ function cutoverHasExactRelevantAttributes(plan, mode) {
   if (
     !Array.isArray(plan.relevant_attributes) ||
     !Array.isArray(reference) ||
-    plan.relevant_attributes.length !== reference.length
+    (mode !== AZURE_CREDENTIAL_CLEANUP_MODE &&
+      plan.relevant_attributes.length !== reference.length) ||
+    (mode === AZURE_CREDENTIAL_CLEANUP_MODE &&
+      (plan.relevant_attributes.length > reference.length ||
+        plan.relevant_attributes.length <
+          reference.length -
+            CUTOVER_CREDENTIAL_CLEANUP_BENIGN_MISSING_RELEVANT_ATTRIBUTE_KEYS.size))
   ) {
     return false;
   }
@@ -7319,10 +7333,17 @@ function cutoverHasExactRelevantAttributes(plan, mode) {
   }
   const actualSet = new Set(actualKeys);
   const referenceSet = new Set(referenceKeys);
+  const allowedMissingKeys =
+    mode === AZURE_CREDENTIAL_CLEANUP_MODE
+      ? CUTOVER_CREDENTIAL_CLEANUP_BENIGN_MISSING_RELEVANT_ATTRIBUTE_KEYS
+      : new Set();
   return (
     actualSet.size === actualKeys.length &&
     referenceSet.size === referenceKeys.length &&
-    [...referenceSet].every((key) => actualSet.has(key))
+    [...referenceSet].every(
+      (key) => actualSet.has(key) || allowedMissingKeys.has(key),
+    ) &&
+    [...actualSet].every((key) => referenceSet.has(key))
   );
 }
 

@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -5549,6 +5550,75 @@ test("cutover-family relevant attributes are exact order-independent path sets",
         candidate.relevant_attributes[0].attribute = reorderedPath;
       });
     }
+  }
+});
+
+test("credential-cleanup tolerates only its two known-benign missing relevant attributes", () => {
+  const benignMissing = [
+    { resource: "azurerm_resource_group.foundation", attribute: ["id"] },
+    {
+      resource:
+        "module.workload_key_vault.azurerm_role_assignment.runtime_secrets_user",
+      attribute: [],
+    },
+  ];
+  const cases = [
+    [runtimeCutoverFixture, "azure-generation-cutover"],
+    [credentialCleanupFixture, "azure-credential-cleanup"],
+    [terminalFixture, "final-rollout-complete"],
+  ];
+  const removeAttribute = (candidate, expected) => {
+    const index = candidate.relevant_attributes.findIndex(
+      (entry) =>
+        entry.resource === expected.resource &&
+        isDeepStrictEqual(entry.attribute, expected.attribute),
+    );
+    assert.notEqual(index, -1);
+    candidate.relevant_attributes.splice(index, 1);
+  };
+
+  for (const missing of benignMissing) {
+    for (const [source, mode] of cases) {
+      const candidate = clone(source);
+      removeAttribute(candidate, missing);
+      assert.equal(
+        acceptsPlan(candidate, mode),
+        mode === "azure-credential-cleanup",
+        `${mode} missing ${JSON.stringify(missing)}`,
+      );
+    }
+  }
+
+  const missingBoth = clone(credentialCleanupFixture);
+  for (const missing of benignMissing) removeAttribute(missingBoth, missing);
+  assert.equal(acceptsPlan(missingBoth, "azure-credential-cleanup"), true);
+
+  const otherMissing = credentialCleanupFixture.relevant_attributes.find(
+    (entry) =>
+      !benignMissing.some(
+        (benign) =>
+          entry.resource === benign.resource &&
+          isDeepStrictEqual(entry.attribute, benign.attribute),
+      ),
+  );
+  assert.ok(otherMissing);
+  for (const [source, mode] of cases) {
+    const candidate = clone(source);
+    removeAttribute(candidate, otherMissing);
+    assert.equal(
+      acceptsPlan(candidate, mode),
+      false,
+      `${mode} missing ${JSON.stringify(otherMissing)}`,
+    );
+  }
+
+  for (const [source, mode] of cases) {
+    const candidate = clone(source);
+    candidate.relevant_attributes.push({
+      resource: "module.unreviewed.azurerm_resource.this",
+      attribute: ["id"],
+    });
+    assert.equal(acceptsPlan(candidate, mode), false, `${mode} extra entry`);
   }
 });
 
