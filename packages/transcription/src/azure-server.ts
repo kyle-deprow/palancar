@@ -3,6 +3,7 @@ import {
   isIso6391LanguageCode,
   snapshotOwnDataProperties
 } from './types.js';
+import { AZURE_REALTIME_DEPLOYMENT_PATTERN } from './azure-deployment.js';
 
 export const MAX_AZURE_REALTIME_SERVER_EVENT_JSON_BYTES = MAX_CONTROL_MESSAGE_BYTES;
 export const DEFAULT_AZURE_REALTIME_SERVER_EVENT_MAX_BYTES =
@@ -33,7 +34,6 @@ export const MAX_AZURE_REALTIME_SERVER_AUDIO_OFFSET_MS = 86_400_000 as const;
 export const MAX_AZURE_REALTIME_SERVER_SEGMENT_SECONDS = 86_400 as const;
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 // Dedicated transcription streams plus the VAD and item lifecycle events
 // documented as companions to automatic/manual input-audio commits.
 const EVENT_TYPES = new Set([
@@ -1460,7 +1460,7 @@ function validateParserOptions(
       expectedDeployment,
       MAX_AZURE_REALTIME_SERVER_DEPLOYMENT_BYTES
     ) ||
-    !DEPLOYMENT_PATTERN.test(expectedDeployment)
+    !AZURE_REALTIME_DEPLOYMENT_PATTERN.test(expectedDeployment)
   ) {
     fail('invalid-input');
   }

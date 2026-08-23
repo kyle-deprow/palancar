@@ -3,13 +3,12 @@ import {
   snapshotOwnDataProperties
 } from './types.js';
 import type { TranscriptionLanguageConfiguration } from './types.js';
+import { AZURE_REALTIME_DEPLOYMENT_PATTERN } from './azure-deployment.js';
 
 export const AZURE_REALTIME_INPUT_AUDIO_FORMAT = 'audio/pcm' as const;
 /** One 100 ms 16 kHz relay frame after 16->24 kHz conversion. */
 export const DEFAULT_AZURE_REALTIME_APPEND_MAX_BYTES = 4_800 as const;
 export const MAX_AZURE_REALTIME_APPEND_BYTES = 4_800 as const;
-
-const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/;
 
 export type AzureRealtimeClientMessageErrorReason =
   | 'invalid-deployment'
@@ -94,7 +93,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function validateDeployment(deployment: unknown): asserts deployment is string {
-  if (typeof deployment !== 'string' || !DEPLOYMENT_PATTERN.test(deployment)) {
+  if (typeof deployment !== 'string' || !AZURE_REALTIME_DEPLOYMENT_PATTERN.test(deployment)) {
     fail('invalid-deployment');
   }
 }

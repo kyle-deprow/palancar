@@ -13,6 +13,7 @@ import {
   buildAzureRealtimeSessionUpdateMessage,
   type AzureRealtimeClientMessage
 } from './azure-client.js';
+import { AZURE_REALTIME_DEPLOYMENT_PATTERN } from './azure-deployment.js';
 import { validateTranscriptionSessionConfiguration } from './configuration.js';
 import {
   AzureRealtimeServerEventError,
@@ -55,7 +56,6 @@ export const AZURE_REALTIME_TRANSCRIPTION_COMMIT_ORIGINAL_SAMPLES = 9_600 as con
 export const AZURE_REALTIME_TRANSCRIPTION_COMMIT_PROVIDER_SAMPLES = 14_400 as const;
 
 const SOCKET_OPEN = 1 as const;
-const DEPLOYMENT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/;
 const AZURE_OPENAI_HOST_PATTERN =
   /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.openai\.azure\.com$/;
 const EVENT_ID_PATTERN = /^[A-Za-z0-9:_-]{1,64}$/;
@@ -346,7 +346,7 @@ export class AzureRealtimeTranscriptionAdapter implements TranscriptionAdapter {
   readonly #options: Readonly<AzureAdapterRuntimeOptions>;
 
   constructor(options: AzureRealtimeTranscriptionAdapterOptions) {
-    if (!isPlainObject(options) || !DEPLOYMENT_PATTERN.test(options.deployment)) {
+    if (!isPlainObject(options) || !AZURE_REALTIME_DEPLOYMENT_PATTERN.test(options.deployment)) {
       throw new TypeError('Invalid Azure Realtime adapter options');
     }
     this.endpoint = validateWebSocketEndpoint(options.endpoint);

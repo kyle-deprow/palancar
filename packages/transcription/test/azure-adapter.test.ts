@@ -362,6 +362,18 @@ function messageTypes(socket: FakeSocket): string[] {
 }
 
 describe('AzureRealtimeTranscriptionAdapter', () => {
+  it('accepts a two-character deployment name', () => {
+    expect(() => new AzureRealtimeTranscriptionAdapter({
+      endpoint: AZURE_ENDPOINT,
+      deployment: 'ab',
+      tokenProvider: async () => ({
+        token: 'test-token',
+        expiresOnTimestamp: Date.now() + 60_000
+      }),
+      socketFactory: () => new FakeSocket()
+    })).not.toThrow();
+  });
+
   it('accepts only the canonical public Azure OpenAI transcription websocket', () => {
     const socketFactory: AzureRealtimeSocketFactory = () => new FakeSocket();
     const tokenProvider = async () => ({
