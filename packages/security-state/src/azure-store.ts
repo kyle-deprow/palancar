@@ -2627,7 +2627,10 @@ class AzureSecurityStateCore {
         mapBoundary(error);
       }
     }
-    fail('invalid-ticket');
+    const finalNow = this.#now();
+    const finalAuthentication = await this.#readAuthentication(input.credential, finalNow, false);
+    if (finalAuthentication === undefined) fail('invalid-ticket');
+    fail('state-unavailable');
   }
 
   async consumeSessionTicket(value: ConsumeTicketInput): Promise<SessionLease> {
@@ -2764,7 +2767,59 @@ class AzureSecurityStateCore {
         mapBoundary(error);
       }
     }
-    fail('invalid-ticket');
+    const finalNow = this.#now();
+    const finalTicketEntity = await this.#point(this.#security, this.environment, ticketKey(hash));
+    if (finalTicketEntity === undefined) fail('invalid-ticket');
+    const finalTicket = parseTicket(finalTicketEntity, this.environment, hash);
+    if (
+      finalTicket.status !== 'issued' || finalNow >= finalTicket.expiresAt ||
+      !this.#ticketBindingMatches(finalTicket, binding, bindingHash)
+    ) fail('invalid-ticket');
+    const finalInstallationEntity = await this.#point(
+      this.#security,
+      this.environment,
+      installationKey(finalTicket.installationId)
+    );
+    const finalSessionEntity = await this.#point(
+      this.#security,
+      this.environment,
+      sessionKey(finalTicket.installationId)
+    );
+    if (finalInstallationEntity === undefined || finalSessionEntity === undefined) fail('invalid-ticket');
+    const finalInstallation = parseInstallation(
+      finalInstallationEntity,
+      this.environment,
+      finalTicket.installationId
+    );
+    const finalSession = parseSession(
+      finalSessionEntity,
+      this.environment,
+      finalTicket.installationId
+    );
+    if (
+      finalInstallation.status !== 'active' || finalNow >= finalInstallation.idleExpiresAt ||
+      finalNow >= finalInstallation.absoluteExpiresAt ||
+      finalInstallation.tombstoneVersion !== finalTicket.tombstoneVersion ||
+      finalInstallation.currentCredentialVersion !== finalTicket.credentialVersion ||
+      ((finalSession.status === 'opening' || finalSession.status === 'active') &&
+        finalNow < finalSession.leaseExpiresAt)
+    ) fail('invalid-ticket');
+    const finalCredentialEntity = await this.#point(
+      this.#security,
+      this.environment,
+      credentialKey(finalInstallation.currentCredentialHash)
+    );
+    if (finalCredentialEntity === undefined) fail('state-unavailable');
+    const finalCredential = parseCredential(
+      finalCredentialEntity,
+      this.environment,
+      finalInstallation.currentCredentialHash
+    );
+    if (
+      !this.#credentialValid(finalCredential, finalInstallation, finalNow, false) ||
+      finalCredential.version !== finalTicket.credentialVersion
+    ) fail('invalid-ticket');
+    fail('state-unavailable');
   }
 
   async #sessionMutation(

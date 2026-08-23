@@ -23,6 +23,7 @@ import {
 } from '../src/index.js';
 import {
   AzureTableBoundaryError,
+  AZURE_CAS_ATTEMPTS,
   createAzureTableStoresForTesting,
   createAudioGrantMeter,
   createDeterministicIdFactory,
@@ -183,7 +184,7 @@ function requiredReplacement(
 function fakeTable() {
   let rows = new Map<string, AzureStoredEntity>();
   let version = 0;
-  let failure: Failure | undefined;
+  const failures: Failure[] = [];
   let afterTransaction: (() => Promise<void>) | undefined;
   let beforeTransaction: (() => Promise<void>) | undefined;
   let afterPointRead: (() => Promise<void>) | undefined;
@@ -191,9 +192,10 @@ function fakeTable() {
   const key = (partitionKey: string, rowKey: string): string => `${partitionKey}\u0000${rowKey}`;
   const nextEtag = (): string => `"etag-${++version}"`;
   const takeFailure = (operation: Operation, after: boolean): void => {
-    if (failure?.operation === operation && failure.after === after) {
-      const current = failure;
-      failure = undefined;
+    const index = failures.findIndex((item) => item.operation === operation && item.after === after);
+    if (index >= 0) {
+      const current = failures.splice(index, 1)[0];
+      if (current === undefined) throw new Error('missing scheduled failure');
       throw new AzureTableBoundaryError(current.kind);
     }
   };
@@ -284,12 +286,13 @@ function fakeTable() {
   return Object.freeze({
     client,
     failNext: (operation: Operation, kind: AzureBoundaryErrorKind, after = false): void => {
-      failure = { operation, kind, after };
+      failures.push({ operation, kind, after });
     },
     afterNextPointRead: (callback: () => Promise<void>): void => { afterPointRead = callback; },
     beforeNextTransaction: (callback: () => Promise<void>): void => { beforeTransaction = callback; },
     afterNextTransaction: (callback: () => Promise<void>): void => { afterTransaction = callback; },
     insertRaw: (entity: AzureNewEntity): void => { rows.set(key(entity.partitionKey, entity.rowKey), store(entity)); },
+    deleteRaw: (partitionKey: string, rowKey: string): void => { rows.delete(key(partitionKey, rowKey)); },
     snapshot: (): readonly AzureStoredEntity[] => Object.freeze([...rows.values()].map(cloneEntity)),
     transactions: (): readonly (readonly AzureTableMutation[])[] => Object.freeze(transactions.map((item) => Object.freeze([...item])))
   });
@@ -329,6 +332,37 @@ function ticketRequest(credential: string) {
 
 function ticketConsume(ticketValue: string) {
   return { ticket: ticketValue, environment: ENVIRONMENT, audience: AUDIENCE, intent: 'new' as const };
+}
+
+function keepSecurityRowContended(
+  base: ReturnType<typeof fixture>,
+  kind: string,
+  status?: string
+): void {
+  const refresh = async (): Promise<void> => {
+    const row = requiredRow(base.security.snapshot(), kind, status);
+    base.security.insertRaw({
+      partitionKey: row.partitionKey,
+      rowKey: row.rowKey,
+      properties: row.properties
+    });
+    base.security.beforeNextTransaction(refresh);
+  };
+  base.security.beforeNextTransaction(refresh);
+}
+
+function forceSecurityTransactionConflicts(
+  base: ReturnType<typeof fixture>,
+  callback: (attempt: number) => void | Promise<void>
+): void {
+  let attempt = 0;
+  const prepare = async (): Promise<void> => {
+    attempt += 1;
+    await callback(attempt);
+    base.security.failNext('transaction', 'precondition-failed');
+    if (attempt < AZURE_CAS_ATTEMPTS) base.security.beforeNextTransaction(prepare);
+  };
+  base.security.beforeNextTransaction(prepare);
 }
 
 async function enroll(base: ReturnType<typeof fixture>, source = 'source-1') {
@@ -587,6 +621,152 @@ describe('Azure Table durable adapter', () => {
       .rejects.toMatchObject({ category: 'state-unavailable' });
     await expect(outage.runtime.consumeSessionTicket(ticketConsume(token(9_999))))
       .rejects.toMatchObject({ category: 'invalid-ticket' });
+  });
+
+  it('reports state-unavailable after persistent ticket issue ETag contention', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    keepSecurityRowContended(base, 'credential', 'current');
+
+    await expect(base.runtime.issueSessionTicket(ticketRequest(redeemed.credential)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+  });
+
+  it('reports state-unavailable after persistent ticket consume ETag contention while invalid tickets stay invalid', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const ticket = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
+
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(token(9_999))))
+      .rejects.toMatchObject({ category: 'invalid-ticket' });
+
+    keepSecurityRowContended(base, 'ticket', 'issued');
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(ticket.ticket)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+  });
+
+  it('reports invalid-ticket when ticket issuance authentication becomes invalid during retries', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'credential', 'current');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: attempt === 2 ? { ...row.properties, status: 'revoked' } : row.properties
+      });
+    });
+
+    await expect(base.runtime.issueSessionTicket(ticketRequest(redeemed.credential)))
+      .rejects.toMatchObject({ category: 'invalid-ticket' });
+  });
+
+  it('reports invalid-ticket when the final ticket-issue conflict observes a revoked installation', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'installation', 'active');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: attempt === AZURE_CAS_ATTEMPTS
+          ? { ...row.properties, status: 'revoked', revokedAt: base.fake.now() }
+          : row.properties
+      });
+    });
+
+    await expect(base.runtime.issueSessionTicket(ticketRequest(redeemed.credential)))
+      .rejects.toMatchObject({ category: 'invalid-ticket' });
+  });
+
+  it('reports invalid-ticket when the final ticket-consume conflict observes an invalidated installation', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const ticket = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'installation', 'active');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: attempt === AZURE_CAS_ATTEMPTS
+          ? { ...row.properties, status: 'revoked', revokedAt: base.fake.now() }
+          : row.properties
+      });
+    });
+
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(ticket.ticket)))
+      .rejects.toMatchObject({ category: 'invalid-ticket' });
+  });
+
+  it('reports invalid-ticket when the final ticket-consume conflict observes a deleted ticket', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const ticket = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      if (attempt !== AZURE_CAS_ATTEMPTS) return;
+      const row = requiredRow(base.security.snapshot(), 'ticket', 'issued');
+      base.security.deleteRaw(row.partitionKey, row.rowKey);
+    });
+
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(ticket.ticket)))
+      .rejects.toMatchObject({ category: 'invalid-ticket' });
+  });
+
+  it('reports state-unavailable when ticket-issue final reconciliation cannot be read', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'credential', 'current');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: row.properties
+      });
+      if (attempt === AZURE_CAS_ATTEMPTS) base.security.failNext('pointRead', 'unavailable');
+    });
+
+    await expect(base.runtime.issueSessionTicket(ticketRequest(redeemed.credential)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+  });
+
+  it('reports state-unavailable when ticket-consume final reconciliation cannot be read', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const ticket = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'installation', 'active');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: row.properties
+      });
+      if (attempt === AZURE_CAS_ATTEMPTS) base.security.failNext('pointRead', 'unavailable');
+    });
+
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(ticket.ticket)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
+  });
+
+  it('reports state-unavailable when ticket-consume exhaustion re-read cannot be read', async () => {
+    const base = fixture();
+    const { redeemed } = await enroll(base);
+    const ticket = await base.runtime.issueSessionTicket(ticketRequest(redeemed.credential));
+    forceSecurityTransactionConflicts(base, (attempt) => {
+      const row = requiredRow(base.security.snapshot(), 'installation', 'active');
+      base.security.insertRaw({
+        partitionKey: row.partitionKey,
+        rowKey: row.rowKey,
+        properties: row.properties
+      });
+      if (attempt === AZURE_CAS_ATTEMPTS) {
+        base.security.afterNextPointRead(async () => {
+          base.security.failNext('pointRead', 'unavailable');
+        });
+      }
+    });
+
+    await expect(base.runtime.consumeSessionTicket(ticketConsume(ticket.ticket)))
+      .rejects.toMatchObject({ category: 'state-unavailable' });
   });
 
   it('redeems one pairing exactly once across 100 concurrent calls', async () => {
