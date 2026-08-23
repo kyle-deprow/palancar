@@ -35,6 +35,7 @@ import {
   type G2Transport,
 } from "../src/bridge/index.js";
 import { PAGE_LAYOUTS } from "../src/display/index.js";
+import { RelayTransportError } from "../src/transport/index.js";
 import type {
   RelayTransportCallbackEvent,
   RelayTransportOptions,
@@ -205,8 +206,18 @@ class FakeTransport implements G2Transport {
     this.options.onEvent?.(event);
   }
 
-  emitError(recoveryDisposition: "retry" | "stop"): void {
-    this.options.onTransportError?.({ recoveryDisposition } as never);
+  emitError(recoveryDisposition: RelayTransportError["recoveryDisposition"]): void;
+  emitError(
+    kind: RelayTransportError["kind"],
+    recoveryDisposition: RelayTransportError["recoveryDisposition"],
+  ): void;
+  emitError(
+    kindOrDisposition: RelayTransportError["kind"] | RelayTransportError["recoveryDisposition"],
+    recoveryDisposition?: RelayTransportError["recoveryDisposition"],
+  ): void {
+    const kind = recoveryDisposition === undefined ? "websocket" : kindOrDisposition as RelayTransportError["kind"];
+    const disposition = recoveryDisposition ?? kindOrDisposition as RelayTransportError["recoveryDisposition"];
+    this.options.onTransportError?.(new RelayTransportError(kind, disposition));
   }
 }
 
@@ -1322,6 +1333,44 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
       }),
     });
     expect(transport.pcm).toHaveLength(1);
+  });
+
+  it("routes an active audio queue overflow through utterance abort and keeps the session alive", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+    expect(harness.runtime.snapshot.state).toBe("Listening");
+
+    transport.emitError("audio", "stop");
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Ready");
+    expect(harness.runtime.snapshot.sessionReady).toBe(true);
+    expect(harness.runtime.snapshot.cleanupState).toBe("active");
+    expect(transport.closed).toBe(false);
+    expect(harness.bridge.audioCalls.filter(({ isOpen }) => !isOpen)).toHaveLength(1);
+  });
+
+  it.each([
+    { name: "authentication ticket", kind: "ticket" as const },
+    { name: "protocol", kind: "protocol" as const },
+  ])("keeps an unrecoverable $name transport error terminal", async ({ kind }) => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+
+    transport.emitError(kind, "stop");
+    await harness.runtime.whenEventsIdle();
+
+    expect(harness.runtime.snapshot.state).toBe("Error");
+    expect(harness.runtime.snapshot.sessionReady).toBe(false);
+    expect(harness.runtime.snapshot.cleanupState).toBe("cleaned");
+    expect(transport.closed).toBe(true);
   });
 
   it("reports audio open failure without marking the microphone open", async () => {

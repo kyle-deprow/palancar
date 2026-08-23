@@ -1662,6 +1662,33 @@ describe("G2 relay transport", () => {
     expect(events.some((event) => event.type === "fatal")).toBe(false);
   });
 
+  it("classifies an audio queue overflow as a stop-scoped audio error after cancelling", async () => {
+    const errors: RelayTransportError[] = [];
+    const { transport } = createTransport(undefined, (error) => errors.push(error));
+    const socket = await openSocket(transport);
+
+    socket.message(JSON.stringify(readyMessage({
+      ...DEFAULT_NEGOTIATED_LIMITS,
+      maxUnacknowledgedSamples: 2,
+      maxRetainedReplaySamples: 2,
+      maxUtteranceSamples: 2,
+    })));
+    transport.startUtterance(UTTERANCE_ID);
+    transport.pushPcm(Uint8Array.of(1, 2, 3, 4, 5, 6));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "audio", recoveryDisposition: "stop" });
+    expect(sentControl(socket, socket.sent.length - 1)).toMatchObject({
+      type: "utterance.cancel",
+      utteranceId: UTTERANCE_ID,
+    });
+    expect(transport.snapshot).toMatchObject({
+      connectionState: "open",
+      sessionReady: true,
+      activeUtteranceId: UTTERANCE_ID,
+    });
+  });
+
   it("follows the relay recoverable error to 4503 flow with exactly one fresh loss", async () => {
     const errors: RelayTransportError[] = [];
     const events: RelayTransportCallbackEvent[] = [];

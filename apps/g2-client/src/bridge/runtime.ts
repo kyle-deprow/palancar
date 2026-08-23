@@ -258,6 +258,35 @@ function toClientEvent(event: RelayTransportCallbackEvent): ClientEvent | undefi
   }
 }
 
+function transportErrorEvent(error: RelayTransportError, state: ClientState): ClientEvent {
+  if (error.kind !== "audio" || error.recoveryDisposition !== "stop") {
+    return { type: "fatal" };
+  }
+
+  switch (state.state) {
+    case "Listening":
+    case "Finalizing":
+    case "Translating":
+    case "Results":
+      return Object.freeze({
+        type: "utterance.aborted" as const,
+        sessionId: state.sessionId,
+        sessionEpoch: state.sessionEpoch,
+        utteranceId: state.utteranceId,
+        category: "flow" as const,
+      });
+    case "Starting":
+    case "EnrollmentChecking":
+    case "EnrollmentRequired":
+    case "Enrolling":
+    case "StorageError":
+    case "TargetSelection":
+    case "Ready":
+    case "Error":
+      return { type: "fatal" };
+  }
+}
+
 function randomUuidV4(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
@@ -1901,7 +1930,11 @@ export class G2BridgeRuntime {
       );
       return;
     }
-    this.#queueTransportEvent(transport, { type: "fatal" }, generation);
+    this.#queueTransportEvent(
+      transport,
+      transportErrorEvent(error, this.#state),
+      generation,
+    );
   }
 
   #handleTransportCallback(
