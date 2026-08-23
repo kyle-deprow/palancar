@@ -28,7 +28,7 @@ const SOURCE_MIN_CORE_WORDS = 2;
 const SOURCE_MIN_SINGLETON_CORES = 2;
 const CLASSIFIER_ID = 'eld-small-development-provisional';
 const VALIDATOR_ID = 'eld-small-development-provisional';
-const COMPONENT_VERSION = '1.1.0';
+const COMPONENT_VERSION = '1.2.0';
 const CLASSIFIERS = new WeakSet<object>();
 const VALIDATORS = new WeakSet<object>();
 const READINESS_SANITY_FIXTURES = Object.freeze([
@@ -474,9 +474,10 @@ function sourceMarginThreshold(
 
 function generatedFullTextMarginThreshold(
   expectedLanguage: GeneratedLanguage,
+  detectedLanguage: string,
   settings: DevelopmentProvisionalProfile
 ): number {
-  return expectedLanguage === ENGLISH_LANGUAGE
+  return expectedLanguage === ENGLISH_LANGUAGE || detectedLanguage !== expectedLanguage
     ? settings.provisionalMarginThreshold
     : settings.generatedOutputTargetMarginThresholds[expectedLanguage];
 }
@@ -682,6 +683,7 @@ function classifyGenerated(
     const full = detect(detector, text);
     const fullTextMarginThreshold = generatedFullTextMarginThreshold(
       expectedLanguage,
+      full.language,
       settings
     );
     if (hasSubstantiveMix(detector, text, settings, full)) {

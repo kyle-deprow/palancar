@@ -14,12 +14,12 @@ detector. Provisional readiness resolves only after module loading, detector
 construction, and exact reliable Spanish, Turkish, and English sanity
 detections, so malformed or semantically incompatible initialization keeps
 `/readyz` closed. Input is NFKC-normalized and bounded to 512 Unicode code
-points by the `eld-small-dev-7` profile. Within that bound every qualifying
+points by the `eld-small-dev-8` profile. Within that bound every qualifying
 clause and every overlapping one-through-eight-word window is inspected. A
-selected-target source detection uses its registry source margin (`.04` for
-Spanish and `.08` for Turkish); non-selected full detections retain the shared
-`.08` margin. Generated English and Turkish full-text also retain `.08`. Only
-generated Spanish full-text uses `.05`, accepting proven-correct
+selected-target source detection uses its registry source margin (`.01` for
+Spanish and `.04` for Turkish); non-selected full detections retain the shared
+`.08` margin. Generated English full-text retains `.08`; generated Spanish and
+Turkish full-text use `.01` and `.04`, accepting proven-correct
 Spanish/Catalan-close output while still rejecting a different top language.
 A conflicting source interval is strong only when its raw score meets the
 profile threshold and its margin meets the generic provisional margin (the

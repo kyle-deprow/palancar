@@ -32,12 +32,12 @@ const DEVELOPMENT_PROFILE = {
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
   sourceTargetMarginThresholds: {
-    es: 0.04,
-    tr: 0.08
+    es: 0.01,
+    tr: 0.04
   },
   generatedOutputTargetMarginThresholds: {
-    es: 0.05,
-    tr: 0.08
+    es: 0.01,
+    tr: 0.04
   },
   minimumTextCharacters: DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   minimumWindowCharacters: 1,
@@ -124,16 +124,16 @@ describe('language registry', () => {
   });
 
   it('exports the exact frozen provisional profile versions and margins', () => {
-    expect(DEVELOPMENT_PROVISIONAL_PROFILE_VERSION).toBe('eld-small-dev-7');
-    expect(LANGUAGE_REGISTRY_VERSION).toBe('2.5.0');
+    expect(DEVELOPMENT_PROVISIONAL_PROFILE_VERSION).toBe('eld-small-dev-8');
+    expect(LANGUAGE_REGISTRY_VERSION).toBe('2.5.1');
     for (const definition of listLanguageDefinitions()) {
       expect(definition.developmentProvisional?.sourceTargetMarginThresholds)
-        .toEqual({ es: 0.04, tr: 0.08 });
+        .toEqual({ es: 0.01, tr: 0.04 });
       expect(Object.isFrozen(
         definition.developmentProvisional?.sourceTargetMarginThresholds
       )).toBe(true);
       expect(definition.developmentProvisional?.generatedOutputTargetMarginThresholds)
-        .toEqual({ es: 0.05, tr: 0.08 });
+        .toEqual({ es: 0.01, tr: 0.04 });
       expect(Object.isFrozen(
         definition.developmentProvisional?.generatedOutputTargetMarginThresholds
       )).toBe(true);
@@ -295,9 +295,9 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           sourceTargetMarginThresholds: {
-            es: 0.04,
-            tr: 0.08,
-            ca: 0.04
+            es: 0.01,
+            tr: 0.04,
+            ca: 0.01
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>
@@ -308,7 +308,7 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           sourceTargetMarginThresholds: {
-            es: 0.04
+            es: 0.01
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>
@@ -319,7 +319,7 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           sourceTargetMarginThresholds: {
-            tr: 0.08
+            tr: 0.04
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>
@@ -342,9 +342,9 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           generatedOutputTargetMarginThresholds: {
-            es: 0.05,
-            tr: 0.08,
-            ca: 0.05
+            es: 0.01,
+            tr: 0.04,
+            ca: 0.04
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>
@@ -355,7 +355,7 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           generatedOutputTargetMarginThresholds: {
-            es: 0.05
+            es: 0.01
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>
@@ -366,7 +366,7 @@ describe('language registry', () => {
         developmentProvisional: {
           ...DEVELOPMENT_PROFILE,
           generatedOutputTargetMarginThresholds: {
-            tr: 0.08
+            tr: 0.04
           }
         }
       } as unknown as LanguageDefinition<TargetLanguage>

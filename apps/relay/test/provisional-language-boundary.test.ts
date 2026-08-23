@@ -24,12 +24,24 @@ const TEXT = Object.freeze({
   tr: 'Merhaba. Tren istasyonu nerede?'
 });
 const REAL_SOURCE_TEXT = Object.freeze({
+  esTrainDeparture: 'El tren sale a las tres de la tarde.',
+  esStationTwoBlocks: 'La estación de tren está a dos calles de aquí.',
   esDisculpe: 'Disculpe, ¿dónde está la estación de tren?',
+  trTicket: 'Bilet on avro tutuyor.',
+  trStationTwoBlocks: 'Tren istasyonu buradan iki sokak ötede.',
   esQuestion: '¿Dónde está la estación de tren?',
   trSize: 'Size yardım etmek istiyorum.',
   trQuestion: 'Merhaba, tren istasyonu nerede?',
   catalan: "Podria ajudar-me a localitzar l'estació de tren, si us plau?"
 });
+const MEASURED_MINIMUM_MARGIN_CORPUS = Object.freeze([
+  ['es', REAL_SOURCE_TEXT.esTrainDeparture],
+  ['es', REAL_SOURCE_TEXT.esStationTwoBlocks],
+  ['es', REAL_SOURCE_TEXT.esDisculpe],
+  ['tr', REAL_SOURCE_TEXT.trTicket],
+  ['tr', REAL_SOURCE_TEXT.trStationTwoBlocks],
+  ['tr', REAL_SOURCE_TEXT.trSize]
+] as const);
 
 interface DetectorSelection {
   readonly language: string;
@@ -230,7 +242,7 @@ describe('development provisional ELD-small boundary', () => {
   ] as const)('accepts substantive symmetric %s source text', async (target, text) => {
     const boundary = createDevelopmentProvisionalLanguageBoundary();
     expect(isDevelopmentProvisionalTextLanguageClassifier(boundary.classifier)).toBe(true);
-    expect(boundary.generatedLanguageValidator.version).toBe('1.1.0');
+    expect(boundary.generatedLanguageValidator.version).toBe('1.2.0');
     expect(
       isDevelopmentProvisionalGeneratedLanguageValidator(
         boundary.generatedLanguageValidator
@@ -260,6 +272,20 @@ describe('development provisional ELD-small boundary', () => {
     });
   });
 
+  it.each(MEASURED_MINIMUM_MARGIN_CORPUS)(
+    'accepts the measured minimum-margin %s source sentence: %s',
+    async (target, text) => {
+      await expect(
+        createDevelopmentProvisionalLanguageBoundary().classifier.classify(text, target)
+      ).resolves.toMatchObject({
+        status: 'provisional',
+        detectedLanguage: target,
+        decision: 'accept',
+        reason: 'MATCH'
+      });
+    }
+  );
+
   it.each([
     ['es', TEXT.en],
     ['tr', TEXT.en]
@@ -288,6 +314,26 @@ describe('development provisional ELD-small boundary', () => {
     ).resolves.toMatchObject({
       status: 'provisional',
       detectedLanguage,
+      decision: 'reject',
+      reason: 'UNSELECTED_LANGUAGE'
+    });
+  });
+
+  it('keeps a detected Catalan source rejection on the generic margin', async () => {
+    const text = REAL_SOURCE_TEXT.catalan;
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => candidate === text
+        ? {
+            language: 'ca',
+            score: 0.9,
+            secondLanguage: 'es',
+            secondScore: 0.8,
+            reliable: true
+          }
+        : tokenLanguage(candidate))
+    });
+    await expect(boundary.classifier.classify(text, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'ca',
       decision: 'reject',
       reason: 'UNSELECTED_LANGUAGE'
     });
@@ -354,6 +400,28 @@ describe('development provisional ELD-small boundary', () => {
     });
     await expect(boundary.classifier.classify(unselectedText, 'es')).resolves.toMatchObject({
       detectedLanguage: 'unknown',
+      decision: 'uncertain',
+      reason: 'UNKNOWN'
+    });
+  });
+
+  it('keeps the source score threshold after lowering the selected margin', async () => {
+    const text = 'below score selected source text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => candidate === text
+        ? {
+            language: 'es',
+            score: 0.64,
+            secondLanguage: 'ca',
+            secondScore: 0.6,
+            reliable: true
+          }
+        : tokenLanguage(candidate))
+    });
+
+    await expect(boundary.classifier.classify(text, 'es')).resolves.toMatchObject({
+      detectedLanguage: 'unknown',
+      provisionalScore: 0.64,
       decision: 'uncertain',
       reason: 'UNKNOWN'
     });
@@ -452,7 +520,7 @@ describe('development provisional ELD-small boundary', () => {
       await expect(boundary.classifier.classify(fullText, target)).resolves.toEqual({
         status: 'provisional',
         detectorVersion: 'eld-small-2.1.0',
-        profileVersion: 'eld-small-dev-7',
+        profileVersion: 'eld-small-dev-8',
         detectedLanguage: 'unknown',
         provisionalScore: 0,
         decision: 'uncertain',
@@ -583,7 +651,7 @@ describe('development provisional ELD-small boundary', () => {
     ['other target', 'es', TEXT.tr, 'UNSELECTED_LANGUAGE'],
     ['unsupported', 'es', 'Bonjour. Où se trouve la gare ferroviaire?', 'UNSELECTED_LANGUAGE'],
     ['too short', 'es', 'hola', 'TOO_SHORT'],
-    ['mixed English/Spanish', 'es', `${TEXT.en} ${TEXT.es}`, 'UNKNOWN'],
+    ['mixed English/Spanish', 'es', `${TEXT.en} ${TEXT.es}`, 'MIXED'],
     ['mixed Spanish/Turkish', 'tr', `${TEXT.es} ${TEXT.tr}`, 'UNSELECTED_LANGUAGE']
   ] as const)('rejects or marks %s source evidence fail-closed', async (
     _name,
@@ -642,13 +710,15 @@ describe('development provisional ELD-small boundary', () => {
   });
 
   it.each([
-    ['Turkish', 'tr', 'tr', 2],
-    ['English', 'es', 'en', 0]
-  ] as const)('marks reliable %s full detections below the shared margin as indeterminate', async (
+    ['Turkish', 'tr', 'tr', 2, 'tr', 'match'],
+    ['English', 'es', 'en', 0, 'undetermined', 'indeterminate']
+  ] as const)('applies target-specific generated margins to reliable %s full detections', async (
     _name,
     target,
     topLanguage,
-    index
+    index,
+    detectedLanguage,
+    verdict
   ) => {
     const text = `reliable ${topLanguage} generated calibration text`;
     const boundary = createDevelopmentProvisionalLanguageBoundary({
@@ -668,9 +738,72 @@ describe('development provisional ELD-small boundary', () => {
     );
     expect(evidence.checks[index]).toMatchObject({
       expectedLanguage: topLanguage,
+      detectedLanguage,
+      verdict,
+      provisionalScoreBasisPoints: 7000
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(verdict === 'match');
+  });
+
+  it('does not apply the lowered generated margin to a nonmatching detection', async () => {
+    const text = 'Catalan low margin generated output text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => {
+        if (candidate === text) {
+          return {
+            language: 'ca',
+            score: 0.7,
+            secondLanguage: 'es',
+            secondScore: 0.65,
+            reliable: true
+          };
+        }
+        const detected = tokenLanguage(candidate);
+        return detected === 'zz' ? 'es' : detected;
+      })
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text }),
+      { signal: new AbortController().signal }
+    );
+    expect(evidence.checks[2]).toMatchObject({
+      expectedLanguage: 'es',
       detectedLanguage: 'undetermined',
       verdict: 'indeterminate',
       provisionalScoreBasisPoints: 7000
+    });
+    expect(isAcceptedGeneratedLanguageEvidence(
+      evidence,
+      'development-provisional'
+    )).toBe(false);
+  });
+
+  it('keeps the generated score threshold after lowering the target margin', async () => {
+    const text = 'below score selected generated text';
+    const boundary = createDevelopmentProvisionalLanguageBoundary({
+      loadDetector: () => detectorFor((candidate) => candidate === text
+        ? {
+            language: 'es',
+            score: 0.64,
+            secondLanguage: 'ca',
+            secondScore: 0.6,
+            reliable: true
+          }
+        : tokenLanguage(candidate))
+    });
+    const evidence = await boundary.generatedLanguageValidator.validate(
+      generatedInput('es', 5, { index: 2, text }),
+      { signal: new AbortController().signal }
+    );
+
+    expect(evidence.checks[2]).toMatchObject({
+      expectedLanguage: 'es',
+      detectedLanguage: 'undetermined',
+      verdict: 'indeterminate',
+      provisionalScoreBasisPoints: 6400
     });
     expect(isAcceptedGeneratedLanguageEvidence(
       evidence,
@@ -702,7 +835,7 @@ describe('development provisional ELD-small boundary', () => {
       generatedInput('es', 5, { index: 2, text }),
       { signal: new AbortController().signal }
     );
-    expect(observedMargin).toBeGreaterThanOrEqual(0.05);
+    expect(observedMargin).toBeGreaterThanOrEqual(0.01);
     expect(observedMargin).toBeLessThan(0.08);
     expect(evidence.checks[2]).toMatchObject({
       expectedLanguage: 'es',
@@ -714,6 +847,26 @@ describe('development provisional ELD-small boundary', () => {
       'development-provisional'
     )).toBe(true);
   });
+
+  it.each(MEASURED_MINIMUM_MARGIN_CORPUS)(
+    'accepts the measured minimum-margin %s generated sentence: %s',
+    async (target, text) => {
+      const boundary = createDevelopmentProvisionalLanguageBoundary();
+      const evidence = await boundary.generatedLanguageValidator.validate(
+        generatedInput(target, 5, { index: 2, text }),
+        { signal: new AbortController().signal }
+      );
+      expect(evidence.checks[2]).toMatchObject({
+        expectedLanguage: target,
+        detectedLanguage: target,
+        verdict: 'match'
+      });
+      expect(isAcceptedGeneratedLanguageEvidence(
+        evidence,
+        'development-provisional'
+      )).toBe(true);
+    }
+  );
 
   it('uses the source margin independently from the generated Spanish margin', async () => {
     const calibratedText = 'calibrated Spanish generated output text';
@@ -752,9 +905,14 @@ describe('development provisional ELD-small boundary', () => {
   });
 
   it.each([
-    ['Catalan', "Podria ajudar-me a localitzar l'estació de tren, si us plau?"],
-    ['Portuguese', 'Poderia ajudar-me a localizar a estação de trem, por favor?']
-  ] as const)('rejects real-ELD %s generated output for Spanish', async (_name, text) => {
+    ['Catalan', "Podria ajudar-me a localitzar l'estació de tren, si us plau?", 'other', 'mismatch'],
+    ['Portuguese', 'Poderia ajudar-me a localizar a estação de trem, por favor?', 'undetermined', 'indeterminate']
+  ] as const)('rejects real-ELD %s generated output for Spanish', async (
+    _name,
+    text,
+    detectedLanguage,
+    verdict
+  ) => {
     const boundary = createDevelopmentProvisionalLanguageBoundary();
     const evidence = await boundary.generatedLanguageValidator.validate(
       generatedInput('es', 5, { index: 2, text }),
@@ -762,8 +920,8 @@ describe('development provisional ELD-small boundary', () => {
     );
     expect(evidence.checks[2]).toMatchObject({
       expectedLanguage: 'es',
-      detectedLanguage: 'other',
-      verdict: 'mismatch'
+      detectedLanguage,
+      verdict
     });
     expect(isAcceptedGeneratedLanguageEvidence(
       evidence,

@@ -361,7 +361,7 @@ export const CONTROLLED_FIXTURE_DETECTOR_VERSION =
 export const CONTROLLED_FIXTURE_CALIBRATION_VERSION =
   'controlled-fixture-calibration-1';
 export const DEVELOPMENT_PROVISIONAL_DETECTOR_VERSION = 'eld-small-2.1.0';
-export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-7';
+export const DEVELOPMENT_PROVISIONAL_PROFILE_VERSION = 'eld-small-dev-8';
 export const DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS = 12;
 
 export function countSubstantiveCharacters(text: string): number {
@@ -376,12 +376,12 @@ const developmentProvisional = {
   provisionalScoreThreshold: 0.65,
   provisionalMarginThreshold: 0.08,
   sourceTargetMarginThresholds: Object.freeze({
-    es: 0.04,
-    tr: 0.08
+    es: 0.01,
+    tr: 0.04
   }),
   generatedOutputTargetMarginThresholds: Object.freeze({
-    es: 0.05,
-    tr: 0.08
+    es: 0.01,
+    tr: 0.04
   }),
   minimumTextCharacters: DEVELOPMENT_PROVISIONAL_MINIMUM_SUBSTANTIVE_CHARACTERS,
   minimumWindowCharacters: 1,
@@ -419,7 +419,7 @@ const initialDefinitions = [
   }
 ] as const satisfies readonly LanguageDefinition<TargetLanguage>[];
 
-export const LANGUAGE_REGISTRY_VERSION = '2.5.0';
+export const LANGUAGE_REGISTRY_VERSION = '2.5.1';
 
 export const languageRegistry = createLanguageRegistry(initialDefinitions);
 
