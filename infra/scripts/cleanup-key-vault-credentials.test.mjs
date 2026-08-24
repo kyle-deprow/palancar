@@ -476,6 +476,46 @@ function rewriteJson(filePath, mutate) {
   return value;
 }
 
+function writeLifecycleCheckpoint(harness, sequence, name, details) {
+  writeExclusive(harness.path(`${String(sequence).padStart(6, "0")}-${name}.json`), {
+    version: 1,
+    type: "lifecycle-checkpoint",
+    sequence,
+    name,
+    runId: harness.runId,
+    phase: "credential-cleanup",
+    createdAt: CREATE_TIME,
+    ...details,
+  });
+}
+
+function consumeGuardReceipt(harness, { cleanupStart = true, receiptsConsumed = true } = {}) {
+  const guardPath = harness.path("guard-receipt.json");
+  const consumedPath = harness.path("guard-receipt.json.consumed");
+  const bytes = readFileSync(guardPath);
+  const guardReceiptSha256 = createHash("sha256").update(bytes).digest("hex");
+  writeExclusive(consumedPath, bytes);
+  unlinkSync(guardPath);
+  let sequence = 1;
+  if (cleanupStart) {
+    writeLifecycleCheckpoint(harness, sequence, "cleanup-start", {
+      cleanupOperationManifestSha256: createHash("sha256").update(readFileSync(harness.path(OPERATION_MANIFEST_FILENAME))).digest("hex"),
+      guardReceiptSha256,
+    });
+    sequence += 1;
+  }
+  if (receiptsConsumed) {
+    const preflightPath = harness.path(PREFLIGHT_RECEIPT_FILENAME);
+    writeLifecycleCheckpoint(harness, sequence, "receipts-consumed", {
+      guardReceiptSha256,
+      preflightReceiptSha256: existsSync(preflightPath)
+        ? createHash("sha256").update(readFileSync(preflightPath)).digest("hex")
+        : "f".repeat(64),
+    });
+  }
+  return guardReceiptSha256;
+}
+
 function rebindStateEnvelope(harness, sequence, mutate) {
   const statePath = harness.path(`cleanup-state-${String(sequence).padStart(6, "0")}.json`);
   const state = readJson(statePath);
@@ -765,6 +805,37 @@ test("descriptor, create, guard, preflight, operation, and state schemas are clo
     writeExclusive(filePath, value);
     await expectCode(harness.cleanup.resume(harness.runId), expectedCode);
   }
+});
+
+test("consumed guard receipts are accepted only with matching lifecycle checkpoint evidence", async () => {
+  const resumed = makeHarness();
+  await resumed.cleanup.start(resumed.runId);
+  const resumedGuardSha256 = consumeGuardReceipt(resumed);
+  resumed.active.clear();
+  resumed.deleted.clear();
+  const resumedResult = await resumed.cleanup.resume(resumed.runId);
+  assert.deepEqual(resumedResult, { status: "absent", runId: resumed.runId });
+  assert.equal(resumedGuardSha256, createHash("sha256").update(readFileSync(resumed.path("guard-receipt.json.consumed"))).digest("hex"));
+
+  const asserted = makeHarness({ autoPreflight: false });
+  await asserted.cleanup.start(asserted.runId);
+  consumeGuardReceipt(asserted);
+  asserted.active.clear();
+  asserted.deleted.clear();
+  assert.deepEqual(await asserted.cleanup.assertAbsent(asserted.runId), { status: "absent", runId: asserted.runId });
+
+  const missingCheckpoint = makeHarness({ autoPreflight: false });
+  await missingCheckpoint.cleanup.start(missingCheckpoint.runId);
+  consumeGuardReceipt(missingCheckpoint, { cleanupStart: false, receiptsConsumed: false });
+  await expectCode(missingCheckpoint.cleanup.resume(missingCheckpoint.runId), "guard-receipt-missing");
+
+  const mismatched = makeHarness();
+  await mismatched.cleanup.start(mismatched.runId);
+  consumeGuardReceipt(mismatched);
+  rewriteJson(mismatched.path("000002-receipts-consumed.json"), (checkpoint) => {
+    checkpoint.guardReceiptSha256 = "b".repeat(64);
+  });
+  await expectCode(mismatched.cleanup.resume(mismatched.runId), "guard-receipt-checkpoint-hash");
 });
 
 test("start writes exclusive protected artifacts and exact context bindings", async () => {

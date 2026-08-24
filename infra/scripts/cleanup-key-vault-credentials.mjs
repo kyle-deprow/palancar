@@ -176,6 +176,18 @@ const GUARD_KEYS = Object.freeze([
   "version", "type", "runId", "phase", "planSha256", "bindingSha256",
   "createdAt", "guard", "showSha256", "guardArgv", "stdinSha256", "result",
 ]);
+const LIFECYCLE_CHECKPOINT_FILE_RE = /^(\d{6})-(cleanup-start|receipts-consumed)\.json$/u;
+const LIFECYCLE_CHECKPOINT_COMMON_KEYS = Object.freeze([
+  "version", "type", "sequence", "name", "runId", "phase", "createdAt",
+]);
+const LIFECYCLE_CHECKPOINT_KEYS = Object.freeze({
+  "cleanup-start": Object.freeze([
+    ...LIFECYCLE_CHECKPOINT_COMMON_KEYS, "cleanupOperationManifestSha256", "guardReceiptSha256",
+  ]),
+  "receipts-consumed": Object.freeze([
+    ...LIFECYCLE_CHECKPOINT_COMMON_KEYS, "guardReceiptSha256", "preflightReceiptSha256",
+  ]),
+});
 const PREFLIGHT_KEYS = Object.freeze([
   "version", "type", "runId", "phase", "planSha256", "bindingSha256", "contextSha256",
   "createdAt", "deadlineAt", "result", "verifierId", "verifierArtifact", "verifierSha256", "runtimeIdentity",
@@ -818,14 +830,64 @@ function validatePreflightReceipt(raw, descriptor, manifest) {
   };
 }
 
+function readGuardReceiptCheckpointBindings(directory, descriptor) {
+  const checkpoints = new Map();
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const match = LIFECYCLE_CHECKPOINT_FILE_RE.exec(entry.name);
+    if (match === null) continue;
+    const sequence = Number(match[1]);
+    const name = match[2];
+    failIf(checkpoints.has(name), "guard-receipt-checkpoint");
+    const checkpoint = readJson(artifactPath(directory, entry.name), "guard-receipt-checkpoint");
+    exactKeys(checkpoint, LIFECYCLE_CHECKPOINT_KEYS[name], "guard-receipt-checkpoint-schema");
+    failIf(
+      checkpoint.version !== 1 || checkpoint.type !== "lifecycle-checkpoint" ||
+        checkpoint.sequence !== sequence || checkpoint.name !== name ||
+        checkpoint.runId !== descriptor.runId || checkpoint.phase !== "credential-cleanup",
+      "guard-receipt-checkpoint-context",
+    );
+    assertIsoTimestamp(checkpoint.createdAt, "guard-receipt-checkpoint-time");
+    failIf(!isSha256(checkpoint.guardReceiptSha256), "guard-receipt-checkpoint-hash");
+    if (name === "cleanup-start") {
+      failIf(!isSha256(checkpoint.cleanupOperationManifestSha256), "guard-receipt-checkpoint-context");
+    } else {
+      failIf(!isSha256(checkpoint.preflightReceiptSha256), "guard-receipt-checkpoint-context");
+    }
+    checkpoints.set(name, checkpoint);
+  }
+  const cleanupStart = checkpoints.get("cleanup-start");
+  const consumed = checkpoints.get("receipts-consumed");
+  if (cleanupStart !== undefined && consumed !== undefined) {
+    failIf(cleanupStart.sequence >= consumed.sequence, "guard-receipt-checkpoint-order");
+    failIf(cleanupStart.guardReceiptSha256 !== consumed.guardReceiptSha256, "guard-receipt-checkpoint-hash");
+  }
+  return consumed?.guardReceiptSha256 ?? cleanupStart?.guardReceiptSha256;
+}
+
+function readGuardReceipt(directory, descriptor, manifest) {
+  const recordedSha256 = readGuardReceiptCheckpointBindings(directory, descriptor);
+  const guardPath = artifactPath(directory, "guard-receipt.json");
+  const consumedGuardPath = artifactPath(directory, "guard-receipt.json.consumed");
+  const guardExists = existsSync(guardPath);
+  const consumedGuardExists = existsSync(consumedGuardPath);
+  if (!guardExists && recordedSha256 === undefined) reject("guard-receipt-missing");
+  if (!guardExists && !consumedGuardExists) reject("guard-receipt-missing");
+  const receiptPath = guardExists ? guardPath : consumedGuardPath;
+  const guard = validateGuardReceipt(readJson(receiptPath, "guard-receipt"), descriptor, manifest);
+  const actualSha256 = sha256File(receiptPath);
+  if (recordedSha256 !== undefined) {
+    failIf(actualSha256 !== recordedSha256, "guard-receipt-checkpoint-hash");
+  }
+  return { guard, guardReceiptSha256: actualSha256 };
+}
+
 function readLifecycleContext(config, directory, descriptor, { rejectPreflight = false } = {}) {
   const planPath = artifactPath(directory, "plan.tfplan");
   assertRegular(planPath, "plan");
   failIf(sha256File(planPath) !== descriptor.planSha256, "plan-hash");
   const createPath = artifactPath(directory, "create-manifest.json");
   const manifest = validateCreateManifest(readJson(createPath, "create-manifest"), descriptor, planPath);
-  const guardPath = artifactPath(directory, "guard-receipt.json");
-  const guard = validateGuardReceipt(readJson(guardPath, "guard-receipt"), descriptor, manifest);
+  const guard = readGuardReceipt(directory, descriptor, manifest);
   const preflightPath = artifactPath(directory, PREFLIGHT_RECEIPT_FILENAME);
   let preflight;
   if (existsSync(preflightPath)) {
@@ -841,9 +903,9 @@ function readLifecycleContext(config, directory, descriptor, { rejectPreflight =
   return {
     planPath,
     manifest,
-    guard,
+    guard: guard.guard,
     preflight,
-    guardReceiptSha256: sha256File(guardPath),
+    guardReceiptSha256: guard.guardReceiptSha256,
   };
 }
 
