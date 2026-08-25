@@ -62,6 +62,9 @@ const PLAN_SHA256 = createHash("sha256").update(PLAN).digest("hex");
 const CREATE_TIME = "2026-08-21T00:00:00.000Z";
 const PREFLIGHT_TIME = "2026-08-21T00:00:30.000Z";
 const COMMIT = "c".repeat(40);
+const HISTORICAL_UTILITY_COMMIT = "8a12340084da96135985df11529d4c1c05403fe1";
+const NON_ANCESTOR_UTILITY_COMMIT = "73e03fdd1748b4d4fd64581a65fa35956dedfa9f";
+const HISTORICAL_UTILITY_SHA256 = "ab715f30be100074ab70727e84ded906b79844db116a87d5ff488a28f1b84edb";
 const ACR_LOGIN_SERVER = "palancardev.azurecr.io";
 const ACCOUNT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.CognitiveServices/accounts/palancar-dev`;
 const RUNTIME_IDENTITY_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/palancar-runtime`;
@@ -239,7 +242,7 @@ function listBody(names, kind) {
       }), nextLink: null });
 }
 
-function makeBindings(planPath) {
+function makeBindings(planPath, repositoryCommit = COMMIT) {
   const backend = {
     container_name: "tfstate-dev",
     key: "dev/terraform.tfstate",
@@ -259,7 +262,7 @@ function makeBindings(planPath) {
     lifecycleSha256: "2".repeat(64),
     guardSha256: "3".repeat(64),
     dependencyBlobs: [],
-    repositoryCommit: COMMIT,
+    repositoryCommit,
     cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../environments/dev"),
     phase: "credential-cleanup",
     argv: ["plan", "-refresh=true", "-input=false", "-lock=true", "-lock-timeout=5m", `-out=${planPath}`],
@@ -301,7 +304,7 @@ function makeHarness(overrides = {}) {
   let faultAt = overrides.faultAt;
   const httpState = overrides.httpState ?? {};
   const planPath = path.join(directory, "plan.tfplan");
-  const { bindings, bindingSha256 } = makeBindings(planPath);
+  const { bindings, bindingSha256 } = makeBindings(planPath, overrides.repositoryCommit ?? COMMIT);
   let liveContext = overrides.liveContext;
 
   writeExclusive(planPath, PLAN);
@@ -474,6 +477,48 @@ function rewriteJson(filePath, mutate) {
   unlinkSync(filePath);
   writeExclusive(filePath, value);
   return value;
+}
+
+function fileSha256(filePath) {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
+function rehashOperationVersion(filePath) {
+  return rewriteJson(filePath, (operation) => {
+    operation.sha256 = hashJson(Object.fromEntries(Object.entries(operation).filter(([key]) => key !== "sha256")));
+  });
+}
+
+function rebindPreparedOperationUtility(harness, utilitySha256) {
+  const versionPath = harness.path("cleanup-manifest-000000.json");
+  rewriteJson(versionPath, (operation) => {
+    operation.utilitySha256 = utilitySha256;
+  });
+  rehashOperationVersion(versionPath);
+  const manifestSha256 = fileSha256(versionPath);
+  const headPath = harness.path(OPERATION_MANIFEST_FILENAME);
+  rewriteJson(headPath, (head) => {
+    const version = readJson(versionPath);
+    Object.assign(head, version, {
+      manifestFilename: "cleanup-manifest-000000.json",
+      manifestSha256,
+      previousHeadSha256: null,
+    });
+    head.headSha256 = hashJson(Object.fromEntries(Object.entries(head).filter(([key]) => key !== "headSha256")));
+  });
+  const journalDirectory = commitmentDirectory(harness);
+  const intentPath = path.join(journalDirectory, "cleanup-operation-head-intent-000000.json");
+  rewriteJson(intentPath, (intent) => {
+    intent.manifestSha256 = manifestSha256;
+    intent.intentSha256 = hashJson(Object.fromEntries(Object.entries(intent).filter(([key]) => key !== "intentSha256")));
+  });
+  const anchorPath = path.join(journalDirectory, "cleanup-operation-head-000000.json");
+  rewriteJson(anchorPath, (anchor) => {
+    anchor.manifestSha256 = manifestSha256;
+    anchor.headSha256 = fileSha256(headPath);
+    anchor.intentSha256 = fileSha256(intentPath);
+    anchor.anchorSha256 = hashJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256")));
+  });
 }
 
 function writeLifecycleCheckpoint(harness, sequence, name, details) {
@@ -1428,6 +1473,67 @@ test("prepared manifest recovery only records the exact start proof before any m
   await harness.cleanup.resume(harness.runId);
   assert.deepEqual([...harness.active], []);
   assert.deepEqual([...harness.deleted], []);
+});
+
+test("utility history accepts current and recorded-commit hashes, but rejects invalid or mixed histories", async () => {
+  const currentUtilitySha256 = fileSha256(new URL("./cleanup-key-vault-credentials.mjs", import.meta.url));
+  for (const [label, repositoryCommit, utilitySha256, expected] of [
+    ["current", COMMIT, currentUtilitySha256, undefined],
+    ["historical", HISTORICAL_UTILITY_COMMIT, HISTORICAL_UTILITY_SHA256, undefined],
+    ["neither", HISTORICAL_UTILITY_COMMIT, "0".repeat(64), "operation-manifest-version-context"],
+    ["non-ancestor", NON_ANCESTOR_UTILITY_COMMIT, HISTORICAL_UTILITY_SHA256, "operation-manifest-version-context"],
+    ["unknown-commit", "d".repeat(40), HISTORICAL_UTILITY_SHA256, "operation-manifest-version-context"],
+  ]) {
+    let blocked = true;
+    const harness = makeHarness({
+      repositoryCommit,
+      autoPreflight: false,
+      processRunner: (request, controls) => blocked
+        ? ({ status: null, timedOut: true, stdout: "" })
+        : ({ status: 0, stdout: JSON.stringify({ accessToken: jwt(request.argv[3], controls.now()) }) }),
+    });
+    await expectCode(harness.cleanup.start(harness.runId), "token-timeout");
+    rebindPreparedOperationUtility(harness, utilitySha256);
+    blocked = false;
+    if (expected === undefined) {
+      assert.deepEqual(await harness.cleanup.resume(harness.runId), {
+        status: "start-inventory-validated",
+        runId: harness.runId,
+      });
+    } else {
+      await expectCode(harness.cleanup.resume(harness.runId), expected);
+    }
+    if (label === "historical") {
+      harness.writePreflight();
+      rewriteJson(harness.path(PREFLIGHT_RECEIPT_FILENAME), (receipt) => {
+        receipt.verifierSha256 = HISTORICAL_UTILITY_SHA256;
+        receipt.receiptSha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "receiptSha256")));
+      });
+      harness.active.clear();
+      assert.deepEqual(await harness.cleanup.resume(harness.runId), { status: "absent", runId: harness.runId });
+      assert.deepEqual(await harness.cleanup.assertAbsent(harness.runId), { status: "absent", runId: harness.runId });
+    }
+  }
+
+  const mixed = makeHarness({
+    repositoryCommit: HISTORICAL_UTILITY_COMMIT,
+    autoPreflight: false,
+    processRunner: () => ({ status: null, timedOut: true, stdout: "" }),
+  });
+  await expectCode(mixed.cleanup.start(mixed.runId), "token-timeout");
+  rebindPreparedOperationUtility(mixed, HISTORICAL_UTILITY_SHA256);
+  const firstVersion = readJson(mixed.path("cleanup-manifest-000000.json"));
+  const secondVersion = {
+    ...firstVersion,
+    status: "completed",
+    sequence: 1,
+    utilitySha256: currentUtilitySha256,
+    previousManifestSha256: fileSha256(mixed.path("cleanup-manifest-000000.json")),
+    sha256: null,
+  };
+  secondVersion.sha256 = hashJson(Object.fromEntries(Object.entries(secondVersion).filter(([key]) => key !== "sha256")));
+  writeExclusive(mixed.path("cleanup-manifest-000001.json"), secondVersion);
+  await expectCode(mixed.cleanup.resume(mixed.runId), "operation-manifest-history");
 });
 
 test("external journal heads reject paired tail deletion while terminal receipts remain protected", async () => {

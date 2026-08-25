@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   closeSync,
   constants as fsConstants,
@@ -39,6 +39,13 @@ export const TERRAFORM_PATH = "/home/dev/.local/bin/terraform-1.15.8";
 export const TERRAFORM_SHA256 =
   "00f55981f5215594c418cd6b20f44fa4c99f9126650602e65d533d131005ea81";
 const GIT_PATH = "/usr/bin/git";
+const GIT_ENVIRONMENT = Object.freeze({
+  PATH: "/usr/bin:/bin",
+  LANG: "C",
+  LC_ALL: "C",
+  GIT_NO_REPLACE_OBJECTS: "1",
+});
+const CLEANUP_UTILITY_RELATIVE_PATH = "infra/scripts/cleanup-key-vault-credentials.mjs";
 // Must equal dev-plan-lifecycle.mjs REVIEWED_DEPENDENCIES["credential-cleanup"]
 // minus its leading dev-plan-lifecycle.mjs entry (bound via lifecycleSha256):
 // the lifecycle manifest's dependencyBlobs is that slice, in order.
@@ -307,6 +314,38 @@ function sha256Json(value) {
 
 function sha256File(filePath) {
   return sha256Bytes(readFileSync(filePath));
+}
+
+function gitOutput(args, maxOutputBytes = MAX_COMMAND_OUTPUT_BYTES) {
+  let result;
+  try {
+    result = spawnSync(GIT_PATH, ["--no-replace-objects", ...args], {
+      cwd: REPOSITORY_ROOT,
+      env: GIT_ENVIRONMENT,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TOKEN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: maxOutputBytes,
+    });
+  } catch {
+    return undefined;
+  }
+  if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout) || result.stdout.length > maxOutputBytes) {
+    return undefined;
+  }
+  return result.stdout;
+}
+
+function utilitySha256AtRecordedCommit(repositoryCommit) {
+  if (!COMMIT_RE.test(repositoryCommit)) return null;
+  if (gitOutput(["merge-base", "--is-ancestor", repositoryCommit, "HEAD"], 128) === undefined) return null;
+  const blob = gitOutput(["cat-file", "blob", `${repositoryCommit}:${CLEANUP_UTILITY_RELATIVE_PATH}`]);
+  return blob === undefined ? null : sha256Bytes(blob);
+}
+
+function utilitySha256Allowed(utilitySha256, repositoryCommit) {
+  if (utilitySha256 === sha256File(SCRIPT_PATH)) return true;
+  return utilitySha256 === utilitySha256AtRecordedCommit(repositoryCommit);
 }
 
 function fileMode(stat) {
@@ -799,7 +838,7 @@ function validatePreflightReceipt(raw, descriptor, manifest) {
       raw.bindingSha256 !== manifest.bindingSha256 || raw.contextSha256 !== descriptor.contextSha256 ||
       raw.result !== "passed" || raw.verifierId !== PREFLIGHT_VERIFIER_ID ||
       raw.verifierArtifact !== PREFLIGHT_VERIFIER_ARTIFACT ||
-      !isSha256(raw.verifierSha256) || raw.verifierSha256 !== sha256File(SCRIPT_PATH) ||
+      !isSha256(raw.verifierSha256) || !utilitySha256Allowed(raw.verifierSha256, manifest.bindings.repositoryCommit) ||
       raw.vaultResourceId !== descriptor.vaultResourceId || raw.vaultUri !== descriptor.vaultUri,
     "preflight-receipt-schema",
   );
@@ -926,7 +965,7 @@ function validateOperationManifest(raw, context) {
       raw.createdAt !== lifecycleManifest.createdAt ||
       raw.repositoryCommit !== lifecycleManifest.bindings.repositoryCommit ||
       !Array.isArray(raw.runtimeSecretReferences) || raw.runtimeSecretReferences.length !== 0 ||
-      !isSha256(raw.utilitySha256) || raw.utilitySha256 !== sha256File(SCRIPT_PATH) ||
+      !isSha256(raw.utilitySha256) ||
       raw.vaultResourceId !== descriptor.vaultResourceId ||
       raw.journalCommitmentPath !== journalCommitmentRelativePath(descriptor.runId) ||
       (raw.sequence === 0 ? raw.previousManifestSha256 !== null : !isSha256(raw.previousManifestSha256)) ||
@@ -936,6 +975,14 @@ function validateOperationManifest(raw, context) {
   );
   validateSupersession(raw.supersession, "operation-manifest-supersession");
   return raw;
+}
+
+function validateOperationUtilitySha256(utilitySha256, context, code = "operation-manifest-version-context") {
+  failIf(
+    !isSha256(utilitySha256) ||
+      !utilitySha256Allowed(utilitySha256, context.lifecycle.manifest.bindings.repositoryCommit),
+    code,
+  );
 }
 
 function operationVersionPath(directory, sequence) {
@@ -1164,7 +1211,7 @@ function reconcileOperationHeadPublication(config, context, headPath, headRaw, r
   );
 }
 
-function validateOperationHead(raw, context, headPath, versionPath) {
+function validateOperationHead(raw, context, headPath, versionPath, { validateUtility = true } = {}) {
   exactKeys(raw, OPERATION_HEAD_KEYS, "operation-manifest-head-schema");
   const operation = Object.fromEntries(OPERATION_KEYS.map((key) => [key, raw[key]]));
   validateOperationManifest(operation, context);
@@ -1178,6 +1225,7 @@ function validateOperationHead(raw, context, headPath, versionPath) {
   failIf(raw.manifestFilename !== path.basename(versionPath), "operation-manifest-head-context");
   failIf(raw.manifestSha256 !== sha256File(versionPath), "operation-manifest-head-context");
   failIf(!isSha256(raw.headSha256) || raw.headSha256 !== sha256Json(Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "headSha256"))), "operation-manifest-head-integrity");
+  if (validateUtility) validateOperationUtilitySha256(operation.utilitySha256, context);
   const expectedPreviousHead = operation.sequence === 0 ? null : raw.previousHeadSha256;
   failIf(operation.sequence === 0 ? expectedPreviousHead !== null : !isSha256(expectedPreviousHead), "operation-manifest-head-history");
   assertRegular(headPath, "operation-manifest-head");
@@ -1202,6 +1250,12 @@ function assertOperationHeadExternallyAnchored(config, context) {
   );
 }
 
+function validateOperationUtilityHistory(versions, context) {
+  const utilitySha256 = versions[0]?.value?.utilitySha256;
+  failIf(versions.some(({ value }) => value?.utilitySha256 !== utilitySha256), "operation-manifest-history");
+  validateOperationUtilitySha256(utilitySha256, context);
+}
+
 function readOperationHistory(config, context) {
   const headRecords = readOperationHeadAnchors(config, context);
   const entries = readdirSync(context.directory, { withFileTypes: true });
@@ -1217,6 +1271,7 @@ function readOperationHistory(config, context) {
     }
   }
   versions.sort((left, right) => left.sequence - right.sequence);
+  if (versions.length > 0) validateOperationUtilityHistory(versions, context);
   const headPath = artifactPath(context.directory, OPERATION_MANIFEST_FILENAME);
   if (!existsSync(headPath)) {
     failIf(headRecords.anchors.length > 0, "operation-head-anchor-missing");
@@ -1230,7 +1285,7 @@ function readOperationHistory(config, context) {
   failIf(headSequence < 0, "operation-manifest-head-context");
   const version = versions.find((candidate) => candidate.sequence === headSequence);
   failIf(version === undefined, "operation-manifest-head-missing");
-  const operation = validateOperationHead(headRaw, context, headPath, version.filePath);
+  const operation = validateOperationHead(headRaw, context, headPath, version.filePath, { validateUtility: false });
   const latestJournalCommitment = readJournalCommitments(config, context.descriptor.runId);
   if (latestJournalCommitment !== undefined) {
     failIf(
