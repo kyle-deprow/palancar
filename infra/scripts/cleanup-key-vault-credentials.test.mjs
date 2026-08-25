@@ -1909,6 +1909,18 @@ test("cumulative deadline is exact, accounted once, and read-only assertion rema
   assert.equal(exact.sleepCalls.length, 0);
 });
 
+test("completed-operation resume confirms after the mutation ceiling without deleting", async () => {
+  const harness = makeHarness();
+  await harness.cleanup.start(harness.runId);
+  harness.active.clear();
+  await harness.cleanup.resume(harness.runId);
+  const deleteCallsBefore = harness.httpCalls.filter((request) => request.method === "DELETE").length;
+
+  harness.advance(CUMULATIVE_ELAPSED_LIMIT_MS);
+  assert.deepEqual(await harness.cleanup.resume(harness.runId), { status: "absent", runId: harness.runId });
+  assert.equal(harness.httpCalls.filter((request) => request.method === "DELETE").length, deleteCallsBefore);
+});
+
 test("token and HTTP deadlines are bounded and response values remain unread", async () => {
   const tokenHang = makeHarness({ processRunner: () => ({ status: null, timedOut: true, stdout: "" }) });
   await expectCode(tokenHang.cleanup.start(tokenHang.runId), "token-timeout");

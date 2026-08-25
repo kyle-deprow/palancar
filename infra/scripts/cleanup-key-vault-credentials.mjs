@@ -3431,13 +3431,23 @@ async function resumeOperation(config, runId) {
   const invocationStarted = config.now();
   let context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
   let state = readStateFiles(config, context);
-  const deadline = state.sequence < 0
+  const hasTerminalReceipt = existsSync(artifactPath(context.directory, ABSENCE_RECEIPT_FILENAME));
+  // A completed operation can only take the terminal confirmation path below;
+  // it must never regain permission to mutate.  Give that read-only path the
+  // invocation deadline so an old mutation ceiling cannot prevent live
+  // verification.  All other resume paths retain the cumulative mutation
+  // ceiling as their deadline.
+  const terminalConfirmation = context.operation.status === "completed" &&
+    (state.status === "complete" || hasTerminalReceipt);
+  const deadline = terminalConfirmation
     ? invocationStarted + INVOCATION_DEADLINE_MS
-    : Math.min(invocationStarted + INVOCATION_DEADLINE_MS, state.operationStartedAt + CUMULATIVE_ELAPSED_LIMIT_MS);
+    : state.sequence < 0
+      ? invocationStarted + INVOCATION_DEADLINE_MS
+      : Math.min(invocationStarted + INVOCATION_DEADLINE_MS, state.operationStartedAt + CUMULATIVE_ELAPSED_LIMIT_MS);
   // A valid receipt is authoritative even if the state tail was lost after
   // publication, but the external immutable journal-head chain is checked
   // first so paired state/anchor tail deletion cannot reset history.
-  if (existsSync(artifactPath(context.directory, ABSENCE_RECEIPT_FILENAME))) {
+  if (hasTerminalReceipt) {
     return reconcileTerminalReceipt(config, context, state, deadline, invocationStarted);
   }
   if (state.sequence < 0) {
