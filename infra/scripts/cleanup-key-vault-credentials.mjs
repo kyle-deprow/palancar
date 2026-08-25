@@ -46,6 +46,8 @@ const GIT_ENVIRONMENT = Object.freeze({
   GIT_NO_REPLACE_OBJECTS: "1",
 });
 const CLEANUP_UTILITY_RELATIVE_PATH = "infra/scripts/cleanup-key-vault-credentials.mjs";
+const LIFECYCLE_RELATIVE_PATH = "infra/scripts/dev-plan-lifecycle.mjs";
+const GUARD_RELATIVE_PATH = "infra/scripts/assert-dev-plan.mjs";
 // Must equal dev-plan-lifecycle.mjs REVIEWED_DEPENDENCIES["credential-cleanup"]
 // minus its leading dev-plan-lifecycle.mjs entry (bound via lifecycleSha256):
 // the lifecycle manifest's dependencyBlobs is that slice, in order.
@@ -336,16 +338,54 @@ function gitOutput(args, maxOutputBytes = MAX_COMMAND_OUTPUT_BYTES) {
   return result.stdout;
 }
 
+function reviewedBlobAtRecordedCommit(repositoryCommit, relativePath) {
+  if (!COMMIT_RE.test(repositoryCommit)) return null;
+  const blob = gitOutput(["rev-parse", `${repositoryCommit}:${relativePath}`], 128);
+  if (blob === undefined) return null;
+  const blobId = blob.toString("utf8").trim();
+  if (!/^[0-9a-f]{40}$/u.test(blobId)) return null;
+  const contents = gitOutput(["cat-file", "blob", `${repositoryCommit}:${relativePath}`]);
+  return contents === undefined ? null : { blob: blobId, sha256: sha256Bytes(contents) };
+}
+
 function utilitySha256AtRecordedCommit(repositoryCommit) {
   if (!COMMIT_RE.test(repositoryCommit)) return null;
   if (gitOutput(["merge-base", "--is-ancestor", repositoryCommit, "HEAD"], 128) === undefined) return null;
-  const blob = gitOutput(["cat-file", "blob", `${repositoryCommit}:${CLEANUP_UTILITY_RELATIVE_PATH}`]);
-  return blob === undefined ? null : sha256Bytes(blob);
+  return reviewedBlobAtRecordedCommit(repositoryCommit, CLEANUP_UTILITY_RELATIVE_PATH)?.sha256 ?? null;
 }
 
 function utilitySha256Allowed(utilitySha256, repositoryCommit) {
   if (utilitySha256 === sha256File(SCRIPT_PATH)) return true;
   return utilitySha256 === utilitySha256AtRecordedCommit(repositoryCommit);
+}
+
+function historicalCodeBindingsMatch(live, bound) {
+  if (!COMMIT_RE.test(bound.repositoryCommit) || !COMMIT_RE.test(live.repositoryCommit)) return false;
+  if (!isSha256(bound.lifecycleSha256) || !isSha256(bound.guardSha256) || !Array.isArray(bound.dependencyBlobs)) return false;
+  if (gitOutput(["merge-base", "--is-ancestor", bound.repositoryCommit, "HEAD"], 128) === undefined) return false;
+  if (gitOutput(["merge-base", "--is-ancestor", bound.repositoryCommit, live.repositoryCommit], 128) === undefined) return false;
+
+  const liveDependencies = live.dependencyBlobs;
+  if (!Array.isArray(liveDependencies) ||
+      bound.dependencyBlobs.length !== liveDependencies.length ||
+      !bound.dependencyBlobs.every((entry, index) =>
+        isObject(entry) &&
+        JSON.stringify(Object.keys(entry).sort()) === JSON.stringify(["blob", "path", "sha256"]) &&
+        entry.path === liveDependencies[index]?.path &&
+        /^[0-9a-f]{40}$/u.test(entry.blob ?? "") &&
+        isSha256(entry.sha256),
+      )) {
+    return false;
+  }
+
+  const lifecycle = reviewedBlobAtRecordedCommit(bound.repositoryCommit, LIFECYCLE_RELATIVE_PATH);
+  const guard = reviewedBlobAtRecordedCommit(bound.repositoryCommit, GUARD_RELATIVE_PATH);
+  if (lifecycle?.sha256 !== bound.lifecycleSha256 || guard?.sha256 !== bound.guardSha256) return false;
+
+  return bound.dependencyBlobs.every((entry) => {
+    const resolved = reviewedBlobAtRecordedCommit(bound.repositoryCommit, entry.path);
+    return resolved?.blob === entry.blob && resolved.sha256 === entry.sha256;
+  });
 }
 
 function fileMode(stat) {
@@ -1365,7 +1405,8 @@ function validateContext(config, runId, requireManifest, options = {}) {
   const directory = runDirectory(config, runId);
   const descriptor = readDescriptor(config, directory, runId);
   const lifecycle = readLifecycleContext(config, directory, descriptor, options);
-  if (!requireManifest) return { directory, descriptor, lifecycle };
+  const allowPostApplyRecovery = options.allowPostApplyRecovery === true;
+  if (!requireManifest) return { directory, descriptor, lifecycle, allowPostApplyRecovery };
   const operationHistory = readOperationHistory(config, { directory, descriptor, lifecycle });
   failIf(operationHistory === undefined, "operation-manifest-missing");
   if (operationHistory.head === undefined) {
@@ -1380,6 +1421,7 @@ function validateContext(config, runId, requireManifest, options = {}) {
     operationPath: operationHistory.operationPath,
     operationHeadPath: operationHistory.headPath,
     operationHead: operationHistory.head,
+    allowPostApplyRecovery,
   };
 }
 
@@ -1617,6 +1659,25 @@ async function revalidateLiveContext(config, context, deadline) {
     : initial;
   const candidate = liveBindingValue(live);
   failIf(!isObject(candidate), "live-context-schema");
+  if (context.allowPostApplyRecovery === true) {
+    // Resume/assert-absent may follow the lifecycle apply: code can advance
+    // along the recorded commit's descendant line and Terraform may advance
+    // state exactly once, while all non-code context remains immutable.
+    failIf(!historicalCodeBindingsMatch(candidate, bound), "live-context-drift");
+    failIf(
+      !Number.isSafeInteger(candidate.stateSerial) ||
+        (candidate.stateSerial !== bound.stateSerial && candidate.stateSerial !== bound.stateSerial + 1),
+      "live-context-drift",
+    );
+    const comparableCandidate = { ...candidate };
+    const comparableBound = { ...bound };
+    for (const key of ["repositoryCommit", "lifecycleSha256", "guardSha256", "dependencyBlobs", "stateSerial"]) {
+      delete comparableCandidate[key];
+      delete comparableBound[key];
+    }
+    failIf(canonicalJson(comparableCandidate) !== canonicalJson(comparableBound), "live-context-drift");
+    return;
+  }
   // The lifecycle binding is the shared context schema.  Comparing the whole
   // closed object covers repository/code/dependency hashes, backend identity,
   // workspace/state lineage+serial, live revision, Azure cloud/account, and
@@ -2831,7 +2892,9 @@ async function httpRequest(config, request, deadline, code, context) {
       // adapter is allowed to send the DELETE.  This second check is
       // intentionally inside the bounded operation, after all preparation.
       if (emptyResponse) {
-        const fresh = validateContext(config, context.descriptor.runId, true);
+        const fresh = validateContext(config, context.descriptor.runId, true, {
+          allowPostApplyRecovery: context.allowPostApplyRecovery === true,
+        });
         await revalidateLiveContext(config, fresh, deadline);
         const preflight = readRuntimePreflight(config, fresh, deadline);
         failIf(request.preflightReceiptSha256 !== preflight.receiptSha256 || request.preflightVerifierId !== preflight.verifierId || request.preflightVerifierSha256 !== preflight.verifierSha256, `${code}-preflight-binding`);
@@ -2855,7 +2918,9 @@ async function httpRequest(config, request, deadline, code, context) {
         );
         // The live reread is deliberately followed by a second freshness
         // check: either operation may advance the shared wall clock.
-        validateContext(config, context.descriptor.runId, true);
+        validateContext(config, context.descriptor.runId, true, {
+          allowPostApplyRecovery: context.allowPostApplyRecovery === true,
+        });
       }
       assertWithinDeadline(config, deadline);
       requireRemaining(config, deadline, emptyResponse ? CONVERGENCE_POLL_MS + 1 : 1);
@@ -3153,7 +3218,9 @@ async function mutateTarget(config, context, state, token, name, action, deadlin
   // for its mandatory convergence poll; otherwise the DELETE could succeed
   // without a bounded confirmation window.
   requireRemaining(config, deadline, CONVERGENCE_POLL_MS + 1);
-  context = validateContext(config, context.descriptor.runId, true);
+  context = validateContext(config, context.descriptor.runId, true, {
+    allowPostApplyRecovery: context.allowPostApplyRecovery === true,
+  });
   await revalidateLiveContext(config, context, deadline);
   const preflight = readRuntimePreflight(config, context, deadline);
   failIf(
@@ -3233,7 +3300,9 @@ function finalizeOperationManifest(config, context) {
   value.sha256 = sha256Json(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "sha256")));
   const versionPath = publishOperationVersion(config, context, value);
   publishOperationHead(config, context, value, versionPath);
-  return validateContext(config, context.descriptor.runId, true);
+  return validateContext(config, context.descriptor.runId, true, {
+    allowPostApplyRecovery: context.allowPostApplyRecovery === true,
+  });
 }
 
 async function startOperation(config, runId) {
@@ -3322,7 +3391,7 @@ async function startOperation(config, runId) {
 
 async function assertAbsentOperation(config, runId) {
   const started = config.now();
-  const context = validateContext(config, runId, true);
+  const context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
   const state = readStateFiles(config, context);
   const terminal = existsSync(artifactPath(context.directory, ABSENCE_RECEIPT_FILENAME));
   if (terminal) readAbsenceReceiptWithExpectedHash(context, state.absenceReceiptSha256);
@@ -3360,7 +3429,7 @@ async function reconcileTerminalReceipt(config, context, state, deadline, invoca
 
 async function resumeOperation(config, runId) {
   const invocationStarted = config.now();
-  let context = validateContext(config, runId, true);
+  let context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
   let state = readStateFiles(config, context);
   const deadline = state.sequence < 0
     ? invocationStarted + INVOCATION_DEADLINE_MS
@@ -3395,7 +3464,7 @@ async function resumeOperation(config, runId) {
     // fresh token and inventory may still prove convergence and authorize the
     // terminal receipt, but no DELETE is reachable from this branch.
     assertMutationBudget(state, config.now());
-    context = validateContext(config, runId, true);
+    context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
     const reconciled = await validateAzureAndInventory(config, context, deadline);
     assertMutationBudget(state, config.now());
     if (!allTargetsAbsent(reconciled.inventory)) reject("attempt-ceiling");
@@ -3422,7 +3491,7 @@ async function resumeOperation(config, runId) {
   if (retryAt !== null) {
     const waitMs = Math.max(0, retryAt - config.now());
     if (waitMs > 0) await sleep(config, waitMs, deadline);
-    context = validateContext(config, runId, true);
+    context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
   }
   assertMutationBudget(state, config.now());
   // This is deliberately after backoff.  The token and inventory used for the
@@ -3463,7 +3532,7 @@ async function resumeOperation(config, runId) {
   const token = refreshed.vaultToken;
   try {
     for (const name of TARGET_SECRET_NAMES) {
-      context = validateContext(config, runId, true);
+      context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
       for (;;) {
         const stateForTarget = targetState(inventory, name);
         if (stateForTarget === "absent") break;
@@ -3471,7 +3540,7 @@ async function resumeOperation(config, runId) {
         if (stateForTarget === "active") inventory = await mutateTarget(config, context, state, token, name, "delete", deadline);
         else if (stateForTarget === "deleted") inventory = await mutateTarget(config, context, state, token, name, "purge", deadline);
         else reject("inventory-state");
-        context = validateContext(config, runId, true);
+        context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
         await revalidateLiveContext(config, context, deadline);
       }
     }

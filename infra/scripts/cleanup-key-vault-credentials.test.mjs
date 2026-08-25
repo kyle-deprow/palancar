@@ -61,10 +61,48 @@ const PLAN = Buffer.from("protected plan bytes\n", "utf8");
 const PLAN_SHA256 = createHash("sha256").update(PLAN).digest("hex");
 const CREATE_TIME = "2026-08-21T00:00:00.000Z";
 const PREFLIGHT_TIME = "2026-08-21T00:00:30.000Z";
-const COMMIT = "c".repeat(40);
+const COMMIT = spawnSync("/usr/bin/git", ["--no-replace-objects", "rev-parse", "HEAD"], {
+  cwd: process.cwd(),
+  env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", GIT_NO_REPLACE_OBJECTS: "1" },
+  encoding: "utf8",
+}).stdout.trim();
 const HISTORICAL_UTILITY_COMMIT = "8a12340084da96135985df11529d4c1c05403fe1";
 const NON_ANCESTOR_UTILITY_COMMIT = "73e03fdd1748b4d4fd64581a65fa35956dedfa9f";
 const HISTORICAL_UTILITY_SHA256 = "ab715f30be100074ab70727e84ded906b79844db116a87d5ff488a28f1b84edb";
+const REVIEWED_DEPENDENCY_PATHS = Object.freeze([
+  "infra/scripts/verify-acr-image-platform.mjs",
+  "infra/scripts/assert-dev-plan.mjs",
+  "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json",
+  "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json",
+  "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json",
+  "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json",
+]);
+const HISTORICAL_CODE_BINDINGS = Object.freeze({
+  lifecycleSha256: "c3eef606cf54588cf23e58ed1dc2af955bc9ad718ebb715a9e1b2c470f88f56c",
+  guardSha256: "d3035676393f79ff09fc778da7abecd185edebce91573404ac115e550e386272",
+  dependencyBlobs: [
+    { path: REVIEWED_DEPENDENCY_PATHS[0], blob: "3a23c927add217307d4bfa9cc67bb9fa6bbcb643", sha256: "4f346837cfa1633495d95c5a6d9001336875a8b40fdf60bcfd40176187100035" },
+    { path: REVIEWED_DEPENDENCY_PATHS[1], blob: "3160ad8daeec3ed4a496a644293abd55998eba8a", sha256: "d3035676393f79ff09fc778da7abecd185edebce91573404ac115e550e386272" },
+    { path: REVIEWED_DEPENDENCY_PATHS[2], blob: "7697d29a239caabe08c71e5c27ce1354ae3eae6f", sha256: "41b2f20ecfe751360093b34c9789f00c07d91838ef264e67fc4d9da37415a5dd" },
+    { path: REVIEWED_DEPENDENCY_PATHS[3], blob: "2eab854e5858267c0a926db914998f4b92ccbfeb", sha256: "da7d48c80b91eb3b7f4a88c66d293958160e4c80996c48ad51fd9697f1329b19" },
+    { path: REVIEWED_DEPENDENCY_PATHS[4], blob: "5c3b9f712dafb6f59a1f077901309df134ec0da0", sha256: "524ef7341171b1c42eeaa757d6514d74399ae67d5e0d6a004d377b4b230cf312" },
+    { path: REVIEWED_DEPENDENCY_PATHS[5], blob: "5b37e1e8be5de49b1b45b29069890b65cbf723b9", sha256: "35605793eaf3d0c4622deb2e6ee2ca615ed4f228d5af392b04ae30a9327ed0bf" },
+  ],
+});
+const CURRENT_CODE_BINDINGS = Object.freeze({
+  lifecycleSha256: "4ceb3786137f1c434bd3612383fe692074c92e42e4f416d41dbba40437564550",
+  guardSha256: HISTORICAL_CODE_BINDINGS.guardSha256,
+  dependencyBlobs: HISTORICAL_CODE_BINDINGS.dependencyBlobs,
+});
+
+function codeBindingsForCommit(repositoryCommit) {
+  const source = repositoryCommit === HISTORICAL_UTILITY_COMMIT ? HISTORICAL_CODE_BINDINGS : CURRENT_CODE_BINDINGS;
+  return {
+    lifecycleSha256: source.lifecycleSha256,
+    guardSha256: source.guardSha256,
+    dependencyBlobs: source.dependencyBlobs.map((entry) => ({ ...entry })),
+  };
+}
 const ACR_LOGIN_SERVER = "palancardev.azurecr.io";
 const ACCOUNT_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.CognitiveServices/accounts/palancar-dev`;
 const RUNTIME_IDENTITY_ID = `/subscriptions/${SUBSCRIPTION}/resourceGroups/rg-palancar-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/palancar-runtime`;
@@ -243,6 +281,7 @@ function listBody(names, kind) {
 }
 
 function makeBindings(planPath, repositoryCommit = COMMIT) {
+  const reviewed = codeBindingsForCommit(repositoryCommit);
   const backend = {
     container_name: "tfstate-dev",
     key: "dev/terraform.tfstate",
@@ -259,9 +298,9 @@ function makeBindings(planPath, repositoryCommit = COMMIT) {
   const bindings = {
     planSha256: PLAN_SHA256,
     terraformSha256: "1".repeat(64),
-    lifecycleSha256: "2".repeat(64),
-    guardSha256: "3".repeat(64),
-    dependencyBlobs: [],
+    lifecycleSha256: reviewed.lifecycleSha256,
+    guardSha256: reviewed.guardSha256,
+    dependencyBlobs: reviewed.dependencyBlobs,
     repositoryCommit,
     cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../environments/dev"),
     phase: "credential-cleanup",
@@ -2084,6 +2123,55 @@ test("live shared-context drift is re-read and rejected before every vault acces
     assert.equal(harness.azCalls.length, 0);
     assert.equal(existsSync(harness.path(OPERATION_MANIFEST_FILENAME)), true);
   }
+});
+
+test("post-apply recovery accepts one state serial advance and historical code identities only on resume/assert-absent", async () => {
+  const postApply = makeHarness();
+  await postApply.cleanup.start(postApply.runId);
+  postApply.active.clear();
+  postApply.setLiveContext({ ...postApply.bindings, stateSerial: postApply.bindings.stateSerial + 1 });
+  assert.deepEqual(await postApply.cleanup.resume(postApply.runId), { status: "absent", runId: postApply.runId });
+  assert.deepEqual(await postApply.cleanup.assertAbsent(postApply.runId), { status: "absent", runId: postApply.runId });
+
+  const serialTooFar = makeHarness();
+  await serialTooFar.cleanup.start(serialTooFar.runId);
+  serialTooFar.setLiveContext({ ...serialTooFar.bindings, stateSerial: serialTooFar.bindings.stateSerial + 2 });
+  await expectCode(serialTooFar.cleanup.resume(serialTooFar.runId), "live-context-drift");
+
+  const changedLineage = makeHarness();
+  await changedLineage.cleanup.start(changedLineage.runId);
+  changedLineage.setLiveContext({
+    ...changedLineage.bindings,
+    stateLineage: "changed-lineage",
+    stateSerial: changedLineage.bindings.stateSerial + 1,
+  });
+  await expectCode(changedLineage.cleanup.resume(changedLineage.runId), "live-context-drift");
+
+  const historicalStart = makeHarness({ repositoryCommit: HISTORICAL_UTILITY_COMMIT });
+  historicalStart.setLiveContext({
+    ...historicalStart.bindings,
+    ...CURRENT_CODE_BINDINGS,
+    repositoryCommit: COMMIT,
+  });
+  await expectCode(historicalStart.cleanup.start(historicalStart.runId), "live-context-drift");
+
+  const historicalResume = makeHarness({ repositoryCommit: HISTORICAL_UTILITY_COMMIT });
+  await historicalResume.cleanup.start(historicalResume.runId);
+  historicalResume.active.clear();
+  historicalResume.setLiveContext({
+    ...historicalResume.bindings,
+    ...CURRENT_CODE_BINDINGS,
+    repositoryCommit: COMMIT,
+    stateSerial: historicalResume.bindings.stateSerial + 1,
+  });
+  assert.deepEqual(await historicalResume.cleanup.resume(historicalResume.runId), { status: "absent", runId: historicalResume.runId });
+  assert.deepEqual(await historicalResume.cleanup.assertAbsent(historicalResume.runId), { status: "absent", runId: historicalResume.runId });
+
+  const nonAncestor = makeHarness({ repositoryCommit: NON_ANCESTOR_UTILITY_COMMIT });
+  await nonAncestor.cleanup.start(nonAncestor.runId);
+  nonAncestor.active.clear();
+  nonAncestor.setLiveContext({ ...nonAncestor.bindings, stateSerial: nonAncestor.bindings.stateSerial + 1 });
+  await expectCode(nonAncestor.cleanup.resume(nonAncestor.runId), "live-context-drift");
 });
 
 test("preflight order and age are enforced independently of plan creation", async () => {
