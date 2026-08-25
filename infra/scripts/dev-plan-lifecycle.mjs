@@ -8454,7 +8454,8 @@ function runtimePrincipalId(app, outputs, code) {
   failIf(!isObject(app.identity) || app.identity.type !== "UserAssigned" ||
     !isObject(app.identity.userAssignedIdentities), code);
   const identityIds = Object.keys(app.identity.userAssignedIdentities);
-  const identityId = identityIds.find((id) => id === outputs.runtimeIdentityId);
+  const runtimeIdentityKey = identityKey(outputs.runtimeIdentityId, code);
+  const identityId = identityIds.find((id) => identityKey(id, code) === runtimeIdentityKey);
   failIf(!identityId, code);
   const identity = app.identity.userAssignedIdentities[identityId];
   assertKnownKeys(identity, ["clientId", "principalId"], code);

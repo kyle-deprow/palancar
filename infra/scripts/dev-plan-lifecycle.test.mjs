@@ -43,7 +43,7 @@ const instrumentedSource = `${productionSource
   .replace(
     cachePathDeclaration,
     `const LIFECYCLE_CACHE_ROOT = ${JSON.stringify(instrumentedCacheRoot)};`,
-)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, parseAccessToken, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision, assertRevisionResponse };\n`;
+)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, parseAccessToken, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision, assertRevisionResponse, runtimePrincipalId };\n`;
 const instrumentedFd = openSync(instrumentedPath, "wx", 0o600);
 try {
   writeSync(instrumentedFd, instrumentedSource, 0, "utf8");
@@ -79,6 +79,7 @@ const {
   assertRevisionResponse,
   normalizeLiveRevision,
   parseAccessToken,
+  runtimePrincipalId,
   reviewedRuntimeShapes,
   sha256File,
   sha256Bytes,
@@ -5629,6 +5630,61 @@ test("protected role flags and the prior apply proof gate lifecycle boundaries",
     } finally {
       harness.cleanup();
     }
+  }
+});
+
+test("runtime identity RBAC lookup canonicalizes ARM keys and remains fail-closed", () => {
+  const code = "reconcile-credential-rbac";
+  const outputs = {
+    runtimeIdentityId: RUNTIME_ID,
+    runtimeIdentityClientId: RUNTIME_CLIENT,
+    runtimeIdentityPrincipalId: RUNTIME_PRINCIPAL,
+  };
+  const appFor = (identityId) => ({
+    identity: {
+      type: "UserAssigned",
+      userAssignedIdentities: {
+        [identityId]: { clientId: RUNTIME_CLIENT, principalId: RUNTIME_PRINCIPAL },
+      },
+    },
+  });
+
+  assert.equal(
+    runtimePrincipalId(appFor(RUNTIME_ID.replace("/resourceGroups/", "/resourcegroups/")), outputs, code),
+    RUNTIME_PRINCIPAL,
+  );
+  expectCode(
+    () => runtimePrincipalId(appFor(RUNTIME_ID.replace(/\/runtime$/, "/other-runtime")), outputs, code),
+    code,
+  );
+  expectCode(() => runtimePrincipalId(appFor("not-an-arm-resource-id"), outputs, code), code);
+
+  const credential = makeHarness();
+  try {
+    const runId = prepareCredentialReconcile(credential);
+    credential.setSerial(8);
+    credential.setLiveAppMutator((app) => {
+      const next = structuredClone(app);
+      const runtimeIdentity = next.identity.userAssignedIdentities[RUNTIME_ID];
+      delete next.identity.userAssignedIdentities[RUNTIME_ID];
+      next.identity.userAssignedIdentities[RUNTIME_ID.replace("/resourceGroups/", "/resourcegroups/")] = runtimeIdentity;
+      return next;
+    });
+    const start = credential.calls.length;
+    assert.deepEqual(credential.lifecycle.reconcile("credential-cleanup", runId), {
+      runId,
+      phase: "credential-cleanup",
+      status: "applied",
+      state: "credentials-and-RBAC-cleaned",
+    });
+    const calls = roleAssignmentCalls(credential, start).filter(
+      (call) => call.argv.includes("--assignee-object-id"),
+    );
+    assert.equal(calls.length, 2);
+    assertExactScopedRoleAssignmentArgv(calls[0], KEY_VAULT_ID, RUNTIME_PRINCIPAL);
+    assertExactScopedRoleAssignmentArgv(calls[1], FOUNDry_ACCOUNT_ID, RUNTIME_PRINCIPAL);
+  } finally {
+    credential.cleanup();
   }
 });
 

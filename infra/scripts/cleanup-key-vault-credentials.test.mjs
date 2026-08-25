@@ -89,7 +89,7 @@ const HISTORICAL_CODE_BINDINGS = Object.freeze({
   ],
 });
 const CURRENT_CODE_BINDINGS = Object.freeze({
-  lifecycleSha256: "6be59eaac860a620a09a2e5f9d910d464da8a5912ac16807f21c2f67cb308f65",
+  lifecycleSha256: "feae067df5f817c16e1746e760ae7585703cbbb3caf053c90e413e7d5830c044",
   guardSha256: HISTORICAL_CODE_BINDINGS.guardSha256,
   dependencyBlobs: HISTORICAL_CODE_BINDINGS.dependencyBlobs,
 });
