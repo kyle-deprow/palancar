@@ -107,7 +107,6 @@ export const AZURE_CLOUD_DESCRIPTORS = Object.freeze({
 export const OUTER_SIGNAL_GRACE_MS = 1_000;
 export const PREFLIGHT_RECEIPT_FILENAME = "preflight-receipt.json";
 export const PREFLIGHT_VERIFIER_ID = "palancar.azure-key-vault-cleanup.runtime-preflight.v1";
-export const PREFLIGHT_VERIFIER_ARTIFACT = "infra/scripts/cleanup-key-vault-credentials.mjs";
 export const PREFLIGHT_MAX_AGE_MS = 2 * 60 * 1000;
 
 const ARTIFACT_MODE = 0o600;
@@ -188,7 +187,7 @@ const GUARD_KEYS = Object.freeze([
   "version", "type", "runId", "phase", "planSha256", "bindingSha256",
   "createdAt", "guard", "showSha256", "guardArgv", "stdinSha256", "result",
 ]);
-const LIFECYCLE_CHECKPOINT_FILE_RE = /^(\d{6})-(cleanup-start|receipts-consumed)\.json$/u;
+const LIFECYCLE_CHECKPOINT_FILE_RE = /^(\d{6})-(cleanup-start|preflight-receipt|receipts-consumed)\.json$/u;
 const LIFECYCLE_CHECKPOINT_COMMON_KEYS = Object.freeze([
   "version", "type", "sequence", "name", "runId", "phase", "createdAt",
 ]);
@@ -196,14 +195,16 @@ const LIFECYCLE_CHECKPOINT_KEYS = Object.freeze({
   "cleanup-start": Object.freeze([
     ...LIFECYCLE_CHECKPOINT_COMMON_KEYS, "cleanupOperationManifestSha256", "guardReceiptSha256",
   ]),
+  "preflight-receipt": Object.freeze([
+    ...LIFECYCLE_CHECKPOINT_COMMON_KEYS, "receiptSha256", "verifierSha256", "cleanupOperationManifestSha256",
+  ]),
   "receipts-consumed": Object.freeze([
     ...LIFECYCLE_CHECKPOINT_COMMON_KEYS, "guardReceiptSha256", "preflightReceiptSha256",
   ]),
 });
 const PREFLIGHT_KEYS = Object.freeze([
-  "version", "type", "runId", "phase", "planSha256", "bindingSha256", "contextSha256",
-  "createdAt", "deadlineAt", "result", "verifierId", "verifierArtifact", "verifierSha256", "runtimeIdentity",
-  "vaultResourceId", "vaultUri", "targetNames", "receiptSha256",
+  "version", "type", "runId", "phase", "planSha256", "bindingSha256", "createdAt",
+  "result", "verifierSha256",
 ]);
 const OPERATION_KEYS = Object.freeze([
   "version", "type", "status", "operation", "runId", "phase", "planSha256",
@@ -256,7 +257,7 @@ const MUTATION_INTENT_KEYS = Object.freeze([
   "version", "type", "runId", "phase", "sequence", "target", "action",
   "contextSha256", "stateSequence", "stateSha256", "journalCommitmentSha256",
   "preflightReceiptSha256", "preflightVerifierId", "preflightVerifierSha256",
-  "preflightCreatedAt", "preflightDeadlineAt", "createdAt", "previousIntentSha256",
+  "preflightCreatedAt", "createdAt", "previousIntentSha256",
   "intentSha256",
 ]);
 const MUTATION_COMMITMENT_KEYS = Object.freeze([
@@ -876,78 +877,92 @@ function validateGuardReceipt(raw, descriptor, manifest) {
 function validatePreflightReceipt(raw, descriptor, manifest) {
   exactKeys(raw, PREFLIGHT_KEYS, "preflight-receipt-schema");
   failIf(
-      raw.version !== 2 || raw.type !== "runtime-preflight" || raw.runId !== descriptor.runId ||
-      raw.phase !== "credential-cleanup" || raw.planSha256 !== manifest.planSha256 ||
-      raw.bindingSha256 !== manifest.bindingSha256 || raw.contextSha256 !== descriptor.contextSha256 ||
-      raw.result !== "passed" || raw.verifierId !== PREFLIGHT_VERIFIER_ID ||
-      raw.verifierArtifact !== PREFLIGHT_VERIFIER_ARTIFACT ||
-      !isSha256(raw.verifierSha256) || !utilitySha256Allowed(raw.verifierSha256, manifest.bindings.repositoryCommit) ||
-      raw.vaultResourceId !== descriptor.vaultResourceId || raw.vaultUri !== descriptor.vaultUri,
+    raw.version !== 1 || raw.type !== "preflight" ||
+      raw.runId !== descriptor.runId || raw.runId !== manifest.runId ||
+      raw.phase !== descriptor.raw.phase || raw.phase !== manifest.phase || raw.phase !== "credential-cleanup" ||
+      raw.planSha256 !== descriptor.planSha256 || raw.planSha256 !== manifest.planSha256 ||
+      raw.bindingSha256 !== descriptor.bindingSha256 || raw.bindingSha256 !== manifest.bindingSha256 ||
+      // verifierSha256 is the lifecycle's preflight-evidence hash, not a
+      // code-file hash; the lifecycle itself validates it only as a sha256.
+      raw.result !== "passed" || !isSha256(raw.verifierSha256),
     "preflight-receipt-schema",
   );
-  exactKeys(raw.runtimeIdentity, ["cloud", "subscription", "tenant", "userType", "objectId"], "preflight-runtime-identity");
-  failIf(
-    raw.runtimeIdentity.cloud !== descriptor.cloud ||
-      raw.runtimeIdentity.subscription !== descriptor.subscription ||
-      raw.runtimeIdentity.tenant !== descriptor.tenant ||
-      raw.runtimeIdentity.userType !== descriptor.callerIdentity.userType ||
-      raw.runtimeIdentity.objectId !== descriptor.callerIdentity.objectId,
-    "preflight-runtime-identity",
-  );
-  validateTargetNames(raw.targetNames, "preflight-targets");
   assertIsoTimestamp(raw.createdAt, "preflight-receipt-time");
-  assertIsoTimestamp(raw.deadlineAt, "preflight-receipt-deadline");
-  const unsigned = Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "receiptSha256"));
-  failIf(!isSha256(raw.receiptSha256) || raw.receiptSha256 !== sha256Json(unsigned), "preflight-receipt-hash");
   const createdAt = Date.parse(raw.createdAt);
-  const deadlineAt = Date.parse(raw.deadlineAt);
-  failIf(deadlineAt <= createdAt || deadlineAt - createdAt > PREFLIGHT_MAX_AGE_MS, "preflight-receipt-deadline");
+  failIf(new Date(createdAt).toISOString() !== raw.createdAt, "preflight-receipt-time");
   return {
     raw,
-    receiptSha256: raw.receiptSha256,
-    verifierId: raw.verifierId,
+    receiptSha256: undefined,
+    verifierId: PREFLIGHT_VERIFIER_ID,
     verifierSha256: raw.verifierSha256,
     createdAt,
-    deadlineAt,
   };
 }
 
-function readGuardReceiptCheckpointBindings(directory, descriptor) {
+function readLifecycleReceiptCheckpointBindings(directory, descriptor, { includePreflight = true, requirePreflight = false } = {}) {
   const checkpoints = new Map();
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const match = LIFECYCLE_CHECKPOINT_FILE_RE.exec(entry.name);
     if (match === null) continue;
     const sequence = Number(match[1]);
     const name = match[2];
+    if (name === "preflight-receipt" && !includePreflight) continue;
     failIf(checkpoints.has(name), "guard-receipt-checkpoint");
-    const checkpoint = readJson(artifactPath(directory, entry.name), "guard-receipt-checkpoint");
-    exactKeys(checkpoint, LIFECYCLE_CHECKPOINT_KEYS[name], "guard-receipt-checkpoint-schema");
+    const checkpoint = readJson(
+      artifactPath(directory, entry.name),
+      name === "preflight-receipt" ? "preflight-receipt-checkpoint" : "guard-receipt-checkpoint",
+    );
+    exactKeys(
+      checkpoint,
+      LIFECYCLE_CHECKPOINT_KEYS[name],
+      name === "preflight-receipt" ? "preflight-receipt-checkpoint-schema" : "guard-receipt-checkpoint-schema",
+    );
     failIf(
       checkpoint.version !== 1 || checkpoint.type !== "lifecycle-checkpoint" ||
         checkpoint.sequence !== sequence || checkpoint.name !== name ||
         checkpoint.runId !== descriptor.runId || checkpoint.phase !== "credential-cleanup",
-      "guard-receipt-checkpoint-context",
+      name === "preflight-receipt" ? "preflight-receipt-checkpoint-context" : "guard-receipt-checkpoint-context",
     );
-    assertIsoTimestamp(checkpoint.createdAt, "guard-receipt-checkpoint-time");
-    failIf(!isSha256(checkpoint.guardReceiptSha256), "guard-receipt-checkpoint-hash");
+    assertIsoTimestamp(
+      checkpoint.createdAt,
+      name === "preflight-receipt" ? "preflight-receipt-checkpoint-time" : "guard-receipt-checkpoint-time",
+    );
     if (name === "cleanup-start") {
+      failIf(!isSha256(checkpoint.guardReceiptSha256), "guard-receipt-checkpoint-hash");
       failIf(!isSha256(checkpoint.cleanupOperationManifestSha256), "guard-receipt-checkpoint-context");
+    } else if (name === "preflight-receipt") {
+      failIf(!isSha256(checkpoint.receiptSha256) || !isSha256(checkpoint.verifierSha256) || !isSha256(checkpoint.cleanupOperationManifestSha256), "preflight-receipt-checkpoint-context");
     } else {
+      failIf(!isSha256(checkpoint.guardReceiptSha256), "guard-receipt-checkpoint-hash");
       failIf(!isSha256(checkpoint.preflightReceiptSha256), "guard-receipt-checkpoint-context");
     }
     checkpoints.set(name, checkpoint);
   }
   const cleanupStart = checkpoints.get("cleanup-start");
+  const preflightReceipt = checkpoints.get("preflight-receipt");
   const consumed = checkpoints.get("receipts-consumed");
   if (cleanupStart !== undefined && consumed !== undefined) {
     failIf(cleanupStart.sequence >= consumed.sequence, "guard-receipt-checkpoint-order");
     failIf(cleanupStart.guardReceiptSha256 !== consumed.guardReceiptSha256, "guard-receipt-checkpoint-hash");
   }
-  return consumed?.guardReceiptSha256 ?? cleanupStart?.guardReceiptSha256;
+  if (includePreflight && consumed !== undefined) {
+    failIf(requirePreflight && preflightReceipt === undefined, "preflight-receipt-checkpoint-missing");
+    if (preflightReceipt !== undefined) {
+      failIf(preflightReceipt.sequence >= consumed.sequence, "preflight-receipt-checkpoint-order");
+      failIf(preflightReceipt.receiptSha256 !== consumed.preflightReceiptSha256, "preflight-receipt-checkpoint-hash");
+    }
+  }
+  return {
+    guardReceiptSha256: consumed?.guardReceiptSha256 ?? cleanupStart?.guardReceiptSha256,
+    preflightReceiptSha256: preflightReceipt?.receiptSha256 ?? consumed?.preflightReceiptSha256,
+    preflightVerifierSha256: preflightReceipt?.verifierSha256,
+    preflightCheckpoint: preflightReceipt !== undefined,
+    receiptsConsumed: consumed !== undefined,
+  };
 }
 
 function readGuardReceipt(directory, descriptor, manifest) {
-  const recordedSha256 = readGuardReceiptCheckpointBindings(directory, descriptor);
+  const recordedSha256 = readLifecycleReceiptCheckpointBindings(directory, descriptor).guardReceiptSha256;
   const guardPath = artifactPath(directory, "guard-receipt.json");
   const consumedGuardPath = artifactPath(directory, "guard-receipt.json.consumed");
   const guardExists = existsSync(guardPath);
@@ -963,7 +978,11 @@ function readGuardReceipt(directory, descriptor, manifest) {
   return { guard, guardReceiptSha256: actualSha256 };
 }
 
-function readLifecycleContext(config, directory, descriptor, { rejectPreflight = false } = {}) {
+function readLifecycleContext(config, directory, descriptor, {
+  rejectPreflight = false,
+  allowConsumedPreflight = false,
+  validatePreflightAge = true,
+} = {}) {
   const planPath = artifactPath(directory, "plan.tfplan");
   assertRegular(planPath, "plan");
   failIf(sha256File(planPath) !== descriptor.planSha256, "plan-hash");
@@ -971,22 +990,54 @@ function readLifecycleContext(config, directory, descriptor, { rejectPreflight =
   const manifest = validateCreateManifest(readJson(createPath, "create-manifest"), descriptor, planPath);
   const guard = readGuardReceipt(directory, descriptor, manifest);
   const preflightPath = artifactPath(directory, PREFLIGHT_RECEIPT_FILENAME);
+  const consumedPreflightPath = artifactPath(directory, `${PREFLIGHT_RECEIPT_FILENAME}.consumed`);
+  const checkpointBindings = readLifecycleReceiptCheckpointBindings(directory, descriptor, {
+    includePreflight: true,
+  });
   let preflight;
+  let preflightConsumed = false;
   if (existsSync(preflightPath)) {
+    if (checkpointBindings.receiptsConsumed) reject("preflight-receipt-integrity");
     if (rejectPreflight) reject("start-after-preflight");
     preflight = validatePreflightReceipt(readJson(preflightPath, "preflight-receipt"), descriptor, manifest);
+    preflight.receiptSha256 = sha256File(preflightPath);
+    if (checkpointBindings.preflightReceiptSha256 !== undefined) {
+      failIf(preflight.receiptSha256 !== checkpointBindings.preflightReceiptSha256, "preflight-receipt-checkpoint-hash");
+      failIf(preflight.verifierSha256 !== checkpointBindings.preflightVerifierSha256, "preflight-receipt-checkpoint-context");
+    }
     const planTime = Date.parse(manifest.createdAt);
     const preflightTime = preflight.createdAt;
-    const wallNow = config.wallNow();
     failIf(!Number.isFinite(planTime) || !Number.isFinite(preflightTime), "preflight-time");
     failIf(preflightTime <= planTime || preflight.createdAt === manifest.createdAt, "preflight-order");
-    failIf(!Number.isFinite(wallNow) || preflightTime > wallNow || wallNow - preflightTime > PREFLIGHT_MAX_AGE_MS || preflight.deadlineAt <= wallNow, "preflight-expired");
+    if (validatePreflightAge) {
+      const wallNow = config.wallNow();
+      failIf(!Number.isFinite(wallNow) || preflightTime > wallNow || wallNow - preflightTime > PREFLIGHT_MAX_AGE_MS, "preflight-expired");
+    }
+  } else if (allowConsumedPreflight && checkpointBindings.receiptsConsumed) {
+    if (!existsSync(consumedPreflightPath)) reject("preflight-receipt-missing");
+    if (!checkpointBindings.preflightCheckpoint) reject("preflight-receipt-checkpoint-missing");
+    preflight = validatePreflightReceipt(readJson(consumedPreflightPath, "preflight-receipt"), descriptor, manifest);
+    failIf(sha256File(consumedPreflightPath) !== checkpointBindings.preflightReceiptSha256, "preflight-receipt-checkpoint-hash");
+    failIf(preflight.verifierSha256 !== checkpointBindings.preflightVerifierSha256, "preflight-receipt-checkpoint-context");
+    preflight.receiptSha256 = checkpointBindings.preflightReceiptSha256;
+    const planTime = Date.parse(manifest.createdAt);
+    const preflightTime = preflight.createdAt;
+    failIf(!Number.isFinite(planTime) || !Number.isFinite(preflightTime), "preflight-time");
+    failIf(preflightTime <= planTime || preflight.createdAt === manifest.createdAt, "preflight-order");
+    preflightConsumed = true;
+  } else if (checkpointBindings.preflightCheckpoint) {
+    reject("preflight-receipt-missing");
   }
   return {
     planPath,
     manifest,
     guard: guard.guard,
     preflight,
+    preflightConsumed,
+    preflightReceiptSha256: preflightConsumed ? checkpointBindings.preflightReceiptSha256 : undefined,
+    preflightVerifierSha256: preflight === undefined
+      ? undefined
+      : checkpointBindings.preflightVerifierSha256 ?? preflight.verifierSha256,
     guardReceiptSha256: guard.guardReceiptSha256,
   };
 }
@@ -1407,8 +1458,11 @@ function readDescriptor(config, directory, runId) {
 function validateContext(config, runId, requireManifest, options = {}) {
   const directory = runDirectory(config, runId);
   const descriptor = readDescriptor(config, directory, runId);
-  const lifecycle = readLifecycleContext(config, directory, descriptor, options);
   const allowPostApplyRecovery = options.allowPostApplyRecovery === true;
+  const lifecycle = readLifecycleContext(config, directory, descriptor, {
+    rejectPreflight: options.rejectPreflight === true,
+    allowConsumedPreflight: allowPostApplyRecovery,
+  });
   if (!requireManifest) return { directory, descriptor, lifecycle, allowPostApplyRecovery };
   const operationHistory = readOperationHistory(config, { directory, descriptor, lifecycle });
   failIf(operationHistory === undefined, "operation-manifest-missing");
@@ -1430,18 +1484,28 @@ function validateContext(config, runId, requireManifest, options = {}) {
 
 function readRuntimePreflight(config, context, deadline) {
   assertWithinDeadline(config, deadline);
-  const receiptPath = artifactPath(context.directory, PREFLIGHT_RECEIPT_FILENAME);
+  const consumed = context.lifecycle.preflightConsumed === true;
+  const receiptPath = artifactPath(
+    context.directory,
+    consumed ? `${PREFLIGHT_RECEIPT_FILENAME}.consumed` : PREFLIGHT_RECEIPT_FILENAME,
+  );
   const receipt = validatePreflightReceipt(
     readJson(receiptPath, "preflight-receipt"),
     context.descriptor,
     context.lifecycle.manifest,
   );
-  const wallNow = config.wallNow();
-  failIf(!Number.isFinite(wallNow), "preflight-clock");
-  failIf(receipt.createdAt > wallNow || wallNow - receipt.createdAt > PREFLIGHT_MAX_AGE_MS, "preflight-expired");
-  failIf(receipt.deadlineAt <= wallNow, "preflight-expired");
-  failIf(receipt.verifierSha256 !== context.operation.utilitySha256, "preflight-verifier-binding");
-  failIf(receipt.deadlineAt - wallNow < Math.min(CONVERGENCE_POLL_MS, remaining(config, deadline)), "preflight-deadline");
+  receipt.receiptSha256 = sha256File(receiptPath);
+  let wallNow;
+  if (consumed) {
+    failIf(sha256File(receiptPath) !== context.lifecycle.preflightReceiptSha256, "preflight-receipt-checkpoint-hash");
+  } else {
+    wallNow = config.wallNow();
+    failIf(!Number.isFinite(wallNow), "preflight-clock");
+    failIf(receipt.createdAt > wallNow || wallNow - receipt.createdAt > PREFLIGHT_MAX_AGE_MS, "preflight-expired");
+  }
+  if (context.lifecycle?.preflightVerifierSha256 !== undefined) {
+    failIf(receipt.verifierSha256 !== context.lifecycle.preflightVerifierSha256, "preflight-receipt-checkpoint-context");
+  }
   return receipt;
 }
 
@@ -1870,9 +1934,10 @@ function validateMutationIntentShape(value, context, previousIntentSha256) {
       !Number.isSafeInteger(value.stateSequence) || value.stateSequence < 0 || !isSha256(value.stateSha256) ||
       !isSha256(value.journalCommitmentSha256) ||
       !isSha256(value.preflightReceiptSha256) || value.preflightVerifierId !== PREFLIGHT_VERIFIER_ID ||
-      !isSha256(value.preflightVerifierSha256) || value.preflightVerifierSha256 !== context.operation.utilitySha256 ||
-      !Number.isFinite(Date.parse(value.preflightCreatedAt)) || !Number.isFinite(Date.parse(value.preflightDeadlineAt)) ||
-      Date.parse(value.preflightDeadlineAt) <= Date.parse(value.preflightCreatedAt) ||
+      !isSha256(value.preflightVerifierSha256) ||
+      !isSha256(context.lifecycle?.preflightVerifierSha256) ||
+      value.preflightVerifierSha256 !== context.lifecycle.preflightVerifierSha256 ||
+      !Number.isFinite(Date.parse(value.preflightCreatedAt)) ||
       !Number.isFinite(Date.parse(value.createdAt)) ||
       (previousIntentSha256 === undefined
         ? value.previousIntentSha256 !== null
@@ -2045,7 +2110,6 @@ function publishMutationIntent(config, context, state, target, action, preflight
     preflightVerifierId: preflight.verifierId,
     preflightVerifierSha256: preflight.verifierSha256,
     preflightCreatedAt: preflight.raw.createdAt,
-    preflightDeadlineAt: preflight.raw.deadlineAt,
     createdAt: new Date(config.wallNow()).toISOString(),
     previousIntentSha256: previousFilePath === undefined ? null : sha256File(previousFilePath),
     intentSha256: null,
@@ -2164,7 +2228,9 @@ function validateStateShape(value, context, filePath, previousFilePath) {
   } else {
     failIf(
       !isSha256(value.preflightReceiptSha256) || value.preflightVerifierId !== PREFLIGHT_VERIFIER_ID ||
-        value.preflightVerifierSha256 !== context.operation.utilitySha256,
+        !isSha256(value.preflightVerifierSha256) ||
+        !isSha256(context.lifecycle?.preflightVerifierSha256) ||
+        value.preflightVerifierSha256 !== context.lifecycle.preflightVerifierSha256,
       "state-preflight-verifier",
     );
   }
@@ -2915,8 +2981,7 @@ async function httpRequest(config, request, deadline, code, context) {
             intent.value.preflightReceiptSha256 !== preflight.receiptSha256 ||
             intent.value.preflightVerifierId !== preflight.verifierId ||
             intent.value.preflightVerifierSha256 !== preflight.verifierSha256 ||
-            intent.value.preflightCreatedAt !== preflight.raw.createdAt ||
-            intent.value.preflightDeadlineAt !== preflight.raw.deadlineAt,
+            intent.value.preflightCreatedAt !== preflight.raw.createdAt,
           `${code}-mutation-intent`,
         );
         // The live reread is deliberately followed by a second freshness
@@ -3118,7 +3183,9 @@ function validateAbsenceReceipt(raw, context) {
       raw.createdAt !== operation.createdAt || raw.repositoryCommit !== operation.repositoryCommit ||
       canonicalJson(raw.supersession) !== canonicalJson(operation.supersession) ||
       raw.preflightReceiptSha256 === null || !isSha256(raw.preflightReceiptSha256) ||
-      raw.preflightVerifierId !== PREFLIGHT_VERIFIER_ID || raw.preflightVerifierSha256 !== operation.utilitySha256 ||
+      raw.preflightVerifierId !== PREFLIGHT_VERIFIER_ID || !isSha256(raw.preflightVerifierSha256) ||
+      !isSha256(context.lifecycle?.preflightVerifierSha256) ||
+      raw.preflightVerifierSha256 !== context.lifecycle.preflightVerifierSha256 ||
       !isSha256(raw.sha256) || raw.sha256 !== sha256Json(Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "sha256"))),
     "absence-receipt-context",
   );
@@ -3270,6 +3337,11 @@ function validatePriorSupersession(config, context) {
   const oldOperation = Object.fromEntries(OPERATION_KEYS.map((key) => [key, oldHead[key]]));
   const oldOperationPath = artifactPath(oldDirectory, oldHead.manifestFilename);
   failIf(oldHead.manifestSha256 !== sha256File(oldOperationPath), "supersession-manifest-hash");
+  const oldDescriptor = readDescriptor(config, oldDirectory, supersession.oldRunId);
+  const oldLifecycle = readLifecycleContext(config, oldDirectory, oldDescriptor, {
+    allowConsumedPreflight: true,
+    validatePreflightAge: false,
+  });
   const oldContext = {
     descriptor: {
       runId: oldOperation.runId,
@@ -3280,6 +3352,9 @@ function validatePriorSupersession(config, context) {
     operation: oldOperation,
     operationPath: oldOperationPath,
     directory: oldDirectory,
+    lifecycle: {
+      preflightVerifierSha256: oldLifecycle.preflightVerifierSha256,
+    },
   };
   const oldState = readStateFiles(config, oldContext);
   const oldReceipt = readAbsenceReceiptWithExpectedHash(oldContext, oldState.absenceReceiptSha256).receipt;

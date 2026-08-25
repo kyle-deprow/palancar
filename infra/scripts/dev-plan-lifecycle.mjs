@@ -6692,7 +6692,7 @@ const CLEANUP_JOURNAL_COMMITMENT_KEYS = Object.freeze([
 const CLEANUP_MUTATION_INTENT_KEYS = Object.freeze([
   "version", "type", "runId", "phase", "sequence", "target", "action", "contextSha256",
   "stateSequence", "stateSha256", "journalCommitmentSha256", "preflightReceiptSha256",
-  "preflightVerifierId", "preflightVerifierSha256", "preflightCreatedAt", "preflightDeadlineAt",
+  "preflightVerifierId", "preflightVerifierSha256", "preflightCreatedAt",
   "createdAt", "previousIntentSha256", "intentSha256",
 ]);
 const CLEANUP_MUTATION_COMMITMENT_KEYS = Object.freeze([
@@ -6922,7 +6922,39 @@ function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanu
   };
 }
 
-function validateCleanupAbsence(filePath, manifest, operation, code = "cleanup-absence") {
+function validatedCleanupPreflightVerifierSha256(request) {
+  const directory = path.dirname(request.artifacts.cleanupOperation);
+  const checkpoints = Array.isArray(request.checkpoints)
+    ? request.checkpoints
+    : readCheckpoints(directory, { runId: request.manifest.runId, phase: "credential-cleanup" });
+  const preflightCheckpoint = checkpoints.find((checkpoint) => checkpoint.name === "preflight-receipt");
+  if (preflightCheckpoint === undefined) return undefined;
+  failIf(!isSha(preflightCheckpoint.verifierSha256), "cleanup-preflight-checkpoint");
+
+  const livePath = request.artifacts.preflight;
+  const consumedPath = `${livePath}.consumed`;
+  const consumedCheckpoint = checkpoints.find((checkpoint) => checkpoint.name === "receipts-consumed");
+  const liveExists = existsSync(livePath);
+  const consumedExists = existsSync(consumedPath);
+  if (consumedCheckpoint === undefined) {
+    failIf(!liveExists || consumedExists, "cleanup-preflight-receipt");
+  } else {
+    failIf(liveExists || !consumedExists || !isSha(consumedCheckpoint.preflightReceiptSha256), "cleanup-preflight-receipt");
+  }
+
+  const receiptPath = liveExists ? livePath : consumedPath;
+  const receipt = readReceiptAtCheckpoint(receiptPath, preflightCheckpoint, request.manifest, "preflight");
+  failIf(receipt.verifierSha256 !== preflightCheckpoint.verifierSha256, "cleanup-preflight-checkpoint");
+  if (consumedCheckpoint !== undefined) {
+    failIf(
+      consumedCheckpoint.preflightReceiptSha256 !== sha256File(receiptPath, JSON_MAX_BYTES),
+      "cleanup-preflight-receipt",
+    );
+  }
+  return receipt.verifierSha256;
+}
+
+function validateCleanupAbsence(filePath, manifest, operation, preflightVerifierSha256, code = "cleanup-absence") {
   assertRegular(filePath, undefined, code);
   const absence = readJson(filePath, code);
   assertKnownKeys(absence, CLEANUP_ABSENCE_KEYS, code);
@@ -6936,7 +6968,8 @@ function validateCleanupAbsence(filePath, manifest, operation, code = "cleanup-a
       absence.repositoryCommit !== manifest.bindings.repositoryCommit ||
       typeof absence.createdAt !== "string" || !Number.isFinite(Date.parse(absence.createdAt)) ||
       !isSha(absence.preflightReceiptSha256) || absence.preflightVerifierId !== CLEANUP_PREFLIGHT_VERIFIER_ID ||
-      absence.preflightVerifierSha256 !== operation.value.utilitySha256 ||
+      !isSha(absence.preflightVerifierSha256) ||
+      !isSha(preflightVerifierSha256) || absence.preflightVerifierSha256 !== preflightVerifierSha256 ||
       !Number.isSafeInteger(absence.mutationTailSequence) || absence.mutationTailSequence < -1 ||
       (absence.mutationTailSequence === -1 ? absence.mutationTailSha256 !== null : !isSha(absence.mutationTailSha256)) ||
       !isSha(absence.sha256) || absence.sha256 !== hashJson(Object.fromEntries(Object.entries(absence).filter(([key]) => key !== "sha256"))),
@@ -6950,15 +6983,16 @@ function validateCleanupAbsence(filePath, manifest, operation, code = "cleanup-a
   return { value: absence, fileSha256: sha256File(filePath, JSON_MAX_BYTES) };
 }
 
-function cleanupStatePreflightValid(state, utilitySha256) {
+function cleanupStatePreflightValid(state, preflightVerifierSha256) {
   if (state.status === "start-inventory-validated") {
     return state.preflightReceiptSha256 === null && state.preflightVerifierId === null && state.preflightVerifierSha256 === null;
   }
   return isSha(state.preflightReceiptSha256) && state.preflightVerifierId === CLEANUP_PREFLIGHT_VERIFIER_ID &&
-    state.preflightVerifierSha256 === utilitySha256;
+    isSha(state.preflightVerifierSha256) && isSha(preflightVerifierSha256) &&
+    state.preflightVerifierSha256 === preflightVerifierSha256;
 }
 
-function cleanupValidateMutationEvidence(directory, operation, states, journalCommitments, code) {
+function cleanupValidateMutationEvidence(directory, operation, states, journalCommitments, preflightVerifierSha256, code) {
   const commitments = [];
   const intents = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -7010,13 +7044,13 @@ function cleanupValidateMutationEvidence(directory, operation, states, journalCo
         intent.contextSha256 !== operation.value.contextSha256 || !Number.isSafeInteger(intent.stateSequence) || intent.stateSequence < 0 ||
         !isSha(intent.stateSha256) || intent.stateSha256 !== state.stateSha256 || !isSha(intent.journalCommitmentSha256) ||
         !isSha(intent.preflightReceiptSha256) || intent.preflightVerifierId !== CLEANUP_PREFLIGHT_VERIFIER_ID ||
-        intent.preflightVerifierSha256 !== operation.value.utilitySha256 ||
+        !isSha(intent.preflightVerifierSha256) ||
+        !isSha(preflightVerifierSha256) || intent.preflightVerifierSha256 !== preflightVerifierSha256 ||
         intent.preflightReceiptSha256 !== state.preflightReceiptSha256 ||
         intent.preflightVerifierId !== state.preflightVerifierId ||
         intent.preflightVerifierSha256 !== state.preflightVerifierSha256 ||
-        typeof intent.preflightCreatedAt !== "string" || typeof intent.preflightDeadlineAt !== "string" ||
-        !Number.isFinite(Date.parse(intent.preflightCreatedAt)) || !Number.isFinite(Date.parse(intent.preflightDeadlineAt)) ||
-        Date.parse(intent.preflightDeadlineAt) <= Date.parse(intent.preflightCreatedAt) ||
+        typeof intent.preflightCreatedAt !== "string" ||
+        !Number.isFinite(Date.parse(intent.preflightCreatedAt)) ||
         typeof intent.createdAt !== "string" || !Number.isFinite(Date.parse(intent.createdAt)) ||
         (index === 0 ? intent.previousIntentSha256 !== null : intent.previousIntentSha256 !== sha256File(intents[index - 1].path, JSON_MAX_BYTES)) ||
         !isSha(intent.intentSha256) || intent.intentSha256 !== hashJson(Object.fromEntries(Object.entries(intent).filter(([key]) => key !== "intentSha256"))),
@@ -7028,7 +7062,7 @@ function cleanupValidateMutationEvidence(directory, operation, states, journalCo
   return commitments;
 }
 
-function cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFiles, journalHeadFiles, directory, code) {
+function cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFiles, journalHeadFiles, directory, preflightVerifierSha256, code) {
   const journalCommitments = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const match = CLEANUP_JOURNAL_COMMITMENT_RE.exec(entry.name);
@@ -7059,7 +7093,7 @@ function cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFi
     assertRequiredKeys(commitment, CLEANUP_JOURNAL_COMMITMENT_KEYS, `${code}-commitment`);
     const previousCommitmentPath = index === 0 ? undefined : journalCommitments[index - 1].path;
     const previousHeadPath = index === 0 ? undefined : journalHeadFiles.get(index - 1);
-    const preflightValid = cleanupStatePreflightValid(state, operation.value.utilitySha256);
+    const preflightValid = cleanupStatePreflightValid(state, preflightVerifierSha256);
     failIf(
       anchor.version !== 1 || anchor.type !== "key-vault-cleanup-state-anchor" || anchor.runId !== request.manifest.runId ||
         anchor.phase !== "credential-cleanup" || anchor.stateSequence !== index || anchor.stateSha256 !== state.stateSha256 ||
@@ -7093,7 +7127,7 @@ function cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFi
       `${code}-commitment`);
     failIf(!preflightValid, `${code}-preflight`);
   }
-  const mutationCommitments = cleanupValidateMutationEvidence(directory, operation, stateFiles, journalCommitments, code);
+  const mutationCommitments = cleanupValidateMutationEvidence(directory, operation, stateFiles, journalCommitments, preflightVerifierSha256, code);
   for (const stateFile of stateFiles) {
     const state = readJson(stateFile.path, `${code}-state`);
     if (state.mutationTailSequence === -1) failIf(state.mutationTailSha256 !== null, `${code}-mutation-tail`);
@@ -7103,7 +7137,7 @@ function cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFi
   return journalCommitments;
 }
 
-function validateCleanupStateEvidence(request, operation, { requireComplete = false } = {}) {
+function validateCleanupStateEvidence(request, operation, { requireComplete = false, preflightVerifierSha256 } = {}) {
   const directory = path.dirname(request.artifacts.cleanupOperation);
   const stateFiles = [];
   const anchorFiles = new Map();
@@ -7140,7 +7174,7 @@ function validateCleanupStateEvidence(request, operation, { requireComplete = fa
       value.stateSha256 !== hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "stateSha256"))) ||
       !Number.isSafeInteger(value.mutationTailSequence) || value.mutationTailSequence < -1 ||
       (value.mutationTailSequence === -1 ? value.mutationTailSha256 !== null : !isSha(value.mutationTailSha256)) ||
-      !cleanupStatePreflightValid(value, operation.value.utilitySha256);
+      !cleanupStatePreflightValid(value, preflightVerifierSha256);
     failIf(cleanupStateContextInvalid, "cleanup-state-context");
     assertKnownKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
     assertRequiredKeys(value.inventory, ["activeNames", "deletedNames", "targetStates"], "cleanup-state-inventory");
@@ -7198,12 +7232,26 @@ function validateCleanupStateEvidence(request, operation, { requireComplete = fa
     failIf(last.status === "complete" && stateFiles.some(({ path: statePath }, index) => index < stateFiles.length - 1 && readJson(statePath, "cleanup-state").status === "complete"), "cleanup-state-terminal");
     const journalDirectory = cleanupJournalDirectoryFor(request.artifacts.cleanupOperation, request.manifest.runId);
     assertDirectory(journalDirectory, "cleanup-journal-directory");
-    cleanupValidateJournalEvidence(request, operation, stateFiles, anchorFiles, journalHeadFiles, journalDirectory, "cleanup-journal");
+    cleanupValidateJournalEvidence(
+      request,
+      operation,
+      stateFiles,
+      anchorFiles,
+      journalHeadFiles,
+      journalDirectory,
+      preflightVerifierSha256,
+      "cleanup-journal",
+    );
     for (const stateFile of stateFiles) {
       const state = readJson(stateFile.path, "cleanup-state");
       if (state.absenceReceiptSha256 !== null) {
         failIf(!existsSync(request.artifacts.absence) || sha256File(request.artifacts.absence, JSON_MAX_BYTES) !== state.absenceReceiptSha256, "cleanup-absence-linkage");
-        const absence = validateCleanupAbsence(request.artifacts.absence, request.manifest, operation);
+        const absence = validateCleanupAbsence(
+          request.artifacts.absence,
+          request.manifest,
+          operation,
+          preflightVerifierSha256,
+        );
         failIf(absence.value.mutationTailSequence !== state.mutationTailSequence ||
           absence.value.mutationTailSha256 !== state.mutationTailSha256 ||
           absence.value.preflightReceiptSha256 !== state.preflightReceiptSha256 ||
@@ -7233,12 +7281,13 @@ function requiredCleanup(request, { requireAbsence = true, processRunner = reque
     "cleanup-operation",
     processRunner,
   );
+  const preflightVerifierSha256 = validatedCleanupPreflightVerifierSha256(request);
   let stateFiles = [];
   if (!existsSync(request.artifacts.absence)) {
-    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: false });
+    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: false, preflightVerifierSha256 });
   } else {
     failIf(operation.value.status !== "completed", "cleanup-operation-incomplete");
-    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: true });
+    stateFiles = validateCleanupStateEvidence(request, operation, { requireComplete: true, preflightVerifierSha256 });
   }
   if (request.guardReceiptSha256 !== undefined) {
     const guardPath = existsSync(`${request.artifacts.guard}.consumed`)
@@ -7248,9 +7297,14 @@ function requiredCleanup(request, { requireAbsence = true, processRunner = reque
   }
   let absence;
   if (requireAbsence) {
-    absence = validateCleanupAbsence(request.artifacts.absence, manifest, { ...operation, path: operationPath });
+    absence = validateCleanupAbsence(
+      request.artifacts.absence,
+      manifest,
+      { ...operation, path: operationPath },
+      preflightVerifierSha256,
+    );
   }
-  return { descriptor, operation, absence };
+  return { descriptor, operation, absence, preflightVerifierSha256 };
 }
 
 function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifest, processRunner) {
@@ -7280,7 +7334,12 @@ function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifes
     if (checkpoint.absenceReceiptSha256 !== undefined) {
       failIf(!isSha(checkpoint.absenceReceiptSha256), "cleanup-absence-checkpoint");
       assertCheckpointArtifact(artifacts.absence, checkpoint, "absenceReceiptSha256", "cleanup-absence");
-      validateCleanupAbsence(artifacts.absence, manifest, { ...cleanup.operation, path: artifacts.cleanupOperation });
+      validateCleanupAbsence(
+        artifacts.absence,
+        manifest,
+        { ...cleanup.operation, path: artifacts.cleanupOperation },
+        cleanup.preflightVerifierSha256,
+      );
     }
   }
 }

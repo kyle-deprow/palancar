@@ -15,7 +15,7 @@ import {
   writeSync,
   closeSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -39,7 +39,6 @@ import {
   OPERATION_MANIFEST_FILENAME,
   PREFLIGHT_MAX_AGE_MS,
   PREFLIGHT_RECEIPT_FILENAME,
-  PREFLIGHT_VERIFIER_ARTIFACT,
   PREFLIGHT_VERIFIER_ID,
   productionProcess,
   productionContextReaderForTests,
@@ -376,26 +375,16 @@ function makeHarness(overrides = {}) {
   });
   const writePreflightFile = () => {
     const receipt = {
-      version: 2,
-      type: "runtime-preflight",
+      version: 1,
+      type: "preflight",
       runId,
       phase: "credential-cleanup",
       planSha256: PLAN_SHA256,
       bindingSha256,
-      contextSha256: bindingSha256,
       createdAt: PREFLIGHT_TIME,
-      deadlineAt: new Date(Date.parse(PREFLIGHT_TIME) + PREFLIGHT_MAX_AGE_MS).toISOString(),
       result: "passed",
-      verifierId: PREFLIGHT_VERIFIER_ID,
-      verifierArtifact: PREFLIGHT_VERIFIER_ARTIFACT,
-      verifierSha256: createHash("sha256").update(readFileSync(new URL("./cleanup-key-vault-credentials.mjs", import.meta.url))).digest("hex"),
-      runtimeIdentity: { cloud: "AzureCloud", subscription: SUBSCRIPTION, tenant: TENANT, userType: "user", objectId: OBJECT_ID },
-      vaultResourceId: RESOURCE_ID,
-      vaultUri: VAULT_URI,
-      targetNames: [...TARGET_SECRET_NAMES],
-      receiptSha256: null,
+      verifierSha256: randomBytes(32).toString("hex"),
     };
-    receipt.receiptSha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "receiptSha256")));
     const filePath = path.join(directory, PREFLIGHT_RECEIPT_FILENAME);
     if (existsSync(filePath)) unlinkSync(filePath);
     writeExclusive(filePath, receipt);
@@ -573,7 +562,7 @@ function writeLifecycleCheckpoint(harness, sequence, name, details) {
   });
 }
 
-function consumeGuardReceipt(harness, { cleanupStart = true, receiptsConsumed = true } = {}) {
+function consumeGuardReceipt(harness, { cleanupStart = true, receiptsConsumed = true, preflight = false } = {}) {
   const guardPath = harness.path("guard-receipt.json");
   const consumedPath = harness.path("guard-receipt.json.consumed");
   const bytes = readFileSync(guardPath);
@@ -588,13 +577,24 @@ function consumeGuardReceipt(harness, { cleanupStart = true, receiptsConsumed = 
     });
     sequence += 1;
   }
+  const preflightPath = harness.path(PREFLIGHT_RECEIPT_FILENAME);
+  const preflightReceiptSha256 = existsSync(preflightPath) ? fileSha256(preflightPath) : "f".repeat(64);
+  if (preflight) {
+    const preflightBytes = readFileSync(preflightPath);
+    const preflight = readJson(preflightPath);
+    writeExclusive(`${preflightPath}.consumed`, preflightBytes);
+    unlinkSync(preflightPath);
+    writeLifecycleCheckpoint(harness, sequence, "preflight-receipt", {
+      receiptSha256: preflightReceiptSha256,
+      verifierSha256: preflight.verifierSha256,
+      cleanupOperationManifestSha256: fileSha256(harness.path(OPERATION_MANIFEST_FILENAME)),
+    });
+    sequence += 1;
+  }
   if (receiptsConsumed) {
-    const preflightPath = harness.path(PREFLIGHT_RECEIPT_FILENAME);
     writeLifecycleCheckpoint(harness, sequence, "receipts-consumed", {
       guardReceiptSha256,
-      preflightReceiptSha256: existsSync(preflightPath)
-        ? createHash("sha256").update(readFileSync(preflightPath)).digest("hex")
-        : "f".repeat(64),
+      preflightReceiptSha256,
     });
   }
   return guardReceiptSha256;
@@ -891,10 +891,44 @@ test("descriptor, create, guard, preflight, operation, and state schemas are clo
   }
 });
 
+test("preflight receipts use the lifecycle nine-key shape and reject contract mutations", async () => {
+  const accepted = makeHarness();
+  await accepted.cleanup.start(accepted.runId);
+  assert.deepEqual(Object.keys(readJson(accepted.path(PREFLIGHT_RECEIPT_FILENAME))).sort(), [
+    "bindingSha256", "createdAt", "phase", "planSha256", "result", "runId",
+    "type", "verifierSha256", "version",
+  ]);
+  accepted.active.clear();
+  assert.deepEqual(await accepted.cleanup.resume(accepted.runId), { status: "absent", runId: accepted.runId });
+
+  const mutations = [
+    ["extra key", (value) => { value.deadlineAt = PREFLIGHT_TIME; }],
+    ["missing key", (value) => { delete value.verifierSha256; }],
+    ["version", (value) => { value.version = 2; }],
+    ["type", (value) => { value.type = "runtime-preflight"; }],
+    ["run ID", (value) => { value.runId = "other-run"; }],
+    ["phase", (value) => { value.phase = "model-bootstrap"; }],
+    ["plan hash", (value) => { value.planSha256 = "b".repeat(64); }],
+    ["binding hash", (value) => { value.bindingSha256 = "b".repeat(64); }],
+    ["result", (value) => { value.result = "failed"; }],
+  ];
+  for (const [, mutate] of mutations) {
+    const harness = makeHarness();
+    await harness.cleanup.start(harness.runId);
+    rewriteJson(harness.path(PREFLIGHT_RECEIPT_FILENAME), mutate);
+    await expectCode(harness.cleanup.resume(harness.runId), "preflight-receipt-schema");
+  }
+
+  const badTime = makeHarness();
+  await badTime.cleanup.start(badTime.runId);
+  rewriteJson(badTime.path(PREFLIGHT_RECEIPT_FILENAME), (value) => { value.createdAt = "not-an-iso-timestamp"; });
+  await expectCode(badTime.cleanup.resume(badTime.runId), "preflight-receipt-time");
+});
+
 test("consumed guard receipts are accepted only with matching lifecycle checkpoint evidence", async () => {
   const resumed = makeHarness();
   await resumed.cleanup.start(resumed.runId);
-  const resumedGuardSha256 = consumeGuardReceipt(resumed);
+  const resumedGuardSha256 = consumeGuardReceipt(resumed, { preflight: true });
   resumed.active.clear();
   resumed.deleted.clear();
   const resumedResult = await resumed.cleanup.resume(resumed.runId);
@@ -903,7 +937,6 @@ test("consumed guard receipts are accepted only with matching lifecycle checkpoi
 
   const asserted = makeHarness({ autoPreflight: false });
   await asserted.cleanup.start(asserted.runId);
-  consumeGuardReceipt(asserted);
   asserted.active.clear();
   asserted.deleted.clear();
   assert.deepEqual(await asserted.cleanup.assertAbsent(asserted.runId), { status: "absent", runId: asserted.runId });
@@ -915,11 +948,77 @@ test("consumed guard receipts are accepted only with matching lifecycle checkpoi
 
   const mismatched = makeHarness();
   await mismatched.cleanup.start(mismatched.runId);
-  consumeGuardReceipt(mismatched);
-  rewriteJson(mismatched.path("000002-receipts-consumed.json"), (checkpoint) => {
+  consumeGuardReceipt(mismatched, { preflight: true });
+  rewriteJson(mismatched.path("000003-receipts-consumed.json"), (checkpoint) => {
     checkpoint.guardReceiptSha256 = "b".repeat(64);
   });
   await expectCode(mismatched.cleanup.resume(mismatched.runId), "guard-receipt-checkpoint-hash");
+});
+
+test("consumed preflight receipts are accepted only for post-apply recovery and remain bound", async () => {
+  const resumed = makeHarness();
+  await resumed.cleanup.start(resumed.runId);
+  consumeGuardReceipt(resumed, { preflight: true });
+  resumed.setWallNow(Date.parse(PREFLIGHT_TIME) + PREFLIGHT_MAX_AGE_MS + 24 * 60 * 60 * 1000);
+  assert.deepEqual(await resumed.cleanup.resume(resumed.runId), { status: "absent", runId: resumed.runId });
+
+  const asserted = makeHarness();
+  await asserted.cleanup.start(asserted.runId);
+  consumeGuardReceipt(asserted, { preflight: true });
+  asserted.active.clear();
+  assert.deepEqual(await asserted.cleanup.assertAbsent(asserted.runId), { status: "absent", runId: asserted.runId });
+
+  const tampered = makeHarness();
+  await tampered.cleanup.start(tampered.runId);
+  consumeGuardReceipt(tampered, { preflight: true });
+  rewriteJson(tampered.path(`${PREFLIGHT_RECEIPT_FILENAME}.consumed`), (value) => {
+    value.createdAt = "2026-08-21T00:00:31.000Z";
+  });
+  await expectCode(tampered.cleanup.resume(tampered.runId), "preflight-receipt-checkpoint-hash");
+
+  const mismatchedVerifier = makeHarness();
+  await mismatchedVerifier.cleanup.start(mismatchedVerifier.runId);
+  consumeGuardReceipt(mismatchedVerifier, { preflight: true });
+  rewriteJson(mismatchedVerifier.path("000002-preflight-receipt.json"), (checkpoint) => {
+    checkpoint.verifierSha256 = "b".repeat(64);
+  });
+  await expectCode(mismatchedVerifier.cleanup.resume(mismatchedVerifier.runId), "preflight-receipt-checkpoint-context");
+
+  const coexisting = makeHarness();
+  await coexisting.cleanup.start(coexisting.runId);
+  consumeGuardReceipt(coexisting, { preflight: true });
+  writeExclusive(
+    coexisting.path(PREFLIGHT_RECEIPT_FILENAME),
+    readJson(coexisting.path(`${PREFLIGHT_RECEIPT_FILENAME}.consumed`)),
+  );
+  await expectCode(coexisting.cleanup.resume(coexisting.runId), "preflight-receipt-integrity");
+
+  const missing = makeHarness({ autoPreflight: false });
+  await missing.cleanup.start(missing.runId);
+  consumeGuardReceipt(missing);
+  await expectCode(missing.cleanup.resume(missing.runId), "preflight-receipt-missing");
+  await expectCode(missing.cleanup.assertAbsent(missing.runId), "preflight-receipt-missing");
+
+  const preApply = makeHarness({ autoPreflight: false });
+  await preApply.cleanup.start(preApply.runId);
+  await expectCode(preApply.cleanup.resume(preApply.runId), "preflight-receipt-missing");
+
+  const checkpointWithoutReceipt = makeHarness({ autoPreflight: false });
+  await checkpointWithoutReceipt.cleanup.start(checkpointWithoutReceipt.runId);
+  writeLifecycleCheckpoint(checkpointWithoutReceipt, 2, "preflight-receipt", {
+    receiptSha256: "a".repeat(64),
+    verifierSha256: "b".repeat(64),
+    cleanupOperationManifestSha256: fileSha256(checkpointWithoutReceipt.path(OPERATION_MANIFEST_FILENAME)),
+  });
+  await expectCode(
+    checkpointWithoutReceipt.cleanup.resume(checkpointWithoutReceipt.runId),
+    "preflight-receipt-missing",
+  );
+
+  const expired = makeHarness();
+  await expired.cleanup.start(expired.runId);
+  expired.setWallNow(Date.parse(PREFLIGHT_TIME) + PREFLIGHT_MAX_AGE_MS + 1);
+  await expectCode(expired.cleanup.resume(expired.runId), "preflight-expired");
 });
 
 test("start writes exclusive protected artifacts and exact context bindings", async () => {
@@ -1057,6 +1156,101 @@ test("the five cleanup pinning invariants reject self-rehashed mutations", async
   }
 });
 
+test("state, mutation intent, and absence records reject mismatched preflight verifier bindings", async () => {
+  const mismatchedVerifier = "b".repeat(64);
+
+  // A self-rehashed state envelope cannot detach from the validated receipt.
+  {
+    let crashed = true;
+    const harness = makeHarness({
+      faultAt: ({ event, filePath }) => {
+        if (crashed && event === "after-directory-fsync" && /cleanup-state-anchor-000001\.json$/u.test(filePath ?? "")) {
+          crashed = false;
+          return true;
+        }
+        return false;
+      },
+    });
+    await harness.cleanup.start(harness.runId);
+    await assert.rejects(harness.cleanup.resume(harness.runId));
+    harness.setFault(undefined);
+    rebindStateEnvelope(harness, 1, (state) => {
+      state.preflightVerifierSha256 = mismatchedVerifier;
+    });
+    harness.active.clear();
+    await expectCode(harness.cleanup.assertAbsent(harness.runId), "state-preflight-verifier");
+  }
+
+  // A self-rehashed mutation intent and its referenced state cannot detach
+  // from the same validated receipt.
+  {
+    let crashed = true;
+    const harness = makeHarness({
+      faultAt: ({ event }) => {
+        if (crashed && event === "after-mutation-request") {
+          crashed = false;
+          return true;
+        }
+        return false;
+      },
+    });
+    await harness.cleanup.start(harness.runId);
+    await assert.rejects(harness.cleanup.resume(harness.runId));
+    harness.setFault(undefined);
+    const intentPath = path.join(commitmentDirectory(harness), "cleanup-mutation-intent-000000.json");
+    const commitmentPath = path.join(commitmentDirectory(harness), "cleanup-mutation-commitment-000000.json");
+    const intent = rewriteJson(intentPath, (value) => {
+      value.preflightVerifierSha256 = mismatchedVerifier;
+      value.intentSha256 = hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "intentSha256")));
+    });
+    rewriteJson(commitmentPath, (commitment) => {
+      commitment.intent = intent;
+      commitment.intentSha256 = intent.intentSha256;
+      commitment.intentFileSha256 = fileSha256(intentPath);
+      commitment.commitmentSha256 = hashJson(Object.fromEntries(Object.entries(commitment).filter(([key]) => key !== "commitmentSha256")));
+    });
+    await expectCode(harness.cleanup.resume(harness.runId), "mutation-intent-context");
+  }
+
+  // The terminal state and absence receipt cannot agree on a substituted
+  // verifier hash while both remain bound to the live receipt.
+  {
+    const harness = makeHarness();
+    await harness.cleanup.start(harness.runId);
+    harness.active.clear();
+    await harness.cleanup.resume(harness.runId);
+    rewriteJson(harness.path(ABSENCE_RECEIPT_FILENAME), (receipt) => {
+      receipt.preflightVerifierSha256 = mismatchedVerifier;
+      receipt.sha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "sha256")));
+    });
+    rebindStateEnvelope(harness, 1, (state) => {
+      state.preflightVerifierSha256 = mismatchedVerifier;
+      state.absenceReceiptSha256 = fileSha256(harness.path(ABSENCE_RECEIPT_FILENAME));
+    });
+  await expectCode(harness.cleanup.resume(harness.runId), "absence-receipt-context");
+  }
+
+  // A bound state cannot fall back to its own SHA when the validated receipt
+  // evidence disappears.
+  {
+    let crashed = true;
+    const harness = makeHarness({
+      faultAt: ({ event, filePath }) => {
+        if (crashed && event === "after-directory-fsync" && /cleanup-state-anchor-000001\.json$/u.test(filePath ?? "")) {
+          crashed = false;
+          return true;
+        }
+        return false;
+      },
+    });
+    await harness.cleanup.start(harness.runId);
+    await assert.rejects(harness.cleanup.resume(harness.runId));
+    harness.setFault(undefined);
+    unlinkSync(harness.path(PREFLIGHT_RECEIPT_FILENAME));
+    await expectCode(harness.cleanup.assertAbsent(harness.runId), "state-preflight-verifier");
+  }
+});
+
 test("every nested durable schema is directly mutated through its intended validator", async () => {
   const cases = [
     {
@@ -1191,10 +1385,9 @@ test("a runtime preflight receipt is mandatory, fresh, closed, and journal-bound
   const tampered = makeHarness();
   await tampered.cleanup.start(tampered.runId);
   rewriteJson(tampered.path(PREFLIGHT_RECEIPT_FILENAME), (value) => {
-    value.runtimeIdentity.objectId = "44444444-4444-4444-8444-444444444444";
-    value.receiptSha256 = hashJson(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "receiptSha256")));
+    value.bindingSha256 = "b".repeat(64);
   });
-  await expectCode(tampered.cleanup.resume(tampered.runId), "preflight-runtime-identity");
+  await expectCode(tampered.cleanup.resume(tampered.runId), "preflight-receipt-schema");
   assert.equal(tampered.httpCalls.some((request) => request.method === "DELETE"), false);
 
   const bound = makeHarness();
@@ -1278,8 +1471,7 @@ test("each DELETE is pinned to one fresh preflight receipt through the external 
           if (!changed) {
             changed = true;
             rewriteJson(path.join(controls.directory, PREFLIGHT_RECEIPT_FILENAME), (receipt) => {
-              receipt.deadlineAt = new Date(Date.parse(receipt.deadlineAt) - 1_000).toISOString();
-              receipt.receiptSha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "receiptSha256")));
+              receipt.createdAt = "2026-08-21T00:00:29.000Z";
             });
           }
         }
@@ -1545,8 +1737,7 @@ test("utility history accepts current and recorded-commit hashes, but rejects in
     if (label === "historical") {
       harness.writePreflight();
       rewriteJson(harness.path(PREFLIGHT_RECEIPT_FILENAME), (receipt) => {
-        receipt.verifierSha256 = HISTORICAL_UTILITY_SHA256;
-        receipt.receiptSha256 = hashJson(Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "receiptSha256")));
+        receipt.verifierSha256 = randomBytes(32).toString("hex");
       });
       harness.active.clear();
       assert.deepEqual(await harness.cleanup.resume(harness.runId), { status: "absent", runId: harness.runId });
@@ -1788,6 +1979,7 @@ test("supersession validates prior manifest/absence hashes and inherits only ter
     root: oldRun.root,
     runId: "credential-run-2",
     preflight: true,
+    autoPreflight: false,
     supersession: {
       oldRunId: oldRun.runId,
       cleanupManifestSha256: oldManifestSha256,
@@ -2244,8 +2436,6 @@ test("preflight order and age are enforced independently of plan creation", asyn
   equal.writePreflight();
   const equalReceipt = readJson(equal.path("preflight-receipt.json"));
   equalReceipt.createdAt = CREATE_TIME;
-  equalReceipt.deadlineAt = new Date(Date.parse(CREATE_TIME) + PREFLIGHT_MAX_AGE_MS).toISOString();
-  equalReceipt.receiptSha256 = hashJson(Object.fromEntries(Object.entries(equalReceipt).filter(([key]) => key !== "receiptSha256")));
   unlinkSync(equal.path("preflight-receipt.json"));
   writeExclusive(equal.path("preflight-receipt.json"), equalReceipt);
   await expectCode(equal.cleanup.resume(equal.runId), "preflight-order");

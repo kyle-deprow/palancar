@@ -95,6 +95,7 @@ const REPO_ROOT = process.cwd();
 const REAL_GUARD_PATH = path.join(REPO_ROOT, "infra/scripts/assert-dev-plan.mjs");
 const CLEANUP_UTILITY_PATH = path.join(REPO_ROOT, "infra/scripts/cleanup-key-vault-credentials.mjs");
 const CLEANUP_UTILITY_SHA256 = sha256Bytes(readFileSync(CLEANUP_UTILITY_PATH));
+const CLEANUP_PREFLIGHT_EVIDENCE_SHA256 = sha256Bytes("cleanup preflight evidence fixture\n");
 const HISTORICAL_CLEANUP_UTILITY_SOURCE = "historical cleanup utility source\n";
 const HISTORICAL_CLEANUP_UTILITY_SHA256 = sha256Bytes(HISTORICAL_CLEANUP_UTILITY_SOURCE);
 const HISTORICAL_CODE_COMMIT = "1".repeat(40);
@@ -845,9 +846,8 @@ function publishCleanupState(
 const CLEANUP_MUTATION_PREFLIGHT = Object.freeze({
   receiptSha256: "a".repeat(64),
   verifierId: CLEANUP_PREFLIGHT_VERIFIER_ID,
-  verifierSha256: CLEANUP_UTILITY_SHA256,
+  verifierSha256: CLEANUP_PREFLIGHT_EVIDENCE_SHA256,
   createdAt: "2026-08-23T12:00:00.000Z",
-  deadlineAt: "2026-08-23T12:05:00.000Z",
 });
 
 function cleanupStateTestPath(directory, sequence) {
@@ -946,7 +946,6 @@ function publishCleanupMutationEvidence(directory, state, contextSha256, target,
     preflightVerifierId: preflight.verifierId,
     preflightVerifierSha256: preflight.verifierSha256,
     preflightCreatedAt: preflight.createdAt,
-    preflightDeadlineAt: preflight.deadlineAt,
     createdAt: new Date(Date.parse(preflight.createdAt) + 1000).toISOString(),
     previousIntentSha256: null,
     intentSha256: null,
@@ -1016,7 +1015,20 @@ function publishCleanupEvidence(directory, runId, manifest, supersession, { term
     operationStartedAt = Date.now();
     publishCleanupState(directory, runId, operation, 0, "start-inventory-validated", cleanupInventory(false), undefined, null, operationStartedAt);
   }
-  const preflight = { receiptSha256: "a".repeat(64), verifierId: CLEANUP_PREFLIGHT_VERIFIER_ID, verifierSha256: CLEANUP_UTILITY_SHA256 };
+  const preflightPath = existsSync(path.join(directory, "preflight-receipt.json"))
+    ? path.join(directory, "preflight-receipt.json")
+    : path.join(directory, "preflight-receipt.json.consumed");
+  const preflight = existsSync(preflightPath)
+    ? (() => {
+        const receipt = JSON.parse(readFileSync(preflightPath, "utf8"));
+        return {
+          receiptSha256: utilityFileSha256(preflightPath),
+          verifierId: CLEANUP_PREFLIGHT_VERIFIER_ID,
+          verifierSha256: receipt.verifierSha256,
+          createdAt: receipt.createdAt,
+        };
+      })()
+    : { receiptSha256: "a".repeat(64), verifierId: CLEANUP_PREFLIGHT_VERIFIER_ID, verifierSha256: CLEANUP_PREFLIGHT_EVIDENCE_SHA256 };
   if (terminal) {
     const absenceUnsigned = {
       version: 3,
@@ -2165,6 +2177,7 @@ function seedAppliedPhase(harness, phase, runId, sourceState, targetState) {
       : name === "preflight-receipt"
         ? {
             receiptSha256: sha256Bytes(canonicalJson(preflight)),
+            verifierSha256: preflight.verifierSha256,
             ...(manifest.phase === "runtime-cutover"
               ? { diagnosticReceiptSha256: sha256Bytes(readFileSync(harness.paths(runId).diagnostic)) }
               : manifest.phase === "credential-cleanup"
@@ -2265,7 +2278,7 @@ function forceUnknownRun(harness, runId) {
     bindingSha256: manifest.bindingSha256,
     createdAt: manifest.createdAt,
     result: "passed",
-    verifierSha256: SHA,
+    verifierSha256: manifest.phase === "credential-cleanup" ? CLEANUP_PREFLIGHT_EVIDENCE_SHA256 : SHA,
   };
   writeExclusive(`${harness.paths(runId).guard}.consumed`, guard);
   writeExclusive(`${harness.paths(runId).preflight}.consumed`, preflight);
@@ -2279,6 +2292,7 @@ function forceUnknownRun(harness, runId) {
       : name === "preflight-receipt"
         ? {
             receiptSha256: sha256Bytes(canonicalJson(preflight)),
+            verifierSha256: preflight.verifierSha256,
             ...(manifest.phase === "runtime-cutover"
               ? { diagnosticReceiptSha256: sha256Bytes(readFileSync(harness.paths(runId).diagnostic)) }
                 : manifest.phase === "credential-cleanup"
@@ -5221,13 +5235,9 @@ test("cleanup v3 rejects accepted-but-never-produced operation and evidence laxi
         "delete",
         CLEANUP_MUTATION_PREFLIGHT,
       );
-      assert.doesNotThrow(() => harness.lifecycle.preflight("credential-cleanup", runId));
-      rewriteCleanupMutationIntent(directory, 0, (intent) => {
-        intent.preflightReceiptSha256 = "b".repeat(64);
-      });
       expectCode(
         () => harness.lifecycle.preflight("credential-cleanup", runId),
-        "cleanup-journal-mutation-intent",
+        "cleanup-state-context",
       );
     } finally {
       harness.cleanup();
@@ -5303,7 +5313,74 @@ test("cleanup v3 rejects accepted-but-never-produced operation and evidence laxi
       });
       expectCode(
         () => harness.lifecycle.preflight("credential-cleanup", runId),
-        "cleanup-absence-linkage",
+        "cleanup-state-context",
+      );
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("cleanup v3 binds state, mutation intent, and absence to the validated preflight verifier", () => {
+  const mismatchedVerifier = "b".repeat(64);
+
+  {
+    const harness = makeHarness();
+    try {
+      const runId = prepareCredentialReconcile(harness);
+      const directory = path.join(harness.root, runId);
+      rewriteCleanupState(directory, 1, (state) => {
+        state.preflightVerifierSha256 = mismatchedVerifier;
+      });
+      expectCode(
+        () => harness.lifecycle.reconcile("credential-cleanup", runId),
+        "cleanup-state-context",
+      );
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  {
+    const harness = makeHarness();
+    try {
+      const runId = prepareCredentialReconcile(harness);
+      const directory = path.join(harness.root, runId);
+      const state = JSON.parse(readFileSync(cleanupStateTestPath(directory, 1), "utf8"));
+      publishCleanupMutationEvidence(
+        directory,
+        state,
+        JSON.parse(readFileSync(path.join(directory, "create-manifest.json"), "utf8")).bindingSha256,
+        "openrouter-api-key",
+        "delete",
+        CLEANUP_MUTATION_PREFLIGHT,
+      );
+      rewriteCleanupMutationIntent(directory, 0, (intent) => {
+        intent.preflightVerifierSha256 = mismatchedVerifier;
+      });
+      expectCode(
+        () => harness.lifecycle.reconcile("credential-cleanup", runId),
+        "cleanup-journal-mutation-intent",
+      );
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  {
+    const harness = makeHarness();
+    try {
+      const runId = prepareCredentialReconcile(harness);
+      const directory = path.join(harness.root, runId);
+      rewriteCleanupAbsence(directory, (absence) => {
+        absence.preflightVerifierSha256 = mismatchedVerifier;
+      });
+      rewriteCleanupState(directory, 1, (state) => {
+        state.absenceReceiptSha256 = utilityFileSha256(path.join(directory, "cleanup-absence-receipt.json"));
+      });
+      expectCode(
+        () => harness.lifecycle.reconcile("credential-cleanup", runId),
+        "cleanup-absence-context",
       );
     } finally {
       harness.cleanup();
