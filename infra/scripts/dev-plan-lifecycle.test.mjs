@@ -94,6 +94,8 @@ const REPO_ROOT = process.cwd();
 const REAL_GUARD_PATH = path.join(REPO_ROOT, "infra/scripts/assert-dev-plan.mjs");
 const CLEANUP_UTILITY_PATH = path.join(REPO_ROOT, "infra/scripts/cleanup-key-vault-credentials.mjs");
 const CLEANUP_UTILITY_SHA256 = sha256Bytes(readFileSync(CLEANUP_UTILITY_PATH));
+const HISTORICAL_CLEANUP_UTILITY_SOURCE = "historical cleanup utility source\n";
+const HISTORICAL_CLEANUP_UTILITY_SHA256 = sha256Bytes(HISTORICAL_CLEANUP_UTILITY_SOURCE);
 const CLEANUP_PREFLIGHT_VERIFIER_ID = "palancar.azure-key-vault-cleanup.runtime-preflight.v1";
 const REVIEWED_LUNA_FIXTURE_TEXT = readFileSync(
   path.join(REPO_ROOT, "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json"),
@@ -1021,32 +1023,58 @@ function publishCleanupEvidence(directory, runId, manifest, supersession, { term
   }
 }
 
-function mutateCleanupOperationVersion(directory, mutate, { rehashOperation = true } = {}) {
+function mutateCleanupOperationVersion(directory, mutate, { rehashOperation = true, sequence: requestedSequence } = {}) {
   const headPath = path.join(directory, "cleanup-manifest.json");
   const head = JSON.parse(readFileSync(headPath, "utf8"));
-  const versionPath = path.join(directory, head.manifestFilename);
+  const sequence = requestedSequence ?? head.sequence;
+  const versionPath = path.join(directory, `cleanup-manifest-${String(sequence).padStart(6, "0")}.json`);
   const operation = JSON.parse(readFileSync(versionPath, "utf8"));
   mutate(operation);
   if (rehashOperation) {
     operation.sha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(operation).filter(([key]) => key !== "sha256"))));
   }
   replaceUtilityJson(versionPath, operation);
-  const nextHead = cleanupOperationHead(operation, utilityFileSha256(versionPath), head.previousHeadSha256);
-  replaceUtilityJson(headPath, nextHead);
-
+  for (let nextSequence = sequence + 1; nextSequence <= head.sequence; nextSequence += 1) {
+    const nextVersionPath = path.join(directory, `cleanup-manifest-${String(nextSequence).padStart(6, "0")}.json`);
+    const nextOperation = JSON.parse(readFileSync(nextVersionPath, "utf8"));
+    nextOperation.previousManifestSha256 = utilityFileSha256(path.join(directory, `cleanup-manifest-${String(nextSequence - 1).padStart(6, "0")}.json`));
+    nextOperation.sha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(nextOperation).filter(([key]) => key !== "sha256"))));
+    replaceUtilityJson(nextVersionPath, nextOperation);
+  }
   const journalDirectory = path.join(path.dirname(directory), JOURNAL_COMMITMENT_DIRECTORY_NAME, operation.runId);
-  const intentPath = path.join(journalDirectory, `cleanup-operation-head-intent-${String(operation.sequence).padStart(6, "0")}.json`);
-  const intent = JSON.parse(readFileSync(intentPath, "utf8"));
-  intent.manifestSha256 = utilityFileSha256(versionPath);
-  intent.intentSha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(intent).filter(([key]) => key !== "intentSha256"))));
-  replaceUtilityJson(intentPath, intent);
-  const anchorPath = path.join(journalDirectory, `cleanup-operation-head-${String(operation.sequence).padStart(6, "0")}.json`);
-  const anchor = JSON.parse(readFileSync(anchorPath, "utf8"));
-  anchor.manifestSha256 = utilityFileSha256(versionPath);
-  anchor.headSha256 = utilityFileSha256(headPath);
-  anchor.intentSha256 = utilityFileSha256(intentPath);
-  anchor.anchorSha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256"))));
-  replaceUtilityJson(anchorPath, anchor);
+  let nextHead;
+  for (let journalSequence = 0; journalSequence <= head.sequence; journalSequence += 1) {
+    const journalVersionPath = path.join(directory, `cleanup-manifest-${String(journalSequence).padStart(6, "0")}.json`);
+    const intentPath = path.join(journalDirectory, `cleanup-operation-head-intent-${String(journalSequence).padStart(6, "0")}.json`);
+    const intent = JSON.parse(readFileSync(intentPath, "utf8"));
+    intent.manifestSha256 = utilityFileSha256(journalVersionPath);
+    const previousHeadSha256 = journalSequence === 0
+      ? null
+      : JSON.parse(readFileSync(path.join(journalDirectory, `cleanup-operation-head-${String(journalSequence - 1).padStart(6, "0")}.json`), "utf8")).headSha256;
+    intent.previousHeadSha256 = previousHeadSha256;
+    intent.previousAnchorSha256 = journalSequence === 0
+      ? null
+      : utilityFileSha256(path.join(journalDirectory, `cleanup-operation-head-${String(journalSequence - 1).padStart(6, "0")}.json`));
+    intent.intentSha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(intent).filter(([key]) => key !== "intentSha256"))));
+    replaceUtilityJson(intentPath, intent);
+    const anchorPath = path.join(journalDirectory, `cleanup-operation-head-${String(journalSequence).padStart(6, "0")}.json`);
+    const anchor = JSON.parse(readFileSync(anchorPath, "utf8"));
+    const historicalHead = cleanupOperationHead(
+      JSON.parse(readFileSync(journalVersionPath, "utf8")),
+      intent.manifestSha256,
+      previousHeadSha256,
+    );
+    anchor.manifestSha256 = utilityFileSha256(journalVersionPath);
+    anchor.headSha256 = sha256Bytes(`${canonicalJson(historicalHead)}\n`);
+    anchor.previousAnchorSha256 = journalSequence === 0
+      ? null
+      : utilityFileSha256(path.join(journalDirectory, `cleanup-operation-head-${String(journalSequence - 1).padStart(6, "0")}.json`));
+    anchor.intentSha256 = utilityFileSha256(intentPath);
+    anchor.anchorSha256 = sha256Bytes(canonicalJson(Object.fromEntries(Object.entries(anchor).filter(([key]) => key !== "anchorSha256"))));
+    replaceUtilityJson(anchorPath, anchor);
+    if (journalSequence === head.sequence) nextHead = historicalHead;
+  }
+  replaceUtilityJson(headPath, nextHead);
 }
 
 function mutateCleanupOperationHead(directory, mutate) {
@@ -1119,6 +1147,7 @@ function makeHarness(overrides = {}) {
   let verifierMutator = (value) => value;
   let verifierFailureReference;
   let guardStatus = "success";
+  const historicalCleanupUtilityStatus = overrides.historicalCleanupUtilityStatus ?? 0;
   const httpCalls = [];
   const calls = [];
   const verifierCalls = [];
@@ -1126,6 +1155,7 @@ function makeHarness(overrides = {}) {
     calls.push({
       command: request.command,
       argv: [...request.argv],
+      cwd: request.cwd,
       env: { ...request.env },
       input: request.input,
       phase: request.phase,
@@ -1134,6 +1164,11 @@ function makeHarness(overrides = {}) {
       killSignal: request.killSignal,
     });
     if (request.command === "/usr/bin/git") {
+      if (request.argv[0] === "cat-file" && request.argv[1] === "blob") {
+        return historicalCleanupUtilityStatus === 0
+          ? { status: 0, stdout: HISTORICAL_CLEANUP_UTILITY_SOURCE }
+          : { status: historicalCleanupUtilityStatus, exitCode: historicalCleanupUtilityStatus, stdout: "", stderr: "not found\n" };
+      }
       if (request.argv[0] === "status") {
         return { status: 0, stdout: "" };
       }
@@ -4852,6 +4887,99 @@ test("cleanup v3 operation history accepts faithful evidence and rejects manifes
     } finally {
       harness.cleanup();
     }
+  }
+});
+
+test("cleanup v3 utility hash accepts only current or the recorded commit blob", () => {
+  {
+    const harness = makeHarness();
+    try {
+      const runId = prepareCredential(harness);
+      harness.setTopology("post");
+      harness.options.lowLevel.cleanupRunner({ operation: "start", runId, root: harness.root });
+      const directory = path.join(harness.root, runId);
+      mutateCleanupOperationVersion(directory, (operation) => {
+        operation.utilitySha256 = HISTORICAL_CLEANUP_UTILITY_SHA256;
+      }, { sequence: 0 });
+      mutateCleanupOperationVersion(directory, (operation) => {
+        operation.utilitySha256 = HISTORICAL_CLEANUP_UTILITY_SHA256;
+      });
+      rewriteCleanupState(directory, 0, (state) => {
+        state.manifestSha256 = utilityFileSha256(path.join(directory, "cleanup-manifest-000001.json"));
+      });
+      assert.deepEqual(harness.lifecycle.preflight("credential-cleanup", runId), {
+        runId,
+        phase: "credential-cleanup",
+        status: "preflighted",
+      });
+      const historyCalls = harness.calls.filter(
+        (call) => call.command === "/usr/bin/git" && call.argv[0] === "cat-file",
+      );
+      assert.ok(historyCalls.length > 0);
+      for (const call of historyCalls) {
+        assert.deepEqual(call.argv, [
+          "cat-file",
+          "blob",
+          `${COMMIT}:infra/scripts/cleanup-key-vault-credentials.mjs`,
+        ]);
+        assert.equal(call.cwd, REPO_ROOT);
+      }
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  for (const [label, overrides] of [
+    ["neither current nor historical", {}],
+    ["recorded commit is absent", { historicalCleanupUtilityStatus: 128 }],
+  ]) {
+    const harness = makeHarness(overrides);
+    try {
+      const runId = prepareCredential(harness);
+      harness.setTopology("post");
+      harness.options.lowLevel.cleanupRunner({ operation: "start", runId, root: harness.root });
+      const directory = path.join(harness.root, runId);
+      const utilitySha256 = label === "neither current nor historical"
+        ? "0".repeat(64)
+        : HISTORICAL_CLEANUP_UTILITY_SHA256;
+      mutateCleanupOperationVersion(directory, (operation) => {
+        operation.utilitySha256 = utilitySha256;
+      }, { sequence: 0 });
+      mutateCleanupOperationVersion(directory, (operation) => {
+        operation.utilitySha256 = utilitySha256;
+      });
+      rewriteCleanupState(directory, 0, (state) => {
+        state.manifestSha256 = utilityFileSha256(path.join(directory, "cleanup-manifest-000001.json"));
+      });
+      expectCode(
+        () => harness.lifecycle.preflight("credential-cleanup", runId),
+        "cleanup-operation-version-context",
+      );
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("cleanup v3 rejects a utility hash switch across operation versions", () => {
+  const harness = makeHarness();
+  try {
+    const runId = prepareCredential(harness);
+    harness.setTopology("post");
+    harness.options.lowLevel.cleanupRunner({ operation: "start", runId, root: harness.root });
+    const directory = path.join(harness.root, runId);
+    mutateCleanupOperationVersion(directory, (operation) => {
+      operation.utilitySha256 = HISTORICAL_CLEANUP_UTILITY_SHA256;
+    });
+    rewriteCleanupState(directory, 0, (state) => {
+      state.manifestSha256 = utilityFileSha256(path.join(directory, "cleanup-manifest-000001.json"));
+    });
+    expectCode(
+      () => harness.lifecycle.preflight("credential-cleanup", runId),
+      "cleanup-operation-history",
+    );
+  } finally {
+    harness.cleanup();
   }
 });
 

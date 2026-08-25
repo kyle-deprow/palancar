@@ -41,6 +41,7 @@ const CLEANUP_UTILITY_PATH = path.join(
   path.dirname(SCRIPT_PATH),
   "cleanup-key-vault-credentials.mjs",
 );
+const CLEANUP_UTILITY_RELATIVE_PATH = "infra/scripts/cleanup-key-vault-credentials.mjs";
 const LIFECYCLE_CACHE_ROOT =
   "/home/dev/.local/state/palancar/azure-foundry-entra-cutover-cache";
 export const TERRAFORM_PATH = "/home/dev/.local/bin/terraform-1.15.8";
@@ -1979,6 +1980,24 @@ function gitResult(repoRoot, args, processRunner, phase) {
   );
   failIf(result.status !== "success", "git-check");
   return result.stdout;
+}
+
+function cleanupUtilitySha256AtCommit(repositoryCommit, processRunner) {
+  if (!isCommit(repositoryCommit)) return null;
+  const result = commandResult(
+    "/usr/bin/git",
+    ["cat-file", "blob", `${repositoryCommit}:${CLEANUP_UTILITY_RELATIVE_PATH}`],
+    {
+      cwd: REPOSITORY_ROOT,
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      maxOutputBytes: EXECUTABLE_MAX_BYTES,
+      phase: "cleanup-operation-version-context",
+    },
+    processRunner,
+  );
+  if (result.status !== "success") return null;
+  return sha256Bytes(result.stdout);
 }
 
 function reviewedFileIdentity(repoRoot, relativePath, processRunner) {
@@ -4019,12 +4038,13 @@ function recoverStateFromCheckpoints(config, state) {
         manifest,
         artifacts,
         guardReceiptSha256: startCheckpoint.guardReceiptSha256,
+        processRunner: config.processRunner,
       }, { requireAbsence: false });
     }
     if (!closedRun && names.has("preflight-receipt") && existsSync(artifacts.preflight)) {
       const checkpoint = checkpointNamed(checkpoints, "preflight-receipt");
       const preflight = readReceiptAtCheckpoint(artifacts.preflight, checkpoint, manifest, "preflight");
-      validateRecoveryEvidenceArtifacts(run.phase, artifacts, checkpoint, manifest);
+      validateRecoveryEvidenceArtifacts(run.phase, artifacts, checkpoint, manifest, config.processRunner);
       if (run.status === "guarded") {
         run.status = "preflighted";
         run.preflightAt = run.preflightAt ?? preflight.createdAt;
@@ -4040,6 +4060,7 @@ function recoverStateFromCheckpoints(config, state) {
         artifacts,
         checkpointNamed(checkpoints, "preflight-receipt"),
         manifest,
+        config.processRunner,
       );
     }
     if (run.status === "preflighted" && names.has("applying")) {
@@ -4311,6 +4332,7 @@ function terminalPredecessorEvidence(config, state, terminalRequest) {
     manifest: credential.manifest,
     artifacts: credential.artifacts,
     guardReceiptSha256: consumed.guardReceiptSha256,
+    processRunner: config.processRunner,
   });
 
   const revocation = validateRevocationEvidence(config, { requireComplete: true });
@@ -6657,7 +6679,7 @@ function cleanupOperationHeadValue(operation, manifestSha256, previousHeadSha256
   return value;
 }
 
-function validateCleanupOperationValue(operation, manifest, descriptor, code) {
+function validateCleanupOperationValue(operation, manifest, descriptor, code, processRunner) {
   assertKnownKeys(operation, CLEANUP_OPERATION_KEYS, code);
   assertRequiredKeys(operation, CLEANUP_OPERATION_KEYS, code);
   failIf(
@@ -6670,7 +6692,7 @@ function validateCleanupOperationValue(operation, manifest, descriptor, code) {
       operation.contextSha256 !== descriptor.contextSha256 || operation.createdAt !== manifest.createdAt ||
       operation.repositoryCommit !== manifest.bindings.repositoryCommit ||
       !Array.isArray(operation.runtimeSecretReferences) || operation.runtimeSecretReferences.length !== 0 ||
-      !isSha(operation.utilitySha256) || operation.utilitySha256 !== sha256File(CLEANUP_UTILITY_PATH, EXECUTABLE_MAX_BYTES) ||
+      !isSha(operation.utilitySha256) ||
       operation.vaultResourceId !== descriptor.vaultResourceId ||
       operation.journalCommitmentPath !== `${JOURNAL_COMMITMENT_DIRECTORY_NAME}/${operation.runId}` ||
       !Number.isSafeInteger(operation.sequence) || operation.sequence < 0 || operation.sequence > 1 ||
@@ -6681,6 +6703,12 @@ function validateCleanupOperationValue(operation, manifest, descriptor, code) {
   if (operation.supersession !== null) validateSupersessionShape(operation.supersession, `${code}-supersession`);
   failIf(canonicalJson(operation.supersession) !== canonicalJson(descriptor.supersession ?? null), `${code}-supersession`);
   return operation;
+}
+
+function cleanupOperationUtilitySha256Allowed(utilitySha256, manifest, processRunner) {
+  const currentUtilitySha256 = sha256File(CLEANUP_UTILITY_PATH, EXECUTABLE_MAX_BYTES);
+  return utilitySha256 === currentUtilitySha256 ||
+    utilitySha256 === cleanupUtilitySha256AtCommit(manifest.bindings.repositoryCommit, processRunner);
 }
 
 function validateCleanupOperationHeadJournal(filePath, operation, versions, head, code) {
@@ -6745,7 +6773,7 @@ function validateCleanupOperationHeadJournal(filePath, operation, versions, head
   failIf(head.previousHeadSha256 !== (operation.sequence === 0 ? null : readJson(anchors.get(operation.sequence - 1), `${code}-anchor`).headSha256), `${code}-head`);
 }
 
-function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanup-operation") {
+function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanup-operation", processRunner) {
   assertRegular(filePath, undefined, `${code}-head`);
   const directory = path.dirname(filePath);
   const head = readJson(filePath, code);
@@ -6764,10 +6792,13 @@ function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanu
   }
   versions.sort((left, right) => left.sequence - right.sequence);
   failIf(versions.length !== head.sequence + 1, `${code}-history`);
+  const utilitySha256 = versions[0]?.value?.utilitySha256;
+  failIf(versions.some(({ value }) => value?.utilitySha256 !== utilitySha256), `${code}-history`);
+  failIf(!isSha(utilitySha256) || !cleanupOperationUtilitySha256Allowed(utilitySha256, manifest, processRunner), `${code}-version-context`);
   for (let sequence = 0; sequence <= head.sequence; sequence += 1) {
     const version = versions[sequence];
     failIf(version === undefined || version.sequence !== sequence, `${code}-history`);
-    const operation = validateCleanupOperationValue(version.value, manifest, descriptor, `${code}-version`);
+    const operation = validateCleanupOperationValue(version.value, manifest, descriptor, `${code}-version`, processRunner);
     failIf(operation.sequence !== sequence || path.basename(version.filePath) !== `cleanup-manifest-${String(sequence).padStart(6, "0")}.json` ||
       operation.previousManifestSha256 !== (sequence === 0 ? null : sha256File(versions[sequence - 1].filePath, JSON_MAX_BYTES)), `${code}-history`);
     failIf(sha256File(version.filePath, JSON_MAX_BYTES) !== cleanupCanonicalFileSha256(operation), `${code}-version`);
@@ -6777,6 +6808,7 @@ function validateCleanupOperation(filePath, manifest, descriptor, code = "cleanu
     manifest,
     descriptor,
     `${code}-head`,
+    processRunner,
   );
   const version = versions[head.sequence];
   failIf(canonicalJson(operation) !== canonicalJson(version.value) ||
@@ -7092,7 +7124,7 @@ function validateCleanupStateEvidence(request, operation, { requireComplete = fa
   return stateFiles;
 }
 
-function requiredCleanup(request, { requireAbsence = true } = {}) {
+function requiredCleanup(request, { requireAbsence = true, processRunner = request.processRunner } = {}) {
   const manifest = request.manifest;
   failIf(!manifest, "cleanup-context");
   const descriptor = validateCleanupDescriptor(request.artifacts.descriptor, manifest);
@@ -7101,6 +7133,8 @@ function requiredCleanup(request, { requireAbsence = true } = {}) {
     operationPath,
     manifest,
     descriptor.value,
+    "cleanup-operation",
+    processRunner,
   );
   let stateFiles = [];
   if (!existsSync(request.artifacts.absence)) {
@@ -7122,7 +7156,7 @@ function requiredCleanup(request, { requireAbsence = true } = {}) {
   return { descriptor, operation, absence };
 }
 
-function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifest) {
+function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifest, processRunner) {
   if (phase === "runtime-cutover") {
     failIf(!isSha(checkpoint.diagnosticReceiptSha256), "diagnostic-receipt-checkpoint");
     assertCheckpointArtifact(
@@ -7144,6 +7178,7 @@ function validateRecoveryEvidenceArtifacts(phase, artifacts, checkpoint, manifes
       manifest,
       artifacts,
       guardReceiptSha256: checkpoint.guardReceiptSha256,
+      processRunner,
     }, { requireAbsence: false });
     if (checkpoint.absenceReceiptSha256 !== undefined) {
       failIf(!isSha(checkpoint.absenceReceiptSha256), "cleanup-absence-checkpoint");
@@ -8459,7 +8494,10 @@ function defaultPreflightVerifier(config, request) {
     };
   } else if (request.phase === "credential-cleanup") {
     requireRuntimeOutputs(outputs);
-    const cleanup = requiredCleanup(request, { requireAbsence: false });
+    const cleanup = requiredCleanup(
+      { ...request, processRunner: config.processRunner },
+      { requireAbsence: false },
+    );
     const live = liveReadOnlyChecks(providerConfig, outputs, request, "post");
     evidence = {
       cleanupOperationManifestSha256: cleanup.operation.fileSha256,
@@ -8514,7 +8552,7 @@ function defaultLiveInspector(config, request) {
   }
   if (request.phase === "credential-cleanup") {
     requireRuntimeOutputs(outputs);
-    requiredCleanup(request);
+    requiredCleanup({ ...request, processRunner: config.processRunner });
   }
   const state = defaultRemoteState(providerConfig);
   failIf(state.stateLineage !== request.bindings.stateLineage, "binding-mismatch");
@@ -8642,7 +8680,11 @@ function defaultCleanupValidator(config, request) {
       tenant: request.manifest.bindings.backend.tenant_id,
     },
   };
-  const evidence = requiredCleanup({ ...request, artifacts: request.artifacts });
+  const evidence = requiredCleanup({
+    ...request,
+    artifacts: request.artifacts,
+    processRunner: config.processRunner,
+  });
   const outputs = defaultOutputs(providerConfig);
   requireRuntimeOutputs(outputs);
   const live = liveReadOnlyChecks(providerConfig, outputs, request, "post");
@@ -9530,6 +9572,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
                 manifest,
                 artifacts: run.artifacts,
                 guardReceiptSha256: sha256File(run.artifacts.guard, JSON_MAX_BYTES),
+                processRunner: config.processRunner,
               }, { requireAbsence: false });
               if (existing.operation.value.status === "prepared") {
                 runCleanupUtility(config, "resume", runId);
@@ -9542,6 +9585,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
               manifest,
               artifacts: run.artifacts,
               guardReceiptSha256: sha256File(run.artifacts.guard, JSON_MAX_BYTES),
+              processRunner: config.processRunner,
             }, { requireAbsence: false });
             cleanupStart = writeCheckpoint(config, run.runDirectory, runId, phase, "cleanup-start", {
               cleanupOperationManifestSha256: cleanup.operation.fileSha256,
@@ -9559,6 +9603,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
               manifest,
               artifacts: run.artifacts,
               guardReceiptSha256: cleanupStart.guardReceiptSha256,
+              processRunner: config.processRunner,
             }, { requireAbsence: false });
           }
         }
@@ -9586,6 +9631,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
             manifest,
             artifacts: run.artifacts,
             guardReceiptSha256: cleanupStart.guardReceiptSha256,
+            processRunner: config.processRunner,
           }, { requireAbsence: false });
           evidence = {
             cleanupOperationManifestSha256: cleanup.operation.fileSha256,
@@ -9647,7 +9693,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
           manifest,
           "preflight",
         );
-        validateRecoveryEvidenceArtifacts(phase, run.artifacts, preflightCheckpoint, manifest);
+        validateRecoveryEvidenceArtifacts(phase, run.artifacts, preflightCheckpoint, manifest, config.processRunner);
         assertPreflightAge(preflightReceipt, config.now);
         const applyingAt = nowIso(config.now);
         writeCheckpoint(config, run.runDirectory, runId, phase, "applying", {
@@ -9701,6 +9747,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
               manifest,
               artifacts: run.artifacts,
               guardReceiptSha256: sha256File(`${run.artifacts.guard}.consumed`, JSON_MAX_BYTES),
+              processRunner: config.processRunner,
             });
             failIf(cleanup.absence === undefined, "cleanup-absence-missing");
           }
@@ -10036,6 +10083,7 @@ function createLifecycleInternal(options = {}, internal = {}) {
         manifest: oldManifest,
         artifacts: old.artifacts,
         guardReceiptSha256: consumed?.guardReceiptSha256 ?? sha256File(old.artifacts.guard, JSON_MAX_BYTES),
+        processRunner: config.processRunner,
       });
       const cleanupArtifactSha256 = cleanup.operation.fileSha256;
       const absenceArtifactSha256 = cleanup.absence.fileSha256;
