@@ -500,6 +500,17 @@ function cacheableCommand(command, args) {
   return false;
 }
 
+const GIT_ENVIRONMENT = Object.freeze({
+  PATH: "/usr/bin:/bin",
+  LANG: "C",
+  LC_ALL: "C",
+  GIT_NO_REPLACE_OBJECTS: "1",
+});
+
+function gitArgs(args) {
+  return ["--no-replace-objects", ...args];
+}
+
 function commandSnapshotKey(command, args, options) {
   return canonicalJson({
     command,
@@ -618,6 +629,14 @@ function sameBindingsForOperation(a, b, operation) {
   delete right.stateSerial;
   delete left.liveRevision;
   delete right.liveRevision;
+  // Reconciliation may resume an apply whose reviewed code was committed
+  // after the run was created.  The recorded code identities are validated
+  // against their recorded commit separately below; all remaining bindings
+  // still compare to the live context here.
+  for (const key of ["repositoryCommit", "lifecycleSha256", "guardSha256", "dependencyBlobs"]) {
+    delete left[key];
+    delete right[key];
+  }
   return same(left, right);
 }
 
@@ -1969,10 +1988,10 @@ function bindingHash(bindings) {
 function gitResult(repoRoot, args, processRunner, phase) {
   const result = commandResult(
     "/usr/bin/git",
-    args,
+    gitArgs(args),
     {
       cwd: repoRoot,
-      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+      env: GIT_ENVIRONMENT,
       timeoutMs: COMMAND_TIMEOUT_MS,
       phase,
     },
@@ -1986,10 +2005,10 @@ function cleanupUtilitySha256AtCommit(repositoryCommit, processRunner) {
   if (!isCommit(repositoryCommit)) return null;
   const result = commandResult(
     "/usr/bin/git",
-    ["cat-file", "blob", `${repositoryCommit}:${CLEANUP_UTILITY_RELATIVE_PATH}`],
+    gitArgs(["cat-file", "blob", `${repositoryCommit}:${CLEANUP_UTILITY_RELATIVE_PATH}`]),
     {
       cwd: REPOSITORY_ROOT,
-      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+      env: GIT_ENVIRONMENT,
       timeoutMs: COMMAND_TIMEOUT_MS,
       maxOutputBytes: EXECUTABLE_MAX_BYTES,
       phase: "cleanup-operation-version-context",
@@ -1998,6 +2017,84 @@ function cleanupUtilitySha256AtCommit(repositoryCommit, processRunner) {
   );
   if (result.status !== "success") return null;
   return sha256Bytes(result.stdout);
+}
+
+function reviewedBlobAtCommit(repoRoot, repositoryCommit, relativePath, processRunner) {
+  const objectName = `${repositoryCommit}:${relativePath}`;
+  const blob = commandResult(
+    "/usr/bin/git",
+    gitArgs(["rev-parse", objectName]),
+    {
+      cwd: repoRoot,
+      env: GIT_ENVIRONMENT,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      maxOutputBytes: 128,
+      phase: "reconcile-code-binding",
+    },
+    processRunner,
+  );
+  if (blob.status !== "success") return null;
+  const blobId = blob.stdout.trim();
+  if (!/^[a-f0-9]{40}$/.test(blobId)) return null;
+  const contents = commandResult(
+    "/usr/bin/git",
+    gitArgs(["cat-file", "blob", objectName]),
+    {
+      cwd: repoRoot,
+      env: GIT_ENVIRONMENT,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      maxOutputBytes: JSON_MAX_BYTES,
+      phase: "reconcile-code-binding",
+    },
+    processRunner,
+  );
+  if (contents.status !== "success") return null;
+  return { blob: blobId, sha256: sha256Bytes(contents.stdout) };
+}
+
+function historicalCodeBindingsMatch(repoRoot, phase, current, recorded, processRunner) {
+  if (!isCommit(recorded.repositoryCommit) || !isCommit(current.repositoryCommit)) return false;
+  if (!isSha(recorded.lifecycleSha256) || !isSha(recorded.guardSha256) ||
+      !Array.isArray(recorded.dependencyBlobs)) return false;
+
+  const ancestor = commandResult(
+    "/usr/bin/git",
+    gitArgs(["merge-base", "--is-ancestor", recorded.repositoryCommit, current.repositoryCommit]),
+    {
+      cwd: repoRoot,
+      env: GIT_ENVIRONMENT,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      maxOutputBytes: 128,
+      phase: "reconcile-code-binding",
+    },
+    processRunner,
+  );
+  if (ancestor.status !== "success") return false;
+
+  const expectedDependencies = current.dependencyBlobs;
+  if (!Array.isArray(expectedDependencies) ||
+      recorded.dependencyBlobs.length !== expectedDependencies.length ||
+      !recorded.dependencyBlobs.every((entry, index) =>
+        isObject(entry) &&
+        canonicalJson(Object.keys(entry).sort()) === canonicalJson(["blob", "path", "sha256"]) &&
+        entry.path === expectedDependencies[index]?.path &&
+        /^[a-f0-9]{40}$/.test(entry.blob ?? "") &&
+        isSha(entry.sha256),
+      )) {
+    return false;
+  }
+
+  const lifecyclePath = REVIEWED_DEPENDENCIES[phase]?.[0];
+  const guardPath = "infra/scripts/assert-dev-plan.mjs";
+  if (typeof lifecyclePath !== "string") return false;
+  const lifecycle = reviewedBlobAtCommit(repoRoot, recorded.repositoryCommit, lifecyclePath, processRunner);
+  const guard = reviewedBlobAtCommit(repoRoot, recorded.repositoryCommit, guardPath, processRunner);
+  if (lifecycle?.sha256 !== recorded.lifecycleSha256 || guard?.sha256 !== recorded.guardSha256) return false;
+
+  return recorded.dependencyBlobs.every((entry) => {
+    const resolved = reviewedBlobAtCommit(repoRoot, recorded.repositoryCommit, entry.path, processRunner);
+    return resolved?.blob === entry.blob && resolved.sha256 === entry.sha256;
+  });
 }
 
 function reviewedFileIdentity(repoRoot, relativePath, processRunner) {
@@ -9925,6 +10022,16 @@ function createLifecycleInternal(options = {}, internal = {}) {
         env,
       );
       failIf(!sameBindingsForOperation(bindings, manifest.bindings, "reconcile"), "binding-mismatch");
+      failIf(
+        !historicalCodeBindingsMatch(
+          config.repoRoot,
+          phase,
+          bindings,
+          manifest.bindings,
+          config.processRunner,
+        ),
+        "binding-mismatch",
+      );
       assertReconcileSerial(bindings.stateSerial, manifest.bindings.stateSerial);
       const checkpoints = readCheckpoints(run.runDirectory, { runId, phase });
       if (checkpoints.some((checkpoint) => checkpoint.name === "receipts-consumed")) {

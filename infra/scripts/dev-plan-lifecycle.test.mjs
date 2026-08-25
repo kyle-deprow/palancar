@@ -90,12 +90,35 @@ const SEED_VERIFIER_SOURCE = "seed verifier source\n";
 const SEED_VERIFIER_SHA = sha256Bytes(SEED_VERIFIER_SOURCE);
 const BLOB = "e".repeat(40);
 const COMMIT = "f".repeat(40);
+const GIT_NO_REPLACE_OBJECTS = "--no-replace-objects";
 const REPO_ROOT = process.cwd();
 const REAL_GUARD_PATH = path.join(REPO_ROOT, "infra/scripts/assert-dev-plan.mjs");
 const CLEANUP_UTILITY_PATH = path.join(REPO_ROOT, "infra/scripts/cleanup-key-vault-credentials.mjs");
 const CLEANUP_UTILITY_SHA256 = sha256Bytes(readFileSync(CLEANUP_UTILITY_PATH));
 const HISTORICAL_CLEANUP_UTILITY_SOURCE = "historical cleanup utility source\n";
 const HISTORICAL_CLEANUP_UTILITY_SHA256 = sha256Bytes(HISTORICAL_CLEANUP_UTILITY_SOURCE);
+const HISTORICAL_CODE_COMMIT = "1".repeat(40);
+const HISTORICAL_CODE_SOURCES = Object.freeze({
+  "infra/scripts/dev-plan-lifecycle.mjs": "historical lifecycle source\n",
+  "infra/scripts/verify-acr-image-platform.mjs": "historical verifier source\n",
+  "infra/scripts/assert-dev-plan.mjs": "historical guard source\n",
+  "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json": "historical luna fixture\n",
+  "infra/scripts/fixtures/azure-generation-cutover.plan-fixture.json": "historical runtime fixture\n",
+  "infra/scripts/fixtures/azure-credential-cleanup.plan-fixture.json": "historical credential fixture\n",
+  "infra/scripts/fixtures/final-rollout-transition.plan-fixture.json": "historical terminal fixture\n",
+});
+const HISTORICAL_CODE_BLOBS = Object.freeze(Object.fromEntries(
+  Object.keys(HISTORICAL_CODE_SOURCES).map((relativePath, index) => [
+    relativePath,
+    `${(index + 2).toString(16)}${"0".repeat(39)}`,
+  ]),
+));
+
+function gitSubcommand(value) {
+  const argv = value.argv ?? value;
+  return argv[0] === GIT_NO_REPLACE_OBJECTS ? argv[1] : argv[0];
+}
+
 const CLEANUP_PREFLIGHT_VERIFIER_ID = "palancar.azure-key-vault-cleanup.runtime-preflight.v1";
 const REVIEWED_LUNA_FIXTURE_TEXT = readFileSync(
   path.join(REPO_ROOT, "infra/scripts/fixtures/luna-model-bootstrap.plan-fixture.json"),
@@ -1116,6 +1139,7 @@ function makeHarness(overrides = {}) {
   let lineage = "lineage-1";
   let acrLoginServer = ACR_LOGIN_SERVER;
   let postPlanAcrLoginServer;
+  let postPlanReviewedFile;
   let revision = "revision-before";
   let applyStatus = "success";
   let modelCase = "ok";
@@ -1148,6 +1172,7 @@ function makeHarness(overrides = {}) {
   let verifierFailureReference;
   let guardStatus = "success";
   const historicalCleanupUtilityStatus = overrides.historicalCleanupUtilityStatus ?? 0;
+  const historicalCode = overrides.historicalCode ?? {};
   const httpCalls = [];
   const calls = [];
   const verifierCalls = [];
@@ -1164,20 +1189,60 @@ function makeHarness(overrides = {}) {
       killSignal: request.killSignal,
     });
     if (request.command === "/usr/bin/git") {
-      if (request.argv[0] === "cat-file" && request.argv[1] === "blob") {
+      assert.equal(request.argv[0], GIT_NO_REPLACE_OBJECTS);
+      assert.equal(request.env.GIT_NO_REPLACE_OBJECTS, "1");
+      const argv = request.argv.slice(1);
+      if (argv[0] === "merge-base" && argv[1] === "--is-ancestor") {
+        const recordedCommit = argv[2];
+        const isAncestor = recordedCommit === historicalCode.commit
+          ? historicalCode.ancestor !== false
+          : recordedCommit === COMMIT;
+        return isAncestor
+          ? { status: 0, stdout: "" }
+          : { status: 1, exitCode: 1, stdout: "", stderr: "not an ancestor\n" };
+      }
+      if (argv[0] === "rev-parse" && typeof argv[1] === "string" && argv[1].includes(":")) {
+        const separator = argv[1].indexOf(":");
+        const recordedCommit = argv[1].slice(0, separator);
+        const relativePath = argv[1].slice(separator + 1);
+        if (recordedCommit === historicalCode.commit) {
+          const blob = historicalCode.blobs?.[relativePath];
+          return blob === undefined
+            ? { status: 1, exitCode: 1, stdout: "", stderr: "not found\n" }
+            : { status: 0, stdout: `${blob}\n` };
+        }
+        if (recordedCommit === COMMIT) return { status: 0, stdout: `${BLOB}\n` };
+      }
+      if (argv[0] === "cat-file" && argv[1] === "blob") {
+        const objectName = argv[2];
+        if (typeof objectName === "string" && objectName.includes(":")) {
+          const separator = objectName.indexOf(":");
+          const recordedCommit = objectName.slice(0, separator);
+          const relativePath = objectName.slice(separator + 1);
+          if (recordedCommit === historicalCode.commit) {
+            const source = historicalCode.sources?.[relativePath];
+            return source === undefined
+              ? { status: 1, exitCode: 1, stdout: "", stderr: "not found\n" }
+              : { status: 0, stdout: source };
+          }
+          if (recordedCommit === COMMIT) {
+            const currentPath = path.join(repoRoot, relativePath);
+            if (existsSync(currentPath)) return { status: 0, stdout: readFileSync(currentPath) };
+          }
+        }
         return historicalCleanupUtilityStatus === 0
           ? { status: 0, stdout: HISTORICAL_CLEANUP_UTILITY_SOURCE }
           : { status: historicalCleanupUtilityStatus, exitCode: historicalCleanupUtilityStatus, stdout: "", stderr: "not found\n" };
       }
-      if (request.argv[0] === "status") {
+      if (argv[0] === "status") {
         return { status: 0, stdout: "" };
       }
-      if (request.argv[0] === "diff") return { status: 0, stdout: generationDiff() };
-      if (request.argv[0] === "rev-parse" && request.argv[1] === "HEAD") {
+      if (argv[0] === "diff") return { status: 0, stdout: generationDiff() };
+      if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
         return { status: 0, stdout: `${COMMIT}\n` };
       }
-      if (request.argv[0] === "rev-parse") return { status: 0, stdout: `${BLOB}\n` };
-      if (request.argv[0] === "hash-object") return { status: 0, stdout: `${BLOB}\n` };
+      if (argv[0] === "rev-parse") return { status: 0, stdout: `${BLOB}\n` };
+      if (argv[0] === "hash-object") return { status: 0, stdout: `${BLOB}\n` };
     }
     if (request.command === "/usr/bin/node" && path.basename(request.argv[0]) === "verify-acr-image-platform.mjs") {
       verifierCalls.push({ argv: [...request.argv], env: { ...request.env } });
@@ -1678,6 +1743,13 @@ function makeHarness(overrides = {}) {
         const planPath = request.argv.find((arg) => arg.startsWith("-out=")).slice(5);
         writeExclusive(planPath, PLAN_BYTES);
         if (postPlanAcrLoginServer !== undefined) acrLoginServer = postPlanAcrLoginServer;
+        if (postPlanReviewedFile !== undefined) {
+          replaceExisting(
+            path.join(repoRoot, postPlanReviewedFile.path),
+            postPlanReviewedFile.contents,
+          );
+          postPlanReviewedFile = undefined;
+        }
         return { status: 0, stdout: "" };
       }
       if (request.argv[0] === "show") {
@@ -1757,6 +1829,9 @@ function makeHarness(overrides = {}) {
     setSerial(value) { serial = value; },
     setAcrLoginServer(value) { acrLoginServer = value; },
     setPostPlanAcrLoginServer(value) { postPlanAcrLoginServer = value; },
+    setPostPlanReviewedFile(relativePath, contents) {
+      postPlanReviewedFile = { path: relativePath, contents };
+    },
     setLineage(value) { lineage = value; },
     setRevision(value) { revision = value; },
     setTopology(value) {
@@ -2500,12 +2575,81 @@ function rewriteLegacyBinding(harness, runId, mutate) {
     guardReceiptSha256: sha256File(`${paths.guard}.consumed`),
     preflightReceiptSha256: sha256File(`${paths.preflight}.consumed`),
   });
-  const advancementPath = checkpointPath(harness, runId, "global-state-advancement");
-  const advancement = JSON.parse(readFileSync(advancementPath, "utf8"));
-  replaceExisting(advancementPath, {
-    ...advancement,
-    applyReceiptSha256: sha256File(paths.apply),
+  const advancementEntry = readdirSync(path.join(harness.root, runId)).find((entry) =>
+    /^\d{6}-global-state-advancement\.json$/.test(entry),
+  );
+  if (advancementEntry !== undefined) {
+    const advancementPath = path.join(harness.root, runId, advancementEntry);
+    const advancement = JSON.parse(readFileSync(advancementPath, "utf8"));
+    replaceExisting(advancementPath, {
+      ...advancement,
+      applyReceiptSha256: sha256File(paths.apply),
+    });
+  }
+}
+
+function setHistoricalCodeBindings(bindings, mutate = () => {}) {
+  bindings.repositoryCommit = HISTORICAL_CODE_COMMIT;
+  bindings.lifecycleSha256 = sha256Bytes(HISTORICAL_CODE_SOURCES["infra/scripts/dev-plan-lifecycle.mjs"]);
+  bindings.guardSha256 = sha256Bytes(HISTORICAL_CODE_SOURCES["infra/scripts/assert-dev-plan.mjs"]);
+  bindings.dependencyBlobs = bindings.dependencyBlobs.map((entry) => ({
+    ...entry,
+    blob: HISTORICAL_CODE_BLOBS[entry.path],
+    sha256: sha256Bytes(HISTORICAL_CODE_SOURCES[entry.path]),
+  }));
+  mutate(bindings);
+}
+
+function rewriteManifestBinding(harness, runId, mutate) {
+  const paths = harness.paths(runId);
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8"));
+  mutate(manifest.bindings);
+  manifest.bindingSha256 = sha256Bytes(canonicalJson(manifest.bindings));
+  replaceExisting(paths.manifest, manifest);
+  const manifestCheckpointPath = checkpointPath(harness, runId, "manifest");
+  const manifestCheckpoint = JSON.parse(readFileSync(manifestCheckpointPath, "utf8"));
+  replaceExisting(manifestCheckpointPath, {
+    ...manifestCheckpoint,
+    manifestSha256: sha256File(paths.manifest),
   });
+
+  for (const receiptPath of [
+    paths.guard,
+    `${paths.guard}.consumed`,
+    paths.preflight,
+    `${paths.preflight}.consumed`,
+    paths.apply,
+  ]) {
+    if (!existsSync(receiptPath)) continue;
+    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    receipt.bindingSha256 = manifest.bindingSha256;
+    replaceExisting(receiptPath, receipt);
+  }
+  for (const [checkpointName, artifactPath] of [
+    ["guard-receipt", existsSync(`${paths.guard}.consumed`) ? `${paths.guard}.consumed` : paths.guard],
+    ["preflight-receipt", existsSync(`${paths.preflight}.consumed`) ? `${paths.preflight}.consumed` : paths.preflight],
+    ["apply-receipt", paths.apply],
+  ]) {
+    const checkpointEntry = readdirSync(path.join(harness.root, runId)).find((entry) =>
+      new RegExp(`^\\d{6}-${checkpointName}\\.json$`).test(entry),
+    );
+    if (checkpointEntry === undefined || !existsSync(artifactPath)) continue;
+    const checkpointPathname = path.join(harness.root, runId, checkpointEntry);
+    const checkpoint = JSON.parse(readFileSync(checkpointPathname, "utf8"));
+    replaceExisting(checkpointPathname, { ...checkpoint, receiptSha256: sha256File(artifactPath) });
+  }
+  const consumedEntry = readdirSync(path.join(harness.root, runId)).find((entry) =>
+    /^\d{6}-receipts-consumed\.json$/.test(entry),
+  );
+  if (consumedEntry !== undefined) {
+    const consumedPath = path.join(harness.root, runId, consumedEntry);
+    const consumed = JSON.parse(readFileSync(consumedPath, "utf8"));
+    replaceExisting(consumedPath, {
+      ...consumed,
+      guardReceiptSha256: sha256File(`${paths.guard}.consumed`),
+      preflightReceiptSha256: sha256File(`${paths.preflight}.consumed`),
+    });
+  }
 }
 
 function waitForPath(filePath, timeoutMs = 1500) {
@@ -4913,11 +5057,12 @@ test("cleanup v3 utility hash accepts only current or the recorded commit blob",
         status: "preflighted",
       });
       const historyCalls = harness.calls.filter(
-        (call) => call.command === "/usr/bin/git" && call.argv[0] === "cat-file",
+        (call) => call.command === "/usr/bin/git" && gitSubcommand(call) === "cat-file",
       );
       assert.ok(historyCalls.length > 0);
       for (const call of historyCalls) {
         assert.deepEqual(call.argv, [
+          GIT_NO_REPLACE_OBJECTS,
           "cat-file",
           "blob",
           `${COMMIT}:infra/scripts/cleanup-key-vault-credentials.mjs`,
@@ -6486,6 +6631,150 @@ test("reconcile performs read-only artifact/state checks and never replays apply
   }
 });
 
+test("reconcile accepts ancestor-bound code identities resolved from the recorded commit", () => {
+  const harness = makeHarness({
+    historicalCode: {
+      commit: HISTORICAL_CODE_COMMIT,
+      ancestor: true,
+      sources: HISTORICAL_CODE_SOURCES,
+      blobs: HISTORICAL_CODE_BLOBS,
+    },
+  });
+  try {
+    initialize(harness);
+    const runId = harness.lifecycle.create("model-bootstrap").runId;
+    forceUnknownRun(harness, runId);
+    rewriteLegacyBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings));
+    harness.setModelCase("luna-present");
+    harness.setSerial(8);
+    assert.equal(harness.lifecycle.reconcile("model-bootstrap", runId).status, "applied");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("reconcile rejects mismatched lifecycle and dependency code identities", () => {
+  const mutations = [
+    ["lifecycle SHA-256", (bindings) => { bindings.lifecycleSha256 = "b".repeat(64); }],
+    ["dependency blob ID", (bindings) => { bindings.dependencyBlobs[0].blob = "c".repeat(40); }],
+    ["dependency SHA-256", (bindings) => { bindings.dependencyBlobs[0].sha256 = "d".repeat(64); }],
+  ];
+  for (const [, mutate] of mutations) {
+    const harness = makeHarness({
+      historicalCode: {
+        commit: HISTORICAL_CODE_COMMIT,
+        ancestor: true,
+        sources: HISTORICAL_CODE_SOURCES,
+        blobs: HISTORICAL_CODE_BLOBS,
+      },
+    });
+    try {
+      initialize(harness);
+      const runId = harness.lifecycle.create("model-bootstrap").runId;
+      forceUnknownRun(harness, runId);
+      rewriteLegacyBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings, mutate));
+      harness.setModelCase("luna-present");
+      harness.setSerial(8);
+      expectCode(() => harness.lifecycle.reconcile("model-bootstrap", runId), "binding-mismatch");
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("reconcile rejects a historical code binding whose commit is not an ancestor of HEAD", () => {
+  const harness = makeHarness({
+    historicalCode: {
+      commit: HISTORICAL_CODE_COMMIT,
+      ancestor: false,
+      sources: HISTORICAL_CODE_SOURCES,
+      blobs: HISTORICAL_CODE_BLOBS,
+    },
+  });
+  try {
+    initialize(harness);
+    const runId = harness.lifecycle.create("model-bootstrap").runId;
+    forceUnknownRun(harness, runId);
+    rewriteLegacyBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings));
+    harness.setModelCase("luna-present");
+    harness.setSerial(8);
+    expectCode(() => harness.lifecycle.reconcile("model-bootstrap", runId), "binding-mismatch");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("guard, preflight, and apply retain current-identity rejection for historical code bindings", () => {
+  for (const operation of ["guard", "preflight", "apply"]) {
+    const harness = makeHarness({
+      historicalCode: {
+        commit: HISTORICAL_CODE_COMMIT,
+        ancestor: true,
+        sources: HISTORICAL_CODE_SOURCES,
+        blobs: HISTORICAL_CODE_BLOBS,
+      },
+    });
+    try {
+      initialize(harness);
+      const runId = harness.lifecycle.create("model-bootstrap").runId;
+      if (operation === "guard") {
+        rewriteManifestBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings));
+        expectCode(() => harness.lifecycle.guard("model-bootstrap", runId), "binding-mismatch");
+        continue;
+      }
+      harness.lifecycle.guard("model-bootstrap", runId);
+      if (operation === "preflight") {
+        rewriteManifestBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings));
+        expectCode(() => harness.lifecycle.preflight("model-bootstrap", runId), "binding-mismatch");
+        continue;
+      }
+      harness.lifecycle.preflight("model-bootstrap", runId);
+      rewriteManifestBinding(harness, runId, (bindings) => setHistoricalCodeBindings(bindings));
+      expectCode(() => harness.lifecycle.apply("model-bootstrap", runId), "binding-mismatch");
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test("supersede retains current-identity rejection for historical code bindings", () => {
+  const harness = makeHarness();
+  try {
+    initialize(harness);
+    advanceThrough(harness, "model-bootstrap");
+    advanceThrough(harness, "runtime-cutover");
+    setProtectedRuntimeSecretsRole(harness, false);
+    const old = harness.lifecycle.create("credential-cleanup");
+    harness.lifecycle.guard("credential-cleanup", old.runId);
+    harness.setTopology("post");
+    harness.lifecycle.preflight("credential-cleanup", old.runId);
+    harness.advance(30 * 60 * 1000 + 1);
+    expectCode(() => harness.lifecycle.apply("credential-cleanup", old.runId), "plan-expired");
+    harness.options.lowLevel.cleanupRunner({ operation: "resume", runId: old.runId, root: harness.root });
+    rewriteManifestBinding(harness, old.runId, (bindings) => setHistoricalCodeBindings(bindings));
+    expectCode(() => harness.lifecycle.supersede("credential-cleanup", old.runId), "binding-mismatch");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("create retains current-identity rejection when reviewed code changes after planning", () => {
+  const harness = productionHarness();
+  try {
+    initialize(harness);
+    harness.setPostPlanReviewedFile(
+      "infra/scripts/dev-plan-lifecycle.mjs",
+      "post-plan reviewed lifecycle source drift\n",
+    );
+    expectCode(() => harness.lifecycle.create("model-bootstrap"), "binding-mismatch");
+    const invalidated = harness.lifecycle.readState().runs.at(-1);
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.reason, "binding-mismatch");
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test("B2a model serial increment post", { concurrency: true }, () => {
   const harness = makeHarness();
   try {
@@ -7090,7 +7379,7 @@ test("C2 test execution adapters are isolated and cache one immutable context sn
     for (const [harness, before] of [[left, beforeLeft], [right, beforeRight]]) {
       const calls = harness.calls.slice(before);
       const count = (command, argv) => calls.filter(
-        (call) => call.command === command && call.argv[0] === argv,
+        (call) => call.command === command && (command === "/usr/bin/git" ? gitSubcommand(call) : call.argv[0]) === argv,
       ).length;
       assert.equal(count("/usr/bin/git", "rev-parse"), 8);
       assert.equal(count(TERRAFORM_PATH, "state"), 1);
@@ -7690,7 +7979,7 @@ test("B1b two actual lifecycle CLI operations contend through the private test a
     lowLevel: {
       ...harness.options.lowLevel,
       processRunner(request) {
-        if (!entered && request.command === "/usr/bin/git" && request.argv[0] === "status") {
+        if (!entered && request.command === "/usr/bin/git" && gitSubcommand(request) === "status") {
           entered = true;
           nestedStatus = runCliForTests(["init"], options);
         }
@@ -8069,7 +8358,7 @@ test("image verification uses one uncached pre/post context pair and exact verif
     const verifierCalls = calls.filter((call) => call.command === "/usr/bin/node");
     assert.equal(verifierCalls.length, 2);
     assert.equal(
-      calls.filter((call) => call.command === "/usr/bin/git" && ["rev-parse", "hash-object"].includes(call.argv[0])).length,
+      calls.filter((call) => call.command === "/usr/bin/git" && ["rev-parse", "hash-object"].includes(gitSubcommand(call))).length,
       30,
     );
     assert.equal(
