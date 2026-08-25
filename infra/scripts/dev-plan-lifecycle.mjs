@@ -8235,12 +8235,17 @@ function parseContainerAppAndRevisions(config, outputs, request, mode) {
 
 function parseAccessToken(result, config) {
   const tokenResponse = parseCommandJson(result, "entra-token");
-  assertKnownKeys(tokenResponse, ["accessToken", "expiresOn", "subscription", "tenant", "tokenType"], "entra-token");
+  assertKnownKeys(tokenResponse, ["accessToken", "expiresOn", "expires_on", "subscription", "tenant", "tokenType"], "entra-token");
   assertRequiredKeys(tokenResponse, ["accessToken", "expiresOn", "subscription", "tenant"], "entra-token");
   failIf(
       typeof tokenResponse.accessToken !== "string" || tokenResponse.accessToken.length < 20 ||
       typeof tokenResponse.expiresOn !== "string" || tokenResponse.subscription === undefined ||
       typeof tokenResponse.tenant !== "string" ||
+      tokenResponse.expires_on !== undefined &&
+        (typeof tokenResponse.expires_on !== "number" ||
+          !Number.isFinite(tokenResponse.expires_on) ||
+          !Number.isInteger(tokenResponse.expires_on) ||
+          tokenResponse.expires_on <= 0) ||
       tokenResponse.subscription !== config.account.subscription ||
       tokenResponse.tenant !== config.account.tenant,
     "entra-token",

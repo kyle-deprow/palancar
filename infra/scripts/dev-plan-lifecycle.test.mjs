@@ -43,7 +43,7 @@ const instrumentedSource = `${productionSource
   .replace(
     cachePathDeclaration,
     `const LIFECYCLE_CACHE_ROOT = ${JSON.stringify(instrumentedCacheRoot)};`,
-)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision, assertRevisionResponse };\n`;
+)}\nexport { LIFECYCLE_CACHE_ROOT, createLifecycle, runCli, createLifecycleForTests, runCliForTests, parseAccessToken, reviewedRuntimeShapes, assertInactiveRevisionTemplate, assertContainerAppResponse, normalizeLiveRevision, assertRevisionResponse };\n`;
 const instrumentedFd = openSync(instrumentedPath, "wx", 0o600);
 try {
   writeSync(instrumentedFd, instrumentedSource, 0, "utf8");
@@ -78,6 +78,7 @@ const {
   assertContainerAppResponse,
   assertRevisionResponse,
   normalizeLiveRevision,
+  parseAccessToken,
   reviewedRuntimeShapes,
   sha256File,
   sha256Bytes,
@@ -4917,6 +4918,25 @@ test("runtime post reconciliation retains the real predecessor contract and isol
   } finally {
     activeNegative.cleanup();
   }
+});
+
+test("access-token parsing accepts Azure CLI expiry compatibility and rejects malformed values", () => {
+  const response = {
+    accessToken: "protected-test-token-value-1234567890",
+    expiresOn: "2099-01-01 00:00:00.000000",
+    subscription: SUBSCRIPTION,
+    tenant: TENANT,
+    tokenType: "Bearer",
+  };
+  const config = { account: { subscription: SUBSCRIPTION, tenant: TENANT } };
+  const parse = (changes = {}) => parseAccessToken({
+    status: "success",
+    stdout: JSON.stringify({ ...response, ...changes }),
+  }, config);
+
+  assert.equal(parse(), response.accessToken);
+  assert.equal(parse({ expires_on: 4102444800 }), response.accessToken);
+  expectCode(() => parse({ expires_on: "4102444800" }), "entra-token");
 });
 
 test("A3 exact credential Entra-only topology and cleanup receipts are fail-closed", () => {
