@@ -1909,6 +1909,58 @@ test("cumulative deadline is exact, accounted once, and read-only assertion rema
   assert.equal(exact.sleepCalls.length, 0);
 });
 
+test("stale journal resumes read-only past the ceiling when all targets are already absent", async () => {
+  const harness = makeHarness();
+  await harness.cleanup.start(harness.runId);
+  harness.active.clear();
+  harness.deleted.clear();
+  harness.advance(CUMULATIVE_ELAPSED_LIMIT_MS + 1);
+  const deleteCallsBefore = harness.httpCalls.filter((request) => request.method === "DELETE").length;
+
+  assert.deepEqual(await harness.cleanup.resume(harness.runId), { status: "absent", runId: harness.runId });
+  assert.equal(harness.httpCalls.filter((request) => request.method === "DELETE").length, deleteCallsBefore);
+  const state = readJson(harness.path(stateFiles(harness).at(-1)));
+  assert.equal(state.status, "complete");
+  assert.equal(state.sequence, 1);
+  assert.equal(state.cumulativeElapsedMs, CUMULATIVE_ELAPSED_LIMIT_MS);
+  assert.equal(state.inventory.targetStates.every((target) => target.state === "absent"), true);
+});
+
+test("a soft-deleted target blocks verification-only completion past the ceiling", async () => {
+  const harness = makeHarness();
+  await harness.cleanup.start(harness.runId);
+  harness.active.clear();
+  // One target remains soft-deleted (recoverable), so absence is not proven.
+  harness.deleted.add("openrouter-api-key");
+  harness.advance(CUMULATIVE_ELAPSED_LIMIT_MS + 1);
+  await expectCode(harness.cleanup.resume(harness.runId), "elapsed-ceiling");
+  const state = readJson(harness.path(stateFiles(harness).at(-1)));
+  assert.notEqual(state.status, "complete");
+});
+
+test("a delete 404 is journaled as an idempotent already-absent result", async () => {
+  let firstDelete = true;
+  const harness = makeHarness({
+    httpState: {
+      onRequest: (request, controls) => {
+        if (request.method !== "DELETE" || !firstDelete) return undefined;
+        firstDelete = false;
+        const name = new URL(request.url).pathname.split("/").at(-1);
+        controls.active.delete(name);
+        controls.deleted.delete(name);
+        return { statusCode: 404, body: "secret-already-absent" };
+      },
+    },
+  });
+  await harness.cleanup.start(harness.runId);
+  await harness.cleanup.resume(harness.runId);
+
+  assert.equal(readJson(harness.path(stateFiles(harness).at(-1))).status, "complete");
+  assert.equal(readJson(harness.path(stateFiles(harness).at(-1))).inventory.targetStates[0].state, "absent");
+  assert.equal(readJson(path.join(commitmentDirectory(harness), "cleanup-mutation-intent-000000.json")).action, "delete");
+  assert.equal(harness.httpCalls.some((request) => request.method === "DELETE" && request.responseMode !== "empty"), false);
+});
+
 test("completed-operation resume confirms after the mutation ceiling without deleting", async () => {
   const harness = makeHarness();
   await harness.cleanup.start(harness.runId);

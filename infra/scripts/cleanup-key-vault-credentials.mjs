@@ -122,7 +122,10 @@ const IMAGE_REFERENCE_RE = /^([a-z0-9]{5,50}\.azurecr\.io)\/(palancar-relay|pala
 const SECRET_NAME_RE = /^[A-Za-z0-9-]{1,127}$/u;
 const COMMIT_RE = /^[0-9a-f]{40}$/u;
 const STATES = Object.freeze(["start-inventory-validated", "attempting", "unknown", "complete"]);
-const ACCEPTED_DELETE_STATUS = new Set([200, 202, 204]);
+// Key Vault can report that a concurrent recovery already removed the
+// secret.  DELETE is idempotent for this cleanup: the live convergence poll
+// below still has to prove the target is absent before the journal advances.
+const ACCEPTED_DELETE_STATUS = new Set([200, 202, 204, 404]);
 const MAX_HTTP_BODY_BYTES = 256 * 1024;
 // Must exceed the live Terraform state (already ~194 KiB and growing with
 // each relay revision); matches the lifecycle's 8 MiB bounded-JSON reads.
@@ -3411,10 +3414,13 @@ async function reconcileTerminalReceipt(config, context, state, deadline, invoca
   if (state.status === "complete") return { status: "absent", runId: context.descriptor.runId };
   failIf(state.status === "prepared" && context.operation.status !== "completed", "state-history");
   const completionNow = config.now();
-  const cumulativeElapsedMs = state.sequence < 0
+  const observedElapsedMs = state.sequence < 0
     ? Math.max(0, completionNow - invocationStarted)
     : currentElapsed(state, completionNow);
-  failIf(cumulativeElapsedMs >= CUMULATIVE_ELAPSED_LIMIT_MS, "elapsed-ceiling");
+  // Receipt reconciliation is verification-only.  A stale state tail may be
+  // older than the mutation ceiling even though the receipt and live
+  // inventory prove terminal absence; preserve the bounded durable value.
+  const cumulativeElapsedMs = Math.min(observedElapsedMs, CUMULATIVE_ELAPSED_LIMIT_MS);
   writeState(config, context, state, {
     status: "complete",
     attempts: state.attempts,
@@ -3427,11 +3433,36 @@ async function reconcileTerminalReceipt(config, context, state, deadline, invoca
   return { status: "absent", runId: context.descriptor.runId };
 }
 
+async function reconcileAlreadyAbsentPastCeiling(config, context, state, deadline) {
+  // This is deliberately a read-only precheck.  It is the recovery path for
+  // a completed operation whose manifest advanced but whose state journal did
+  // not: only a fresh inventory proving every fixed target is absent may
+  // advance the journal, and no DELETE is reachable from this function.
+  const reconciled = await validateAzureAndInventory(config, context, deadline);
+  assertWithinDeadline(config, deadline);
+  if (!allTargetsAbsent(reconciled.inventory)) reject("elapsed-ceiling");
+  const completionNow = config.now();
+  const cumulativeElapsedMs = Math.min(currentElapsed(state, completionNow), CUMULATIVE_ELAPSED_LIMIT_MS);
+  const absence = writeAbsenceReceipt(config, context, reconciled.inventory);
+  writeState(config, context, state, {
+    status: "complete",
+    attempts: state.attempts,
+    cumulativeElapsedMs,
+    accountingCursor: completionNow,
+    inventory: terminalInventory(reconciled.inventory),
+    absenceReceiptSha256: absence.receiptSha256,
+    preflight: absence.preflight,
+  });
+  return { status: "absent", runId: context.descriptor.runId };
+}
+
 async function resumeOperation(config, runId) {
   const invocationStarted = config.now();
   let context = validateContext(config, runId, true, { allowPostApplyRecovery: true });
   let state = readStateFiles(config, context);
   const hasTerminalReceipt = existsSync(artifactPath(context.directory, ABSENCE_RECEIPT_FILENAME));
+  const pastMutationCeiling = state.sequence >= 0 && state.status !== "complete" && !hasTerminalReceipt &&
+    currentElapsed(state, invocationStarted) >= CUMULATIVE_ELAPSED_LIMIT_MS;
   // A completed operation can only take the terminal confirmation path below;
   // it must never regain permission to mutate.  Give that read-only path the
   // invocation deadline so an old mutation ceiling cannot prevent live
@@ -3439,7 +3470,8 @@ async function resumeOperation(config, runId) {
   // ceiling as their deadline.
   const terminalConfirmation = context.operation.status === "completed" &&
     (state.status === "complete" || hasTerminalReceipt);
-  const deadline = terminalConfirmation
+  const staleJournalAbsencePrecheck = !terminalConfirmation && pastMutationCeiling;
+  const deadline = terminalConfirmation || staleJournalAbsencePrecheck
     ? invocationStarted + INVOCATION_DEADLINE_MS
     : state.sequence < 0
       ? invocationStarted + INVOCATION_DEADLINE_MS
@@ -3449,6 +3481,9 @@ async function resumeOperation(config, runId) {
   // first so paired state/anchor tail deletion cannot reset history.
   if (hasTerminalReceipt) {
     return reconcileTerminalReceipt(config, context, state, deadline, invocationStarted);
+  }
+  if (staleJournalAbsencePrecheck) {
+    return reconcileAlreadyAbsentPastCeiling(config, context, state, deadline);
   }
   if (state.sequence < 0) {
     failIf(context.operation.status !== "prepared", "state-history");
