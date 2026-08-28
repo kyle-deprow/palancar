@@ -1,5 +1,14 @@
 # Palancar handoff — 2026-08-25
 
+> **SUPERSEDED 2026-08-28.** The guarded dev-plan lifecycle described below no
+> longer exists: `infra/scripts/` was reduced to a single image preflight in
+> commit `eddb629`, and the evidence store at `~/.local/state/palancar/` was
+> deleted. The terminal phase was never run and now cannot be; the OpenRouter
+> revocation blocker was closed by decision, not by evidence. Do not attempt the
+> lifecycle commands in this document. Retained as a record of how the migration
+> was executed.
+
+
 Continuation of `PALANCAR_HANDOFF_2026-08-22.md` and `AUDIT_2026-08-22.md`.
 Read those first for app architecture, the fix-series history, and the
 guarded-lifecycle design. This document covers what changed since, the exact
