@@ -28,8 +28,8 @@ OpenRouter, LiteLLM, and their credential names are retired. Any occurrence in
 this repository's operator flow is historical cleanup context only; they are
 not runtime providers, sidecars, fallbacks, or active configuration.
 
-The implementation and guards are present, but this document does not claim
-that the live rollout or final evidence is complete.
+The Terraform implementation is present; review the plan before applying
+changes to the intended environment.
 
 ## Bootstrap and remote state
 
@@ -63,74 +63,7 @@ terraform -chdir=infra/environments/dev validate
 Do not paste backend values, resource IDs, endpoints, or secrets into this
 document or committed Terraform examples.
 
-## Lifecycle-controlled rollout
-
-Enabled-relay changes are lifecycle-only. `dev-plan-lifecycle.mjs` owns the
-saved plan, guard, diagnostic, preflight, apply, receipt, and phase-order
-checks. Do not substitute a standalone Terraform plan or apply for an
-enabled-relay phase.
-
-Initialize once, then run each non-terminal phase in order:
-
-```sh
-node infra/scripts/dev-plan-lifecycle.mjs init
-
-run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create model-bootstrap)"
-node infra/scripts/dev-plan-lifecycle.mjs guard model-bootstrap "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs preflight model-bootstrap "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs apply model-bootstrap "$run_id"
-
-run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create runtime-cutover)"
-node infra/scripts/dev-plan-lifecycle.mjs guard runtime-cutover "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs preflight runtime-cutover "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs apply runtime-cutover "$run_id"
-
-run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create credential-cleanup)"
-node infra/scripts/dev-plan-lifecycle.mjs guard credential-cleanup "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs preflight credential-cleanup "$run_id"
-node infra/scripts/dev-plan-lifecycle.mjs apply credential-cleanup "$run_id"
-```
-
-The phase-to-guard contract is:
-
-| Phase | Guard mode | Allowed transition |
-| --- | --- | --- |
-| `model-bootstrap` | `luna-model-bootstrap` | One canonical `gpt-5.6-luna` deployment create; transcription, relay, RBAC, outputs, and all other resources are no-op. |
-| `runtime-cutover` | `azure-generation-cutover` | One relay Container App update to Azure-only generation; one container, zero secrets, and all other resources are no-op. |
-| `credential-cleanup` | `azure-credential-cleanup` | One deletion of the runtime Key Vault Secrets User assignment; the app, deployments, and all other RBAC are no-op. |
-| `terminal` | `final-rollout-complete` | Complete no-op plan with final checks and zero drift; verification only. |
-
-If an apply exits ambiguously, run only the matching read-only reconciliation.
-For runtime cutover this is:
-
-```sh
-node infra/scripts/dev-plan-lifecycle.mjs reconcile runtime-cutover <run-id>
-```
-
-Never replay an old plan after an ambiguous apply. A credential-cleanup plan
-that expires after irreversible cleanup is recovered with the utility's
-supported supersession flow:
-
-```sh
-node infra/scripts/dev-plan-lifecycle.mjs supersede credential-cleanup <old-run-id>
-```
-
-The replacement run receives its own guard and preflight. The terminal phase
-has no `preflight` or `apply`:
-
-```sh
-terminal_run_id="$(node infra/scripts/dev-plan-lifecycle.mjs create terminal)"
-node infra/scripts/dev-plan-lifecycle.mjs guard terminal "$terminal_run_id"
-node infra/scripts/dev-plan-lifecycle.mjs finalize terminal "$terminal_run_id"
-node infra/scripts/dev-plan-lifecycle.mjs close terminal "$terminal_run_id"
-```
-
-`close` seals the protected rollout evidence root and is permitted only after
-terminal finalization. The final guard and close are not evidence that has
-already been produced; they are the last operator actions.
-
-### Immutable runtime image contract
+## Runtime image contract
 
 Build and push both runtime images from the repository root with the exact
 reviewed amd64-only commands. Obtain the ephemeral Azure CLI expose-token JSON
@@ -206,125 +139,21 @@ performs no second registry lookup, so a mutable tag cannot race digest
 capture. The private Docker config and metadata directory may be removed after
 the pins are recorded.
 
-The lifecycle's remote ACR verifier is authoritative: it accepts only a
-single Linux/amd64 OCI or Docker manifest and matching config, and rejects
-ARM64 images, indexes, manifest lists, tags, and other mutable references.
-It obtains ephemeral Azure CLI refresh and scoped registry access tokens in
-memory for verification and never persists or exposes either token. The
-protected verifier is also reviewed against the Azure CLI 2.83 `az acr
-login --expose-token` JSON shape and the current ACR SAS blob-redirect
-schema; revalidate those compatibility contracts before upgrading the Azure
-CLI or changing registry behavior.
-
-## Diagnostics and cleanup utilities
-
-### Azure generation diagnostic
-
-The runtime-cutover lifecycle operation is the operator entry point. It
-validates the existing Container Apps Job, reserves durable intent, and starts
-at most one execution for the run. The Job uses the guarded immutable relay
-image, the Entra runtime identity, the exact no-argument diagnostic command,
-and no secrets:
+Before applying the immutable pins, run the preflight for each image:
 
 ```sh
-node infra/scripts/dev-plan-lifecycle.mjs diagnostic runtime-cutover <run-id>
+node infra/scripts/verify-image-platform.mjs --subscription "$subscription_id" --image "$ACR_LOGIN_SERVER/palancar-relay@$relay_digest"
+node infra/scripts/verify-image-platform.mjs --subscription "$subscription_id" --image "$ACR_LOGIN_SERVER/palancar-expiry-cleanup@$cleanup_digest"
 ```
 
-The Job's inner command is:
-
-```sh
-node apps/relay/dist/azure-generation-diagnostic.js
-```
-
-The lifecycle supplies `AZURE_CLIENT_ID`,
-`PALANCAR_AZURE_GENERATION_ENDPOINT`, and
-`PALANCAR_AZURE_GENERATION_DEPLOYMENT` from the guarded plan. The executable
-uses Entra and permits at most two sequential model attempts, each through a
-fresh `GenerationService`, with retry limited to the two exact trusted,
-correlation-matched complete language-validation evidence shapes. Any
-malformed, missing, multiple, inconsistent, provider, timeout, cancellation,
-or unknown evidence is terminal; attempt two is final and no third attempt is
-allowed. `GenerationService` and the session do not retry. The executable
-makes one bounded synthetic generation request per attempt and prints only
-`azure-generation-diagnostic: passed` or a fixed failure stage. It exits `0`
-on success and `20` on failure, with one 90-second watchdog. This is
-diagnostic-process retry only; the lifecycle still makes one ACA Job start.
-Intent, invoking, submission, execution, and receipt artifacts are durable and
-resumable. A timeout or ambiguous start is reconciled against the Job execution
-and never submitted again; runtime preflight requires the receipt bound to the
-guarded image.
-
-### Runtime Key Vault role toggle
-
-This utility operates only on the protected ignored dev tfvars file and has
-three production modes:
-
-```sh
-node infra/scripts/set-dev-runtime-secrets-role.mjs assert-enabled
-node infra/scripts/set-dev-runtime-secrets-role.mjs disable
-node infra/scripts/set-dev-runtime-secrets-role.mjs assert-disabled
-```
-
-Use `assert-enabled` before the runtime cutover. After the Azure-only runtime
-is proven, disable the role and verify the disabled state before creating and
-guarding the credential-cleanup run. Its lifecycle preflight checks the same
-disabled state; lifecycle apply resumes the cleanup and requires absence
-evidence.
-There is no production `enable` command.
-
-### Key Vault credential cleanup
-
-The cleanup utility uses Entra-authenticated Azure reads and a protected,
-run-bound operation. Its exact CLI is:
-
-```sh
-node infra/scripts/cleanup-key-vault-credentials.mjs start <run-id>
-node infra/scripts/cleanup-key-vault-credentials.mjs resume <run-id>
-node infra/scripts/cleanup-key-vault-credentials.mjs assert-absent <run-id>
-```
-
-Credential cleanup is fixed to the two retired secret names
-`openrouter-api-key` and `litellm-master-key`; those names are documented here
-only as historical cleanup targets. The lifecycle credential-cleanup
-preflight creates the descriptor and starts/resumes the operation as needed.
-Use the direct commands only with the matching lifecycle run and protected
-receipts; do not invent a run ID or a target name.
-
-### Local environment cleanup
-
-After the revocation utility has proved provider-side revocation, and after
-the Azure-only runtime is proven, remove the retired local credential with its
-fixed production file/key pair:
-
-```sh
-node infra/scripts/remove-env-entry.mjs remove /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
-node infra/scripts/remove-env-entry.mjs assert-absent /home/dev/repos/palancar_ws/.env OPENROUTER_API_KEY
-```
-
-The key name is shown only in this historical cleanup command. The utility is
-fail-closed for other paths or keys and maintains bounded recovery artifacts.
-
-### Historical provider-revocation evidence
-
-The retained revocation utility is a terminal prerequisite for the retired
-provider credential. It captures preflight evidence, waits for user/provider
-revocation, requires an HTTP 401 response before entering `revoked`, and then
-requires the local environment removal proof before `local-removed` and
-`assert-complete`:
-
-```sh
-node infra/scripts/openrouter-revocation-state.mjs prepare
-node infra/scripts/openrouter-revocation-state.mjs resume
-node infra/scripts/openrouter-revocation-state.mjs mark-local-removed
-node infra/scripts/openrouter-revocation-state.mjs assert-complete
-```
-
-The provider and key names in this section are historical cleanup context only;
-they are not runtime providers, fallbacks, sidecars, or active configuration.
+The build host is aarch64 (ARM), while Azure Container Apps run linux/amd64.
+A plain `docker build` can produce an arm64 image, and buildx provenance or
+SBOM settings can publish an OCI index. The preflight checks the immutable
+manifest and config in ACR so either mismatch is caught before deployment.
 
 ## Checks
 
-Useful non-mutating repository checks are:
+Run these repository checks before applying infrastructure changes:
 
 ```sh
 terraform fmt -check -recursive infra
@@ -333,7 +162,8 @@ npm run typecheck
 npm test
 npm run build
 git diff --check
+node --test infra/scripts/verify-image-platform.test.mjs
 ```
 
-Run the lifecycle/guard and utility tests before any live phase. Keep all
-plans, receipts, state, and live configuration outside Git.
+For a change, update Terraform, review the plan, and apply it to the intended
+environment.

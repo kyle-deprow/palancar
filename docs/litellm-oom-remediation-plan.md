@@ -4,9 +4,7 @@ Status: historical and superseded. The retired generation-workload OOM
 remediation and telemetry-enrichment material in this document is completed
 evidence only; none of it is an active rollout. This document does not
 authorize creating, guarding, preflighting, applying, or finalizing any plan.
-The current rollout is governed by
-[docs/azure-foundry-entra-cutover-plan.md](azure-foundry-entra-cutover-plan.md)
-and its lifecycle phase modes, not by this historical record.
+The cutover referenced here is complete, and its plan is retained as a historical record at `.archive/azure-foundry-entra-cutover-plan.md`.
 
 ## Evidence and decision
 
