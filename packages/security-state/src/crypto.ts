@@ -2,11 +2,10 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { SecurityStateError } from './errors.js';
 
-const PAIRING_PATTERN = /^[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$/;
+const PAIRING_PATTERN = /^[0-9]{6}$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
-const PAIRING_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
 export type CanonicalPairingCode = string & { readonly __pairing: unique symbol };
 export type CanonicalToken = string & { readonly __token: unique symbol };
@@ -85,11 +84,11 @@ export function systemUuid(): string {
 }
 
 export function systemPairingCode(): string {
-  let source = BigInt(`0x${randomBytes(16).toString('hex')}`);
-  const output = Array<string>(26).fill('0');
-  for (let index = output.length - 1; index >= 0; index -= 1) {
-    output[index] = PAIRING_ALPHABET[Number(source & 31n)] ?? '0';
-    source >>= 5n;
+  for (;;) {
+    const source = randomBytes(3);
+    const candidate = ((source[0]! & 0x0f) << 16) | (source[1]! << 8) | source[2]!;
+    if (candidate < 1_000_000) {
+      return String(candidate).padStart(6, '0');
+    }
   }
-  return output.join('');
 }

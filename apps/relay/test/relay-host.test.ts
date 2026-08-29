@@ -3853,7 +3853,7 @@ describe('relay HTTP/WebSocket host', () => {
         'x-forwarded-for': '203.0.113.99',
         forwarded: 'for=203.0.113.100'
       },
-      body: JSON.stringify({ pairingCode: '00000000000000000000000001' })
+      body: JSON.stringify({ pairingCode: '000001' })
     });
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');

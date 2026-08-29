@@ -15,7 +15,7 @@ import type {
   RotationConfirmationResponseLike,
 } from "../src/auth/types.js";
 
-const PAIRING = `0${"A".repeat(25)}`;
+const PAIRING = "012345";
 const CURRENT = `${"A".repeat(42)}E`;
 const PENDING = `${"B".repeat(42)}I`;
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";

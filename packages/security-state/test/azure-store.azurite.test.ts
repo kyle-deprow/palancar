@@ -41,7 +41,7 @@ function uuid(index: number): string {
 }
 
 function pairing(index: number): string {
-  return `0${String(index).padStart(25, '0')}`;
+  return String(index + 100_000).padStart(6, '0');
 }
 
 function token(index: number): string {

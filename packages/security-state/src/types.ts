@@ -10,7 +10,7 @@ export const SECURITY_STATE_CAPABILITIES = Object.freeze({
   paidProvidersAllowed: false
 } as const);
 
-export const PAIRING_TTL_MS = 600_000;
+export const PAIRING_TTL_MS = 1_800_000;
 export const CREDENTIAL_IDLE_TTL_MS = 2_592_000_000;
 export const CREDENTIAL_ABSOLUTE_TTL_MS = 7_776_000_000;
 export const PENDING_CREDENTIAL_TTL_MS = 300_000;

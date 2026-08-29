@@ -562,9 +562,11 @@ describe('authentication and semantic timestamps', () => {
     expect(CONTROLLED_FIXTURE_NOTICE).toContain('synthetic');
     expect(isCanonicalPairingCode(CONTROLLED_PAIRING_CODE)).toBe(true);
     for (const invalid of [
-      CONTROLLED_PAIRING_CODE.toLowerCase(),
-      '8123456789ABCDEFGHJKMNPQRS',
-      '0123456789-ABCDEFGHJKMNPQRS',
+      '12345',
+      '1234567',
+      '12345A',
+      '',
+      '00000000000000000000000000',
       CONTROLLED_PAIRING_CODE.replace('0', 'O'),
       CONTROLLED_PAIRING_CODE.replace('1', 'I')
     ]) {
@@ -737,7 +739,7 @@ describe('binary audio codec', () => {
     expect(MAX_UNACKNOWLEDGED_SAMPLES).toBe(8_000);
     expect(AUDIO_RATE_REFILL_SAMPLES_PER_SECOND).toBe(16_000);
     expect(AUDIO_RATE_BUCKET_CAPACITY_SAMPLES).toBe(8_000);
-    expect(PAIRING_LIFETIME_MS).toBe(600_000);
+    expect(PAIRING_LIFETIME_MS).toBe(1_800_000);
     expect(Object.isFrozen(PROTOCOL_CONSTANTS)).toBe(true);
   });
 });

@@ -61,7 +61,7 @@ function uuid(index: number): string {
 }
 
 function pairing(index: number): string {
-  return `0${String(index).padStart(25, '0')}`;
+  return String(index + 100_000).padStart(6, '0');
 }
 
 function token(index: number): string {
@@ -1607,7 +1607,7 @@ describe('expiry, cleanup, snapshots, and safe time', () => {
   it('bounds lazy cleanup work and uses no timers', async () => {
     const { store, fake } = fixture();
     await store.issuePairing({ operatorScope: 'operator' });
-    fake.advance(600_000);
+    fake.advance(PAIRING_TTL_MS);
     const result = await store.cleanupExpired({ limit: 3 });
     expect(result.visited).toBeLessThanOrEqual(3);
     expect(result.removed).toBe(1);

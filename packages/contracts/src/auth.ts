@@ -10,14 +10,14 @@ import {
 } from './schemas.js';
 
 export const CANONICAL_PAIRING_CODE_PATTERN =
-  '^[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$';
+  '^[0-9]{6}$';
 export const BASE64URL_SECRET_PATTERN =
   '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$';
 
 export const CanonicalPairingCodeSchema = Type.String({
   pattern: CANONICAL_PAIRING_CODE_PATTERN,
-  minLength: 26,
-  maxLength: 26
+  minLength: 6,
+  maxLength: 6
 });
 export type CanonicalPairingCode = Static<typeof CanonicalPairingCodeSchema>;
 
@@ -155,7 +155,7 @@ export function isCanonicalPairingCode(value: unknown): value is CanonicalPairin
 
 export function assertCanonicalPairingCode(value: unknown): CanonicalPairingCode {
   if (!isCanonicalPairingCode(value)) {
-    throw new TypeError('Pairing code is not canonical Crockford Base32');
+    throw new TypeError('Pairing code is not canonical six-digit decimal');
   }
 
   return value;

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { CANONICAL_PAIRING_CODE_PATTERN } from "@palancar/contracts";
 
 import {
   type PhoneAuthViewCallbacks,
@@ -7,8 +6,8 @@ import {
   createPhoneAuthView,
 } from "../src/phone-ui";
 
-const VALID_CODE = "0123456789ABCDEFGHJKMNPQRS";
-const INVALID_CODE = "0123456789ABCDEFGHJKMNPQRI";
+const VALID_CODE = "012345";
+const INVALID_CODE = "01234A";
 const CANARY = "pairing-code-canary";
 const ERROR_CANARY = "platform-error-canary";
 
@@ -23,6 +22,8 @@ class FakeElement {
   public maxLength = 524288;
   public autocomplete = "";
   public autocapitalize = "";
+  public inputMode = "";
+  public pattern = "";
   public spellcheck = true;
   public type = "text";
   public blurCount = 0;
@@ -158,16 +159,19 @@ describe("phone authentication UI", () => {
 
     view.render({ status: "required", reason: "missing" });
     expect(input.attributes.get("type")).toBe("password");
-    expect(input.attributes.get("minlength")).toBe("26");
-    expect(input.attributes.get("maxlength")).toBe("26");
-    expect(input.attributes.get("pattern")).toBe(CANONICAL_PAIRING_CODE_PATTERN);
+    expect(input.attributes.get("minlength")).toBe("6");
+    expect(input.attributes.get("maxlength")).toBe("6");
+    expect(input.attributes.get("inputmode")).toBe("numeric");
+    expect(input.attributes.get("pattern")).toBe("[0-9]*");
     expect(input.attributes.get("autocomplete")).toBe("off");
     expect(input.attributes.get("autocapitalize")).toBe("off");
     expect(input.attributes.get("autocorrect")).toBe("off");
     expect(input.attributes.get("spellcheck")).toBe("false");
     expect(input.attributes.has("name")).toBe(false);
-    expect(input.minLength).toBe(26);
-    expect(input.maxLength).toBe(26);
+    expect(input.minLength).toBe(6);
+    expect(input.maxLength).toBe(6);
+    expect(input.inputMode).toBe("numeric");
+    expect(input.pattern).toBe("[0-9]*");
     expect(input.type).toBe("password");
     expect(input.autocomplete).toBe("off");
     expect(input.autocapitalize).toBe("off");
@@ -261,7 +265,7 @@ describe("phone authentication UI", () => {
     submit(document, VALID_CODE);
     expect(calls).toEqual([VALID_CODE]);
 
-    for (const invalid of [INVALID_CODE, VALID_CODE.toLowerCase(), ` ${VALID_CODE}`, `${VALID_CODE} `]) {
+    for (const invalid of [INVALID_CODE, "12345", "0123457", ` ${VALID_CODE}`, `${VALID_CODE} `]) {
       submit(document, invalid);
     }
     expect(calls).toEqual([VALID_CODE]);

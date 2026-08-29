@@ -26,7 +26,7 @@ const ENV = Object.freeze({
   PALANCAR_OP_PRINCIPAL_ID: '00000000-0000-4000-8000-000000000003'
 });
 
-const PAIRING = '00000000000000000000000000';
+const PAIRING = '012345';
 const CREDENTIAL = Buffer.alloc(32, 1).toString('base64url');
 const TICKETS = Object.freeze([
   Buffer.alloc(32, 2).toString('base64url'),

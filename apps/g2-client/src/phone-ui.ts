@@ -1,12 +1,9 @@
-import {
-  CANONICAL_PAIRING_CODE_PATTERN,
-  isCanonicalPairingCode,
-} from "@palancar/contracts";
+import { isCanonicalPairingCode } from "@palancar/contracts";
 
 import type { AuthRequiredReason } from "./auth/types.js";
 
 const PHONE_AUTH_UI_ERROR = "Phone authentication UI unavailable";
-const PAIRING_LENGTH = 26;
+const PAIRING_LENGTH = 6;
 const INVALID_PAIRING_COPY = "Enter a valid pairing code.";
 const ACTION_ERROR_COPY = "The authentication action could not be completed.";
 const DISPOSED_COPY = "Authentication UI unavailable.";
@@ -328,7 +325,8 @@ export function createPhoneAuthView(options: {
   pairingCode.setAttribute("type", "password");
   pairingCode.setAttribute("minlength", String(PAIRING_LENGTH));
   pairingCode.setAttribute("maxlength", String(PAIRING_LENGTH));
-  pairingCode.setAttribute("pattern", CANONICAL_PAIRING_CODE_PATTERN);
+  pairingCode.setAttribute("inputmode", "numeric");
+  pairingCode.setAttribute("pattern", "[0-9]*");
   pairingCode.setAttribute("autocomplete", "off");
   pairingCode.setAttribute("autocapitalize", "off");
   pairingCode.setAttribute("autocorrect", "off");
@@ -338,6 +336,8 @@ export function createPhoneAuthView(options: {
   pairingCode.type = "password";
   pairingCode.minLength = PAIRING_LENGTH;
   pairingCode.maxLength = PAIRING_LENGTH;
+  pairingCode.inputMode = "numeric";
+  pairingCode.pattern = "[0-9]*";
   pairingCode.autocomplete = "off";
   pairingCode.autocapitalize = "off";
   pairingCode.spellcheck = false;

@@ -27,6 +27,7 @@ import {
   decodeAudioFrame,
   encodeAudioFrame,
   isBase64UrlSecret,
+  isCanonicalPairingCode,
   isCanonicalWssOrigin,
   isClientControlMessage,
   isControlMessage,
@@ -203,6 +204,15 @@ describe('semantic aggregate validation', () => {
 });
 
 describe('canonical auth values', () => {
+  it('accepts only six-digit pairing codes', () => {
+    for (const valid of ['000000', '999999']) {
+      expect(isCanonicalPairingCode(valid)).toBe(true);
+    }
+    for (const invalid of ['12345', '1234567', '12345A', '', '00000000000000000000000000']) {
+      expect(isCanonicalPairingCode(invalid)).toBe(false);
+    }
+  });
+
   it('accepts only exact empty credential rotation request objects', () => {
     const canary = 'ROTATION-CREDENTIAL-CANARY';
     const contracts = [

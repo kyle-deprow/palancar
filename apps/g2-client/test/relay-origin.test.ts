@@ -93,8 +93,9 @@ describe("G2 browser shell", () => {
     const input = html.match(/<input\b[^>]*id="palancar-pairing-code"[^>]*>/)?.[0];
     expect(input).toBeDefined();
     expect(input).toContain('type="password"');
-    expect(input).toContain('minlength="26"');
-    expect(input).toContain('maxlength="26"');
+    expect(input).toContain('minlength="6"');
+    expect(input).toContain('maxlength="6"');
+    expect(input).toContain('pattern="^[0-9]{6}$"');
     expect(input).toContain('autocomplete="off"');
     expect(input).toContain('autocapitalize="off"');
     expect(input).toContain('autocorrect="off"');

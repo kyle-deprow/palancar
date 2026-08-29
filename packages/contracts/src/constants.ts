@@ -16,7 +16,7 @@ export const HEARTBEAT_GRACE_MS = 10_000 as const;
 export const AUDIO_RATE_REFILL_SAMPLES_PER_SECOND = 16_000 as const;
 export const AUDIO_RATE_BUCKET_CAPACITY_SAMPLES = 8_000 as const;
 export const TICKET_LIFETIME_MS = 60_000 as const;
-export const PAIRING_LIFETIME_MS = 600_000 as const;
+export const PAIRING_LIFETIME_MS = 1_800_000 as const;
 
 export const HEADER_BYTES = AUDIO_HEADER_BYTES;
 export const BINARY_HEADER_BYTES = AUDIO_HEADER_BYTES;
