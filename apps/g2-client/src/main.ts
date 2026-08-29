@@ -21,6 +21,11 @@ import {
   type PhoneAuthViewCallbacks,
   type PhoneAuthViewState,
 } from "./phone-ui.js";
+import {
+  getBootDiagnosticDetail,
+  getLastBootFailureStep,
+  reportBootDiagnostic,
+} from "./diagnostics.js";
 
 declare const __PALANCAR_RELAY_ORIGIN__: string;
 
@@ -292,7 +297,7 @@ export function startG2ApplicationShell(options: G2ApplicationShellOptions): G2A
     () => {
       if (!disposed && status === "starting") status = "running";
     },
-    () => {
+    (error: unknown) => {
       if (disposed) return;
       status = "failed";
       try {
@@ -300,7 +305,19 @@ export function startG2ApplicationShell(options: G2ApplicationShellOptions): G2A
       } catch {
         // The fixed shell state below is independent from view rendering.
       }
+      const failingStep = getLastBootFailureStep();
+      const detail = getBootDiagnosticDetail(error);
+      reportBootDiagnostic(detail === undefined
+        ? { step: "shell-boot", outcome: "fail", at: Date.now() }
+        : { step: "shell-boot", outcome: "fail", detail, at: Date.now() });
       renderFixedShellError(options.document);
+      if (import.meta.env.DEV) {
+        try {
+          options.document.documentElement.dataset.palancarDiagStep = failingStep ?? "shell-boot";
+        } catch {
+          // Dev diagnostics remain best-effort on a damaged DOM.
+        }
+      }
     },
   );
 

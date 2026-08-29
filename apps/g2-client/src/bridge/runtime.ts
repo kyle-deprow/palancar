@@ -33,6 +33,10 @@ import {
   type RelayTransportError,
   type RelayTransportOptions,
 } from "../transport/index.js";
+import {
+  getBootDiagnosticDetail,
+  reportBootDiagnostic,
+} from "../diagnostics.js";
 import { toStartUpPageContainer } from "./sdk-layout.js";
 
 export const PALANCAR_G2_READY = "PALANCAR_G2_READY";
@@ -70,6 +74,37 @@ function normalizeError(error: unknown, fallbackMessage: string): Error {
     return new Error(`${fallbackMessage}: ${String(error)}`);
   } catch {
     return new Error(fallbackMessage);
+  }
+}
+
+function reportBootStep(
+  step: string,
+  outcome: "start" | "ok" | "fail",
+  error?: unknown,
+): void {
+  if (!import.meta.env.DEV) return;
+  const detail = error === undefined ? undefined : getBootDiagnosticDetail(error);
+  reportBootDiagnostic({
+    step,
+    outcome,
+    ...(detail === undefined ? {} : { detail }),
+    at: Date.now(),
+  });
+}
+
+async function awaitBootStep<T>(
+  step: string,
+  operation: () => Promise<T>,
+  startAlreadyReported = false,
+): Promise<T> {
+  if (!startAlreadyReported) reportBootStep(step, "start");
+  try {
+    const result = await operation();
+    reportBootStep(step, "ok");
+    return result;
+  } catch (error: unknown) {
+    reportBootStep(step, "fail", error);
+    throw error;
   }
 }
 
@@ -979,20 +1014,27 @@ export class G2BridgeRuntime {
   async #bootOnce(): Promise<void> {
     this.#bootState = "booting";
     try {
-      this.#state = createInitialState(await this.#awaitBootDependency(
-        this.#readTarget(),
-        "G2 target storage read was interrupted during startup",
+      this.#state = createInitialState(await awaitBootStep(
+        "target-storage-read",
+        () => this.#awaitBootDependency(
+          this.#readTarget(),
+          "G2 target storage read was interrupted during startup",
+        ),
       ));
       this.#assertBootActive();
-      const bridge = await this.#awaitBootDependency(
-        this.#waitForBridge(),
-        "G2 bridge arrival was interrupted during startup",
+      const bridge = await awaitBootStep(
+        "bridge-wait",
+        () => this.#awaitBootDependency(
+          this.#waitForBridge(),
+          "G2 bridge arrival was interrupted during startup",
+        ),
       );
       this.#assertBootActive();
       this.#bridge = bridge;
       this.#startupAttempts += 1;
       const startupCreation = Promise.resolve().then(() =>
         bridge.createStartUpPageContainer(this.#startupContainer));
+      reportBootStep("startup-container-create", "start");
       this.#pendingStartupCreation = startupCreation;
       void startupCreation.then((result) => {
         if (result === StartUpPageCreateResult.success) {
@@ -1004,35 +1046,52 @@ export class G2BridgeRuntime {
           this.#pendingStartupCreation = undefined;
         }
       });
-      const result = await this.#awaitBootDependency(
-        startupCreation,
-        "G2 startup container creation was interrupted",
+      const result = await awaitBootStep(
+        "startup-container-create",
+        () => this.#awaitBootDependency(
+          startupCreation,
+          "G2 startup container creation was interrupted",
+        ),
+        true,
       );
       if (result === StartUpPageCreateResult.success) this.#startupContainerCreated = true;
       this.#assertBootActive();
       if (result !== StartUpPageCreateResult.success) {
         this.#dispatch({ type: "startup.failed" }, false);
-        throw new BridgeStartupError("G2 startup page creation failed", result);
+        const startupError = new BridgeStartupError("G2 startup page creation failed", result);
+        reportBootStep("startup-container-create", "fail", startupError);
+        throw startupError;
       }
       this.#displayAvailable = true;
       this.#unsubscribe = bridge.onEvenHubEvent((event) => this.#receiveBridgeEvent(event));
       this.#bootState = "ready";
-      await this.#dispatchAndRunEffects({ type: "startup.ready" });
-      await this.#awaitBootDependency(
-        this.#whenDisplayIdle(),
-        "G2 initial display was interrupted during startup",
+      await awaitBootStep(
+        "startup-ready-effects",
+        () => this.#dispatchAndRunEffects({ type: "startup.ready" }),
+      );
+      await awaitBootStep(
+        "initial-display-idle",
+        () => this.#awaitBootDependency(
+          this.#whenDisplayIdle(),
+          "G2 initial display was interrupted during startup",
+        ),
       );
       if (this.#isRuntimeInactive() || this.#displayFault !== undefined) {
-        throw new BridgeStartupError(
+        const displayError = new BridgeStartupError(
           "G2 bridge runtime was cleaned or display failed during startup",
           undefined,
           this.#displayFault,
         );
+        reportBootStep("initial-display-idle", "fail", displayError);
+        throw displayError;
       }
       try {
-        await this.#awaitBootDependency(
-          Promise.resolve().then(() => this.#readyLogger(PALANCAR_G2_READY)),
-          "G2 bridge ready logging was interrupted during startup",
+        await awaitBootStep(
+          "ready-log",
+          () => this.#awaitBootDependency(
+            Promise.resolve().then(() => this.#readyLogger(PALANCAR_G2_READY)),
+            "G2 bridge ready logging was interrupted during startup",
+          ),
         );
       } catch (error: unknown) {
         throw new BridgeStartupError(
@@ -1042,7 +1101,10 @@ export class G2BridgeRuntime {
         );
       }
     } catch (error: unknown) {
-      await this.#teardownAfterBootFailure();
+      await awaitBootStep(
+        "boot-failure-teardown",
+        () => this.#teardownAfterBootFailure(),
+      );
       this.#bootState = "failed";
       if (error instanceof BridgeStartupError) {
         if (error.cause === undefined && this.#displayFault !== undefined) {

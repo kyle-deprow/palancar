@@ -15,7 +15,7 @@ import type {
 } from "../src/phone-ui.js";
 
 const RELAY_ORIGIN = "https://relay.example.test";
-const PAIRING_CODE = "00000000000000000000000000";
+const PAIRING_CODE = "012345";
 
 interface Deferred<T> {
   readonly promise: Promise<T>;

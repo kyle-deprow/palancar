@@ -6,3 +6,4 @@ simulator-screenshots/
 .env
 .env.*
 relay-origin.production.json
+palancar-diag.log
