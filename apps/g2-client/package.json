@@ -4,14 +4,14 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "0.0.12",
+    "@evenrealities/even_hub_sdk": "0.0.14",
     "@palancar/audio": "0.1.0",
     "@palancar/contracts": "0.1.0",
     "@palancar/language-registry": "0.1.0"
   },
   "devDependencies": {
-    "@evenrealities/evenhub-cli": "0.1.13",
-    "@evenrealities/evenhub-simulator": "0.8.0",
+    "@evenrealities/evenhub-cli": "0.1.14",
+    "@evenrealities/evenhub-simulator": "0.9.3",
     "fake-indexeddb": "6.2.5",
     "vite": "8.1.5",
     "vitest": "4.1.10"
