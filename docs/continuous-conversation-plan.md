@@ -162,15 +162,16 @@ The client opens one session-scoped stream after `session.ready`. The relay
 accepts a session-scoped ordered audio sequence and feeds a provider
 transcription session that can advance from one VAD item to the next without
 requiring a client control message between items. At the first provider speech
-item (or a final with no partial), the relay binds an immutable `turnIndex`,
-`utteranceId`, and `segmentId`; it binds the next identity only after the prior
-item reaches a VAD or duration boundary. `RelayIdGenerator` therefore needs an
-utterance-ID generator in addition to its current session and error IDs. A
-partial or final for a bound identity may only advance its revision. The first
-unseen provider item must be exactly the next relay `turnIndex`; a lower or
-duplicate index is ignored (duplicate finals are immutable), a higher/gapped
-index is rejected, and a changed utterance/segment identity is rejected. The
-client never creates or rebinds a turn.
+item (or a final with no partial), the relay allocates the next immutable
+`turnIndex`, `utteranceId`, and `segmentId` and emits that identity (a
+`turn.started` event may have an empty transcript). It allocates the next
+identity only after the prior item reaches a VAD or duration boundary.
+`RelayIdGenerator` therefore needs an utterance-ID generator in addition to its
+current session and error IDs. A partial or final for a bound identity may only
+advance its revision. The relay, not the client, assigns the next index; a
+lower/duplicate index is ignored (duplicate finals are immutable), a
+higher/gapped index is rejected, and a changed utterance/segment identity is
+rejected. The client never creates or rebinds a turn.
 
 The protocol should be versioned rather than overloading the old
 `utteranceId` field:
@@ -300,15 +301,18 @@ The main transitions are:
 
 1. A matching `session.ready` in pending `Ready` enters
    `ConversationStarting` and effects `start-audio-stream`. A named
-   `audio.stream.started` event enters `ConversationLive`; a failed start
-   enters recoverable `Error`, while a late completion is ignored unless its
-   session identity still matches. There is no press transition into listening.
-2. The first valid partial or final binds the server turn identity. A newer
-   partial updates source text immediately. A final is immutable and carries
-   the relay's authoritative `turnIndex`; the relay then starts the next VAD
-   item without a client commit effect.
-3. A higher turn's first partial/final immediately invalidates the visible
-   suggestion card and displays `Updating`; it does not wait for generation.
+   `audio.stream.started` event enters `ConversationLive`; an
+   `audio.stream.start.failed` event enters recoverable `Error`, while a late
+   completion is ignored unless its session identity still matches. There is
+   no press transition into listening.
+2. `turn.started` (which may have an empty transcript), or a first partial or
+   final when no start event is available, binds the server turn identity. A
+   newer partial updates source text immediately. A final is immutable and
+   carries the relay's authoritative `turnIndex`; the relay then starts the
+   next VAD item without a client commit effect.
+3. A higher turn's `turn.started`, first partial, or final immediately
+   invalidates the visible suggestion card and displays `Updating`; it does
+   not wait for generation.
    `language.decision` marks the turn accepted or rejected. Rejection clears
    the stale card, updates a short status message, and does not stop capture.
 4. `translation.ready` and `suggestions.ready` update only the matching
@@ -316,10 +320,14 @@ The main transitions are:
    `turnIndex` can become visible; late lower turns are retained neither as
    cards nor as current English text.
 5. A single press requests local mic stop and a relay `conversation.pause`.
-   The relay finalizes or explicitly cancels any open VAD item before
-   acknowledging `conversation.paused`; the client enters
-   `ConversationPaused` only after the stop/ack result. A start/stop failure
-   has a visible error and no automatic forwarding.
+   The relay finalizes an open VAD item with boundary reason `pause` before
+   acknowledging `conversation.paused`; if the provider misses the pause
+   deadline, it explicitly cancels that item and emits `turn.cancelled`. The
+   client enters
+   `ConversationPaused` only after both `audio.stream.stopped` and
+   `conversation.paused`. `audio.stream.start.failed`,
+   `audio.stream.stop.failed`, or `conversation.pause.failed` enters `Error`,
+   with no automatic forwarding.
 6. A press in `ConversationPaused` enters `ConversationStarting` and resumes
    only after a new `audio.stream.started` event. It never auto-opens merely
    because a recovered transport delivered `session.ready`. Swipes cycle only
@@ -331,13 +339,19 @@ The main transitions are:
    open the microphone. Session expiry or the pause-retention deadline clears
    context and returns to pending `Ready`; the next press starts a new session.
 
+Foreground/background recovery is new implementation work; the current G2
+client does not already provide the continuous-stream recovery claimed here.
+
 The reducer should be split into a small bootstrap/auth reducer and a
 conversation reducer rather than extending the 1,902-line turn switch. Keep
 the pure `{state, effects}` interface and deep validation, but remove
 `pressReduction`'s `Ready -> Listening`, `Listening -> Finalizing`, and
 `Results -> Listening` behavior. Remove the result-pipeline watchdog as a
-single-turn concept. Use one session-health deadline and one revision-tagged
-suggestion-dwell deadline; cancel both on pause, session loss, and cleanup.
+single-turn concept. The relay owns the session-duration, inactivity, and
+paused-retention timers and emits `session.expired`; the client owns mic
+start/stop deadlines and the revision-tagged suggestion-dwell timer. Every
+timer event carries its session/turn token, and all are cancelled on pause,
+session loss, expiry, and cleanup.
 
 On the relay, replace the singular `#active`/`#finalToken` generation model
 with a stream record plus a bounded `Map` of in-flight turn work. Transcription event
@@ -390,8 +404,8 @@ for this lean refactor; split them only if the latency gate fails.
 
 ### Suggestion freshness and display policy
 
-The first partial or final for a higher `turnIndex` invalidates the visible
-suggestion immediately and changes `translated` to `Updating...`. A same-turn
+The first `turn.started`, partial, or final for a higher `turnIndex` invalidates
+the visible suggestion immediately and changes `translated` to `Updating...`. A same-turn
 card may use an initial two-second minimum dwell against harmless partial
 updates, but dwell never keeps a stale card visible across turns. If generation
 fails, is quota-limited, or misses the release deadline, leave `Updating...`
@@ -572,8 +586,9 @@ than capture during a user-started turn.
 
 Press is the explicit pause/resume control. Root double press retains the
 system exit confirmation through `shutDownPageContainer(1)`. On pause, audio
-capture and forwarding stop; any open VAD item is finalized or explicitly
-cancelled before the pause acknowledgement. On exit, the session ends and all
+capture and forwarding stop; any open VAD item is finalized with boundary reason
+`pause` (or explicitly cancelled after a provider deadline) before the pause
+acknowledgement. On exit, the session ends and all
 in-memory conversation context and turn text are cleared. A paused context has
 a five-minute bounded retention window and is cleared when it expires.
 
@@ -590,7 +605,8 @@ Keep six text containers and the current absolute geometry. Do not add a list,
 scrolling transcript, or image container for the first continuous design. Use
 the regions as follows:
 
-- `status`: `MIC LIVE`, `Updating`, `Paused`, or a short safe error.
+- `status`: `MIC LIVE`, `VERIFYING`, `Voice enrollment required`, `Updating`,
+  `Paused`, or a short safe error.
 - `target`: selected target language.
 - `source`: newest incoming partial/final source text, truncated through the
   existing display-length helper.
@@ -601,7 +617,7 @@ the regions as follows:
   action hint.
 
 The source and English regions track the newest current turn. A higher turn's
-first partial/final clears `translated` to `Updating...`; a same-turn partial
+`turn.started`, first partial, or final clears `translated` to `Updating...`; a same-turn partial
 cannot churn an otherwise valid card. Preserve one event-capture target,
 unique IDs/names, in-bounds rectangles, text limits, and serialized
 `textContainerUpgrade` calls. Use rebuild only if the layout type changes;
@@ -617,7 +633,7 @@ No phase should expose both continuous and push-to-talk modes. Preparatory
 work may be developed behind tests or an unreleased protocol version, but the
 first user-facing client for the new contract is continuous-only.
 
-### Phase 0: role and verification measurement (unreleased)
+### Phase 0: role and verification pass/fail feasibility gate (unreleased)
 
 Measure both signals on physical G2 hardware in real rooms. Use scripted,
 labeled windows for the owner speaking normally and reading a displayed
@@ -633,23 +649,31 @@ model at 250 ms, 500 ms, 1 second, and 2 seconds of speech. Measure EER,
 false-accept wearer-as-Other duration, other-speaker recall, read-aloud
 behavior, correction time, and CPU/memory cost with and without AS-Norm.
 
-Do not predeclare a universal pass threshold. Report verifier wearer misses,
-false invalidations of other speech, transient partial exposure, p95 correction
-time, and CPU/memory cost alongside the SDK role accuracy and other-speaker
-recall. Phase 0 outputs the selected ONNX model, background cohort, AS-Norm and
-hysteresis procedure, calibrated threshold, enrollment quality rules, and the
-measured residual-error curve. Model selection and threshold calibration are
-measurement outputs, not guesses or fixed constants. The deterministic protocol
-fixtures move to Phase 1 with the actual contract; release remains blocked
-until the owner accepts the measured residual bound.
+The initial feasibility gates are false-`Other` wearer-speech duration <=0.1%
+in every labeled scenario and other-speaker recall >=95% in every scenario;
+mixed wearer/other frames and overlap are scored separately, never averaged
+away. Report verifier wearer misses, false invalidations of other speech,
+transient partial exposure, p95 correction time, and CPU/memory cost alongside
+the SDK role accuracy and other-speaker recall. Phase 0 outputs the selected
+ONNX model, background cohort, AS-Norm and hysteresis procedure, calibrated
+threshold, enrollment quality rules, and the measured residual-error curve.
+Model selection and threshold calibration are measurement outputs, not guesses
+or fixed constants. If either role/recall gate fails, no candidate threshold
+meets the owner's bound, or read-aloud behavior is unacceptable, the result is
+an explicit **no-go** and requirements must be revisited before any v2 client is
+distributed. The deterministic protocol fixtures move to Phase 1 with the
+actual contract; release remains blocked until the owner accepts the measured
+residual bound.
 
 ### Phase 1: atomic v2 wire and all consumers (unreleased)
 
 Land the entire v2 wire change in one phase. Change
 `packages/contracts/src/schemas.ts`, `validation.ts`, constants, and
 `packages/contracts/src/audio.ts` binary framing for continuous negotiation,
-session-scoped offsets, pause/resume, turn metadata, strict high-watermark
-validation, and the `turn.invalidate`/`turn.invalidated` schema. Change
+session-scoped offsets, pause/resume, `turn.started`/`turn.cancelled`/turn
+metadata, strict high-watermark validation, and the
+`turn.invalidate`/`turn.invalidated` schema.
+Change
 `packages/contracts/src/auth.ts` (`/v1/stream`, `palancar.v1`, and protocol
 version), `packages/security-state` stores and tests, `packages/audio`, and
 transcription types/session/Azure adapter. The relay must implement
@@ -687,8 +711,9 @@ cannot start generation, and must be covered by the
 `packages/language-registry` policy/test update.
 
 Add the minimal phone live/paused/error indicator and ambient-capture copy in
-`phone-ui.ts`/the application shell, and update `app.json`'s microphone
-description. This phase uses the already deployed v2 relay and is still an
+`apps/g2-client/src/phone-ui.ts`/the application shell, and update
+`apps/g2-client/app.json`'s microphone description. This phase uses the
+already deployed v2 relay and is still an
 unreleased development slice.
 
 ### Phase 3: rolling generation and freshness (unreleased)
@@ -739,17 +764,18 @@ not use sleeps to test VAD or generation ordering.
 - In `apps/g2-client/test/state.test.ts`, test every transition above,
   monotonic revisions, unseen and final-only turns, immutable identities,
   stale-session rejection, latest-wins suggestions, stale-card clearing, the
-  revision-tagged dwell timer, pause/resume, transport recovery, retention
-  expiry, and the absence of any press-to-talk transition. Use generated event
-  sequences only where they clarify that a lower `turnIndex` cannot replace a
-  newer visible result.
+  revision-tagged dwell timer (including an old timer token being ignored),
+  pause/resume, transport recovery, retention expiry, and the absence of any
+  press-to-talk transition. Inject the scheduler and clock; use generated
+  event sequences only where they clarify that a lower `turnIndex` cannot
+  replace a newer visible result.
 - In bridge/runtime tests, inject `EvenHubEvent` values with each
   `AudioSpeakerRole`. Assert `Other` PCM is copied and forwarded, while
   `Unknown` is copied and forwarded immediately, and `Self` becomes
   equal-duration zero PCM. Missing or malformed roles normalize to `Unknown`
   and are forwarded; explicit phone or missing-source audio remains excluded.
-  Feed the
-  original patterned PCM through the deterministic VAD/embedding adapter and
+  Feed original patterned PCM, including runs of `Self` and `Unknown`, through
+  the deterministic VAD/embedding adapter and
   assert a positive decision emits one idempotent invalidation without waiting
   for transport, not just that buffers are masked.
 - In enrollment tests, cover prompted 10-30 second capture, quality rejection,
@@ -770,7 +796,8 @@ not use sleeps to test VAD or generation ordering.
   turns arriving before the first generation completes, out-of-order
   completions, context snapshots/eviction, one-in-flight/one-pending
   scheduling, quota exhaustion, VAD finalization, long monologues, pause,
-  retention expiry, inactivity, provider failure, cleanup, and invalidation of
+  pause-finalization deadlines and `turn.cancelled`, retention expiry,
+  inactivity, provider failure, cleanup, and invalidation of
   open, in-flight, and already-completed turns. Assert invalidated turns never
   enter generation or rolling context and that duplicate invalidations are
   harmless.
