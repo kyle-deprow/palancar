@@ -6,19 +6,24 @@ Replace the current gesture-bracketed turn pipeline with one session-scoped,
 server-VAD-driven conversation stream. After `session.ready`, the client opens
 the G2 microphone automatically and remains in a live conversation state until
 the wearer pauses it, the session expires, or the app exits. There is no
-push-to-talk mode and no per-utterance press fallback. This plan cannot promise
-absolute wearer-voice exclusion: the SDK supplies a probabilistic role label,
-not an identity proof.
+push-to-talk mode and no per-utterance press fallback. The system includes
+voice verification with voice pre-registration. The goal is for wearer turns
+not to remain in accepted transcription or influence generation; a brief
+provisional partial or a false negative remains possible, so engineering can
+reduce, not eliminate, residual speaker-classification and verification error.
 
 The key decisions are:
 
 - Server VAD is the only speech-boundary authority. The hard duration limit is
-  an explicit safety split, not a second user-controlled boundary. Client audio
-  processing is limited to speaker-role masking and transport flow control.
-- `Self`, `Unknown`, missing, or invalid speaker-role frames are replaced with
-  same-duration silence before they leave the client. Only frames labelled
-  `Other` are forwarded; this is a measured probabilistic filter, not a
-  guarantee that every forwarded frame belongs to someone else.
+  an explicit safety split, not a second user-controlled boundary.
+- The audio path is fast path plus retro-correction: `Self` is masked
+  immediately; `Other` and `Unknown` are forwarded immediately, while an
+  on-device verifier runs in parallel. The two signals have different failure
+  modes. If verification concludes that the wearer spoke, the relay invalidates
+  that turn within roughly 500-1000 ms.
+- Speaker verification uses a locally enrolled voice centroid. It is a
+  privacy boundary and generation gate, not an identity proof; the chosen
+  thresholds and residual error come from Phase 0 measurements.
 - The wire protocol moves from one active utterance to one bounded,
   session-scoped audio stream. The relay assigns turn identities at VAD
   boundaries and emits ordered turn metadata.
@@ -31,10 +36,13 @@ The key decisions are:
 - The HUD keeps a same-turn suggestion stable for a short minimum dwell, but a
   newer turn invalidates that card immediately. The newest completed set is
   promoted when it is ready, subject to an explicit latency bound.
+- Voice enrollment is a separate phone UX and biometric-data lifecycle. The
+  centroid stays in encrypted app-private device storage and never leaves the
+  phone.
 
 This plan does not redesign authentication, pairing, or relay security. The
-existing enrollment states remain authentication/pairing states, not voice
-enrollment states.
+existing enrollment states remain authentication/pairing states; voice
+enrollment is a separate biometric-data flow on the phone.
 
 ## Current-state analysis
 
@@ -49,7 +57,9 @@ The client runtime reflects that model:
 - `apps/g2-client/src/bridge/runtime.ts:#receiveBridgeEvent` forwards every
   accepted Glasses PCM event while audio is open, checks explicit
   `AudioInputSource` values but also accepts a missing source, and ignores
-  `speakerRole`.
+  `speakerRole`. Audio is already available in the WebView as coalesced roughly
+  60 ms frames: `packages/audio/src/pcm.ts:DEFAULT_PCM_COALESCING_TARGET_MS`,
+  16 kHz mono signed 16-bit PCM (`PCM_SAMPLE_RATE_HZ`).
 - `#runEffects` handles `start-utterance`, `start-audio`, `stop-audio`, and
   `commit-utterance`; translation and suggestion effects are only reducer
   bookkeeping because the relay performs the work.
@@ -102,6 +112,36 @@ an app-algorithm result, not a firmware identity assertion.
 
 ### Segmentation and audio stream
 
+Model inference itself is not the latency floor. A verifier can infer in
+roughly 5-20 ms, but an embedding needs speech: about 250 ms is poor, 500 ms
+moderate, 1 second good, and 2 seconds or more best. Audio arrives in roughly
+60 ms coalesced frames
+(`packages/audio/src/pcm.ts:DEFAULT_PCM_COALESCING_TARGET_MS`) at 16 kHz mono
+S16 (`PCM_SAMPLE_RATE_HZ`), exactly the input format these models consume.
+
+Considered and rejected: buffer-and-release. Holding every frame until the
+speaker decision is available would add roughly 300-1000 ms to the `Other`
+speaker's path, which is the path that matters for a usable live conversation.
+It also makes ordinary turn latency depend on the slowest verification window.
+
+Choose fast path plus retro-correction. On arrival, the SDK's `speakerRole` is
+used at zero cost. `Self` is replaced immediately with same-duration silence;
+`Other` and `Unknown` are forwarded immediately with no added latency. Missing
+or malformed role metadata is normalized to `Unknown` and forwarded; a missing
+or non-Glasses source is rejected or replaced with silence. In parallel, the
+original PCM is consumed only by the on-device verifier. Silero
+VAD gates verification on speech onset, a sliding roughly 1-second window
+produces an embedding every roughly 250 ms, and cosine similarity is measured
+against the enrolled centroid. Hysteresis and EMA smoothing prevent the
+decision from flapping frame to frame. A positive wearer decision emits the
+turn invalidation described below within roughly 500-1000 ms.
+
+Common-case added latency is zero. The verifier is intended to prevent a
+wearer turn from influencing generation, but a provisional partial can reach
+ASR before retro-correction and a false negative can survive. The plan makes no
+claim that wearer audio never touches a server: the accepted residual rate is
+measured and bounded by the Phase 0 hardware gate and the owner's decision.
+
 Use the existing relay/provider server VAD as the authoritative speech
 boundary. The provider is already responsible for speech endpointing, understands the
 resampled audio path, and exposes the VAD lifecycle in the existing Azure
@@ -126,9 +166,11 @@ item (or a final with no partial), the relay binds an immutable `turnIndex`,
 `utteranceId`, and `segmentId`; it binds the next identity only after the prior
 item reaches a VAD or duration boundary. `RelayIdGenerator` therefore needs an
 utterance-ID generator in addition to its current session and error IDs. A
-partial or final for a bound identity may only advance its revision; a rebind,
-duplicate final, lower index, or unexplained index gap is rejected or ignored
-according to the protocol high-watermark rule.
+partial or final for a bound identity may only advance its revision. The first
+unseen provider item must be exactly the next relay `turnIndex`; a lower or
+duplicate index is ignored (duplicate finals are immutable), a higher/gapped
+index is rejected, and a changed utterance/segment identity is rejected. The
+client never creates or rebinds a turn.
 
 The protocol should be versioned rather than overloading the old
 `utteranceId` field:
@@ -147,6 +189,9 @@ The protocol should be versioned rather than overloading the old
   and suggestion messages. It is the context high-watermark; do not add a
   second `contextRevision` unless a later design gives it semantics that can
   differ from `turnIndex`.
+- Add the client-to-relay `turn.invalidate` message for a positive local
+  wearer-verification result. It is part of the atomic v2 contract, not an
+  out-of-band control.
 - Keep the existing bounded suggestion pair shape, correlated to `turnIndex`
   and the accepted final revision.
 
@@ -167,12 +212,71 @@ treated as one conversation partner; the product does not attempt diarization.
 VAD configuration and interleaved/overlapping audio must be measured on
 hardware.
 
+### Turn invalidation protocol
+
+The v2 client sends this strict JSON control message when local verification
+crosses the calibrated wearer threshold:
+
+```text
+turn.invalidate {
+  type: "turn.invalidate",
+  sessionId: string,
+  sessionEpoch: non-negative integer,
+  turnIndex: non-negative integer,
+  utteranceId: string,
+  segmentId: string,
+  reason: "speaker_verification_self",
+  streamOffset: non-negative integer
+}
+```
+
+The relay's corresponding event is:
+
+```text
+turn.invalidated {
+  type: "turn.invalidated",
+  sessionId: string,
+  sessionEpoch: non-negative integer,
+  turnIndex: non-negative integer,
+  utteranceId: string,
+  segmentId: string,
+  status: "invalidated" | "already_invalidated"
+}
+```
+
+`streamOffset` identifies the end of the locally observed audio range; no
+embedding, centroid, similarity score, or raw PCM is sent. The client sends at
+most one invalidation for an immutable turn and retries it idempotently until
+the relay acknowledges it or the session ends.
+
+The relay accepts the message only for the authenticated session and matching
+turn identity. On first receipt it marks the turn invalid, aborts or
+suppresses its provider transcription, discards the partial/final transcript
+from relay memory, cancels generation when possible, removes the turn from
+rolling context, and emits no translation or suggestion from it. The relay
+returns a `turn.invalidated` acknowledgement/event so the client can clear
+matching source, English, and suggestion state. It does not move the display
+high-watermark backwards. Duplicate messages are harmless; an identity
+conflict, stale session, or unknown identity is rejected, while a lower
+historical turn is acknowledged as already invalidated only if its tombstone
+exists.
+
+If the turn already completed, the relay still marks it invalid, removes any
+not-yet-published work, and sends `turn.invalidated` as a corrective event. A
+previously published transcript or card cannot be unsent from a provider or a
+display, but it is cleared client-side when current and is never reused for
+generation or context. The relay does not log the transcript or biometric
+decision. This bounded retro-correction window is why the latency target is
+500-1000 ms and why Phase 0 must measure the residual error honestly.
+
 ### State machine
 
 Keep the existing bootstrap and authentication states through `TargetSelection`
 and pending `Ready` states. Replace the active turn states with the following
 small set:
 
+- `VoiceEnrollmentRequired`: no ambient stream may start without a valid local
+  centroid; the phone enrollment flow is the only exit.
 - `ConversationStarting`: session identity is established and the runtime is
   opening the continuous audio stream.
 - `ConversationLive`: audio is armed. It retains only the current/in-flight
@@ -247,20 +351,22 @@ allowed to replace a newer visible result.
 ### Rolling context and generation overlap
 
 Keep conversation context only in `apps/relay/src/session.ts`. Start with the
-last 12 finalized other-party turns or 8,000 characters, whichever limit is
-reached first, plus the current final turn. Evict oldest entries FIFO at both
-limits. This is enough short-term context for follow-up replies without making
-every prompt grow with a long conversation. Do not persist it in the client,
+last 12 finalized eligible turns or 8,000 characters, whichever limit is
+reached first, plus the current final turn. A forwarded `Other` or `Unknown`
+turn is eligible only until a verification invalidation; an invalidated turn
+is removed. Evict oldest entries FIFO at both limits. This is enough short-term
+context for follow-up replies without making every prompt grow with a long
+conversation. Do not persist it in the client,
 relay durable state, browser storage, logs, or telemetry. Clear it on session
 end, terminal transport loss, and the paused-session retention deadline.
 
 The context entry should contain the bounded source transcript and its
 `turnIndex`; it may contain a translation only when already available, but
-generation must not wait for prior translations. Because the client applies a
-probabilistic role mask, the relay context is an ordered list of transcripts
-derived from frames classified as `Other`, not a fabricated wearer/other
-dialogue. The current turn is marked separately so the model knows what reply
-it is proposing; the residual false-`Other` risk remains.
+generation must not wait for prior translations. Because role and verification
+are probabilistic, the relay context is an ordered list of forwarded
+transcripts, not a fabricated wearer/other dialogue. The current turn is marked
+separately so the model knows what reply it is proposing; invalidation is the
+only way to remove a false inclusion.
 
 Extend `GenerationProviderCompletionInput` and the accepted-turn boundary with
 an immutable context snapshot and `turnIndex`. Extend the Azure request
@@ -310,61 +416,110 @@ candidate that misses either bound is not released until the provider path is
 changed (for example, split translation and suggestions) or the owner accepts
 a different product requirement.
 
-### Wearer-voice exclusion
+### Speaker verification, role masking, and residual risk
 
 Filter in `apps/g2-client/src/bridge/runtime.ts:#receiveBridgeEvent`, before
 calling transport audio methods. Require `AudioInputSource.Glasses` explicitly
-for the v2 stream and copy every `Uint8Array`. For a frame tagged `Other`,
-forward the copied PCM. For `Self`, `Unknown`, missing, or invalid
-`speakerRole`, forward a same-length zero-filled PCM buffer. Do not concatenate
-only `Other` frames: the ordered audio protocol requires contiguous offsets, and
-removing time would make server VAD see artificial speech with no pauses.
-Zero-filling preserves the timeline and suppresses frames that are ambiguous
-according to the SDK classifier; it does not prove that forwarded audio is not
-the wearer's voice.
+for the v2 stream and copy every `Uint8Array`. The fast path is:
 
-An explicit phone source or a missing source is not eligible for the v2 stream;
-while capture is open, represent it as same-duration silence (or reject the
-malformed event before it can reach transport) so the stream cannot silently
-switch microphones.
+- `Self`: forward same-duration silence immediately.
+- `Other` or `Unknown`: forward the copied PCM immediately, with no added
+  latency.
+- Missing or malformed role metadata: normalize to `Unknown` and forward. A
+  missing or non-Glasses source is fail closed to same-duration silence.
 
-This is a fail-closed policy. It accepts false negatives for the other party
-as the cost of not forwarding ambiguous audio. It also means role masking by
-itself does not reduce wire bytes; it provides classifier-conditioned
-suppression and VAD silence, not bandwidth savings. The relay must treat the v2
-stream as role-filtered input and must not claim an independent identity
-decision.
+Do not concatenate only `Other` frames: the ordered audio protocol requires
+contiguous offsets, and removing time would make server VAD see artificial
+speech with no pauses. Zero-filling preserves the timeline. The relay treats
+the stream as role-filtered input, not as an identity proof.
 
-No voice-registration/enrollment step is needed for this refactor. The
-installed SDK already supplies per-frame role classification, and its public
-contract has no voice-template registration API. Existing enrollment is for
-pairing/authentication and must not be repurposed. Adding biometric capture,
-storage, matching, and lifecycle would be redundant complexity and would add a
-new privacy obligation without removing the SDK's algorithmic error. Do not
-store a voice template; the independently validated mechanism in the owner
-decision is a separate, larger project.
+The verifier consumes the original copied PCM locally, before role masking, so
+it can catch a wearer frame that the SDK labels `Other`. It retains only the
+bounded sliding window needed for VAD and embedding, then clears that buffer;
+raw PCM, embeddings, scores, and the centroid never enter relay messages,
+logs, telemetry, browser sync, or durable server state. An explicit phone
+source is not eligible for the v2 stream and is represented as silence or
+rejected before transport.
 
-The residual risk is central and must be explicit: `speakerRole` is not an
-identity assertion. A wearer frame mislabeled `Other` can still be transcribed.
-A wearer reading a displayed suggestion aloud is blocked when tagged `Self` or
-`Unknown`, but can still create a self-response loop when misclassified as
-`Other`. No client-only policy can distinguish that frame after the
-misclassification.
+#### On-device placement and models
+
+Run verification in the phone's Even App WebView. The PCM is already present in
+`apps/g2-client/src/bridge/runtime.ts` audio-event handling, so this adds no
+network hop or privacy inversion. Use ONNX Runtime Web with WASM SIMD. iOS
+WKWebView requires COOP/COEP for `SharedArrayBuffer` and worker threads; do
+not assume those headers or capabilities, and budget for single-threaded SIMD.
+
+Silero VAD (about 1 MB, sub-ms inference) gates embeddings on speech onset.
+Candidate embedding models are small ECAPA-TDNN, ReDimNet-B0, and TitaNet-S
+ONNX exports (roughly 5-25 MB). Resemblyzer is smaller but less accurate. The
+model choice is a Phase 0 measurement, not a guess. Use a sliding roughly
+1-second window and produce an embedding every roughly 250 ms. Smooth cosine
+similarity to the enrolled centroid with EMA and hysteresis; the positive
+decision must persist long enough to avoid frame-to-frame flapping.
+
+If the phone cannot carry the selected model, relay-side verification is the
+fallback, not the default. It requires sending verifier input to the relay,
+adds phone-relay RTT to the correction path, and places raw voice and the
+biometric comparison in the server privacy boundary. It must preserve the same
+`turn.invalidate` behavior; it must not silently become buffer-and-release.
+Before enabling it, resize the relay from its current 0.25 vCPU / 0.5 GiB in
+`infra/environments/dev` and repeat the privacy and latency gate. On-device
+placement avoids both the capacity change and this privacy cost.
+
+#### Voice enrollment and biometric-data lifecycle
+
+Voice verification requires a completed enrollment before continuous capture
+can start. The phone UI provides a dedicated `Voice verification` setup:
+
+1. Explain that a voice biometric is being created, where it will live, that
+   it is not sent to Palancar's relay, and how to delete it; obtain explicit
+   consent.
+2. With the G2 connected, guide the owner through several prompted phrases
+   totaling 10-30 seconds. Use the same glasses microphone and audio format as
+   conversation; reject clips that fail speech or quality checks.
+3. Compute embeddings on-device, average them into one owner centroid, discard
+   the enrollment PCM and intermediate embeddings, and show the enrolled
+   state. A model/calibration version is stored with the record so upgrades
+   require deliberate re-enrollment.
+
+Store the centroid in an encrypted, app-private phone record accessed through
+the host storage boundary (`setLocalStorage`/`getLocalStorage`) with an
+OS-secure key; never put it in relay storage, telemetry, logs, or an
+unprotected sync backup. If the host storage path cannot provide encryption at
+rest, use platform secure storage and block release until that requirement is
+met. The enrolled record contains only the centroid, model/calibration
+version, and lifecycle metadata; no raw enrollment audio is retained.
+
+Thresholds are calibrated against a background cohort, not shipped as a
+guessed universal constant. Phase 0 selects the thresholding procedure and
+cohort, with AS-Norm score normalization for noisy rooms. The resulting
+calibration is versioned with the local record and re-evaluated when the model
+or audio path changes.
+
+Re-enrollment records a new sample set and atomically replaces the old
+centroid only after the new enrollment succeeds. `Reset voice verification`
+deletes the centroid, calibration, and model-bound metadata from device
+storage, clears in-memory buffers, and returns the app to `Enrollment required`;
+it does not disable itself silently or upload a backup. A failed deletion is
+reported as an error and is not presented as complete. The phone UI must
+repeat this disclosure and provide the delete action because enrollment is a
+new biometric-data privacy obligation, separate from pairing/authentication.
 
 #### Decision required from the owner
 
-The stated requirement that the wearer's voice is never transcribed cannot be
-met absolutely with this SDK metadata. The owner must choose one honest option:
+The fast role path plus local verifier reduces exposure and prevents an
+identified wearer turn from influencing generation, but it cannot prove zero
+error. A wearer frame mislabeled `Other`, or a verifier decision that arrives
+after publication, can still have reached transcription. A wearer reading a
+displayed suggestion aloud is handled by both signals but remains a measured
+residual failure mode. The product must describe this honestly.
 
-1. Accept a measured probabilistic bound: ship only if the Phase 0 gate meets
-   the false-`Other` and other-speaker-recall thresholds below, and describe
-   the residual read-aloud risk in product copy; or
-2. Fund an independently validated speaker-identity/exclusion mechanism. That
-   is substantially larger scope, requires new hardware/model validation, and
-   creates a new biometric-data privacy obligation.
-
-Until that decision and the measurements exist, this refactor is not a claim
-of absolute wearer-voice exclusion.
+The owner has chosen to build verification with voice pre-registration. The
+remaining decision is the accepted residual error rate: Phase 0 must quantify
+SDK `speakerRole` accuracy, candidate-model EER, false-`Other` duration, and
+other-speaker recall in real rooms, including read-aloud, and the owner must
+explicitly accept the resulting bound before release. No fixed error target is
+assumed by this plan.
 
 ### Cost, battery, network, and backpressure
 
@@ -378,8 +533,9 @@ processing and generation calls also increase with accepted incoming turns.
 Controls, in order of safety and simplicity:
 
 - Server VAD gates provider turn finalization and prevents generation during
-  silence. The client role mask supplies silence for frames classified as
-  wearer or ambiguous; it does not establish speaker identity.
+  silence. The client role mask supplies silence for frames classified `Self`;
+  the local Silero VAD only gates embedding work and does not establish a
+  server turn boundary.
 - The wearer can press once to pause the entire ambient stream. The status
   indicator changes before audio forwarding resumes. After the negotiated
   five-minute period with no eligible VAD speech, the relay ends the session
@@ -393,10 +549,11 @@ Controls, in order of safety and simplicity:
   relay asks for pause, and fail to a visible network-slow state rather than
   growing an unbounded PCM queue. Partial transcript events remain
   coalescible; final events and generation results are never silently dropped.
-- Do not add client-side VAD as a second boundary. A future RMS gate may be
-  evaluated only as a measured bandwidth optimization. It must either send
-  explicit silence-range records or retain contiguous timeline semantics; it
-  must not drop samples through the current `RelayOrderedFrameAcceptor`.
+- Do not use client-side VAD as a second server boundary or drop samples. The
+  Silero gate is only for local embedding efficiency. Any future bandwidth
+  optimization must either send explicit silence-range records or retain
+  contiguous timeline semantics; it must not drop samples through the current
+  `RelayOrderedFrameAcceptor`.
 
 Battery impact, BLE delivery timing, and actual eligible-Other duty cycle need
 hardware measurement. Simulator audio is useful for deterministic plumbing but
@@ -407,9 +564,11 @@ does not establish these values.
 The `status` region must continuously show a short state such as `MIC LIVE`,
 `MIC PAUSED`, or `MIC ERROR`. The phone surface must expose the same state and
 explain that live microphone audio classified for forwarding is sent to the
-configured relay while the conversation is live. Update the `g2-microphone`
-manifest description to describe ambient capture rather than capture during a
-user-started turn.
+configured relay while the conversation is live. It must also show whether
+voice verification is enrolled, link to re-enrollment/reset, and state that
+the local centroid never leaves the device. Update the `g2-microphone`
+manifest description to describe ambient capture and local verification rather
+than capture during a user-started turn.
 
 Press is the explicit pause/resume control. Root double press retains the
 system exit confirmation through `shutDownPageContainer(1)`. On pause, audio
@@ -458,33 +617,43 @@ No phase should expose both continuous and push-to-talk modes. Preparatory
 work may be developed behind tests or an unreleased protocol version, but the
 first user-facing client for the new contract is continuous-only.
 
-### Phase 0: role/VAD feasibility gate (unreleased)
+### Phase 0: role and verification measurement (unreleased)
 
-Do only a small labeled hardware procedure and pure role-mask fixtures. Use
-scripted speaker windows (wearer reading, one other speaker, side-by-side,
-noise, overlap, and a third speaker) with no conversation content retained.
-Record frame/duration confusion counts, longest `Unknown` runs, `direction`
-values, VAD boundaries, and timing. Evaluate `direction` as metadata but do
-not depend on it for the decision.
+Measure both signals on physical G2 hardware in real rooms. Use scripted,
+labeled windows for the owner speaking normally and reading a displayed
+suggestion aloud, one other speaker, side-by-side seating, noise, overlap, and
+a third speaker. Retain only labels, timing, and aggregate metrics; do not
+retain conversation content or enrollment PCM.
 
-The proposed initial pass criteria are false-`Other` wearer-speech duration at
-or below 0.1% in every scenario (including read-aloud) and at least 95% recall
-of other-speaker speech in every labeled scenario, including noise,
-side-by-side seating, and a third speaker. Mixed wearer/other frames and
-overlap are scored separately, not averaged away. Failure is a no-go: stop before
-the v2 client is distributed and return to the owner's requirement decision.
-The procedure is metadata-only; deterministic protocol fixtures move to Phase
-1 with the actual contract.
+For the SDK signal, record `speakerRole` confusion counts and duration,
+`Unknown` runs, `direction` values, VAD boundaries, and role-mask timing.
+Evaluate `direction` as metadata but do not depend on it for the decision. For
+the verification signal, evaluate Silero VAD plus every candidate embedding
+model at 250 ms, 500 ms, 1 second, and 2 seconds of speech. Measure EER,
+false-accept wearer-as-Other duration, other-speaker recall, read-aloud
+behavior, correction time, and CPU/memory cost with and without AS-Norm.
+
+Do not predeclare a universal pass threshold. Report verifier wearer misses,
+false invalidations of other speech, transient partial exposure, p95 correction
+time, and CPU/memory cost alongside the SDK role accuracy and other-speaker
+recall. Phase 0 outputs the selected ONNX model, background cohort, AS-Norm and
+hysteresis procedure, calibrated threshold, enrollment quality rules, and the
+measured residual-error curve. Model selection and threshold calibration are
+measurement outputs, not guesses or fixed constants. The deterministic protocol
+fixtures move to Phase 1 with the actual contract; release remains blocked
+until the owner accepts the measured residual bound.
 
 ### Phase 1: atomic v2 wire and all consumers (unreleased)
 
 Land the entire v2 wire change in one phase. Change
 `packages/contracts/src/schemas.ts`, `validation.ts`, constants, and
 `packages/contracts/src/audio.ts` binary framing for continuous negotiation,
-session-scoped offsets, pause/resume, turn metadata, and strict high-watermark
-validation. Change `packages/contracts/src/auth.ts` (`/v1/stream`,
-`palancar.v1`, and protocol version), `packages/security-state` stores and
-tests, `packages/audio`, and transcription types/session/Azure adapter.
+session-scoped offsets, pause/resume, turn metadata, strict high-watermark
+validation, and the `turn.invalidate`/`turn.invalidated` schema. Change
+`packages/contracts/src/auth.ts` (`/v1/stream`, `palancar.v1`, and protocol
+version), `packages/security-state` stores and tests, `packages/audio`, and
+transcription types/session/Azure adapter. The relay must implement
+idempotent invalidation for open, in-flight, and already-completed turns.
 
 Change the client transport/runtime protocol boundary and relay `session.ts`,
 `types.ts`, and `host.ts` in the same phase. Include deterministic v2
@@ -497,13 +666,24 @@ v1/v2 pairing.
 ### Phase 2: continuous client behavior (unreleased)
 
 Refactor `apps/g2-client/src/state/index.ts` to the bootstrap plus
-`ConversationStarting`/`ConversationLive`/`ConversationPaused` model and remove
-the old per-utterance effects. Update `apps/g2-client/src/bridge/runtime.ts`
-for explicit Glasses-source role masking, microphone lifecycle events,
-pause/resume, and foreground recovery. Update `layouts.ts` for live/paused,
-updating, and stale-card content. Deliberately retire the language gate for
-role-filtered source partial display in this phase: partials are provisional
-source text only, cannot start generation, and must be covered by the
+`VoiceEnrollmentRequired`/`ConversationStarting`/`ConversationLive`/
+`ConversationPaused` model and remove
+the old per-utterance effects. Add the enrollment-required state and the phone
+`Voice verification` flow: prompted 10-30 second capture, on-device centroid
+creation, encrypted local storage, re-enrollment, reset, deletion confirmation,
+and no-network/no-telemetry handling. Update
+`apps/g2-client/src/bridge/runtime.ts` for explicit Glasses-source role
+masking, the raw-PCM local Silero/embedding pipeline, hysteresis, and
+`turn.invalidate` emission when verification crosses its calibrated threshold
+(the transport may already have carried provisional frames).
+Use ONNX Runtime Web with the Phase 0 model and calibration, and exercise the
+single-threaded iOS path.
+
+Update microphone lifecycle events, pause/resume, and foreground recovery;
+update `layouts.ts` for live/paused, updating, stale-card, and enrollment
+status content. Deliberately retire the language gate for role-filtered source
+partial display in this phase: partials are provisional source text only,
+cannot start generation, and must be covered by the
 `packages/language-registry` policy/test update.
 
 Add the minimal phone live/paused/error indicator and ambient-capture copy in
@@ -540,8 +720,9 @@ read-aloud suggestions, BLE backpressure, Android background suspension,
 recovery, battery, and provider latency. Package a private `.ehpk` only after
 the hardware path passes. Record the installed SDK, CLI, simulator, Even App,
 firmware, and hardware versions for the release. Release is blocked unless the
-Phase 0 false-`Other`/recall gate, the p95 partial/card latency budget, and the
-owner's requirement decision all pass or are explicitly accepted.
+Phase 0 role/embedding measurements, the p95 partial/card latency budget, the
+enrollment privacy/deletion checks, and the owner's explicit accepted residual
+error bound all pass or are explicitly accepted.
 
 All phases before this are unreleased development slices, not independently
 shippable product releases. For any later schema or binary-frame change, repeat
@@ -564,15 +745,22 @@ not use sleeps to test VAD or generation ordering.
   newer visible result.
 - In bridge/runtime tests, inject `EvenHubEvent` values with each
   `AudioSpeakerRole`. Assert `Other` PCM is copied and forwarded, while
-  `Self`, `Unknown`, missing, and malformed roles produce equal-duration zero
-  PCM. Assert explicit phone or missing-source audio remains excluded and
-  cleanup closes the mic. Feed patterned role/PCM sequences through the mask
-  into the deterministic VAD adapter to test endpoint effects, not just buffers.
+  `Unknown` is copied and forwarded immediately, and `Self` becomes
+  equal-duration zero PCM. Missing or malformed roles normalize to `Unknown`
+  and are forwarded; explicit phone or missing-source audio remains excluded.
+  Feed the
+  original patterned PCM through the deterministic VAD/embedding adapter and
+  assert a positive decision emits one idempotent invalidation without waiting
+  for transport, not just that buffers are masked.
+- In enrollment tests, cover prompted 10-30 second capture, quality rejection,
+  centroid averaging, encrypted local persistence, re-enrollment replacement,
+  reset/deletion, no-network/no-telemetry behavior, and the refusal to enter
+  `ConversationLive` without a valid local enrollment.
 - In `packages/audio` and transport tests, cover session offsets, contiguous
   ACK/replay ranges, flow pause, bounded queues, zero-filled frames, binary
   limits, reconnect, and no unbounded growth. Update protocol replay and
-  conformance fixtures for v2 and assert v1 is rejected rather than silently
-  downgraded.
+  conformance fixtures for v2, the `turn.invalidate` schema and ACK, and
+  assert v1 is rejected rather than silently downgraded.
 - In `packages/transcription/test`, use a deterministic adapter whose VAD
   script emits speech starts, partial revisions, stops, duration splits, and
   overlapping provider callbacks. Assert normalized finals are ordered and
@@ -582,23 +770,30 @@ not use sleeps to test VAD or generation ordering.
   turns arriving before the first generation completes, out-of-order
   completions, context snapshots/eviction, one-in-flight/one-pending
   scheduling, quota exhaustion, VAD finalization, long monologues, pause,
-  retention expiry, inactivity, provider failure, and cleanup.
+  retention expiry, inactivity, provider failure, cleanup, and invalidation of
+  open, in-flight, and already-completed turns. Assert invalidated turns never
+  enter generation or rolling context and that duplicate invalidations are
+  harmless.
 - In `apps/relay/test/relay-host.test.ts`, exercise the actual WebSocket host
   queue, binary stream, ACK flow, async drain, v2 negotiation, and contract
   fixtures. Assert transcript partials are delivered without waiting
-  for generation and that late generation results do not reorder protocol
-  turn messages.
+  for generation, invalidation corrections are delivered in order, and late
+  generation results do not reorder protocol turn messages.
 - In `apps/g2-client/test/display.test.ts`, retain the existing bounds,
   container count, unique-name, one-capture-target, brightness, and text-limit
   assertions. Add live/paused content, immediate stale-card clearing, dwell
   expiry, and semantic update assertions. Extend the existing Azure VAD
-  harness for masking-to-endpoint cases; no separate evidence framework is
-  needed. Run the workspace typecheck/test/build gates before packaging.
+  harness for masking-to-endpoint and retro-correction cases; no separate
+  evidence framework is needed. Run the workspace typecheck/test/build gates
+  before packaging.
 
 ## Open gates
 
-- The Phase 0 false-`Other`/recall gate and the owner's probabilistic-versus-
-  identity decision are release blockers.
+- The Phase 0 `speakerRole` accuracy, candidate-model EER, false-`Other`
+  duration, recall, and correction-time measurements are release blockers, as
+  is the owner's explicit acceptance of the resulting residual error rate.
+- Enrollment must remain device-local, encrypted, absent from telemetry and
+  relay traffic, and verifiably deletable before release.
 - Hardware must confirm VAD endpoint behavior, mixed/overlap handling, read-aloud
   behavior, BLE timing, battery, and the p95 latency budget.
 - The scheduler must stay within the existing six-generations-per-minute and
