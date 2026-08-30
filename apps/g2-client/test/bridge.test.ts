@@ -576,22 +576,24 @@ describe("G2BridgeRuntime startup", () => {
     expect(harness.bridge.startupContainers[0]?.containerTotalNum).toBe(
       PAGE_LAYOUTS.Starting.containerTotalNum,
     );
-    expect(harness.bridge.textUpdates).toHaveLength(5);
+    expect(harness.bridge.textUpdates).toHaveLength(6);
     expect(harness.bridge.textUpdates.map((update) => update.containerName)).toEqual([
       "status",
       "target",
       "source",
       "english",
-      "suggestion",
+      "translated",
+      "hint",
     ]);
     expect(harness.runtime.snapshot.state).toBe("EnrollmentChecking");
     expect(harness.runtime.snapshot.target).toBe("es");
     expect(harness.runtime.snapshot.lastDisplayContent).toEqual({
       status: "Checking enrollment",
-      target: "Target: Spanish",
-      source: "Source: unavailable",
-      english: "English: unavailable",
-      suggestion: "Please wait",
+      target: "ES",
+      source: "",
+      english: "",
+      translated: "",
+      hint: "Please wait",
     });
     expect(harness.auth.calls).toEqual(["auth:initialize"]);
     expect(harness.transports).toHaveLength(0);
@@ -613,7 +615,7 @@ describe("G2BridgeRuntime startup", () => {
     await boot(harness);
     expect(harness.runtime.snapshot.state).toBe("EnrollmentRequired");
     expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Enrollment required");
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Continue on phone");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Continue on phone");
 
     let resolveEnroll: ((outcome: AuthOutcome) => void) | undefined;
     harness.auth.enrollImplementation = () => new Promise((resolve) => {
@@ -624,7 +626,7 @@ describe("G2BridgeRuntime startup", () => {
     await vi.waitFor(() => expect(harness.runtime.snapshot.state).toBe("Enrolling"));
     expect(harness.runtime.snapshot.state).toBe("Enrolling");
     expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Enrolling");
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Complete on phone");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Complete on phone");
 
     expect(JSON.stringify(harness.runtime.snapshot)).not.toContain(pairingCode);
     resolveEnroll?.({ kind: "storage-error" });
@@ -634,7 +636,7 @@ describe("G2BridgeRuntime startup", () => {
     expect(harness.runtime.snapshot.lastDisplayContent.status).toBe(
       "Enrollment storage error",
     );
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Retry on phone");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Retry on phone");
 
     let resolveRetry: ((outcome: AuthOutcome) => void) | undefined;
     harness.auth.retryPersistenceImplementation = () => new Promise((resolve) => {
@@ -1304,8 +1306,8 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     harness.bridge.emit(listEvent(OsEventTypeList.SCROLL_BOTTOM_EVENT));
     await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.displayUpdateCount).toBe(initialUpdateCount + 1);
-    expect(harness.bridge.textUpdates.at(-1)?.containerName).toBe("target");
+    expect(harness.runtime.snapshot.displayUpdateCount).toBe(initialUpdateCount + 2);
+    expect(harness.bridge.textUpdates.at(-1)?.containerName).toBe("translated");
   });
 
   it("latches a post-boot display failure and blocks a later press", async () => {
@@ -1716,9 +1718,9 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(harness.runtime.snapshot.state).toBe("Ready");
       expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Reconnecting");
-      expect(harness.runtime.snapshot.lastDisplayContent.source).toBe("Source: Interrupted turn cleared");
-      expect(harness.runtime.snapshot.lastDisplayContent.english).toBe("English: waiting");
-      expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Please wait");
+      expect(harness.runtime.snapshot.lastDisplayContent.source).toBe("Interrupted turn cleared");
+      expect(harness.runtime.snapshot.lastDisplayContent.english).toBe("");
+      expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Please wait");
       await vi.advanceTimersByTimeAsync(250);
       await flushMicrotasks();
       const secondTransport = harness.transports[1];
@@ -1931,7 +1933,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.bridge.createCount).toBe(1);
     expect(harness.bridge.subscriptionCount).toBe(1);
     expect(harness.transports).toHaveLength(1);
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Restart app");
 
     const audioCalls = harness.bridge.audioCalls.length;
     harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
@@ -1977,7 +1979,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.bridge.createCount).toBe(1);
     expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
     expect(RECOVERY_BACKOFF_MAX_MS).toBeGreaterThan(expectedDelays.at(-1)!);
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Restart app");
   });
 
   it("blocks a sixth recovery after five successful recoveries inside sixty seconds", async () => {
@@ -2014,7 +2016,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     expect(harness.transports).toHaveLength(6);
     expect(harness.runtime.snapshot.state).toBe("Error");
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Restart app");
     expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
   });
 
@@ -2094,7 +2096,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(recoveryTransport.closed).toBe(true);
     expect(harness.transports).toHaveLength(2);
     expect(clock.timers.filter((timer) => !timer.cancelled && !timer.fired)).toHaveLength(0);
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toBe("Restart app");
+    expect(harness.runtime.snapshot.lastDisplayContent.hint).toBe("Restart app");
   });
 
   it("retries when a recovery transport is lost before its queued ready is reduced", async () => {
@@ -2189,7 +2191,8 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.runtime.snapshot.state).toBe("Ready");
     expect(harness.runtime.snapshot.sessionReady).toBe(true);
     expect(transport.closed).toBe(false);
-    expect(harness.runtime.snapshot.lastDisplayContent.status).toContain("utterance was aborted");
+    expect(harness.runtime.snapshot.lastDisplayContent.status).toBe("Ready");
+    expect(harness.runtime.snapshot.lastDisplayContent.translated).toContain("utterance was aborted");
     await harness.runtime.cleanup();
   });
 
@@ -2646,7 +2649,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     transport.emit(suggestionsReady());
     await harness.runtime.whenEventsIdle();
     expect(harness.runtime.snapshot.state).toBe("Results");
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toContain("hello → hola");
+    expect(harness.runtime.snapshot.lastDisplayContent.translated).toContain("hola");
   });
 
   it("projects the contract utterance-aborted event and stops its microphone", async () => {
@@ -2698,7 +2701,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     const operationCount = harness.operations.length;
     const sessionStartCount = harness.operations.filter((operation) =>
       operation.startsWith("start-session:")).length;
-    expect(resultDisplay.suggestion).toContain("hello → hola");
+    expect(resultDisplay.translated).toContain("hola");
 
     harness.bridge.emit(systemEvent(
       OsEventTypeList.CLICK_EVENT,
@@ -2778,7 +2781,7 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
 
     harness.bridge.emit(listEvent(OsEventTypeList.SCROLL_BOTTOM_EVENT));
     await harness.runtime.whenEventsIdle();
-    expect(harness.runtime.snapshot.lastDisplayContent.suggestion).toContain("hi → buenas");
+    expect(harness.runtime.snapshot.lastDisplayContent.translated).toContain("buenas");
   });
 
   it.each([

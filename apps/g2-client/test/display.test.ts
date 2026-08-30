@@ -15,6 +15,8 @@ import {
   type TextUpgradeTarget,
   validatePageLayout,
 } from "../src/display/index.js";
+import { displayTexts } from "../src/bridge/runtime.js";
+import type { ClientState } from "../src/state/index.js";
 
 const replaceLayout = (
   layout: ImmutablePageLayout,
@@ -52,7 +54,7 @@ class FakeClock implements SchedulerClock {
   }
 }
 
-const TEXT_TARGET = Object.freeze({ containerID: 5, containerName: "suggestion" });
+const TEXT_TARGET = Object.freeze({ containerID: 6, containerName: "hint" });
 const textUpdate = (
   content: string,
   target: TextUpgradeTarget = TEXT_TARGET,
@@ -84,20 +86,90 @@ describe("G2 page layouts", () => {
     expect(layout.textObject.every(Object.isFrozen)).toBe(true);
   });
 
-  it("keeps stable regions and symmetric Spanish/Turkish labels", () => {
-    const expectedRegions = ["status", "target", "source", "english", "suggestion"];
+  it("keeps stable regions and a quiet, label-free hierarchy", () => {
+    const expectedRegions = ["status", "target", "source", "english", "translated", "hint"];
     for (const state of DISPLAY_STATES) {
       const layout = PAGE_LAYOUTS[state];
       expect(layout.textObject.map((region) => region.containerName)).toEqual(expectedRegions);
       expect(layout.textObject.map(({ xPosition, yPosition, width, height }) => [xPosition, yPosition, width, height])).toEqual(
         PAGE_LAYOUTS.Starting.textObject.map(({ xPosition, yPosition, width, height }) => [xPosition, yPosition, width, height]),
       );
-      expect(layout.textObject.map((region) => region.content).join(" ")).toMatch(/Spanish/);
-      expect(layout.textObject.map((region) => region.content).join(" ")).toMatch(/Turkish/);
+      expect(layout.textObject.map((region) => region.content).some((content) => /(?:Source|English|Target|Suggestion|Status):/.test(content))).toBe(false);
     }
-    expect(PAGE_LAYOUTS.TargetSelection.textObject[1]?.content).toContain("Espanol");
-    expect(PAGE_LAYOUTS.TargetSelection.textObject[1]?.content).toContain("Turkce");
-    expect(PAGE_LAYOUTS.Error.textObject[4]?.content).toBe("Restart app");
+    expect(PAGE_LAYOUTS.TargetSelection.textObject[4]?.content).toContain("[ES]");
+    expect(PAGE_LAYOUTS.TargetSelection.textObject[4]?.content).toContain("TR");
+    expect(PAGE_LAYOUTS.Error.textObject[5]?.content).toBe("Restart app");
+    expect(PAGE_LAYOUTS.Starting.textObject.map(({ textColor, paddingLength }) => [textColor, paddingLength])).toEqual([
+      [1, 2],
+      [1, 2],
+      [2, 4],
+      [2, 4],
+      [4, 6],
+      [1, 4],
+    ]);
+  });
+
+  it("keeps regions non-overlapping and inside the 576x288 display", () => {
+    for (const state of DISPLAY_STATES) {
+      const regions = PAGE_LAYOUTS[state].textObject;
+      for (let index = 0; index < regions.length; index += 1) {
+        const region = regions[index];
+        if (region === undefined) continue;
+        expect(region.xPosition).toBeGreaterThanOrEqual(0);
+        expect(region.yPosition).toBeGreaterThanOrEqual(0);
+        expect(region.xPosition + region.width).toBeLessThanOrEqual(DISPLAY_WIDTH);
+        expect(region.yPosition + region.height).toBeLessThanOrEqual(DISPLAY_HEIGHT);
+        for (const other of regions.slice(index + 1)) {
+          expect(
+            region.xPosition < other.xPosition + other.width &&
+              region.xPosition + region.width > other.xPosition &&
+              region.yPosition < other.yPosition + other.height &&
+              region.yPosition + region.height > other.yPosition,
+          ).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("uses brightness 4 for at most one region per state", () => {
+    for (const state of DISPLAY_STATES) {
+      expect(PAGE_LAYOUTS[state].textObject.filter((region) => region.textColor === 4)).toHaveLength(1);
+    }
+  });
+
+  it("returns one label-free string per region for every client state variant", () => {
+    const activeTurn = {
+      targetLanguage: "es" as const,
+      authAttempt: 1,
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      sessionEpoch: 1,
+      utteranceId: "22222222-2222-4222-8222-222222222222",
+      turn: 1,
+      transcript: "hola",
+      segmentTexts: {},
+      segmentRevisions: {},
+      finalSegments: {},
+    } as const;
+    const variants = [
+      { state: "Starting", type: "Starting", highlightedTarget: "es", authAttempt: 0 },
+      { state: "EnrollmentChecking", type: "EnrollmentChecking", highlightedTarget: "es", authAttempt: 0, phase: "checking" },
+      { state: "EnrollmentRequired", type: "EnrollmentRequired", highlightedTarget: "es", authAttempt: 0, reason: "missing" },
+      { state: "Enrolling", type: "Enrolling", highlightedTarget: "es", authAttempt: 0 },
+      { state: "StorageError", type: "StorageError", highlightedTarget: "es", authAttempt: 0 },
+      { state: "TargetSelection", type: "TargetSelection", highlightedTarget: "es", authAttempt: 0 },
+      { state: "Ready", type: "Ready", targetLanguage: "es", authAttempt: 0, turn: 0, sessionReady: false, pending: "initial" },
+      { ...activeTurn, state: "Listening", type: "Listening" },
+      { ...activeTurn, state: "Finalizing", type: "Finalizing" },
+      { ...activeTurn, state: "Translating", type: "Translating", suggestions: [], suggestionIndex: 0 },
+      { ...activeTurn, state: "Results", type: "Results", englishTranslation: "hello", suggestions: [{ englishText: "hello", selectedTargetText: "hola" }], suggestionIndex: 0 },
+      { state: "Error", type: "Error", message: "Something went wrong", terminal: true, targetLanguage: "es" },
+    ] as const satisfies readonly ClientState[];
+
+    for (const state of variants) {
+      const texts = displayTexts(state);
+      expect(texts).toHaveLength(PAGE_LAYOUTS.Starting.textObject.length);
+      expect(texts.every((text) => !/(?:Source|English|Target|Suggestion|Status):/.test(text))).toBe(true);
+    }
   });
 
   it("enforces count, identity, bounds, capture, content, and z-order invariants", () => {
@@ -178,7 +250,7 @@ describe("G2 page layouts", () => {
       expect(validatePageLayout(invalidDimensions).valid).toBe(false);
     }
     const maximumDimensions = replaceLayout(base, {
-      containerTotalNum: 6,
+      containerTotalNum: 7,
       imageObject: [image(0, 288, 144)],
     });
     expect(validatePageLayout(maximumDimensions).valid).toBe(true);

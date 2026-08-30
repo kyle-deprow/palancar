@@ -59,4 +59,29 @@ export function reportBootDiagnostic(value: BootDiagnostic): void {
 
 if (import.meta.env.DEV) {
   reportBootDiagnostic({ step: "module-load", outcome: "ok", detail: "diagnostics module evaluated", at: Date.now() });
+  try {
+    globalThis.addEventListener?.("error", (event: unknown) => {
+      const value = event as { message?: unknown; filename?: unknown; lineno?: unknown; error?: unknown };
+      const from = value?.error instanceof Error
+        ? `${value.error.name}: ${value.error.message}`
+        : String(value?.message ?? "unknown");
+      reportBootDiagnostic({
+        step: "uncaught-error",
+        outcome: "fail",
+        detail: `${from} @ ${String(value?.filename ?? "?")}:${String(value?.lineno ?? "?")}`,
+        at: Date.now(),
+      });
+    });
+    globalThis.addEventListener?.("unhandledrejection", (event: unknown) => {
+      const reason = (event as { reason?: unknown })?.reason;
+      reportBootDiagnostic({
+        step: "unhandled-rejection",
+        outcome: "fail",
+        detail: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason),
+        at: Date.now(),
+      });
+    });
+  } catch {
+    // Global crash reporting is best effort and must never affect startup.
+  }
 }

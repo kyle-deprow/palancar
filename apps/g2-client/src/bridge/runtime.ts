@@ -8,10 +8,7 @@ import {
   type EvenAppBridge,
   type EvenHubEvent,
 } from "@evenrealities/even_hub_sdk";
-import {
-  getLanguageDefinition,
-  type TargetLanguage,
-} from "@palancar/language-registry";
+import type { TargetLanguage } from "@palancar/language-registry";
 
 import type {
   AuthOutcome,
@@ -378,10 +375,10 @@ function compact(value: string, maxLength = DISPLAY_MAX_TEXT_LENGTH): string {
   return `${characters.slice(0, Math.max(0, maxLength - 1)).join("")}…`;
 }
 
-function targetName(target: TargetLanguage | undefined): string {
+function targetTag(target: TargetLanguage | undefined): string {
   return target === undefined
-    ? "Spanish / Turkish"
-    : getLanguageDefinition(target)?.displayName ?? target;
+    ? "ES/TR"
+    : target.toUpperCase();
 }
 
 function targetForState(state: ClientState): TargetLanguage | undefined {
@@ -490,65 +487,72 @@ function revocationOutcomeEvent(outcome: AuthOutcome): ClientEvent {
   return { type: "revocation.completed", reason: "revocation-unconfirmed" };
 }
 
-function displayTexts(state: ClientState): readonly string[] {
+export function displayTexts(state: ClientState): readonly string[] {
   const target = targetForState(state);
-  const targetLine = `Target: ${targetName(target)}`;
+  const targetLine = targetTag(target);
   switch (state.state) {
     case "Starting":
       return [
         "Starting",
         targetLine,
-        "Source: waiting",
-        "English: waiting",
-        "Suggestion: ready",
+        "",
+        "",
+        "",
+        "Please wait",
       ];
     case "EnrollmentChecking":
       return [
         state.phase === "revoking" ? "Revoking enrollment" : "Checking enrollment",
         targetLine,
-        "Source: unavailable",
-        "English: unavailable",
+        "",
+        "",
+        "",
         "Please wait",
       ];
     case "EnrollmentRequired":
       return [
         "Enrollment required",
         targetLine,
-        "Source: unavailable",
-        "English: unavailable",
+        "",
+        "",
+        "",
         "Continue on phone",
       ];
     case "Enrolling":
       return [
         "Enrolling",
         targetLine,
-        "Source: unavailable",
-        "English: unavailable",
+        "",
+        "",
+        "",
         "Complete on phone",
       ];
     case "StorageError":
       return [
         "Enrollment storage error",
         targetLine,
-        "Source: unavailable",
-        "English: unavailable",
+        "",
+        "",
+        "",
         "Retry on phone",
       ];
     case "TargetSelection":
       return [
         "Choose target",
-        target === "tr" ? "Target: Spanish / [Turkish]" : "Target: [Spanish] / Turkish",
-        "Press to confirm",
-        "Swipe to change",
-        "press to confirm, swipe to change",
+        targetLine,
+        "",
+        "",
+        target === "tr" ? "ES / [TR]" : "[ES] / TR",
+        "Swipe to change, press to confirm",
       ];
     case "Ready":
       if (state.pending === "recovery") {
         return [
           "Reconnecting",
           targetLine,
-          "Source: Interrupted turn cleared",
-          "English: waiting",
+          "Interrupted turn cleared",
+          "",
+          "",
           "Please wait",
         ];
       }
@@ -556,40 +560,45 @@ function displayTexts(state: ClientState): readonly string[] {
         return [
           state.message === undefined ? "Authenticating" : "Authentication unavailable",
           targetLine,
-          "Source: unavailable",
-          "English: unavailable",
+          "",
+          "",
+          state.message === undefined ? "" : compact(state.message),
           state.message === undefined ? "Please wait" : "Press to retry",
         ];
       }
       return [
-        state.message === undefined ? "Ready" : compact(`Ready: ${state.message}`),
+        "Ready",
         targetLine,
+        "",
+        "",
+        state.message === undefined ? "" : compact(state.message),
         "Press to begin",
-        "English: waiting",
-        "Suggestion: ready",
       ];
     case "Listening":
       return [
         "Listening",
         targetLine,
-        compact(state.transcript === "" ? "Source: listening..." : `Source: ${state.transcript}`),
-        "English: waiting",
+        compact(state.transcript),
+        "",
+        "",
         "Press when finished",
       ];
     case "Finalizing":
       return [
         "Finalizing",
         targetLine,
-        compact(state.transcript === "" ? "Source: finalizing..." : `Source: ${state.transcript}`),
-        "English: waiting",
+        compact(state.transcript),
+        "",
+        "",
         "Please wait",
       ];
     case "Translating":
       return [
         "Translating",
         targetLine,
-        compact(`Source: ${state.finalTranscript ?? state.transcript}`),
-        compact(`English: ${state.englishTranslation ?? "translating..."}`),
+        compact(state.finalTranscript ?? state.transcript),
+        compact(state.englishTranslation ?? ""),
+        "Translating...",
         "Please wait",
       ];
     case "Results": {
@@ -597,19 +606,21 @@ function displayTexts(state: ClientState): readonly string[] {
       return [
         "Results",
         targetLine,
-        compact(`Source: ${state.finalTranscript ?? state.transcript}`),
-        compact(`English: ${state.englishTranslation}`),
+        compact(state.finalTranscript ?? state.transcript),
+        compact(state.englishTranslation),
         suggestion === undefined
-          ? "No suggestion"
-          : compact(`${suggestion.englishText} → ${suggestion.selectedTargetText}`),
+          ? ""
+          : compact(suggestion.selectedTargetText),
+        suggestion === undefined ? "Press to begin" : "Swipe to change, press to begin",
       ];
     }
     case "Error":
       return [
-        compact(`Error: ${state.message}`),
+        "Error",
         targetLine,
-        "Source: unavailable",
-        "English: unavailable",
+        "",
+        "",
+        compact(state.message),
         state.terminal ? "Restart app" : "Try again",
       ];
   }

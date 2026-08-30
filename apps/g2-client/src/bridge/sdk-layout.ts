@@ -26,6 +26,8 @@ const toTextContainer = (container: ImmutableTextContainer): TextContainerProper
     height: container.height,
     isEventCapture: container.isEventCapture,
     content: container.content,
+    textColor: container.textColor,
+    paddingLength: container.paddingLength,
     ...zOrder(container),
   });
 

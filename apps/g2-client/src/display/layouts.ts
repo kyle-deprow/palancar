@@ -48,11 +48,15 @@ export type ImmutableTextContainer = Readonly<
     | "isEventCapture"
     | "zOrderIndex"
     | "content"
+    | "textColor"
+    | "paddingLength"
   >
 > &
   PositionedContainer & {
     readonly isEventCapture: 0 | 1;
     readonly content: string;
+    readonly textColor: number;
+    readonly paddingLength: number;
   };
 
 export type ImmutableListItemContainer = Readonly<
@@ -103,69 +107,148 @@ export interface ImmutablePageLayout {
 }
 
 const REGION_GEOMETRY = [
-  { containerID: 1, containerName: "status", xPosition: 0, yPosition: 0, width: 576, height: 36, isEventCapture: 1, zOrderIndex: 1 },
-  { containerID: 2, containerName: "target", xPosition: 0, yPosition: 40, width: 576, height: 36, isEventCapture: 0, zOrderIndex: 2 },
-  { containerID: 3, containerName: "source", xPosition: 0, yPosition: 80, width: 576, height: 64, isEventCapture: 0, zOrderIndex: 3 },
-  { containerID: 4, containerName: "english", xPosition: 0, yPosition: 148, width: 576, height: 64, isEventCapture: 0, zOrderIndex: 4 },
-  { containerID: 5, containerName: "suggestion", xPosition: 0, yPosition: 216, width: 576, height: 72, isEventCapture: 0, zOrderIndex: 5 },
-] as const satisfies readonly (PositionedContainer & { readonly isEventCapture: 0 | 1 })[];
+  {
+    containerID: 1,
+    containerName: "status",
+    xPosition: 0,
+    yPosition: 0,
+    width: 448,
+    height: 28,
+    isEventCapture: 1,
+    textColor: 1,
+    paddingLength: 2,
+    zOrderIndex: 1,
+  },
+  {
+    containerID: 2,
+    containerName: "target",
+    xPosition: 496,
+    yPosition: 0,
+    width: 80,
+    height: 28,
+    isEventCapture: 0,
+    textColor: 1,
+    paddingLength: 2,
+    zOrderIndex: 2,
+  },
+  {
+    containerID: 3,
+    containerName: "source",
+    xPosition: 0,
+    yPosition: 36,
+    width: 576,
+    height: 40,
+    isEventCapture: 0,
+    textColor: 2,
+    paddingLength: 4,
+    zOrderIndex: 3,
+  },
+  {
+    containerID: 4,
+    containerName: "english",
+    xPosition: 0,
+    yPosition: 84,
+    width: 576,
+    height: 40,
+    isEventCapture: 0,
+    textColor: 2,
+    paddingLength: 4,
+    zOrderIndex: 4,
+  },
+  {
+    containerID: 5,
+    containerName: "translated",
+    xPosition: 0,
+    yPosition: 132,
+    width: 576,
+    height: 100,
+    isEventCapture: 0,
+    textColor: 4,
+    paddingLength: 6,
+    zOrderIndex: 5,
+  },
+  {
+    containerID: 6,
+    containerName: "hint",
+    xPosition: 0,
+    yPosition: 248,
+    width: 576,
+    height: 40,
+    isEventCapture: 0,
+    textColor: 1,
+    paddingLength: 4,
+    zOrderIndex: 6,
+  },
+] as const satisfies readonly (PositionedContainer & {
+  readonly isEventCapture: 0 | 1;
+  readonly textColor: number;
+  readonly paddingLength: number;
+})[];
 
-const CONTENT: Readonly<Record<DisplayState, readonly [string, string, string, string, string]>> =
+const CONTENT: Readonly<Record<DisplayState, readonly [string, string, string, string, string, string]>> =
   Object.freeze({
     Starting: [
       "Starting",
-      "Target: Spanish / Turkish",
-      "Source: waiting",
-      "English: waiting",
-      "Suggestion: Hola / Hello | Merhaba / Hello",
+      "ES/TR",
+      "",
+      "",
+      "",
+      "Please wait",
     ],
     TargetSelection: [
       "Choose target",
-      "Spanish / Espanol | Turkish / Turkce",
-      "Source: not started",
-      "English: not started",
-      "Status: swipe to choose, press to confirm",
+      "ES/TR",
+      "",
+      "",
+      "[ES] / TR",
+      "Swipe to change, press to confirm",
     ],
     Ready: [
       "Ready",
-      "Target: Spanish / Turkish",
-      "Source: press to begin",
-      "English: waiting",
-      "Suggestion: Hola / Hello | Merhaba / Hello",
+      "ES/TR",
+      "",
+      "",
+      "",
+      "Press to begin",
     ],
     Listening: [
       "Listening",
-      "Target: Spanish / Turkish",
-      "Source: listening...",
-      "English: waiting",
-      "Status: press when finished",
+      "ES/TR",
+      "",
+      "",
+      "",
+      "Press when finished",
     ],
     Finalizing: [
       "Finalizing",
-      "Target: Spanish / Turkish",
-      "Source: finalizing...",
-      "English: waiting",
-      "Status: please wait",
+      "ES/TR",
+      "",
+      "",
+      "",
+      "Please wait",
     ],
     Translating: [
       "Translating",
-      "Target: Spanish / Turkish",
-      "Source: captured",
-      "English: translating...",
-      "Status: please wait",
+      "ES/TR",
+      "",
+      "",
+      "Translating...",
+      "Please wait",
     ],
     Results: [
       "Results",
-      "Target: Spanish / Turkish",
-      "Source: sample phrase",
-      "English: sample translation",
-      "Suggestion: Hola / Hello | Merhaba / Hello",
+      "ES/TR",
+      "sample phrase",
+      "sample translation",
+      "Hola",
+      "Swipe to change, press to begin",
     ],
     Error: [
       "Error",
-      "Target: Spanish / Turkish",
-      "Source: unavailable",
-      "English: unavailable",
+      "ES/TR",
+      "",
+      "",
+      "",
       "Restart app",
     ],
   });
