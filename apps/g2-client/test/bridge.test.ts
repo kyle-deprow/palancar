@@ -1,6 +1,7 @@
 import {
   AudioEvent,
   AudioInputSource,
+  AudioSpeakerRole,
   EventSourceType,
   List_ItemEvent,
   OsEventTypeList,
@@ -30,6 +31,7 @@ import {
   RECOVERY_MAX_CONSECUTIVE_ATTEMPTS,
   RECOVERY_READY_DEADLINE_MS,
   RESULT_PIPELINE_DEADLINE_MS,
+  maskAudioFrame,
   type RecoveryTiming,
   isPairedTurnEffects,
   type G2BridgePort,
@@ -463,6 +465,19 @@ function createHarness(harnessOptions: HarnessOptions = {}): TestHarness {
   return { bridge, runtime, auth, transports, operations, persisted };
 }
 
+function emitAudioFrame(
+  harness: TestHarness,
+  audioPcm: Uint8Array,
+  metadata: { readonly source?: unknown; readonly speakerRole?: unknown } = {},
+): void {
+  harness.bridge.emit({
+    audioEvent: {
+      audioPcm,
+      ...metadata,
+    } as unknown as AudioEvent,
+  });
+}
+
 async function bootToEnrollmentChecking(harness: TestHarness): Promise<void> {
   await harness.runtime.boot();
 }
@@ -555,6 +570,33 @@ async function selectSpanishAndStart(harness: TestHarness): Promise<FakeTranspor
   if (transport === undefined) throw new Error("Transport was not created");
   return transport;
 }
+
+describe("audio frame role masking", () => {
+  const input = new Uint8Array([1, 2, 3]);
+
+  it.each([
+    [AudioSpeakerRole.Other, AudioInputSource.Glasses, [1, 2, 3]],
+    [AudioSpeakerRole.Unknown, AudioInputSource.Glasses, [1, 2, 3]],
+    [undefined, AudioInputSource.Glasses, [1, 2, 3]],
+    ["garbage", AudioInputSource.Glasses, [1, 2, 3]],
+    [AudioSpeakerRole.Other, AudioInputSource.Phone, [0, 0, 0]],
+    [AudioSpeakerRole.Other, undefined, [0, 0, 0]],
+  ] as const)("forwards role %s from source %s as %j", (role, source, expected) => {
+    const output = maskAudioFrame(input, role, source);
+
+    expect(output).not.toBe(input);
+    expect(output).toHaveLength(input.length);
+    expect([...output]).toEqual(expected);
+  });
+
+  it("zero-fills Self without changing the frame length", () => {
+    const output = maskAudioFrame(input, AudioSpeakerRole.Self, AudioInputSource.Glasses);
+
+    expect(output).not.toBe(input);
+    expect(output).toHaveLength(input.length);
+    expect([...output]).toEqual([0, 0, 0]);
+  });
+});
 
 describe("G2BridgeRuntime startup", () => {
   it("creates one startup container and renders EnrollmentChecking before initialization completes", async () => {
@@ -1347,7 +1389,13 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
     expect(harness.bridge.audioCalls.at(-1)).toMatchObject({ isOpen: true, source: "glasses" });
 
     const pcm = new Uint8Array([1, 2, 3]);
-    harness.bridge.emit({ audioEvent: new AudioEvent({ audioPcm: pcm }) });
+    harness.bridge.emit({
+      audioEvent: new AudioEvent({
+        audioPcm: pcm,
+        source: AudioInputSource.Glasses,
+        speakerRole: AudioSpeakerRole.Other,
+      }),
+    });
     expect(transport.pcm).toHaveLength(1);
     expect(transport.pcm[0]).not.toBe(pcm);
     expect([...transport.pcm[0]!]).toEqual([1, 2, 3]);
@@ -1356,9 +1404,52 @@ describe("G2BridgeRuntime gestures, transport, display, and cleanup", () => {
       audioEvent: new AudioEvent({
         audioPcm: new Uint8Array([4, 5]),
         source: AudioInputSource.Phone,
+        speakerRole: AudioSpeakerRole.Other,
       }),
     });
-    expect(transport.pcm).toHaveLength(1);
+    expect(transport.pcm).toHaveLength(2);
+    expect([...transport.pcm[1]!]).toEqual([0, 0]);
+  });
+
+  it("masks role and source frames while preserving the audio timeline and counters", async () => {
+    const harness = createHarness();
+    const transport = await selectSpanishAndStart(harness);
+    transport.emit(readyEvent());
+    await harness.runtime.whenEventsIdle();
+    harness.bridge.emit(systemEvent(OsEventTypeList.CLICK_EVENT));
+    await harness.runtime.whenEventsIdle();
+
+    const frames = [
+      { bytes: [1, 2], role: AudioSpeakerRole.Other, source: AudioInputSource.Glasses },
+      { bytes: [3, 4, 5], role: AudioSpeakerRole.Self, source: AudioInputSource.Glasses },
+      { bytes: [6], role: AudioSpeakerRole.Unknown, source: AudioInputSource.Glasses },
+      { bytes: [7, 8], role: "garbage", source: AudioInputSource.Glasses },
+      { bytes: [9, 10, 11], role: AudioSpeakerRole.Other, source: AudioInputSource.Phone },
+      { bytes: [12, 13], role: AudioSpeakerRole.Other },
+    ];
+    for (const frame of frames) {
+      emitAudioFrame(harness, new Uint8Array(frame.bytes), {
+        ...(frame.source === undefined ? {} : { source: frame.source }),
+        speakerRole: frame.role,
+      });
+    }
+
+    expect(transport.pcm).toHaveLength(frames.length);
+    expect(transport.pcm.reduce((total, frame) => total + frame.length, 0)).toBe(
+      frames.reduce((total, frame) => total + frame.bytes.length, 0),
+    );
+    expect(harness.runtime.snapshot).toMatchObject({
+      audioFramesProcessed: 6,
+      audioFramesMaskedSelf: 1,
+      audioFramesMaskedForSource: 2,
+      audioFramesUnknown: 2,
+    });
+    expect([...transport.pcm[0]!]).toEqual([1, 2]);
+    expect([...transport.pcm[1]!]).toEqual([0, 0, 0]);
+    expect([...transport.pcm[2]!]).toEqual([6]);
+    expect([...transport.pcm[3]!]).toEqual([7, 8]);
+    expect([...transport.pcm[4]!]).toEqual([0, 0, 0]);
+    expect([...transport.pcm[5]!]).toEqual([0, 0]);
   });
 
   it("routes an active audio queue overflow through utterance abort and keeps the session alive", async () => {

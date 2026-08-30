@@ -434,7 +434,15 @@ a different product requirement.
 
 Filter in `apps/g2-client/src/bridge/runtime.ts:#receiveBridgeEvent`, before
 calling transport audio methods. Require `AudioInputSource.Glasses` explicitly
-for the v2 stream and copy every `Uint8Array`. The fast path is:
+for the v2 stream and copy every `Uint8Array`.
+
+Known limitation, measured against SDK 0.0.14: `normalizeAudioInputSource` maps
+missing, null, empty, and unrecognised source values to `Glasses`, and the
+bridge delivers an already-parsed `AudioEvent` with no raw metadata retained. A
+source check therefore rejects only an explicit `Phone`, and cannot distinguish
+absent provenance from genuine glasses audio. Wearer exclusion rests on
+`speakerRole` plus verification; the source check is a secondary guard, not a
+provenance proof. Do not claim otherwise. The fast path is:
 
 - `Self`: forward same-duration silence immediately.
 - `Other` or `Unknown`: forward the copied PCM immediately, with no added

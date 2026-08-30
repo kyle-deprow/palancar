@@ -1,5 +1,6 @@
 import {
   AudioInputSource,
+  AudioSpeakerRole,
   EventSourceType,
   OsEventTypeList,
   StartUpPageCreateResult,
@@ -58,6 +59,23 @@ export const RESULT_PIPELINE_DEADLINE_MS = 15_000;
 
 const CLEANUP_PREEMPTED = Symbol("cleanup-preempted");
 const AUTH_OPERATION_PREEMPTED = Symbol("auth-operation-preempted");
+
+// NOTE: the SDK's normalizeAudioInputSource maps missing, null, empty and
+// unrecognised source values to Glasses (verified against 0.0.14), so this
+// check can only reject an explicit Phone source. True provenance is not
+// recoverable here: the bridge hands us a parsed AudioEvent and retains no raw
+// metadata. Wearer exclusion therefore rests on speakerRole plus verification,
+// not on this guard.
+export function maskAudioFrame(
+  audioPcm: Uint8Array,
+  speakerRole: unknown,
+  source: unknown,
+): Uint8Array {
+  if (source !== AudioInputSource.Glasses || speakerRole === AudioSpeakerRole.Self) {
+    return new Uint8Array(audioPcm.length);
+  }
+  return new Uint8Array(audioPcm);
+}
 
 type TransportCloseResult =
   | { readonly ok: true }
@@ -133,6 +151,16 @@ export interface BridgeRuntimeSnapshot {
   readonly target: TargetLanguage | undefined;
   readonly sessionReady: boolean;
   readonly audioOpen: boolean;
+  /**
+   * Frames classified by maskAudioFrame. The transport may still drop a frame
+   * after this point (inactive, non-streaming, not ready, or queue overflow all
+   * discard silently), so these are classification totals for Phase 0 role
+   * measurement, not proof of delivery.
+   */
+  readonly audioFramesProcessed: number;
+  readonly audioFramesMaskedSelf: number;
+  readonly audioFramesMaskedForSource: number;
+  readonly audioFramesUnknown: number;
   readonly displayUpdateCount: number;
   readonly lastDisplayContent: Readonly<Record<string, string>>;
   readonly cleanupWaiterCount: number;
@@ -747,6 +775,10 @@ export class G2BridgeRuntime {
   #audioOpen = false;
   #audioOpenUncertain = false;
   #audioPcmEnabled = false;
+  #audioFramesProcessed = 0;
+  #audioFramesMaskedSelf = 0;
+  #audioFramesMaskedForSource = 0;
+  #audioFramesUnknown = 0;
   #pendingAudioOpen: Promise<void> | undefined;
   #pendingAudioClose: Promise<boolean> | undefined;
   #audioCloseRequired = false;
@@ -832,6 +864,10 @@ export class G2BridgeRuntime {
       target: targetForState(this.#state),
       sessionReady: sessionReadyForState(this.#state),
       audioOpen: this.#audioOpen,
+      audioFramesProcessed: this.#audioFramesProcessed,
+      audioFramesMaskedSelf: this.#audioFramesMaskedSelf,
+      audioFramesMaskedForSource: this.#audioFramesMaskedForSource,
+      audioFramesUnknown: this.#audioFramesUnknown,
       displayUpdateCount: this.#displayUpdateCount,
       lastDisplayContent: Object.freeze({ ...this.#lastDisplayContent }),
       cleanupWaiterCount: this.#cleanupWaiters.size,
@@ -1659,12 +1695,25 @@ export class G2BridgeRuntime {
       this.#audioOpen &&
       this.#audioPcmEnabled &&
       transport !== undefined &&
-      this.#audioPcmFaultTransport !== transport &&
-      (audioSource === undefined || audioSource === AudioInputSource.Glasses)
+      this.#audioPcmFaultTransport !== transport
     ) {
-      const pcm = new Uint8Array(audioEvent.audioPcm);
+      const speakerRole = audioEvent.speakerRole;
+      const isGlassesSource = audioSource === AudioInputSource.Glasses;
+      const isSelfRole = speakerRole === AudioSpeakerRole.Self;
+      const isUnknownRole =
+        speakerRole !== AudioSpeakerRole.Self &&
+        speakerRole !== AudioSpeakerRole.Other;
+      const pcm = maskAudioFrame(audioEvent.audioPcm, speakerRole, audioSource);
       try {
         transport.pushPcm(pcm);
+        this.#audioFramesProcessed += 1;
+        if (!isGlassesSource) {
+          this.#audioFramesMaskedForSource += 1;
+        } else if (isSelfRole) {
+          this.#audioFramesMaskedSelf += 1;
+        } else if (isUnknownRole) {
+          this.#audioFramesUnknown += 1;
+        }
       } catch {
         this.#audioPcmFaultTransport = transport;
         this.#queueTransportEvent(transport, { type: "fatal" });
